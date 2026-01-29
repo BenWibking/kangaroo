@@ -1,0 +1,55 @@
+Kangaroo prototype runtime
+
+This repo contains a prototype implementation of the distributed task runtime described in `PLAN.md`.
+The Python side provides a DSL to author operators and plans, and the C++ side (HPX-based) provides
+execution, data services, adjacency, and kernel registry scaffolding.
+
+Status
+- Python DSL: implemented in `analysis/`
+- C++ runtime: scaffolded in `cpp/` (HPX target with local adjacency/data services)
+- Msgpack decoding: wired via msgpack-c (required)
+
+Python quickstart (prototype)
+```
+from analysis import Runtime, Plan
+from analysis.ctx import LoweringContext
+from analysis.ops import VorticityMag
+from analysis.runmeta import RunMeta, StepMeta, LevelMeta, LevelGeom, BlockBox
+from analysis.dataset import open_dataset
+
+runmeta = RunMeta(steps=[
+    StepMeta(step=0, levels=[
+        LevelMeta(
+            geom=LevelGeom(dx=(1.0, 1.0, 1.0), x0=(0.0, 0.0, 0.0), ref_ratio=1),
+            boxes=[BlockBox((0, 0, 0), (7, 7, 7)), BlockBox((8, 0, 0), (15, 7, 7))],
+        )
+    ])
+])
+
+rt = Runtime()
+
+ds = open_dataset("memory://example", runmeta=runmeta, step=0, level=0)
+vel = ds.field_id("vel")
+
+op = VorticityMag(vel_field=vel)
+ctx = LoweringContext(runtime=rt._rt, runmeta=runmeta._h, dataset=ds)
+plan = Plan(stages=op.lower(ctx))
+
+rt.run(plan, runmeta=runmeta, dataset=ds)
+```
+
+C++ build (HPX required)
+- Configure and build in `cpp/` using CMake. The runtime builds as a static library and installs the `_core` module plus `analysis/` into site-packages.
+- msgpack-c is required and fetched automatically if not found.
+- Python bindings are required and build via nanobind.
+- Recommended (macOS): install HPX via Spack, then point `HPX_DIR` at the CMake package:
+  - `spack install hpx`
+  - `HPX_DIR=$(spack location -i hpx)/lib/cmake/HPX`
+- For `pip`/`uv pip install`, HPX must be discoverable by CMake. Set `HPX_DIR` (or `CMAKE_PREFIX_PATH`) before installing:
+  - `HPX_DIR=/path/to/hpx/lib/cmake/HPX uv pip install -e .`
+  - `uv pip install -e . --config-settings=cmake.args="-DHPX_DIR=/path/to/hpx/lib/cmake/HPX"`
+
+HPX autodetect helper
+- Use `scripts/detect_hpx.sh` to find a suitable `HPX_DIR`:
+  - `HPX_DIR=$(scripts/detect_hpx.sh)`
+  - `cmake -S . -B build -DHPX_DIR=\"$HPX_DIR\"`
