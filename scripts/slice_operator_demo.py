@@ -69,6 +69,7 @@ def main() -> int:
     ds = open_dataset("memory://slice-demo", runmeta=runmeta, step=0, level=0, runtime=rt)
     field = ds.field_id("scalar")
 
+    block_data: list[np.ndarray] = []
     for block_id, box in enumerate(runmeta.steps[0].levels[0].boxes):
         bx = box.hi[0] - box.lo[0] + 1
         by = box.hi[1] - box.lo[1] + 1
@@ -79,6 +80,7 @@ def main() -> int:
             x0[2] + box.lo[2] * dx,
         )
         data = make_synthetic_field(bx, by, bz, dx, x0_block)
+        block_data.append(data)
         ds.set_chunk(field=field, block=block_id, data=data.astype(np.float32).tobytes(order="C"))
 
     # Define a z-slice through the middle of the domain.
@@ -102,9 +104,20 @@ def main() -> int:
         print("Runtime executed but raised (kernels may be missing):", exc)
 
     # Fetch the task-graph output bytes and decode to a 2D float32 array.
+    # Note: Kangaroo's UniformSlice output is laid out with in-plane axes
+    # swapped relative to NumPy's (x, y) indexing, so the raw array is (y, x).
     slice_field = plan.stages[-1].templates[0].outputs[0].field
     raw = rt.get_task_chunk(step=0, level=0, field=slice_field, version=0, block=0)
     slice_2d = np.frombuffer(raw, dtype=np.float32, count=nx * ny).reshape((nx, ny))
+    full_field = np.concatenate(block_data, axis=0)
+    expected_slice = full_field[:, :, k]
+    kangaroo_slice = slice_2d.T
+    max_abs_diff = np.max(np.abs(kangaroo_slice - expected_slice))
+    print(f"Slice comparison: max abs diff = {max_abs_diff:.6e}")
+    print(
+        "Slice comparison: allclose = "
+        f"{np.allclose(kangaroo_slice, expected_slice, rtol=1e-6, atol=1e-6)}"
+    )
 
     fig, ax = plt.subplots(figsize=(6, 5))
     im = ax.imshow(slice_2d.T, origin="lower", cmap="viridis")
