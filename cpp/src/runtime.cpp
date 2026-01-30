@@ -2,6 +2,7 @@
 
 #include "kangaroo/plan_decode.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <mutex>
@@ -349,6 +350,62 @@ Runtime::Runtime() {
               }
               out_f[static_cast<std::size_t>(j) * out_nx + i] = value;
             }
+          }
+        }
+        return hpx::make_ready_future();
+      });
+  kernel_registry_.register_kernel(
+      KernelDesc{.name = "uniform_slice_reduce", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        struct Params {
+          int bytes_per_value = 4;
+        } params;
+
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            for (uint32_t i = 0; i < root.via.map.size; ++i) {
+              const auto& k = root.via.map.ptr[i].key;
+              if (k.type == msgpack::type::STR && k.as<std::string>() == "bytes_per_value") {
+                const auto& v = root.via.map.ptr[i].val;
+                if (v.type == msgpack::type::POSITIVE_INTEGER ||
+                    v.type == msgpack::type::NEGATIVE_INTEGER) {
+                  params.bytes_per_value = v.as<int>();
+                }
+              }
+            }
+          }
+        }
+
+        if (outputs.empty() || inputs.empty()) {
+          return hpx::make_ready_future();
+        }
+
+        auto& out = outputs[0].data;
+        if (out.empty()) {
+          return hpx::make_ready_future();
+        }
+        std::fill(out.begin(), out.end(), 0);
+
+        if (params.bytes_per_value != 4) {
+          return hpx::make_ready_future();
+        }
+
+        const std::size_t n = out.size() / sizeof(float);
+        auto* out_f = reinterpret_cast<float*>(out.data());
+
+        for (const auto& in_view : inputs) {
+          const auto& in = in_view.data;
+          if (in.empty()) {
+            continue;
+          }
+          const std::size_t n_in = std::min(n, in.size() / sizeof(float));
+          const auto* in_f = reinterpret_cast<const float*>(in.data());
+          for (std::size_t i = 0; i < n_in; ++i) {
+            out_f[i] += in_f[i];
           }
         }
         return hpx::make_ready_future();

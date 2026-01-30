@@ -77,6 +77,7 @@ class UniformSlice:
         resolution: tuple[int, int],
         out_name: str = "slice",
         bytes_per_value: int = 4,
+        reduce_fan_in: int = 8,
     ) -> None:
         self.field = field
         self.axis = axis
@@ -85,6 +86,7 @@ class UniformSlice:
         self.resolution = resolution
         self.out_name = out_name
         self.bytes_per_value = bytes_per_value
+        self.reduce_fan_in = reduce_fan_in
 
     def _intersecting_blocks(self, ctx: LoweringContext) -> Iterable[int]:
         ds = ctx.dataset
@@ -120,8 +122,34 @@ class UniformSlice:
         if not blocks:
             return ctx.fragment([])
 
-        out_field = ctx.output_field(self.out_name)
         out_bytes = nx * ny * self.bytes_per_value
+        out_field = ctx.output_field(self.out_name)
+
+        if len(blocks) == 1:
+            stage = ctx.stage("uniform_slice")
+            for block in blocks:
+                dom = ctx.domain(step=ds.step, level=ds.level, blocks=[block])
+                stage.map_blocks(
+                    name=f"uniform_slice_b{block}",
+                    kernel="uniform_slice",
+                    domain=dom,
+                    inputs=[FieldRef(self.field)],
+                    outputs=[out_field],
+                    output_bytes=[out_bytes],
+                    deps={"kind": "None"},
+                    params={
+                        "axis": axis_idx,
+                        "coord": self.coord,
+                        "rect": list(self.rect),
+                        "resolution": [nx, ny],
+                        "plane_axes": [u_axis, v_axis],
+                        "bytes_per_value": self.bytes_per_value,
+                    },
+                )
+            return ctx.fragment([stage])
+
+        block_field = ctx.temp_field(f"{self.out_name}_blocks")
+        stages = []
 
         stage = ctx.stage("uniform_slice")
         for block in blocks:
@@ -131,7 +159,7 @@ class UniformSlice:
                 kernel="uniform_slice",
                 domain=dom,
                 inputs=[FieldRef(self.field)],
-                outputs=[out_field],
+                outputs=[block_field],
                 output_bytes=[out_bytes],
                 deps={"kind": "None"},
                 params={
@@ -143,5 +171,38 @@ class UniformSlice:
                     "bytes_per_value": self.bytes_per_value,
                 },
             )
+        stages.append(stage)
 
-        return ctx.fragment([stage])
+        fan_in = max(1, int(self.reduce_fan_in))
+        num_inputs = len(blocks)
+        input_field = block_field
+        reduce_idx = 0
+        while num_inputs > 1:
+            num_groups = (num_inputs + fan_in - 1) // fan_in
+            output_field = out_field if num_groups == 1 else ctx.temp_field(
+                f"{self.out_name}_reduce_{reduce_idx}"
+            )
+            reduce_stage = ctx.stage("uniform_slice_reduce", plane="graph", after=[stages[-1]])
+            reduce_stage.map_blocks(
+                name=f"uniform_slice_reduce_s{reduce_idx}",
+                kernel="uniform_slice_reduce",
+                domain=ctx.domain(step=ds.step, level=ds.level),
+                inputs=[input_field],
+                outputs=[output_field],
+                output_bytes=[out_bytes],
+                deps={"kind": "None"},
+                params={
+                    "graph_kind": "reduce",
+                    "fan_in": fan_in,
+                    "num_inputs": num_inputs,
+                    "input_base": 0,
+                    "output_base": 0,
+                    "bytes_per_value": self.bytes_per_value,
+                },
+            )
+            stages.append(reduce_stage)
+            input_field = output_field
+            num_inputs = num_groups
+            reduce_idx += 1
+
+        return ctx.fragment(stages)

@@ -5,16 +5,22 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import sys
 
 import numpy as np
 import matplotlib.pyplot as plt
 
-from analysis import Plan, Runtime
-from analysis.runtime import plan_to_dict
-from analysis.ctx import LoweringContext
-from analysis.ops import UniformSlice
-from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
-from analysis.dataset import open_dataset
+REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+
+from analysis import Plan, Runtime  # noqa: E402
+from analysis.runtime import plan_to_dict  # noqa: E402
+from analysis.ctx import LoweringContext  # noqa: E402
+from analysis.ops import UniformSlice  # noqa: E402
+from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta  # noqa: E402
+from analysis.dataset import open_dataset  # noqa: E402
 
 
 def make_synthetic_field(nx: int, ny: int, nz: int, dx: float, x0: tuple[float, float, float]) -> np.ndarray:
@@ -37,10 +43,11 @@ def main() -> int:
         print("Runtime init failed (is the C++ module built?):", exc)
         return 1
 
-    # Single-block synthetic AMR level.
+    # Two-block synthetic AMR level along x.
     nx = ny = nz = 64
     dx = 0.25
     x0 = (0.0, 0.0, 0.0)
+    nx_half = nx // 2
 
     runmeta = RunMeta(
         steps=[
@@ -49,7 +56,10 @@ def main() -> int:
                 levels=[
                     LevelMeta(
                         geom=LevelGeom(dx=(dx, dx, dx), x0=x0, ref_ratio=1),
-                        boxes=[BlockBox((0, 0, 0), (nx - 1, ny - 1, nz - 1))],
+                        boxes=[
+                            BlockBox((0, 0, 0), (nx_half - 1, ny - 1, nz - 1)),
+                            BlockBox((nx_half, 0, 0), (nx - 1, ny - 1, nz - 1)),
+                        ],
                     )
                 ],
             )
@@ -59,8 +69,17 @@ def main() -> int:
     ds = open_dataset("memory://slice-demo", runmeta=runmeta, step=0, level=0, runtime=rt)
     field = ds.field_id("scalar")
 
-    data = make_synthetic_field(nx, ny, nz, dx, x0)
-    ds.set_chunk(field=field, block=0, data=data.astype(np.float32).tobytes(order="C"))
+    for block_id, box in enumerate(runmeta.steps[0].levels[0].boxes):
+        bx = box.hi[0] - box.lo[0] + 1
+        by = box.hi[1] - box.lo[1] + 1
+        bz = box.hi[2] - box.lo[2] + 1
+        x0_block = (
+            x0[0] + box.lo[0] * dx,
+            x0[1] + box.lo[1] * dx,
+            x0[2] + box.lo[2] * dx,
+        )
+        data = make_synthetic_field(bx, by, bz, dx, x0_block)
+        ds.set_chunk(field=field, block=block_id, data=data.astype(np.float32).tobytes(order="C"))
 
     # Define a z-slice through the middle of the domain.
     axis = "z"
@@ -83,7 +102,7 @@ def main() -> int:
         print("Runtime executed but raised (kernels may be missing):", exc)
 
     # Fetch the task-graph output bytes and decode to a 2D float32 array.
-    slice_field = plan.stages[0].templates[0].outputs[0].field
+    slice_field = plan.stages[-1].templates[0].outputs[0].field
     raw = rt.get_task_chunk(step=0, level=0, field=slice_field, version=0, block=0)
     slice_2d = np.frombuffer(raw, dtype=np.float32, count=nx * ny).reshape((nx, ny))
 

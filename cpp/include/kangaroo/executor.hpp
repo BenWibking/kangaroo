@@ -21,6 +21,8 @@ class Executor {
   hpx::future<void> run_stage(int32_t stage_idx, const StageIR& stage);
   hpx::future<void> run_block_task(const TaskTemplateIR& tmpl, int32_t stage_idx, int32_t tmpl_idx,
                                    int32_t block);
+  hpx::future<void> run_graph_task(const TaskTemplateIR& tmpl, int32_t stage_idx, int32_t tmpl_idx,
+                                   int32_t group_idx);
 
   int32_t plan_id_ = 0;
   const RunMeta& meta_;
