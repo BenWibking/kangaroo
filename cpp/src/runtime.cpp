@@ -163,7 +163,9 @@ Runtime::Runtime() {
               }
               return nullptr;
             };
-            if (const auto* axis = get_key("axis"); axis && axis->is_integer()) {
+            if (const auto* axis = get_key("axis"); axis &&
+                                                   (axis->type == msgpack::type::POSITIVE_INTEGER ||
+                                                    axis->type == msgpack::type::NEGATIVE_INTEGER)) {
               params.axis = axis->as<int>();
             }
             if (const auto* coord = get_key("coord"); coord &&
@@ -183,7 +185,9 @@ Runtime::Runtime() {
               params.resolution[0] = res->via.array.ptr[0].as<int>();
               params.resolution[1] = res->via.array.ptr[1].as<int>();
             }
-            if (const auto* bpv = get_key("bytes_per_value"); bpv && bpv->is_integer()) {
+            if (const auto* bpv = get_key("bytes_per_value"); bpv &&
+                                                         (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                                                          bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
               params.bytes_per_value = bpv->as<int>();
             }
           }
