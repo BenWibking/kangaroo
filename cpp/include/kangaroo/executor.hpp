@@ -12,14 +12,17 @@ namespace kangaroo {
 
 class Executor {
  public:
-  Executor(const RunMeta& meta, DataService& data, AdjacencyService& adj, KernelRegistry& kr);
+  Executor(int32_t plan_id, const RunMeta& meta, DataService& data, AdjacencyService& adj,
+           KernelRegistry& kr);
 
   hpx::future<void> run(const PlanIR& plan);
 
  private:
-  hpx::future<void> run_stage(const StageIR& stage);
-  hpx::future<void> run_block_task(const TaskTemplateIR& tmpl, int32_t block);
+  hpx::future<void> run_stage(int32_t stage_idx, const StageIR& stage);
+  hpx::future<void> run_block_task(const TaskTemplateIR& tmpl, int32_t stage_idx, int32_t tmpl_idx,
+                                   int32_t block);
 
+  int32_t plan_id_ = 0;
   const RunMeta& meta_;
   DataService& data_;
   AdjacencyService& adj_;

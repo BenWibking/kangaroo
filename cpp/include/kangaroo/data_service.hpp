@@ -25,6 +25,7 @@ class DataService {
  public:
   virtual ~DataService() = default;
   virtual int home_rank(const ChunkRef&) const = 0;
+  virtual HostView alloc_host(const ChunkRef&, std::size_t bytes) = 0;
   virtual hpx::future<HostView> get_host(const ChunkRef&) = 0;
   virtual hpx::future<void> put_host(const ChunkRef&, HostView) = 0;
 };

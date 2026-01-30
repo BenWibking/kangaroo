@@ -27,6 +27,7 @@ class TaskTemplate:
     domain: Domain
     inputs: List[FieldRef]
     outputs: List[FieldRef]
+    output_bytes: List[int] = field(default_factory=list)
     deps: Dict[str, Any] = field(default_factory=lambda: {"kind": "None"})
     params: Dict[str, Any] = field(default_factory=dict)
 
@@ -46,6 +47,7 @@ class Stage:
         domain: Domain,
         inputs: List[FieldRef],
         outputs: List[FieldRef],
+        output_bytes: List[int] | None = None,
         deps: Dict[str, Any],
         params: Dict[str, Any],
     ) -> None:
@@ -57,6 +59,7 @@ class Stage:
                 domain=domain,
                 inputs=inputs,
                 outputs=outputs,
+                output_bytes=list(output_bytes) if output_bytes is not None else [],
                 deps=deps,
                 params=params,
             )

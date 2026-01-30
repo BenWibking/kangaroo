@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from . import _core  # type: ignore
 
@@ -12,9 +12,9 @@ class Dataset:
     runmeta: Any
     step: int
     level: int
+    runtime: Any
     _h: Any = field(init=False)
     _fields: Dict[str, int] = field(default_factory=dict)
-    _next_field_id: int = 1
 
     def __post_init__(self) -> None:
         self._h = _core.DatasetHandle(self.uri, self.step, self.level)
@@ -25,11 +25,10 @@ class Dataset:
     def field_id(self, name: str) -> int:
         if name in self._fields:
             return self._fields[name]
-        fid = self._next_field_id
-        self._next_field_id += 1
+        fid = self.runtime.alloc_field_id(name)
         self._fields[name] = fid
         return fid
 
 
-def open_dataset(uri: str, *, runmeta: Any, step: int, level: int) -> Dataset:
-    return Dataset(uri=uri, runmeta=runmeta, step=step, level=level)
+def open_dataset(uri: str, *, runmeta: Any, step: int, level: int, runtime: Any) -> Dataset:
+    return Dataset(uri=uri, runmeta=runmeta, step=step, level=level, runtime=runtime)

@@ -53,17 +53,18 @@ def plan_to_dict(plan: Plan) -> dict:
                             if tmpl.domain.blocks is not None
                             else None,
                         },
-                        "inputs": [
-                            {"field": ref.field, "version": ref.version}
-                            for ref in tmpl.inputs
-                        ],
-                        "outputs": [
-                            {"field": ref.field, "version": ref.version}
-                            for ref in tmpl.outputs
-                        ],
-                        "deps": tmpl.deps,
-                        "params": tmpl.params,
-                    }
+                    "inputs": [
+                        {"field": ref.field, "version": ref.version}
+                        for ref in tmpl.inputs
+                    ],
+                    "outputs": [
+                        {"field": ref.field, "version": ref.version}
+                        for ref in tmpl.outputs
+                    ],
+                    "output_bytes": list(tmpl.output_bytes),
+                    "deps": tmpl.deps,
+                    "params": tmpl.params,
+                }
                     for tmpl in stage.templates
                 ],
             }

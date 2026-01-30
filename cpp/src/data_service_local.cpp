@@ -39,6 +39,12 @@ int DataServiceLocal::home_rank(const ChunkRef& ref) const {
   return static_cast<int>(h % localities.size());
 }
 
+HostView DataServiceLocal::alloc_host(const ChunkRef&, std::size_t bytes) {
+  HostView view;
+  view.data.resize(bytes);
+  return view;
+}
+
 HostView DataServiceLocal::get_local_impl(const ChunkRef& ref) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = data_.find(ref);

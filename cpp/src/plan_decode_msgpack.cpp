@@ -162,6 +162,16 @@ PlanIR decode_plan_msgpack(std::span<const std::uint8_t> payload) {
 
       tmpl.inputs = parse_field_refs(expect_map_value(tmpl_obj, "inputs"));
       tmpl.outputs = parse_field_refs(expect_map_value(tmpl_obj, "outputs"));
+      const msgpack::object* out_bytes_obj = nullptr;
+      if (try_get_map_value(tmpl_obj, "output_bytes", &out_bytes_obj)) {
+        if (out_bytes_obj->type != msgpack::type::ARRAY) {
+          throw std::runtime_error("output_bytes must be array");
+        }
+        tmpl.output_bytes.reserve(out_bytes_obj->via.array.size);
+        for (uint32_t i = 0; i < out_bytes_obj->via.array.size; ++i) {
+          tmpl.output_bytes.push_back(out_bytes_obj->via.array.ptr[i].as<int32_t>());
+        }
+      }
       tmpl.deps = parse_deps(expect_map_value(tmpl_obj, "deps"));
       tmpl.params_msgpack = repack_params(expect_map_value(tmpl_obj, "params"));
 

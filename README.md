@@ -2,7 +2,8 @@ Kangaroo prototype runtime
 
 This repo contains a prototype implementation of the distributed task runtime described in `PLAN.md`.
 The Python side provides a DSL to author operators and plans, and the C++ side (HPX-based) provides
-execution, data services, adjacency, and kernel registry scaffolding.
+execution, data services, adjacency, and kernel registry scaffolding. Output buffers are allocated
+by the DataService, with optional per-output sizes provided in the plan.
 
 Status
 - Python DSL: implemented in `analysis/`
@@ -28,7 +29,7 @@ runmeta = RunMeta(steps=[
 
 rt = Runtime()
 
-ds = open_dataset("memory://example", runmeta=runmeta, step=0, level=0)
+ds = open_dataset("memory://example", runmeta=runmeta, step=0, level=0, runtime=rt)
 vel = ds.field_id("vel")
 
 op = VorticityMag(vel_field=vel)
@@ -36,6 +37,25 @@ ctx = LoweringContext(runtime=rt._rt, runmeta=runmeta._h, dataset=ds)
 plan = Plan(stages=op.lower(ctx))
 
 rt.run(plan, runmeta=runmeta, dataset=ds)
+```
+
+Output allocation
+- Outputs are allocated by the DataService.
+- In Python, supply `output_bytes` in `map_blocks(...)` to request sizes per output.
+- If omitted, outputs are allocated with size 0 (kernels may resize if desired).
+
+Example:
+```
+s1.map_blocks(
+    name="gradU",
+    kernel="gradU_stencil",
+    domain=dom,
+    inputs=[FieldRef(self.vel_field)],
+    outputs=[gradU],
+    output_bytes=[1024],
+    deps={"kind": "FaceNeighbors", "width": 1, "faces": [1, 1, 1, 1, 1, 1]},
+    params={"order": 2},
+)
 ```
 
 C++ build (HPX required)

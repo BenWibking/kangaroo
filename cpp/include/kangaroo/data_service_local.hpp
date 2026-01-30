@@ -21,6 +21,7 @@ class DataServiceLocal : public DataService {
   DataServiceLocal();
 
   int home_rank(const ChunkRef& ref) const override;
+  HostView alloc_host(const ChunkRef& ref, std::size_t bytes) override;
   hpx::future<HostView> get_host(const ChunkRef& ref) override;
   hpx::future<void> put_host(const ChunkRef& ref, HostView view) override;
 
