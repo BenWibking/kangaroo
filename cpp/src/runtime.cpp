@@ -2,9 +2,11 @@
 
 #include "kangaroo/plan_decode.hpp"
 
+#include <array>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
+#include <msgpack.hpp>
 
 #include <hpx/include/actions.hpp>
 #include <hpx/collectives/broadcast_direct.hpp>
@@ -132,6 +134,77 @@ Runtime::Runtime() {
          std::span<HostView> outputs, std::span<const std::uint8_t>) {
         if (!outputs.empty()) {
           outputs[0].data.assign(1, 0);
+        }
+        return hpx::make_ready_future();
+      });
+  kernel_registry_.register_kernel(
+      KernelDesc{.name = "uniform_slice", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView>, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        struct Params {
+          int axis = 2;
+          double coord = 0.0;
+          std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
+          std::array<int, 2> resolution{1, 1};
+          int bytes_per_value = 4;
+        } params;
+
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            auto get_key = [&](const char* key) -> const msgpack::object* {
+              for (uint32_t i = 0; i < root.via.map.size; ++i) {
+                const auto& k = root.via.map.ptr[i].key;
+                if (k.type == msgpack::type::STR && k.as<std::string>() == key) {
+                  return &root.via.map.ptr[i].val;
+                }
+              }
+              return nullptr;
+            };
+            if (const auto* axis = get_key("axis"); axis && axis->is_integer()) {
+              params.axis = axis->as<int>();
+            }
+            if (const auto* coord = get_key("coord"); coord &&
+                                                     (coord->type == msgpack::type::FLOAT ||
+                                                      coord->type == msgpack::type::POSITIVE_INTEGER ||
+                                                      coord->type == msgpack::type::NEGATIVE_INTEGER)) {
+              params.coord = coord->as<double>();
+            }
+            if (const auto* rect = get_key("rect"); rect && rect->type == msgpack::type::ARRAY &&
+                                                   rect->via.array.size == 4) {
+              for (uint32_t i = 0; i < 4; ++i) {
+                params.rect[i] = rect->via.array.ptr[i].as<double>();
+              }
+            }
+            if (const auto* res = get_key("resolution"); res && res->type == msgpack::type::ARRAY &&
+                                                       res->via.array.size == 2) {
+              params.resolution[0] = res->via.array.ptr[0].as<int>();
+              params.resolution[1] = res->via.array.ptr[1].as<int>();
+            }
+            if (const auto* bpv = get_key("bytes_per_value"); bpv && bpv->is_integer()) {
+              params.bytes_per_value = bpv->as<int>();
+            }
+          }
+        }
+
+        const auto nx = params.resolution[0];
+        const auto ny = params.resolution[1];
+        std::size_t bytes = 0;
+        if (nx > 0 && ny > 0 && params.bytes_per_value > 0) {
+          bytes = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) *
+                  static_cast<std::size_t>(params.bytes_per_value);
+        }
+
+        if (!outputs.empty()) {
+          if (bytes > 0 && outputs[0].data.size() != bytes) {
+            outputs[0].data.assign(bytes, 0);
+          } else if (outputs[0].data.empty()) {
+            outputs[0].data.assign(1, 0);
+          } else {
+            std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
+          }
         }
         return hpx::make_ready_future();
       });
