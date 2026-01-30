@@ -30,6 +30,9 @@ class Runtime:
         packed = msgpack.packb(plan_to_dict(plan), use_bin_type=True)
         self._rt.run_packed_plan(packed, runmeta._h, dataset._h)
 
+    def preload(self, *, runmeta, dataset, fields: list[int]) -> None:
+        self._rt.preload_dataset(runmeta._h, dataset._h, list(fields))
+
 
 def plan_to_dict(plan: Plan) -> dict:
     stages = []

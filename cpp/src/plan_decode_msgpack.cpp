@@ -109,6 +109,16 @@ DepRuleIR parse_deps(const msgpack::object& obj) {
       }
     }
   }
+  const msgpack::object* halo_obj = nullptr;
+  if (try_get_map_value(obj, "halo_inputs", &halo_obj)) {
+    if (halo_obj->type != msgpack::type::ARRAY) {
+      throw std::runtime_error("halo_inputs must be array");
+    }
+    deps.halo_inputs.reserve(halo_obj->via.array.size);
+    for (uint32_t i = 0; i < halo_obj->via.array.size; ++i) {
+      deps.halo_inputs.push_back(halo_obj->via.array.ptr[i].as<int32_t>());
+    }
+  }
   return deps;
 }
 
@@ -182,6 +192,17 @@ PlanIR decode_plan_msgpack(std::span<const std::uint8_t> payload) {
       }
       tmpl.deps = parse_deps(expect_map_value(tmpl_obj, "deps"));
       tmpl.params_msgpack = repack_params(expect_map_value(tmpl_obj, "params"));
+
+      if (tmpl.deps.kind == "FaceNeighbors") {
+        if (tmpl.inputs.empty()) {
+          throw std::runtime_error("FaceNeighbors deps require at least one input field");
+        }
+        for (int32_t idx : tmpl.deps.halo_inputs) {
+          if (idx < 0 || idx >= static_cast<int32_t>(tmpl.inputs.size())) {
+            throw std::runtime_error("halo_inputs index out of range");
+          }
+        }
+      }
 
       stage.templates.push_back(std::move(tmpl));
     }

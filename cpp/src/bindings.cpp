@@ -73,6 +73,7 @@ NB_MODULE(_core, m) {
       .def("alloc_field_id", &kangaroo::Runtime::alloc_field_id)
       .def("mark_field_persistent", &kangaroo::Runtime::mark_field_persistent)
       .def("kernels", &kangaroo::Runtime::kernels, nb::rv_policy::reference)
+      .def("preload_dataset", &kangaroo::Runtime::preload_dataset)
       .def("run_packed_plan", &kangaroo::Runtime::run_packed_plan)
       .def("run_packed_plan",
            [](kangaroo::Runtime& self, nb::bytes packed, kangaroo::RunMetaHandle& runmeta,
@@ -98,6 +99,16 @@ NB_MODULE(_core, m) {
         self->uri = uri;
         self->step = step;
         self->level = level;
-      });
+      })
+      .def("set_chunk",
+           [](kangaroo::DatasetHandle& self, int32_t field, int32_t version, int32_t block,
+              nb::bytes payload) {
+             const auto* data = static_cast<const std::uint8_t*>(payload.data());
+             std::vector<std::uint8_t> buffer(data, data + payload.size());
+             kangaroo::HostView view;
+             view.data = std::move(buffer);
+             kangaroo::ChunkRef ref{self.step, self.level, field, version, block};
+             self.set_chunk(ref, std::move(view));
+           });
 }
 #endif

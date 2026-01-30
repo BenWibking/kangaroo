@@ -1,5 +1,7 @@
 #include "kangaroo/data_service_local.hpp"
 
+#include "kangaroo/runtime.hpp"
+
 #include <functional>
 
 #include <hpx/include/actions.hpp>
@@ -14,27 +16,14 @@ DataServiceLocal::DataServiceLocal() = default;
 
 std::mutex DataServiceLocal::mutex_;
 DataServiceLocal::MapT DataServiceLocal::data_;
+const DatasetHandle* DataServiceLocal::dataset_ = nullptr;
 
-std::size_t DataServiceLocal::KeyHash::operator()(const ChunkRef& ref) const {
-  std::size_t h = 0xcbf29ce484222325ull;
-  auto mix = [&](auto v) {
-    h ^= static_cast<std::size_t>(v) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
-  };
-  mix(ref.step);
-  mix(ref.level);
-  mix(ref.field);
-  mix(ref.version);
-  mix(ref.block);
-  return h;
-}
-
-bool DataServiceLocal::KeyEq::operator()(const ChunkRef& a, const ChunkRef& b) const {
-  return a.step == b.step && a.level == b.level && a.field == b.field && a.version == b.version &&
-         a.block == b.block;
+void DataServiceLocal::set_dataset(const DatasetHandle* dataset) {
+  dataset_ = dataset;
 }
 
 int DataServiceLocal::home_rank(const ChunkRef& ref) const {
-  std::size_t h = KeyHash{}(ref);
+  std::size_t h = ChunkRefHash{}(ref);
   auto localities = hpx::find_all_localities();
   return static_cast<int>(h % localities.size());
 }
@@ -46,12 +35,27 @@ HostView DataServiceLocal::alloc_host(const ChunkRef&, std::size_t bytes) {
 }
 
 HostView DataServiceLocal::get_local_impl(const ChunkRef& ref) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  auto it = data_.find(ref);
-  if (it == data_.end()) {
-    return HostView{};
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    auto it = data_.find(ref);
+    if (it != data_.end()) {
+      return it->second;
+    }
   }
-  return it->second;
+
+  if (dataset_ != nullptr) {
+    auto view = dataset_->get_chunk(ref);
+    if (view.has_value()) {
+      std::lock_guard<std::mutex> lock(mutex_);
+      auto [it, inserted] = data_.emplace(ref, *view);
+      if (!inserted) {
+        it->second = *view;
+      }
+      return it->second;
+    }
+  }
+
+  return HostView{};
 }
 
 void DataServiceLocal::put_local_impl(const ChunkRef& ref, HostView view) {
@@ -88,6 +92,47 @@ hpx::future<void> DataServiceLocal::put_host(const ChunkRef& ref, HostView view)
   return hpx::async<::kangaroo_data_put_local_action>(localities.at(target), ref, std::move(view))
       .then(
       [](auto&&) { return; });
+}
+
+void DataServiceLocal::preload(const RunMeta& meta,
+                               const DatasetHandle& dataset,
+                               const std::vector<int32_t>& fields) {
+  if (fields.empty()) {
+    return;
+  }
+  if (meta.steps.empty()) {
+    return;
+  }
+  if (dataset.step < 0 || dataset.step >= static_cast<int32_t>(meta.steps.size())) {
+    return;
+  }
+  const auto& step_meta = meta.steps.at(dataset.step);
+  if (dataset.level < 0 || dataset.level >= static_cast<int16_t>(step_meta.levels.size())) {
+    return;
+  }
+  const auto& level_meta = step_meta.levels.at(dataset.level);
+  const int32_t nblocks = static_cast<int32_t>(level_meta.boxes.size());
+  if (nblocks <= 0) {
+    return;
+  }
+
+  DataServiceLocal local;
+  const int here = hpx::get_locality_id();
+
+  for (int32_t block = 0; block < nblocks; ++block) {
+    for (int32_t field : fields) {
+      ChunkRef ref{dataset.step, dataset.level, field, 0, block};
+      if (local.home_rank(ref) != here) {
+        continue;
+      }
+      auto view = dataset.get_chunk(ref);
+      if (!view.has_value()) {
+        continue;
+      }
+      std::lock_guard<std::mutex> lock(mutex_);
+      data_[ref] = std::move(*view);
+    }
+  }
 }
 
 }  // namespace kangaroo

@@ -24,7 +24,12 @@ struct HostView {
 };
 
 struct NeighborViews {
-  std::span<const HostView> xm, xp, ym, yp, zm, zp;
+  struct FieldNeighbors {
+    std::vector<HostView> xm, xp, ym, yp, zm, zp;
+  };
+
+  std::vector<int32_t> input_indices;
+  std::vector<FieldNeighbors> inputs;
 };
 
 struct LevelMeta;  // forward

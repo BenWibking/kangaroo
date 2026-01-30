@@ -29,6 +29,9 @@ class Dataset:
         self._fields[name] = fid
         return fid
 
+    def set_chunk(self, *, field: int, version: int = 0, block: int, data: bytes) -> None:
+        self._h.set_chunk(field, version, block, data)
+
 
 def open_dataset(uri: str, *, runmeta: Any, step: int, level: int, runtime: Any) -> Dataset:
     return Dataset(uri=uri, runmeta=runmeta, step=step, level=level, runtime=runtime)

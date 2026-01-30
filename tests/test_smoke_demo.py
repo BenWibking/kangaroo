@@ -7,10 +7,7 @@ import pytest
 
 
 def test_smoke_demo_script() -> None:
-    try:
-        import analysis._core  # type: ignore # noqa: F401
-    except Exception:
-        pytest.skip("C++ module _core not built; skipping runtime smoke demo")
+    import analysis._core  # type: ignore # noqa: F401
 
     result = subprocess.run([sys.executable, "scripts/smoke_demo.py"], check=False)
 
@@ -46,10 +43,7 @@ def _make_runtime_handles():
 
 
 def test_executor_detects_stage_cycle() -> None:
-    try:
-        import analysis._core  # type: ignore # noqa: F401
-    except Exception:
-        pytest.skip("C++ module _core not built; skipping executor cycle test")
+    import analysis._core  # type: ignore # noqa: F401
 
     import msgpack
 
@@ -68,10 +62,7 @@ def test_executor_detects_stage_cycle() -> None:
 
 
 def test_executor_rejects_bad_stage_dep_index() -> None:
-    try:
-        import analysis._core  # type: ignore # noqa: F401
-    except Exception:
-        pytest.skip("C++ module _core not built; skipping executor stage index test")
+    import analysis._core  # type: ignore # noqa: F401
 
     import msgpack
 
@@ -87,10 +78,7 @@ def test_executor_rejects_bad_stage_dep_index() -> None:
 
 
 def test_neighbor_dep_faces_and_width() -> None:
-    try:
-        import analysis._core  # type: ignore # noqa: F401
-    except Exception:
-        pytest.skip("C++ module _core not built; skipping neighbor dep semantics test")
+    import analysis._core  # type: ignore # noqa: F401
 
     import msgpack
 
@@ -121,3 +109,38 @@ def test_neighbor_dep_faces_and_width() -> None:
     ]}]}
     packed = msgpack.packb(plan_dict, use_bin_type=True)
     rt._rt.run_packed_plan(packed, runmeta._h, ds._h)
+
+
+def test_neighbor_halo_inputs_indices() -> None:
+    import analysis._core  # type: ignore # noqa: F401
+
+    import msgpack
+
+    rt, runmeta, ds = _make_runtime_handles()
+
+    base_task = {
+        "name": "noop",
+        "plane": "chunk",
+        "kernel": "gradU_stencil",
+        "domain": {"step": 0, "level": 0, "blocks": None},
+        "inputs": [{"field": 1, "version": 0}, {"field": 2, "version": 0}],
+        "outputs": [{"field": 3, "version": 0}],
+        "output_bytes": [0],
+        "deps": {
+            "kind": "FaceNeighbors",
+            "width": 1,
+            "faces": [1, 1, 1, 1, 1, 1],
+            "halo_inputs": [1],
+        },
+        "params": {},
+    }
+
+    plan_dict = {"stages": [{"name": "s0", "plane": "chunk", "after": [], "templates": [base_task]}]}
+    packed = msgpack.packb(plan_dict, use_bin_type=True)
+    rt._rt.run_packed_plan(packed, runmeta._h, ds._h)
+
+    bad_task = {**base_task, "deps": {**base_task["deps"], "halo_inputs": [2]}}
+    plan_dict = {"stages": [{"name": "s0", "plane": "chunk", "after": [], "templates": [bad_task]}]}
+    packed = msgpack.packb(plan_dict, use_bin_type=True)
+    with pytest.raises(RuntimeError):
+        rt._rt.run_packed_plan(packed, runmeta._h, ds._h)

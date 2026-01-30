@@ -31,9 +31,28 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl, int32_t block,
     return hpx::make_exceptional_future<void>(
         std::runtime_error("templates must specify inputs and outputs"));
   }
-  if (tmpl.deps.kind == "FaceNeighbors" && tmpl.inputs.size() != 1) {
-    return hpx::make_exceptional_future<void>(
-        std::runtime_error("FaceNeighbors deps require exactly one input field"));
+
+  std::vector<int32_t> halo_inputs;
+  if (tmpl.deps.kind == "FaceNeighbors") {
+    if (tmpl.inputs.empty()) {
+      return hpx::make_exceptional_future<void>(
+          std::runtime_error("FaceNeighbors deps require at least one input field"));
+    }
+    const auto& requested = tmpl.deps.halo_inputs;
+    if (requested.empty()) {
+      halo_inputs.push_back(0);
+    } else {
+      std::unordered_set<int32_t> seen;
+      for (int32_t idx : requested) {
+        if (idx < 0 || idx >= static_cast<int32_t>(tmpl.inputs.size())) {
+          return hpx::make_exceptional_future<void>(
+              std::runtime_error("halo_inputs index out of range"));
+        }
+        if (seen.insert(idx).second) {
+          halo_inputs.push_back(idx);
+        }
+      }
+    }
   }
 
   std::vector<hpx::future<HostView>> input_futures;
@@ -96,32 +115,80 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl, int32_t block,
     });
   };
 
-  const auto& nbr_field = tmpl.inputs.front();
-  auto f_xm = fetch_face(Face::Xm, nbr_field.field, nbr_field.version);
-  auto f_xp = fetch_face(Face::Xp, nbr_field.field, nbr_field.version);
-  auto f_ym = fetch_face(Face::Ym, nbr_field.field, nbr_field.version);
-  auto f_yp = fetch_face(Face::Yp, nbr_field.field, nbr_field.version);
-  auto f_zm = fetch_face(Face::Zm, nbr_field.field, nbr_field.version);
-  auto f_zp = fetch_face(Face::Zp, nbr_field.field, nbr_field.version);
+  struct NeighborSlot {
+    std::size_t input_pos;
+    Face face;
+  };
+
+  std::vector<hpx::future<std::vector<HostView>>> neighbor_futures;
+  std::vector<NeighborSlot> neighbor_slots;
+  neighbor_futures.reserve(halo_inputs.size() * 6);
+  neighbor_slots.reserve(halo_inputs.size() * 6);
+
+  for (std::size_t pos = 0; pos < halo_inputs.size(); ++pos) {
+    const auto& nbr_field = tmpl.inputs.at(halo_inputs[pos]);
+    neighbor_futures.push_back(fetch_face(Face::Xm, nbr_field.field, nbr_field.version));
+    neighbor_slots.push_back({pos, Face::Xm});
+    neighbor_futures.push_back(fetch_face(Face::Xp, nbr_field.field, nbr_field.version));
+    neighbor_slots.push_back({pos, Face::Xp});
+    neighbor_futures.push_back(fetch_face(Face::Ym, nbr_field.field, nbr_field.version));
+    neighbor_slots.push_back({pos, Face::Ym});
+    neighbor_futures.push_back(fetch_face(Face::Yp, nbr_field.field, nbr_field.version));
+    neighbor_slots.push_back({pos, Face::Yp});
+    neighbor_futures.push_back(fetch_face(Face::Zm, nbr_field.field, nbr_field.version));
+    neighbor_slots.push_back({pos, Face::Zm});
+    neighbor_futures.push_back(fetch_face(Face::Zp, nbr_field.field, nbr_field.version));
+    neighbor_slots.push_back({pos, Face::Zp});
+  }
 
   auto all_inputs = hpx::when_all(input_futures);
+  auto all_neighbors = hpx::when_all(neighbor_futures);
 
-  return hpx::when_all(std::move(all_inputs), std::move(f_xm), std::move(f_xp), std::move(f_ym),
-                       std::move(f_yp), std::move(f_zm), std::move(f_zp))
-      .then([&meta, &data, &kernels, tmpl, block](auto&& all) -> hpx::future<void> {
+  return hpx::when_all(std::move(all_inputs), std::move(all_neighbors))
+      .then([&meta, &data, &kernels, tmpl, block, halo_inputs = std::move(halo_inputs),
+             neighbor_slots = std::move(neighbor_slots)](auto&& all) -> hpx::future<void> {
         auto results = all.get();
         auto input_pack = hpx::get<0>(results).get();
-        auto xm = hpx::get<1>(results).get();
-        auto xp = hpx::get<2>(results).get();
-        auto ym = hpx::get<3>(results).get();
-        auto yp = hpx::get<4>(results).get();
-        auto zm = hpx::get<5>(results).get();
-        auto zp = hpx::get<6>(results).get();
+        auto neighbor_pack = hpx::get<1>(results).get();
 
         std::vector<HostView> inputs;
         inputs.reserve(input_pack.size());
         for (auto& f : input_pack) {
           inputs.push_back(f.get());
+        }
+
+        NeighborViews nbrs;
+        nbrs.input_indices = halo_inputs;
+        nbrs.inputs.resize(halo_inputs.size());
+
+        auto assign_face = [](NeighborViews::FieldNeighbors& field, Face face,
+                              std::vector<HostView>&& views) {
+          switch (face) {
+            case Face::Xm:
+              field.xm = std::move(views);
+              break;
+            case Face::Xp:
+              field.xp = std::move(views);
+              break;
+            case Face::Ym:
+              field.ym = std::move(views);
+              break;
+            case Face::Yp:
+              field.yp = std::move(views);
+              break;
+            case Face::Zm:
+              field.zm = std::move(views);
+              break;
+            case Face::Zp:
+              field.zp = std::move(views);
+              break;
+          }
+        };
+
+        for (std::size_t i = 0; i < neighbor_pack.size(); ++i) {
+          auto views = neighbor_pack[i].get();
+          const auto& slot = neighbor_slots.at(i);
+          assign_face(nbrs.inputs.at(slot.input_pos), slot.face, std::move(views));
         }
 
         std::vector<HostView> outputs;
@@ -139,7 +206,6 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl, int32_t block,
           outputs.push_back(data.alloc_host(cref, bytes));
         }
 
-        NeighborViews nbrs{xm, xp, ym, yp, zm, zp};
         const auto& level = meta.steps.at(tmpl.domain.step).levels.at(tmpl.domain.level);
         auto& fn = kernels.get_by_name(tmpl.kernel);
 

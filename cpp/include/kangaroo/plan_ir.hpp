@@ -36,10 +36,11 @@ struct DepRuleIR {
   std::string kind{"None"};  // "None" or "FaceNeighbors"
   int32_t width = 0;
   bool faces[6] = {true, true, true, true, true, true};
+  std::vector<int32_t> halo_inputs;  // input indices that require neighbor halos
 
   template <typename Archive>
   void serialize(Archive& ar, unsigned) {
-    ar& kind& width;
+    ar& kind& width& halo_inputs;
     for (auto& face : faces) {
       ar& face;
     }

@@ -24,6 +24,8 @@ std::once_flag g_hpx_start_once;
 thread_local bool g_hpx_thread_registered = false;
 RunMeta g_runmeta;
 bool g_has_runmeta = false;
+DatasetHandle g_dataset;
+bool g_has_dataset = false;
 KernelRegistry* g_kernel_registry = nullptr;
 std::unordered_map<int32_t, PlanIR> g_plans;
 
@@ -31,6 +33,12 @@ void set_runmeta_impl(const RunMeta& meta) {
   std::lock_guard<std::mutex> lock(g_ctx_mutex);
   g_runmeta = meta;
   g_has_runmeta = true;
+}
+
+void set_dataset_impl(const DatasetHandle& dataset) {
+  std::lock_guard<std::mutex> lock(g_ctx_mutex);
+  g_dataset = dataset;
+  g_has_dataset = true;
 }
 
 void ensure_hpx_started() {
@@ -67,6 +75,18 @@ const RunMeta& global_runmeta() {
   return g_runmeta;
 }
 
+void set_global_dataset(const DatasetHandle& dataset) {
+  set_dataset_impl(dataset);
+}
+
+const DatasetHandle& global_dataset() {
+  std::lock_guard<std::mutex> lock(g_ctx_mutex);
+  if (!g_has_dataset) {
+    throw std::runtime_error("global DatasetHandle not initialized");
+  }
+  return g_dataset;
+}
+
 void set_global_kernel_registry(KernelRegistry* registry) {
   g_kernel_registry = registry;
 }
@@ -101,6 +121,11 @@ void set_runmeta_action(const RunMeta& meta) {
   set_runmeta_impl(meta);
 }
 
+void set_dataset_action(const DatasetHandle& dataset) {
+  set_dataset_impl(dataset);
+  DataServiceLocal::set_dataset(&g_dataset);
+}
+
 void set_plan_action(int32_t plan_id, const PlanIR& plan) {
   set_global_plan(plan_id, plan);
 }
@@ -109,11 +134,19 @@ void erase_plan_action(int32_t plan_id) {
   erase_global_plan(plan_id);
 }
 
+void preload_action(const RunMeta& meta,
+                    const DatasetHandle& dataset,
+                    const std::vector<int32_t>& fields) {
+  DataServiceLocal::preload(meta, dataset, fields);
+}
+
 }  // namespace kangaroo
 
 HPX_PLAIN_ACTION(kangaroo::set_runmeta_action, kangaroo_set_runmeta_action)
+HPX_PLAIN_ACTION(kangaroo::set_dataset_action, kangaroo_set_dataset_action)
 HPX_PLAIN_ACTION(kangaroo::set_plan_action, kangaroo_set_plan_action)
 HPX_PLAIN_ACTION(kangaroo::erase_plan_action, kangaroo_erase_plan_action)
+HPX_PLAIN_ACTION(kangaroo::preload_action, kangaroo_preload_action)
 
 namespace kangaroo {
 
@@ -214,6 +247,22 @@ Runtime::Runtime() {
       });
 }
 
+void DatasetHandle::set_chunk(const ChunkRef& ref, HostView view) {
+  data[ref] = std::move(view);
+}
+
+std::optional<HostView> DatasetHandle::get_chunk(const ChunkRef& ref) const {
+  auto it = data.find(ref);
+  if (it == data.end()) {
+    return std::nullopt;
+  }
+  return it->second;
+}
+
+bool DatasetHandle::has_chunk(const ChunkRef& ref) const {
+  return data.find(ref) != data.end();
+}
+
 int32_t Runtime::alloc_field_id(const std::string&) {
   return next_field_id_++;
 }
@@ -228,12 +277,13 @@ KernelRegistry& Runtime::kernels() {
 
 void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
                               const RunMetaHandle& runmeta,
-                              const DatasetHandle&) {
+                              const DatasetHandle& dataset) {
   ensure_hpx_started();
   PlanIR plan = decode_plan_msgpack(std::span<const std::uint8_t>(packed.data(), packed.size()));
 
   auto localities = hpx::find_all_localities();
   hpx::lcos::broadcast<::kangaroo_set_runmeta_action>(localities, runmeta.meta).get();
+  hpx::lcos::broadcast<::kangaroo_set_dataset_action>(localities, dataset).get();
   int32_t plan_id = next_plan_id_++;
   hpx::lcos::broadcast<::kangaroo_set_plan_action>(localities, plan_id, plan).get();
 
@@ -243,6 +293,16 @@ void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
 
   executor.run(plan).get();
   hpx::lcos::broadcast<::kangaroo_erase_plan_action>(localities, plan_id).get();
+}
+
+void Runtime::preload_dataset(const RunMetaHandle& runmeta,
+                              const DatasetHandle& dataset,
+                              const std::vector<int32_t>& fields) {
+  ensure_hpx_started();
+  auto localities = hpx::find_all_localities();
+  hpx::lcos::broadcast<::kangaroo_set_runmeta_action>(localities, runmeta.meta).get();
+  hpx::lcos::broadcast<::kangaroo_set_dataset_action>(localities, dataset).get();
+  hpx::lcos::broadcast<::kangaroo_preload_action>(localities, runmeta.meta, dataset, fields).get();
 }
 
 }  // namespace kangaroo
