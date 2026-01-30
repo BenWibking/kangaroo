@@ -3,6 +3,7 @@
 #include "kangaroo/plan_decode.hpp"
 
 #include <array>
+#include <cmath>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
@@ -172,8 +173,9 @@ Runtime::Runtime() {
       });
   kernel_registry_.register_kernel(
       KernelDesc{.name = "uniform_slice", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView>, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+      [](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
+         const NeighborViews&, std::span<HostView> outputs,
+         std::span<const std::uint8_t> params_msgpack) {
         struct Params {
           int axis = 2;
           double coord = 0.0;
@@ -226,21 +228,127 @@ Runtime::Runtime() {
           }
         }
 
-        const auto nx = params.resolution[0];
-        const auto ny = params.resolution[1];
+        const auto out_nx = params.resolution[0];
+        const auto out_ny = params.resolution[1];
         std::size_t bytes = 0;
-        if (nx > 0 && ny > 0 && params.bytes_per_value > 0) {
-          bytes = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) *
+        if (out_nx > 0 && out_ny > 0 && params.bytes_per_value > 0) {
+          bytes = static_cast<std::size_t>(out_nx) * static_cast<std::size_t>(out_ny) *
                   static_cast<std::size_t>(params.bytes_per_value);
         }
 
-        if (!outputs.empty()) {
-          if (bytes > 0 && outputs[0].data.size() != bytes) {
-            outputs[0].data.assign(bytes, 0);
-          } else if (outputs[0].data.empty()) {
-            outputs[0].data.assign(1, 0);
-          } else {
-            std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
+        if (outputs.empty() || inputs.empty() || bytes == 0) {
+          return hpx::make_ready_future();
+        }
+
+        if (outputs[0].data.size() != bytes) {
+          outputs[0].data.assign(bytes, 0);
+        } else {
+          std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
+        }
+
+        if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
+          return hpx::make_ready_future();
+        }
+
+        const auto& box = level.boxes.at(static_cast<std::size_t>(block));
+        const int nx = box.hi.x - box.lo.x + 1;
+        const int ny = box.hi.y - box.lo.y + 1;
+        const int nz = box.hi.z - box.lo.z + 1;
+        if (nx <= 0 || ny <= 0 || nz <= 0) {
+          return hpx::make_ready_future();
+        }
+
+        const int axis = params.axis;
+        int u_axis = 0;
+        int v_axis = 1;
+        if (axis == 0) {
+          u_axis = 1;
+          v_axis = 2;
+        } else if (axis == 1) {
+          u_axis = 0;
+          v_axis = 2;
+        } else {
+          u_axis = 0;
+          v_axis = 1;
+        }
+
+        auto cell_index = [&](int ax, double coord) -> int {
+          const double x0 = level.geom.x0[ax];
+          const double dx = level.geom.dx[ax];
+          if (dx == 0.0) {
+            return 0;
+          }
+          const double idx_f = (coord - x0) / dx;
+          return static_cast<int>(std::floor(idx_f));
+        };
+
+        const int k_global = cell_index(axis, params.coord);
+        const int k_local = (axis == 0 ? k_global - box.lo.x
+                                       : (axis == 1 ? k_global - box.lo.y : k_global - box.lo.z));
+        if ((axis == 0 && (k_local < 0 || k_local >= nx)) ||
+            (axis == 1 && (k_local < 0 || k_local >= ny)) ||
+            (axis == 2 && (k_local < 0 || k_local >= nz))) {
+          return hpx::make_ready_future();
+        }
+
+        const double u0 = params.rect[0];
+        const double v0 = params.rect[1];
+        const double u1 = params.rect[2];
+        const double v1 = params.rect[3];
+        const double du = (out_nx > 0) ? (u1 - u0) / static_cast<double>(out_nx) : 0.0;
+        const double dv = (out_ny > 0) ? (v1 - v0) / static_cast<double>(out_ny) : 0.0;
+
+        auto in_index = [&](int i, int j, int k) -> std::size_t {
+          return static_cast<std::size_t>((i * ny + j) * nz + k);
+        };
+
+        const auto& in = inputs[0].data;
+        if (params.bytes_per_value == 4) {
+          const auto* in_f = reinterpret_cast<const float*>(in.data());
+          auto* out_f = reinterpret_cast<float*>(outputs[0].data.data());
+          for (int j = 0; j < out_ny; ++j) {
+            const double v = v0 + (static_cast<double>(j) + 0.5) * dv;
+            const int v_global = cell_index(v_axis, v);
+            const int v_local = v_axis == 0 ? v_global - box.lo.x
+                                            : (v_axis == 1 ? v_global - box.lo.y
+                                                           : v_global - box.lo.z);
+            for (int i = 0; i < out_nx; ++i) {
+              const double u = u0 + (static_cast<double>(i) + 0.5) * du;
+              const int u_global = cell_index(u_axis, u);
+              const int u_local = u_axis == 0 ? u_global - box.lo.x
+                                              : (u_axis == 1 ? u_global - box.lo.y
+                                                             : u_global - box.lo.z);
+              float value = 0.0f;
+              if (u_local >= 0 && v_local >= 0) {
+                if ((u_axis == 0 && u_local < nx) || (u_axis == 1 && u_local < ny) ||
+                    (u_axis == 2 && u_local < nz)) {
+                  if ((v_axis == 0 && v_local < nx) || (v_axis == 1 && v_local < ny) ||
+                      (v_axis == 2 && v_local < nz)) {
+                    int ii = 0;
+                    int jj = 0;
+                    int kk = 0;
+                    if (axis == 0) {
+                      ii = k_local;
+                      jj = u_axis == 1 ? u_local : v_local;
+                      kk = u_axis == 2 ? u_local : v_local;
+                    } else if (axis == 1) {
+                      ii = u_axis == 0 ? u_local : v_local;
+                      jj = k_local;
+                      kk = u_axis == 2 ? u_local : v_local;
+                    } else {
+                      ii = u_axis == 0 ? u_local : v_local;
+                      jj = u_axis == 1 ? u_local : v_local;
+                      kk = k_local;
+                    }
+                    const auto idx = in_index(ii, jj, kk);
+                    if (idx * sizeof(float) < in.size()) {
+                      value = in_f[idx];
+                    }
+                  }
+                }
+              }
+              out_f[static_cast<std::size_t>(j) * out_nx + i] = value;
+            }
           }
         }
         return hpx::make_ready_future();
@@ -303,6 +411,17 @@ void Runtime::preload_dataset(const RunMetaHandle& runmeta,
   hpx::lcos::broadcast<::kangaroo_set_runmeta_action>(localities, runmeta.meta).get();
   hpx::lcos::broadcast<::kangaroo_set_dataset_action>(localities, dataset).get();
   hpx::lcos::broadcast<::kangaroo_preload_action>(localities, runmeta.meta, dataset, fields).get();
+}
+
+HostView Runtime::get_task_chunk(int32_t step,
+                                 int16_t level,
+                                 int32_t field,
+                                 int32_t version,
+                                 int32_t block) {
+  ensure_hpx_started();
+  DataServiceLocal data;
+  ChunkRef ref{step, level, field, version, block};
+  return data.get_host(ref).get();
 }
 
 }  // namespace kangaroo

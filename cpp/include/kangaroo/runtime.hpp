@@ -52,6 +52,12 @@ class Runtime {
                        const DatasetHandle& dataset,
                        const std::vector<int32_t>& fields);
 
+  HostView get_task_chunk(int32_t step,
+                          int16_t level,
+                          int32_t field,
+                          int32_t version,
+                          int32_t block);
+
  private:
   int32_t next_field_id_ = 1000;
   int32_t next_plan_id_ = 1;

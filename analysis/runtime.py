@@ -33,6 +33,17 @@ class Runtime:
     def preload(self, *, runmeta, dataset, fields: list[int]) -> None:
         self._rt.preload_dataset(runmeta._h, dataset._h, list(fields))
 
+    def get_task_chunk(
+        self,
+        *,
+        step: int,
+        level: int,
+        field: int,
+        version: int = 0,
+        block: int,
+    ) -> bytes:
+        return self._rt.get_task_chunk(step, level, field, version, block)
+
 
 def plan_to_dict(plan: Plan) -> dict:
     stages = []

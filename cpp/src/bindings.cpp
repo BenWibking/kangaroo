@@ -73,6 +73,12 @@ NB_MODULE(_core, m) {
       .def("alloc_field_id", &kangaroo::Runtime::alloc_field_id)
       .def("mark_field_persistent", &kangaroo::Runtime::mark_field_persistent)
       .def("kernels", &kangaroo::Runtime::kernels, nb::rv_policy::reference)
+      .def("get_task_chunk",
+           [](kangaroo::Runtime& self, int32_t step, int16_t level, int32_t field,
+              int32_t version, int32_t block) {
+             auto view = self.get_task_chunk(step, level, field, version, block);
+             return nb::bytes(reinterpret_cast<const char*>(view.data.data()), view.data.size());
+           })
       .def("preload_dataset", &kangaroo::Runtime::preload_dataset)
       .def("run_packed_plan", &kangaroo::Runtime::run_packed_plan)
       .def("run_packed_plan",

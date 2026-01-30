@@ -12,6 +12,8 @@ pkg-config = "*"
 hpx = "*"
 msgpack-cxx = "*"
 pip = ">=25.3,<26"
+numpy = "*"
+matplotlib = "*"
 
 [pypi-dependencies]
 msgpack = "*"
