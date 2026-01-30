@@ -98,7 +98,15 @@ DepRuleIR parse_deps(const msgpack::object& obj) {
       throw std::runtime_error("faces must be array of 6");
     }
     for (uint32_t i = 0; i < 6; ++i) {
-      deps.faces[i] = faces_obj->via.array.ptr[i].as<bool>();
+      const auto& face_obj = faces_obj->via.array.ptr[i];
+      if (face_obj.type == msgpack::type::BOOLEAN) {
+        deps.faces[i] = face_obj.as<bool>();
+      } else if (face_obj.type == msgpack::type::POSITIVE_INTEGER ||
+                 face_obj.type == msgpack::type::NEGATIVE_INTEGER) {
+        deps.faces[i] = face_obj.as<int64_t>() != 0;
+      } else {
+        throw std::runtime_error("faces entries must be bool or int");
+      }
     }
   }
   return deps;

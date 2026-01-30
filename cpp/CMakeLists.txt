@@ -34,7 +34,7 @@ target_include_directories(kangaroo_runtime PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
 
-target_link_libraries(kangaroo_runtime PUBLIC HPX::hpx msgpackc-cxx)
+target_link_libraries(kangaroo_runtime PUBLIC HPX::hpx)
 
 if(NOT msgpack-cxx_FOUND AND msgpack_SOURCE_DIR)
   target_include_directories(kangaroo_runtime PUBLIC "${msgpack_SOURCE_DIR}/include")
@@ -48,8 +48,14 @@ nanobind_add_module(_core src/bindings.cpp)
 target_link_libraries(_core PRIVATE kangaroo_runtime)
 target_compile_definitions(_core PRIVATE KANGAROO_USE_NANOBIND)
 
+if(DEFINED SKBUILD_PLATLIB_DIR)
+  set(KANGAROO_PYTHON_SITE "${SKBUILD_PLATLIB_DIR}")
+else()
+  set(KANGAROO_PYTHON_SITE
+      "${CMAKE_INSTALL_PREFIX}/lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages")
+endif()
 set(KANGAROO_PYTHON_SITE
-    "${CMAKE_INSTALL_PREFIX}/lib/python${Python_VERSION_MAJOR}.${Python_VERSION_MINOR}/site-packages"
+    "${KANGAROO_PYTHON_SITE}"
     CACHE PATH "Python site-packages directory for install")
 
 install(TARGETS _core LIBRARY DESTINATION "${KANGAROO_PYTHON_SITE}/analysis")

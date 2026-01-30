@@ -1,0 +1,26 @@
+[workspace]
+name = "kangaroo"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-64", "osx-arm64"]
+
+[dependencies]
+python = ">=3.10"
+cmake = ">=3.22"
+ninja = "*"
+cxx-compiler = "*"
+pkg-config = "*"
+hpx = "*"
+msgpack-cxx = "*"
+pip = ">=25.3,<26"
+
+[pypi-dependencies]
+msgpack = "*"
+pytest = "*"
+scikit-build-core = ">=0.9.10"
+nanobind = ">=1.9"
+
+[tasks]
+configure = "bash -lc 'cmake -S cpp -B build -DHPX_DIR=$(scripts/detect_hpx.sh)'"
+build = "cmake --build build"
+install = "bash -lc 'HPX_DIR=$(scripts/detect_hpx.sh) pip install -e . --no-build-isolation'"
+test = "pytest -q"

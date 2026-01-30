@@ -73,7 +73,14 @@ NB_MODULE(_core, m) {
       .def("alloc_field_id", &kangaroo::Runtime::alloc_field_id)
       .def("mark_field_persistent", &kangaroo::Runtime::mark_field_persistent)
       .def("kernels", &kangaroo::Runtime::kernels, nb::rv_policy::reference)
-      .def("run_packed_plan", &kangaroo::Runtime::run_packed_plan);
+      .def("run_packed_plan", &kangaroo::Runtime::run_packed_plan)
+      .def("run_packed_plan",
+           [](kangaroo::Runtime& self, nb::bytes packed, kangaroo::RunMetaHandle& runmeta,
+              kangaroo::DatasetHandle& dataset) {
+             auto* data = static_cast<const std::uint8_t*>(packed.data());
+             std::vector<std::uint8_t> buffer(data, data + packed.size());
+             self.run_packed_plan(buffer, runmeta, dataset);
+           });
 
   nb::class_<kangaroo::KernelRegistry>(m, "KernelRegistry")
       .def("list", &kangaroo::KernelRegistry::list_kernel_descs);

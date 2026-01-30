@@ -8,14 +8,18 @@
 
 #include <hpx/include/actions.hpp>
 #include <hpx/collectives/broadcast_direct.hpp>
+#include <hpx/hpx_start.hpp>
 #include <hpx/include/lcos.hpp>
 #include <hpx/runtime_distributed/find_localities.hpp>
+#include <hpx/runtime.hpp>
 
 namespace kangaroo {
 
 namespace {
 
 std::mutex g_ctx_mutex;
+std::once_flag g_hpx_start_once;
+thread_local bool g_hpx_thread_registered = false;
 RunMeta g_runmeta;
 bool g_has_runmeta = false;
 KernelRegistry* g_kernel_registry = nullptr;
@@ -25,6 +29,26 @@ void set_runmeta_impl(const RunMeta& meta) {
   std::lock_guard<std::mutex> lock(g_ctx_mutex);
   g_runmeta = meta;
   g_has_runmeta = true;
+}
+
+void ensure_hpx_started() {
+  std::call_once(g_hpx_start_once, []() {
+    int argc = 1;
+    char arg0[] = "kangaroo";
+    char* argv[] = {arg0};
+    hpx::init_params params;
+    params.cfg = {"hpx.os_threads=1"};
+    hpx::start(nullptr, argc, argv, params);
+  });
+  if (auto* rt = hpx::get_runtime_ptr(); rt != nullptr) {
+    if (!g_hpx_thread_registered) {
+      try {
+        g_hpx_thread_registered = hpx::register_thread(rt, "kangaroo_python");
+      } catch (...) {
+        g_hpx_thread_registered = true;
+      }
+    }
+  }
 }
 
 }  // namespace
@@ -128,6 +152,7 @@ KernelRegistry& Runtime::kernels() {
 void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
                               const RunMetaHandle& runmeta,
                               const DatasetHandle&) {
+  ensure_hpx_started();
   PlanIR plan = decode_plan_msgpack(std::span<const std::uint8_t>(packed.data(), packed.size()));
 
   auto localities = hpx::find_all_localities();

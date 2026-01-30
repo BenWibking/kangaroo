@@ -62,14 +62,18 @@ C++ build (HPX required)
 - Configure and build in `cpp/` using CMake. The runtime builds as a static library and installs the `_core` module plus `analysis/` into site-packages.
 - msgpack-c is required and fetched automatically if not found.
 - Python bindings are required and build via nanobind.
-- Recommended (macOS): install HPX via Spack, then point `HPX_DIR` at the CMake package:
-  - `spack install hpx`
-  - `HPX_DIR=$(spack location -i hpx)/lib/cmake/HPX`
-- For `pip`/`uv pip install`, HPX must be discoverable by CMake. Set `HPX_DIR` (or `CMAKE_PREFIX_PATH`) before installing:
-  - `HPX_DIR=/path/to/hpx/lib/cmake/HPX uv pip install -e .`
-  - `uv pip install -e . --config-settings=cmake.args="-DHPX_DIR=/path/to/hpx/lib/cmake/HPX"`
-
+- Pixi environment (recommended for HPX):
+  - Minimal (Python + extension):
+    - `pixi install`
+    - `pixi run install`
+    - `pixi run test`
+  - C++ dev loop (optional):
+    - `pixi run configure`
+    - `pixi run build`
+  - `scripts/detect_hpx.sh` will find HPX inside the Pixi/conda prefix automatically.
+  - Build deps (`scikit-build-core`, `nanobind`) are provided by Pixi; `install` uses `--no-build-isolation`.
+  - The C++ msgpack headers come from `msgpack-cxx` in the Pixi env.
+  - Run Python with `pixi run python ...` so it picks up the Pixi HPX + extension module.
 HPX autodetect helper
-- Use `scripts/detect_hpx.sh` to find a suitable `HPX_DIR`:
+- Use `scripts/detect_hpx.sh` to verify HPX resolution inside the Pixi env:
   - `HPX_DIR=$(scripts/detect_hpx.sh)`
-  - `cmake -S . -B build -DHPX_DIR=\"$HPX_DIR\"`
