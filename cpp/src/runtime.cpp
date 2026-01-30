@@ -5,6 +5,8 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdlib>
+#include <iostream>
 #include <mutex>
 #include <stdexcept>
 #include <unordered_map>
@@ -15,6 +17,7 @@
 #include <hpx/hpx_start.hpp>
 #include <hpx/include/lcos.hpp>
 #include <hpx/runtime_distributed/find_localities.hpp>
+#include <hpx/runtime_local/get_locality_id.hpp>
 #include <hpx/runtime.hpp>
 
 namespace kangaroo {
@@ -24,6 +27,11 @@ namespace {
 std::mutex g_ctx_mutex;
 std::once_flag g_hpx_start_once;
 thread_local bool g_hpx_thread_registered = false;
+bool g_hpx_started = false;
+bool g_hpx_cfg_set = false;
+bool g_hpx_cmdline_set = false;
+std::vector<std::string> g_hpx_cfg;
+std::vector<std::string> g_hpx_cmdline;
 RunMeta g_runmeta;
 bool g_has_runmeta = false;
 DatasetHandle g_dataset;
@@ -31,130 +39,12 @@ bool g_has_dataset = false;
 KernelRegistry* g_kernel_registry = nullptr;
 std::unordered_map<int32_t, PlanIR> g_plans;
 
-void set_runmeta_impl(const RunMeta& meta) {
-  std::lock_guard<std::mutex> lock(g_ctx_mutex);
-  g_runmeta = meta;
-  g_has_runmeta = true;
-}
-
-void set_dataset_impl(const DatasetHandle& dataset) {
-  std::lock_guard<std::mutex> lock(g_ctx_mutex);
-  g_dataset = dataset;
-  g_has_dataset = true;
-}
-
-void ensure_hpx_started() {
-  std::call_once(g_hpx_start_once, []() {
-    int argc = 1;
-    char arg0[] = "kangaroo";
-    char* argv[] = {arg0};
-    hpx::init_params params;
-    params.cfg = {"hpx.os_threads=1"};
-    hpx::start(nullptr, argc, argv, params);
-  });
-  if (auto* rt = hpx::get_runtime_ptr(); rt != nullptr) {
-    if (!g_hpx_thread_registered) {
-      try {
-        g_hpx_thread_registered = hpx::register_thread(rt, "kangaroo_python");
-      } catch (...) {
-        g_hpx_thread_registered = true;
-      }
-    }
-  }
-}
-
-}  // namespace
-
-void set_global_runmeta(const RunMeta& meta) {
-  set_runmeta_impl(meta);
-}
-
-const RunMeta& global_runmeta() {
-  std::lock_guard<std::mutex> lock(g_ctx_mutex);
-  if (!g_has_runmeta) {
-    throw std::runtime_error("global RunMeta not initialized");
-  }
-  return g_runmeta;
-}
-
-void set_global_dataset(const DatasetHandle& dataset) {
-  set_dataset_impl(dataset);
-}
-
-const DatasetHandle& global_dataset() {
-  std::lock_guard<std::mutex> lock(g_ctx_mutex);
-  if (!g_has_dataset) {
-    throw std::runtime_error("global DatasetHandle not initialized");
-  }
-  return g_dataset;
-}
-
-void set_global_kernel_registry(KernelRegistry* registry) {
-  g_kernel_registry = registry;
-}
-
-KernelRegistry& global_kernels() {
-  if (!g_kernel_registry) {
-    throw std::runtime_error("global KernelRegistry not initialized");
-  }
-  return *g_kernel_registry;
-}
-
-void set_global_plan(int32_t plan_id, const PlanIR& plan) {
-  std::lock_guard<std::mutex> lock(g_ctx_mutex);
-  g_plans[plan_id] = plan;
-}
-
-const PlanIR& global_plan(int32_t plan_id) {
-  std::lock_guard<std::mutex> lock(g_ctx_mutex);
-  auto it = g_plans.find(plan_id);
-  if (it == g_plans.end()) {
-    throw std::runtime_error("global PlanIR not initialized for plan id");
-  }
-  return it->second;
-}
-
-void erase_global_plan(int32_t plan_id) {
-  std::lock_guard<std::mutex> lock(g_ctx_mutex);
-  g_plans.erase(plan_id);
-}
-
-void set_runmeta_action(const RunMeta& meta) {
-  set_runmeta_impl(meta);
-}
-
-void set_dataset_action(const DatasetHandle& dataset) {
-  set_dataset_impl(dataset);
-  DataServiceLocal::set_dataset(&g_dataset);
-}
-
-void set_plan_action(int32_t plan_id, const PlanIR& plan) {
-  set_global_plan(plan_id, plan);
-}
-
-void erase_plan_action(int32_t plan_id) {
-  erase_global_plan(plan_id);
-}
-
-void preload_action(const RunMeta& meta,
-                    const DatasetHandle& dataset,
-                    const std::vector<int32_t>& fields) {
-  DataServiceLocal::preload(meta, dataset, fields);
-}
-
-}  // namespace kangaroo
-
-HPX_PLAIN_ACTION(kangaroo::set_runmeta_action, kangaroo_set_runmeta_action)
-HPX_PLAIN_ACTION(kangaroo::set_dataset_action, kangaroo_set_dataset_action)
-HPX_PLAIN_ACTION(kangaroo::set_plan_action, kangaroo_set_plan_action)
-HPX_PLAIN_ACTION(kangaroo::erase_plan_action, kangaroo_erase_plan_action)
-HPX_PLAIN_ACTION(kangaroo::preload_action, kangaroo_preload_action)
-
-namespace kangaroo {
-
-Runtime::Runtime() {
-  set_global_kernel_registry(&kernel_registry_);
-  kernel_registry_.register_kernel(
+void register_default_kernels(KernelRegistry& registry) {
+  static const bool log_locality = []() {
+    const char* env = std::getenv("KANGAROO_LOG_LOCALITY");
+    return env != nullptr && *env != '\0' && *env != '0';
+  }();
+  registry.register_kernel(
       KernelDesc{.name = "gradU_stencil", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = true},
       [](const LevelMeta&, int32_t, std::span<const HostView>, const NeighborViews&,
          std::span<HostView> outputs, std::span<const std::uint8_t>) {
@@ -163,7 +53,7 @@ Runtime::Runtime() {
         }
         return hpx::make_ready_future();
       });
-  kernel_registry_.register_kernel(
+  registry.register_kernel(
       KernelDesc{.name = "vorticity_mag", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
       [](const LevelMeta&, int32_t, std::span<const HostView>, const NeighborViews&,
          std::span<HostView> outputs, std::span<const std::uint8_t>) {
@@ -172,11 +62,15 @@ Runtime::Runtime() {
         }
         return hpx::make_ready_future();
       });
-  kernel_registry_.register_kernel(
+  registry.register_kernel(
       KernelDesc{.name = "uniform_slice", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
       [](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
          const NeighborViews&, std::span<HostView> outputs,
          std::span<const std::uint8_t> params_msgpack) {
+        if (log_locality) {
+          std::cout << "[kangaroo] uniform_slice block=" << block
+                    << " locality=" << hpx::get_locality_id() << std::endl;
+        }
         struct Params {
           int axis = 2;
           double coord = 0.0;
@@ -354,7 +248,7 @@ Runtime::Runtime() {
         }
         return hpx::make_ready_future();
       });
-  kernel_registry_.register_kernel(
+  registry.register_kernel(
       KernelDesc{.name = "uniform_slice_reduce", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
       [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
          std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
@@ -410,6 +304,166 @@ Runtime::Runtime() {
         }
         return hpx::make_ready_future();
       });
+}
+
+void set_runmeta_impl(const RunMeta& meta) {
+  std::lock_guard<std::mutex> lock(g_ctx_mutex);
+  g_runmeta = meta;
+  g_has_runmeta = true;
+}
+
+void set_dataset_impl(const DatasetHandle& dataset) {
+  std::lock_guard<std::mutex> lock(g_ctx_mutex);
+  g_dataset = dataset;
+  g_has_dataset = true;
+}
+
+void ensure_hpx_started() {
+  std::call_once(g_hpx_start_once, []() {
+    std::vector<std::string> argv_storage;
+    if (g_hpx_cmdline_set && !g_hpx_cmdline.empty()) {
+      argv_storage = g_hpx_cmdline;
+    } else {
+      argv_storage.emplace_back("kangaroo");
+    }
+    std::vector<char*> argv;
+    argv.reserve(argv_storage.size());
+    for (auto& arg : argv_storage) {
+      argv.push_back(const_cast<char*>(arg.c_str()));
+    }
+    int argc = static_cast<int>(argv.size());
+    hpx::init_params params;
+    if (g_hpx_cfg_set && !g_hpx_cfg.empty()) {
+      params.cfg = g_hpx_cfg;
+    } else {
+      params.cfg = {"hpx.os_threads=1"};
+    }
+    hpx::start(nullptr, argc, argv.data(), params);
+    g_hpx_started = true;
+  });
+  if (auto* rt = hpx::get_runtime_ptr(); rt != nullptr) {
+    if (!g_hpx_thread_registered) {
+      try {
+        g_hpx_thread_registered = hpx::register_thread(rt, "kangaroo_python");
+      } catch (...) {
+        g_hpx_thread_registered = true;
+      }
+    }
+  }
+}
+
+}  // namespace
+
+void set_global_runmeta(const RunMeta& meta) {
+  set_runmeta_impl(meta);
+}
+
+const RunMeta& global_runmeta() {
+  std::lock_guard<std::mutex> lock(g_ctx_mutex);
+  if (!g_has_runmeta) {
+    throw std::runtime_error("global RunMeta not initialized");
+  }
+  return g_runmeta;
+}
+
+void set_global_dataset(const DatasetHandle& dataset) {
+  set_dataset_impl(dataset);
+}
+
+const DatasetHandle& global_dataset() {
+  std::lock_guard<std::mutex> lock(g_ctx_mutex);
+  if (!g_has_dataset) {
+    throw std::runtime_error("global DatasetHandle not initialized");
+  }
+  return g_dataset;
+}
+
+void set_global_kernel_registry(KernelRegistry* registry) {
+  g_kernel_registry = registry;
+}
+
+KernelRegistry& global_kernels() {
+  if (!g_kernel_registry) {
+    throw std::runtime_error("global KernelRegistry not initialized");
+  }
+  return *g_kernel_registry;
+}
+
+void set_global_plan(int32_t plan_id, const PlanIR& plan) {
+  std::lock_guard<std::mutex> lock(g_ctx_mutex);
+  g_plans[plan_id] = plan;
+}
+
+const PlanIR& global_plan(int32_t plan_id) {
+  std::lock_guard<std::mutex> lock(g_ctx_mutex);
+  auto it = g_plans.find(plan_id);
+  if (it == g_plans.end()) {
+    throw std::runtime_error("global PlanIR not initialized for plan id");
+  }
+  return it->second;
+}
+
+void erase_global_plan(int32_t plan_id) {
+  std::lock_guard<std::mutex> lock(g_ctx_mutex);
+  g_plans.erase(plan_id);
+}
+
+void set_runmeta_action(const RunMeta& meta) {
+  set_runmeta_impl(meta);
+}
+
+void set_dataset_action(const DatasetHandle& dataset) {
+  set_dataset_impl(dataset);
+  DataServiceLocal::set_dataset(&g_dataset);
+}
+
+void set_plan_action(int32_t plan_id, const PlanIR& plan) {
+  set_global_plan(plan_id, plan);
+}
+
+void erase_plan_action(int32_t plan_id) {
+  erase_global_plan(plan_id);
+}
+
+void preload_action(const RunMeta& meta,
+                    const DatasetHandle& dataset,
+                    const std::vector<int32_t>& fields) {
+  DataServiceLocal::preload(meta, dataset, fields);
+}
+
+}  // namespace kangaroo
+
+HPX_PLAIN_ACTION(kangaroo::set_runmeta_action, kangaroo_set_runmeta_action)
+HPX_PLAIN_ACTION(kangaroo::set_dataset_action, kangaroo_set_dataset_action)
+HPX_PLAIN_ACTION(kangaroo::set_plan_action, kangaroo_set_plan_action)
+HPX_PLAIN_ACTION(kangaroo::erase_plan_action, kangaroo_erase_plan_action)
+HPX_PLAIN_ACTION(kangaroo::preload_action, kangaroo_preload_action)
+
+namespace kangaroo {
+
+Runtime::Runtime() {
+  set_global_kernel_registry(&kernel_registry_);
+  register_default_kernels(kernel_registry_);
+}
+
+Runtime::Runtime(const std::vector<std::string>& hpx_config,
+                 const std::vector<std::string>& hpx_cmdline) {
+  if (g_hpx_started) {
+    throw std::runtime_error("HPX already started; cannot change config/args");
+  }
+  if (g_hpx_cfg_set || g_hpx_cmdline_set) {
+    throw std::runtime_error("HPX config/args already set; use the default constructor");
+  }
+  if (!hpx_config.empty()) {
+    g_hpx_cfg = hpx_config;
+    g_hpx_cfg_set = true;
+  }
+  if (!hpx_cmdline.empty()) {
+    g_hpx_cmdline = hpx_cmdline;
+    g_hpx_cmdline_set = true;
+  }
+  set_global_kernel_registry(&kernel_registry_);
+  register_default_kernels(kernel_registry_);
 }
 
 void DatasetHandle::set_chunk(const ChunkRef& ref, HostView view) {

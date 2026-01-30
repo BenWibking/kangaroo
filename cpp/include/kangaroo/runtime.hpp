@@ -38,6 +38,8 @@ struct DatasetHandle {
 class Runtime {
  public:
   Runtime();
+  Runtime(const std::vector<std::string>& hpx_config,
+          const std::vector<std::string>& hpx_cmdline);
 
   int32_t alloc_field_id(const std::string& name);
   void mark_field_persistent(int32_t fid, const std::string& name);

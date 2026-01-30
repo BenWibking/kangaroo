@@ -7,6 +7,8 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
+#include <hpx/version.hpp>
+
 namespace nb = nanobind;
 
 namespace {
@@ -68,8 +70,32 @@ kangaroo::RunMeta parse_runmeta(const nb::object& obj) {
 }  // namespace
 
 NB_MODULE(_core, m) {
+  m.def("hpx_configuration_string", []() { return hpx::configuration_string(); });
+
   nb::class_<kangaroo::Runtime>(m, "Runtime")
       .def(nb::init<>())
+      .def("__init__",
+           [](kangaroo::Runtime* self, nb::object config_obj, nb::object args_obj) {
+             std::vector<std::string> cfg;
+             std::vector<std::string> args;
+             if (!config_obj.is_none()) {
+               auto list = nb::cast<nb::list>(config_obj);
+               cfg.reserve(list.size());
+               for (auto item : list) {
+                 cfg.push_back(nb::cast<std::string>(item));
+               }
+             }
+             if (!args_obj.is_none()) {
+               auto list = nb::cast<nb::list>(args_obj);
+               args.reserve(list.size());
+               for (auto item : list) {
+                 args.push_back(nb::cast<std::string>(item));
+               }
+             }
+             new (self) kangaroo::Runtime(cfg, args);
+           },
+           nb::arg("hpx_config") = nb::none(),
+           nb::arg("hpx_args") = nb::none())
       .def("alloc_field_id", &kangaroo::Runtime::alloc_field_id)
       .def("mark_field_persistent", &kangaroo::Runtime::mark_field_persistent)
       .def("kernels", &kangaroo::Runtime::kernels, nb::rv_policy::reference)

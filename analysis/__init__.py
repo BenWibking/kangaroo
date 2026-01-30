@@ -1,4 +1,4 @@
-from .runtime import Runtime
+from .runtime import Runtime, hpx_configuration_string
 from .plan import Plan, Stage, TaskTemplate, Domain, FieldRef
 from .ctx import LoweringContext
 from .dataset import Dataset, open_dataset
@@ -6,6 +6,7 @@ from .runmeta import RunMeta, StepMeta, LevelMeta, LevelGeom, BlockBox, load_run
 
 __all__ = [
     "Runtime",
+    "hpx_configuration_string",
     "Plan",
     "Stage",
     "TaskTemplate",

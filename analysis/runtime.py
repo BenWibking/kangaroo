@@ -9,10 +9,22 @@ from .plan import Plan
 from . import _core  # type: ignore
 
 
+def hpx_configuration_string() -> str:
+    return _core.hpx_configuration_string()
+
+
 class Runtime:
-    def __init__(self, core_runtime: Any | None = None) -> None:
+    def __init__(
+        self,
+        core_runtime: Any | None = None,
+        *,
+        hpx_config: list[str] | None = None,
+        hpx_args: list[str] | None = None,
+    ) -> None:
         if core_runtime is not None:
             self._rt = core_runtime
+        elif hpx_config is not None or hpx_args is not None:
+            self._rt = _core.Runtime(hpx_config or [], hpx_args or [])
         else:
             self._rt = _core.Runtime()
 

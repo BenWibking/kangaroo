@@ -35,10 +35,32 @@ def make_synthetic_field(nx: int, ny: int, nz: int, dx: float, x0: tuple[float, 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run Kangaroo UniformSlice demo.")
     parser.add_argument("--output", help="Optional path to save the plot as an image.")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--hpx-config",
+        action="append",
+        default=None,
+        help="HPX config entry (repeatable, e.g. hpx.os_threads=2).",
+    )
+    parser.add_argument(
+        "--hpx-arg",
+        action="append",
+        default=None,
+        help="HPX command-line argument (repeatable, e.g. --hpx:localities=4).",
+    )
+    args, unknown = parser.parse_known_args()
+    if unknown:
+        unknown = [sys.argv[0], *unknown]
 
     try:
-        rt = Runtime()
+        if args.hpx_config or args.hpx_arg or unknown:
+            hpx_args = []
+            if args.hpx_arg:
+                hpx_args.extend(args.hpx_arg)
+            if unknown:
+                hpx_args.extend(unknown)
+            rt = Runtime(hpx_config=args.hpx_config, hpx_args=hpx_args)
+        else:
+            rt = Runtime()
     except Exception as exc:
         print("Runtime init failed (is the C++ module built?):", exc)
         return 1
