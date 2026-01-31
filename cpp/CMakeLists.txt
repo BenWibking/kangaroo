@@ -2,6 +2,8 @@ cmake_minimum_required(VERSION 3.22)
 
 project(kangaroo_runtime LANGUAGES CXX)
 
+option(KANGAROO_ASAN "Enable AddressSanitizer for kangaroo targets" OFF)
+
 find_package(HPX REQUIRED)
 find_package(Python REQUIRED COMPONENTS Interpreter Development)
 find_package(nanobind CONFIG REQUIRED)
@@ -20,6 +22,15 @@ if(NOT msgpack-cxx_FOUND)
     add_library(msgpackc-cxx ALIAS msgpack-cxx)
   endif()
 endif()
+
+# If HPX is using tcmalloc, try to link it into standalone modules too
+# to keep allocator ownership consistent across extensions.
+find_library(TCMALLOC_MINIMAL_LIB
+  NAMES tcmalloc_minimal
+  HINTS
+    ${CMAKE_PREFIX_PATH}/lib
+    $ENV{CONDA_PREFIX}/lib
+)
 
 add_library(kangaroo_runtime STATIC
   src/adjacency.cpp
@@ -47,6 +58,35 @@ target_compile_definitions(kangaroo_runtime PUBLIC KANGAROO_USE_MSGPACK)
 nanobind_add_module(_core src/bindings.cpp)
 target_link_libraries(_core PRIVATE kangaroo_runtime)
 target_compile_definitions(_core PRIVATE KANGAROO_USE_NANOBIND)
+if(TCMALLOC_MINIMAL_LIB)
+  target_link_libraries(_core PRIVATE ${TCMALLOC_MINIMAL_LIB})
+endif()
+
+add_library(kangaroo_plotfile STATIC
+  src/plotfile_reader.cpp
+)
+
+target_include_directories(kangaroo_plotfile PUBLIC
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+target_compile_features(kangaroo_plotfile PUBLIC cxx_std_20)
+
+nanobind_add_module(_plotfile src/plotfile_bindings.cpp)
+target_link_libraries(_plotfile PRIVATE kangaroo_plotfile)
+target_compile_definitions(_plotfile PRIVATE KANGAROO_USE_NANOBIND)
+if(TCMALLOC_MINIMAL_LIB)
+  target_link_libraries(kangaroo_plotfile PUBLIC ${TCMALLOC_MINIMAL_LIB})
+  target_link_libraries(_plotfile PRIVATE ${TCMALLOC_MINIMAL_LIB})
+endif()
+
+if(KANGAROO_ASAN)
+  set(_asan_flags "-fsanitize=address" "-fno-omit-frame-pointer")
+  foreach(target kangaroo_runtime _core kangaroo_plotfile _plotfile)
+    target_compile_options(${target} PRIVATE ${_asan_flags})
+    target_link_options(${target} PRIVATE "-fsanitize=address")
+  endforeach()
+endif()
 
 if(DEFINED SKBUILD_PLATLIB_DIR)
   set(KANGAROO_PYTHON_SITE "${SKBUILD_PLATLIB_DIR}")
@@ -58,7 +98,7 @@ set(KANGAROO_PYTHON_SITE
     "${KANGAROO_PYTHON_SITE}"
     CACHE PATH "Python site-packages directory for install")
 
-install(TARGETS _core LIBRARY DESTINATION "${KANGAROO_PYTHON_SITE}/analysis")
+install(TARGETS _core _plotfile LIBRARY DESTINATION "${KANGAROO_PYTHON_SITE}/analysis")
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../analysis/"
         DESTINATION "${KANGAROO_PYTHON_SITE}/analysis"
         FILES_MATCHING PATTERN "*.py")

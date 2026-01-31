@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ -n "${HPX_DIR:-}" ]]; then
-  echo "$HPX_DIR"
-  exit 0
-fi
-
 find_from_prefix() {
   local prefix="$1"
   local cand
@@ -17,6 +12,11 @@ find_from_prefix() {
   done
   return 1
 }
+
+if [[ -n "${HPX_DIR:-}" ]]; then
+  echo "$HPX_DIR"
+  exit 0
+fi
 
 if [[ -n "${CONDA_PREFIX:-}" ]]; then
   if find_from_prefix "$CONDA_PREFIX"; then

@@ -142,5 +142,6 @@ NB_MODULE(_core, m) {
              kangaroo::ChunkRef ref{self.step, self.level, field, version, block};
              self.set_chunk(ref, std::move(view));
            });
+
 }
 #endif
