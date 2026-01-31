@@ -115,12 +115,9 @@ def main() -> int:
     dx = float(cell_size[args.level][0])
 
     # AMReX prob_lo corresponds to the physical location of prob_domain.lo.
-    # The runtime expects coordinates as x0 + i*dx, so shift by domain_lo.
-    x0 = (
-        prob_lo[0] - int(domain_lo[0]) * dx,
-        prob_lo[1] - int(domain_lo[1]) * dx,
-        prob_lo[2] - int(domain_lo[2]) * dx,
-    )
+    # Runtime now stores the index origin separately.
+    x0 = prob_lo
+    index_origin = (int(domain_lo[0]), int(domain_lo[1]), int(domain_lo[2]))
 
     level_boxes = meta.get("level_boxes", [])
     if not level_boxes or args.level >= len(level_boxes):
@@ -138,7 +135,7 @@ def main() -> int:
                 step=0,
                 levels=[
                     LevelMeta(
-                        geom=LevelGeom(dx=(dx, dx, dx), x0=x0, ref_ratio=1),
+                        geom=LevelGeom(dx=(dx, dx, dx), x0=x0, index_origin=index_origin, ref_ratio=1),
                         boxes=[BlockBox(tuple(lo), tuple(hi)) for lo, hi in boxes],
                     )
                 ],

@@ -29,6 +29,7 @@ struct BlockBox {
 struct LevelGeom {
   double dx[3] = {0.0, 0.0, 0.0};
   double x0[3] = {0.0, 0.0, 0.0};
+  int32_t index_origin[3] = {0, 0, 0};
   int ref_ratio = 1;
 
   template <typename Archive>
@@ -37,6 +38,9 @@ struct LevelGeom {
       ar& v;
     }
     for (auto& v : x0) {
+      ar& v;
+    }
+    for (auto& v : index_origin) {
       ar& v;
     }
     ar& ref_ratio;

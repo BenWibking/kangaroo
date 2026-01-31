@@ -170,11 +170,12 @@ void register_default_kernels(KernelRegistry& registry) {
         auto cell_index = [&](int ax, double coord) -> int {
           const double x0 = level.geom.x0[ax];
           const double dx = level.geom.dx[ax];
+          const int origin = level.geom.index_origin[ax];
           if (dx == 0.0) {
-            return 0;
+            return origin;
           }
           const double idx_f = (coord - x0) / dx;
-          return static_cast<int>(std::floor(idx_f));
+          return static_cast<int>(std::floor(idx_f)) + origin;
         };
 
         const int k_global = cell_index(axis, params.coord);

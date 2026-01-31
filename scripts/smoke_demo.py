@@ -21,7 +21,12 @@ def main() -> int:
                 step=0,
                 levels=[
                     LevelMeta(
-                        geom=LevelGeom(dx=(1.0, 1.0, 1.0), x0=(0.0, 0.0, 0.0), ref_ratio=1),
+                        geom=LevelGeom(
+                            dx=(1.0, 1.0, 1.0),
+                            x0=(0.0, 0.0, 0.0),
+                            index_origin=(0, 0, 0),
+                            ref_ratio=1,
+                        ),
                         boxes=[
                             BlockBox((0, 0, 0), (7, 7, 7)),
                             BlockBox((8, 0, 0), (15, 7, 7)),

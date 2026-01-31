@@ -77,7 +77,7 @@ def main() -> int:
                 step=0,
                 levels=[
                     LevelMeta(
-                        geom=LevelGeom(dx=(dx, dx, dx), x0=x0, ref_ratio=1),
+                        geom=LevelGeom(dx=(dx, dx, dx), x0=x0, index_origin=(0, 0, 0), ref_ratio=1),
                         boxes=[
                             BlockBox((0, 0, 0), (nx_half - 1, ny - 1, nz - 1)),
                             BlockBox((nx_half, 0, 0), (nx - 1, ny - 1, nz - 1)),

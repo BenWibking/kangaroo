@@ -16,6 +16,7 @@ class BlockBox:
 class LevelGeom:
     dx: tuple[float, float, float]
     x0: tuple[float, float, float]
+    index_origin: tuple[int, int, int]
     ref_ratio: int
 
 
@@ -46,6 +47,7 @@ class RunMeta:
                         "geom": {
                             "dx": lvl.geom.dx,
                             "x0": lvl.geom.x0,
+                            "index_origin": lvl.geom.index_origin,
                             "ref_ratio": lvl.geom.ref_ratio,
                         },
                         "boxes": [(b.lo, b.hi) for b in lvl.boxes],
@@ -63,6 +65,7 @@ def load_runmeta_from_dict(payload: Dict[str, Any]) -> RunMeta:
             geom = LevelGeom(
                 dx=tuple(lvl_entry["geom"]["dx"]),
                 x0=tuple(lvl_entry["geom"]["x0"]),
+                index_origin=tuple(lvl_entry["geom"].get("index_origin", (0, 0, 0))),
                 ref_ratio=int(lvl_entry["geom"]["ref_ratio"]),
             )
             boxes = [BlockBox(tuple(lo), tuple(hi)) for lo, hi in lvl_entry.get("boxes", [])]

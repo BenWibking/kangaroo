@@ -58,8 +58,10 @@ def _axis_index(axis: str | int) -> int:
     raise ValueError("axis must be 'x', 'y', 'z', or 0/1/2")
 
 
-def _bounds_1d(lo: int, hi: int, x0: float, dx: float) -> tuple[float, float]:
-    return x0 + lo * dx, x0 + (hi + 1) * dx
+def _bounds_1d(
+    lo: int, hi: int, x0: float, dx: float, origin: int
+) -> tuple[float, float]:
+    return x0 + (lo - origin) * dx, x0 + (hi + 1 - origin) * dx
 
 
 def _overlaps_1d(a0: float, a1: float, b0: float, b1: float) -> bool:
@@ -100,12 +102,30 @@ class UniformSlice:
 
         geom = level_meta.geom
         for i, box in enumerate(level_meta.boxes):
-            ax0, ax1 = _bounds_1d(box.lo[axis_idx], box.hi[axis_idx], geom.x0[axis_idx], geom.dx[axis_idx])
+            ax0, ax1 = _bounds_1d(
+                box.lo[axis_idx],
+                box.hi[axis_idx],
+                geom.x0[axis_idx],
+                geom.dx[axis_idx],
+                geom.index_origin[axis_idx],
+            )
             if not (ax0 <= self.coord <= ax1):
                 continue
 
-            u0_b, u1_b = _bounds_1d(box.lo[u_axis], box.hi[u_axis], geom.x0[u_axis], geom.dx[u_axis])
-            v0_b, v1_b = _bounds_1d(box.lo[v_axis], box.hi[v_axis], geom.x0[v_axis], geom.dx[v_axis])
+            u0_b, u1_b = _bounds_1d(
+                box.lo[u_axis],
+                box.hi[u_axis],
+                geom.x0[u_axis],
+                geom.dx[u_axis],
+                geom.index_origin[u_axis],
+            )
+            v0_b, v1_b = _bounds_1d(
+                box.lo[v_axis],
+                box.hi[v_axis],
+                geom.x0[v_axis],
+                geom.dx[v_axis],
+                geom.index_origin[v_axis],
+            )
             if not (_overlaps_1d(u0_b, u1_b, umin, umax) and _overlaps_1d(v0_b, v1_b, vmin, vmax)):
                 continue
             yield i
