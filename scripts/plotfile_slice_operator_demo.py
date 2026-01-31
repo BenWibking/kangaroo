@@ -220,11 +220,11 @@ def main() -> int:
     )
 
     fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(slice_2d.T, origin="lower", cmap="viridis")
+    im = ax.imshow(np.log10(slice_2d.T), origin="lower", cmap="viridis")
     ax.set_title(f"UniformSlice of {comp_name} ({plane_label} plane)")
     ax.set_xlabel("index 0")
     ax.set_ylabel("index 1")
-    fig.colorbar(im, ax=ax, label=comp_name)
+    fig.colorbar(im, ax=ax, label=f"log10({comp_name})")
     fig.tight_layout()
     if args.output:
         fig.savefig(args.output, dpi=150)
