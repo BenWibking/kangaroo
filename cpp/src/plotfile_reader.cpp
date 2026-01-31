@@ -340,6 +340,15 @@ FabHeader read_fab_header(std::istream& is) {
     header.real_desc = RealDescriptor::parse(is);
     header.box = read_box(is);
     is >> header.ncomp;
+    // Consume the end-of-line delimiter after the ASCII header so binary data starts aligned.
+    if (is.peek() == '\r') {
+      is.get();
+      if (is.peek() == '\n') {
+        is.get();
+      }
+    } else if (is.peek() == '\n') {
+      is.get();
+    }
   }
   if (!is.good()) {
     throw std::runtime_error("failed to parse FAB header");

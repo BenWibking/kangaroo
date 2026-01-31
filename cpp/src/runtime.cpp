@@ -245,6 +245,53 @@ void register_default_kernels(KernelRegistry& registry) {
               out_f[static_cast<std::size_t>(j) * out_nx + i] = value;
             }
           }
+        } else if (params.bytes_per_value == 8) {
+          const auto* in_d = reinterpret_cast<const double*>(in.data());
+          auto* out_d = reinterpret_cast<double*>(outputs[0].data.data());
+          for (int j = 0; j < out_ny; ++j) {
+            const double v = v0 + (static_cast<double>(j) + 0.5) * dv;
+            const int v_global = cell_index(v_axis, v);
+            const int v_local = v_axis == 0 ? v_global - box.lo.x
+                                            : (v_axis == 1 ? v_global - box.lo.y
+                                                           : v_global - box.lo.z);
+            for (int i = 0; i < out_nx; ++i) {
+              const double u = u0 + (static_cast<double>(i) + 0.5) * du;
+              const int u_global = cell_index(u_axis, u);
+              const int u_local = u_axis == 0 ? u_global - box.lo.x
+                                              : (u_axis == 1 ? u_global - box.lo.y
+                                                             : u_global - box.lo.z);
+              double value = 0.0;
+              if (u_local >= 0 && v_local >= 0) {
+                if ((u_axis == 0 && u_local < nx) || (u_axis == 1 && u_local < ny) ||
+                    (u_axis == 2 && u_local < nz)) {
+                  if ((v_axis == 0 && v_local < nx) || (v_axis == 1 && v_local < ny) ||
+                      (v_axis == 2 && v_local < nz)) {
+                    int ii = 0;
+                    int jj = 0;
+                    int kk = 0;
+                    if (axis == 0) {
+                      ii = k_local;
+                      jj = u_axis == 1 ? u_local : v_local;
+                      kk = u_axis == 2 ? u_local : v_local;
+                    } else if (axis == 1) {
+                      ii = u_axis == 0 ? u_local : v_local;
+                      jj = k_local;
+                      kk = u_axis == 2 ? u_local : v_local;
+                    } else {
+                      ii = u_axis == 0 ? u_local : v_local;
+                      jj = u_axis == 1 ? u_local : v_local;
+                      kk = k_local;
+                    }
+                    const auto idx = in_index(ii, jj, kk);
+                    if (idx * sizeof(double) < in.size()) {
+                      value = in_d[idx];
+                    }
+                  }
+                }
+              }
+              out_d[static_cast<std::size_t>(j) * out_nx + i] = value;
+            }
+          }
         }
         return hpx::make_ready_future();
       });
@@ -284,22 +331,35 @@ void register_default_kernels(KernelRegistry& registry) {
         }
         std::fill(out.begin(), out.end(), 0);
 
-        if (params.bytes_per_value != 4) {
-          return hpx::make_ready_future();
-        }
+        if (params.bytes_per_value == 4) {
+          const std::size_t n = out.size() / sizeof(float);
+          auto* out_f = reinterpret_cast<float*>(out.data());
 
-        const std::size_t n = out.size() / sizeof(float);
-        auto* out_f = reinterpret_cast<float*>(out.data());
-
-        for (const auto& in_view : inputs) {
-          const auto& in = in_view.data;
-          if (in.empty()) {
-            continue;
+          for (const auto& in_view : inputs) {
+            const auto& in = in_view.data;
+            if (in.empty()) {
+              continue;
+            }
+            const std::size_t n_in = std::min(n, in.size() / sizeof(float));
+            const auto* in_f = reinterpret_cast<const float*>(in.data());
+            for (std::size_t i = 0; i < n_in; ++i) {
+              out_f[i] += in_f[i];
+            }
           }
-          const std::size_t n_in = std::min(n, in.size() / sizeof(float));
-          const auto* in_f = reinterpret_cast<const float*>(in.data());
-          for (std::size_t i = 0; i < n_in; ++i) {
-            out_f[i] += in_f[i];
+        } else if (params.bytes_per_value == 8) {
+          const std::size_t n = out.size() / sizeof(double);
+          auto* out_d = reinterpret_cast<double*>(out.data());
+
+          for (const auto& in_view : inputs) {
+            const auto& in = in_view.data;
+            if (in.empty()) {
+              continue;
+            }
+            const std::size_t n_in = std::min(n, in.size() / sizeof(double));
+            const auto* in_d = reinterpret_cast<const double*>(in.data());
+            for (std::size_t i = 0; i < n_in; ++i) {
+              out_d[i] += in_d[i];
+            }
           }
         }
         return hpx::make_ready_future();

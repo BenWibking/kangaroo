@@ -15,6 +15,9 @@ class PlotfileReader:
     def header(self) -> dict[str, Any]:
         return self._reader.header()
 
+    def metadata(self) -> dict[str, Any]:
+        return self._reader.metadata()
+
     def num_levels(self) -> int:
         return self._reader.num_levels()
 
