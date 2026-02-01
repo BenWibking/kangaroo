@@ -244,10 +244,13 @@ class DashboardApp:
 
         tasks: List[Dict[str, Any]] = []
         stage_task_ids: Dict[int, List[int]] = defaultdict(list)
+        stage_template_task_ids: Dict[int, Dict[int, List[int]]] = defaultdict(lambda: defaultdict(list))
+        stage_templates: Dict[int, List[Dict[str, Any]]] = {}
         for stage_idx, stage in enumerate(stages):
             stage_name = str(stage.get("name", f"stage-{stage_idx}"))
             stage_plane = str(stage.get("plane", ""))
             templates = stage.get("templates") or []
+            stage_templates[stage_idx] = templates
             if not templates:
                 task_id = len(tasks)
                 tasks.append(
@@ -259,6 +262,8 @@ class DashboardApp:
                         "kernel": "",
                         "plane": stage_plane,
                         "block": "",
+                        "block_id": None,
+                        "template_idx": None,
                     }
                 )
                 stage_task_ids[stage_idx].append(task_id)
@@ -281,9 +286,12 @@ class DashboardApp:
                                 "kernel": kernel,
                                 "plane": plane,
                                 "block": str(block),
+                                "block_id": int(block),
+                                "template_idx": tmpl_idx,
                             }
                         )
                         stage_task_ids[stage_idx].append(task_id)
+                        stage_template_task_ids[stage_idx][tmpl_idx].append(task_id)
                 else:
                     task_id = len(tasks)
                     tasks.append(
@@ -295,9 +303,12 @@ class DashboardApp:
                             "kernel": kernel,
                             "plane": plane,
                             "block": "all",
+                            "block_id": None,
+                            "template_idx": tmpl_idx,
                         }
                     )
                     stage_task_ids[stage_idx].append(task_id)
+                    stage_template_task_ids[stage_idx][tmpl_idx].append(task_id)
 
         depth_lanes: Dict[int, List[int]] = defaultdict(list)
         for task_id, task in enumerate(tasks):
@@ -330,24 +341,102 @@ class DashboardApp:
         edge_y0: List[float] = []
         edge_x1: List[float] = []
         edge_y1: List[float] = []
+
+        def domain_blocks(domain: Dict[str, Any] | None) -> List[int] | None:
+            if not domain:
+                return None
+            blocks = domain.get("blocks")
+            if isinstance(blocks, list) and blocks:
+                return [int(b) for b in blocks]
+            return None
+
+        def add_edge(parent_task: int, child_task: int) -> None:
+            parent_pos = positions.get(parent_task)
+            child_pos = positions.get(child_task)
+            if parent_pos is None or child_pos is None:
+                return
+            edge_x0.append(parent_pos[0])
+            edge_y0.append(parent_pos[1])
+            edge_x1.append(child_pos[0])
+            edge_y1.append(child_pos[1])
+
         for stage_idx, parents in enumerate(stage_parents):
             if not parents:
                 continue
+            child_stage = stages[stage_idx]
+            child_plane = str(child_stage.get("plane", ""))
+            child_templates = stage_templates.get(stage_idx, [])
             child_tasks = stage_task_ids.get(stage_idx, [])
             for parent_stage in parents:
+                parent_plane = str(stages[parent_stage].get("plane", ""))
+                parent_templates = stage_templates.get(parent_stage, [])
                 parent_tasks = stage_task_ids.get(parent_stage, [])
-                for parent_task in parent_tasks:
-                    parent_pos = positions.get(parent_task)
-                    if parent_pos is None:
-                        continue
-                    for child_task in child_tasks:
-                        child_pos = positions.get(child_task)
-                        if child_pos is None:
+
+                data_edges = 0
+                if child_plane == "chunk" and parent_plane == "chunk" and child_templates and parent_templates:
+                    output_map: Dict[tuple[int, int], List[Dict[str, Any]]] = defaultdict(list)
+                    for p_tmpl_idx, p_tmpl in enumerate(parent_templates):
+                        outputs = p_tmpl.get("outputs") or []
+                        if not outputs:
                             continue
-                        edge_x0.append(parent_pos[0])
-                        edge_y0.append(parent_pos[1])
-                        edge_x1.append(child_pos[0])
-                        edge_y1.append(child_pos[1])
+                        p_domain = p_tmpl.get("domain") or {}
+                        p_blocks = domain_blocks(p_domain)
+                        for out in outputs:
+                            key = (int(out.get("field", -1)), int(out.get("version", 0)))
+                            for task_id in stage_template_task_ids[parent_stage].get(p_tmpl_idx, []):
+                                output_map[key].append(
+                                    {
+                                        "task_id": task_id,
+                                        "block_id": tasks[task_id]["block_id"],
+                                        "blocks": p_blocks,
+                                    }
+                                )
+
+                    for c_tmpl_idx, c_tmpl in enumerate(child_templates):
+                        inputs = c_tmpl.get("inputs") or []
+                        if not inputs:
+                            continue
+                        c_domain = c_tmpl.get("domain") or {}
+                        c_task_ids = stage_template_task_ids[stage_idx].get(c_tmpl_idx, [])
+                        for inp in inputs:
+                            key = (int(inp.get("field", -1)), int(inp.get("version", 0)))
+                            producers = output_map.get(key)
+                            if not producers:
+                                continue
+                            inp_domain = inp.get("domain")
+                            same_as_task_domain = inp_domain is None or inp_domain == c_domain
+                            in_domain = inp_domain or c_domain
+                            in_blocks = domain_blocks(in_domain)
+                            for child_task in c_task_ids:
+                                child_block = tasks[child_task]["block_id"]
+                                req_blocks = in_blocks
+                                if same_as_task_domain and child_block is not None:
+                                    req_blocks = [int(child_block)]
+                                elif req_blocks is None and child_block is not None:
+                                    req_blocks = [int(child_block)]
+                                for prod in producers:
+                                    prod_block = prod["block_id"]
+                                    prod_blocks = prod["blocks"]
+                                    if req_blocks is None:
+                                        add_edge(prod["task_id"], child_task)
+                                        data_edges += 1
+                                        continue
+                                    if prod_block is None:
+                                        add_edge(prod["task_id"], child_task)
+                                        data_edges += 1
+                                        continue
+                                    if prod_blocks is not None and prod_block not in prod_blocks:
+                                        continue
+                                    if prod_block in req_blocks:
+                                        add_edge(prod["task_id"], child_task)
+                                        data_edges += 1
+
+                if data_edges > 0:
+                    continue
+
+                for parent_task in parent_tasks:
+                    for child_task in child_tasks:
+                        add_edge(parent_task, child_task)
 
         self._dag_source.data = {
             "x": node_x,

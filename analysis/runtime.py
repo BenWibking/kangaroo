@@ -91,6 +91,14 @@ def plan_to_dict(plan: Plan) -> dict:
     stages = []
     topo = plan.topo_stages()
     stage_ids = {id(s): i for i, s in enumerate(topo)}
+
+    def domain_to_dict(domain) -> dict:
+        return {
+            "step": domain.step,
+            "level": domain.level,
+            "blocks": list(domain.blocks) if domain.blocks is not None else None,
+        }
+
     for stage in topo:
         stages.append(
             {
@@ -102,25 +110,25 @@ def plan_to_dict(plan: Plan) -> dict:
                         "name": tmpl.name,
                         "plane": tmpl.plane,
                         "kernel": tmpl.kernel,
-                        "domain": {
-                            "step": tmpl.domain.step,
-                            "level": tmpl.domain.level,
-                            "blocks": list(tmpl.domain.blocks)
-                            if tmpl.domain.blocks is not None
-                            else None,
-                        },
-                    "inputs": [
-                        {"field": ref.field, "version": ref.version}
-                        for ref in tmpl.inputs
-                    ],
-                    "outputs": [
-                        {"field": ref.field, "version": ref.version}
-                        for ref in tmpl.outputs
-                    ],
-                    "output_bytes": list(tmpl.output_bytes),
-                    "deps": tmpl.deps,
-                    "params": tmpl.params,
-                }
+                        "domain": domain_to_dict(tmpl.domain),
+                        "inputs": [
+                            {
+                                "field": ref.field,
+                                "version": ref.version,
+                                "domain": domain_to_dict(
+                                    ref.domain if ref.domain is not None else tmpl.domain
+                                ),
+                            }
+                            for ref in tmpl.inputs
+                        ],
+                        "outputs": [
+                            {"field": ref.field, "version": ref.version}
+                            for ref in tmpl.outputs
+                        ],
+                        "output_bytes": list(tmpl.output_bytes),
+                        "deps": tmpl.deps,
+                        "params": tmpl.params,
+                    }
                     for tmpl in stage.templates
                 ],
             }

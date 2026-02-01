@@ -10,6 +10,7 @@ Plane = str  # "chunk" | "graph" | "mixed" (v0 supports only "chunk")
 class FieldRef:
     field: int
     version: int = 0
+    domain: Domain | None = None
 
 
 @dataclass(frozen=True)

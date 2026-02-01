@@ -11,16 +11,6 @@ namespace kangaroo {
 
 enum class ExecPlane : uint8_t { Chunk = 0, Graph = 1, Mixed = 2 };
 
-struct FieldRefIR {
-  int32_t field = 0;
-  int32_t version = 0;
-
-  template <typename Archive>
-  void serialize(Archive& ar, unsigned) {
-    ar& field& version;
-  }
-};
-
 struct DomainIR {
   int32_t step = 0;
   int16_t level = 0;
@@ -29,6 +19,17 @@ struct DomainIR {
   template <typename Archive>
   void serialize(Archive& ar, unsigned) {
     ar& step& level& blocks;
+  }
+};
+
+struct FieldRefIR {
+  int32_t field = 0;
+  int32_t version = 0;
+  std::optional<DomainIR> domain;
+
+  template <typename Archive>
+  void serialize(Archive& ar, unsigned) {
+    ar& field& version& domain;
   }
 };
 

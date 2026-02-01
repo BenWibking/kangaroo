@@ -66,6 +66,17 @@ std::optional<std::vector<int32_t>> parse_blocks(const msgpack::object& obj) {
   return blocks;
 }
 
+DomainIR parse_domain(const msgpack::object& obj) {
+  DomainIR dom;
+  dom.step = expect_map_value(obj, "step").as<int32_t>();
+  dom.level = expect_map_value(obj, "level").as<int16_t>();
+  const msgpack::object* blocks_obj = nullptr;
+  if (try_get_map_value(obj, "blocks", &blocks_obj)) {
+    dom.blocks = parse_blocks(*blocks_obj);
+  }
+  return dom;
+}
+
 std::vector<FieldRefIR> parse_field_refs(const msgpack::object& obj) {
   if (obj.type != msgpack::type::ARRAY) {
     throw std::runtime_error("field list must be array");
@@ -77,6 +88,10 @@ std::vector<FieldRefIR> parse_field_refs(const msgpack::object& obj) {
     FieldRefIR ref;
     ref.field = expect_map_value(entry, "field").as<int32_t>();
     ref.version = expect_map_value(entry, "version").as<int32_t>();
+    const msgpack::object* domain_obj = nullptr;
+    if (try_get_map_value(entry, "domain", &domain_obj)) {
+      ref.domain = parse_domain(*domain_obj);
+    }
     out.push_back(ref);
   }
   return out;
@@ -171,12 +186,7 @@ PlanIR decode_plan_msgpack(std::span<const std::uint8_t> payload) {
       tmpl.kernel = expect_map_value(tmpl_obj, "kernel").as<std::string>();
 
       const auto& domain_obj = expect_map_value(tmpl_obj, "domain");
-      tmpl.domain.step = expect_map_value(domain_obj, "step").as<int32_t>();
-      tmpl.domain.level = expect_map_value(domain_obj, "level").as<int16_t>();
-      const msgpack::object* blocks_obj = nullptr;
-      if (try_get_map_value(domain_obj, "blocks", &blocks_obj)) {
-        tmpl.domain.blocks = parse_blocks(*blocks_obj);
-      }
+      tmpl.domain = parse_domain(domain_obj);
 
       tmpl.inputs = parse_field_refs(expect_map_value(tmpl_obj, "inputs"));
       tmpl.outputs = parse_field_refs(expect_map_value(tmpl_obj, "outputs"));

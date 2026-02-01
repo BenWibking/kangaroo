@@ -92,6 +92,41 @@ double now_seconds() {
   return std::chrono::duration<double>(now.time_since_epoch()).count();
 }
 
+struct InputLocation {
+  int32_t step = 0;
+  int16_t level = 0;
+  int32_t block = 0;
+};
+
+InputLocation resolve_input_location(const TaskTemplateIR& tmpl,
+                                     const FieldRefIR& input,
+                                     int32_t task_block) {
+  InputLocation loc{tmpl.domain.step, tmpl.domain.level, task_block};
+  if (!input.domain.has_value()) {
+    return loc;
+  }
+
+  const auto& dom = input.domain.value();
+  loc.step = dom.step;
+  loc.level = dom.level;
+  if (!dom.blocks.has_value()) {
+    return loc;
+  }
+  const auto& blocks = dom.blocks.value();
+  if (blocks.empty()) {
+    throw std::runtime_error("input domain blocks must be non-empty");
+  }
+  if (blocks.size() == 1) {
+    loc.block = blocks.front();
+    return loc;
+  }
+  if (std::find(blocks.begin(), blocks.end(), task_block) != blocks.end()) {
+    loc.block = task_block;
+    return loc;
+  }
+  throw std::runtime_error("task block not in input domain blocks");
+}
+
 TaskEvent base_task_event(const TaskTemplateIR& tmpl,
                           int32_t plan_id,
                           int32_t stage_idx,
@@ -195,11 +230,16 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
   std::vector<hpx::future<HostView>> input_futures;
   input_futures.reserve(tmpl.inputs.size());
   for (const auto& input : tmpl.inputs) {
-    ChunkRef cref{tmpl.domain.step, tmpl.domain.level, input.field, input.version, block};
+    const auto loc = resolve_input_location(tmpl, input, block);
+    ChunkRef cref{loc.step, loc.level, input.field, input.version, loc.block};
     input_futures.push_back(data.get_host(cref));
   }
 
-  auto fetch_face = [&](Face face, int32_t field, int32_t ver) -> hpx::future<std::vector<HostView>> {
+  auto fetch_face = [&](Face face,
+                        int32_t field,
+                        int32_t ver,
+                        int32_t step,
+                        int16_t level) -> hpx::future<std::vector<HostView>> {
     if (tmpl.deps.kind != "FaceNeighbors") {
       return hpx::make_ready_future(std::vector<HostView>{});
     }
@@ -219,7 +259,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
     for (int32_t depth = 0; depth < tmpl.deps.width; ++depth) {
       std::vector<int32_t> next;
       for (int32_t b : frontier) {
-        NeighborSpan ns = adj.neighbors(tmpl.domain.step, tmpl.domain.level, b, face);
+        NeighborSpan ns = adj.neighbors(step, level, b, face);
         for (int32_t i = 0; i < ns.n; ++i) {
           int32_t nbr = ns.ptr[i];
           if (visited.insert(nbr).second) {
@@ -239,7 +279,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
       if (nbr == block) {
         continue;
       }
-      ChunkRef cref{tmpl.domain.step, tmpl.domain.level, field, ver, nbr};
+      ChunkRef cref{step, level, field, ver, nbr};
       futs.push_back(data.get_host(cref));
     }
     return hpx::when_all(futs).then([](auto&& all) {
@@ -264,17 +304,23 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
 
   for (std::size_t pos = 0; pos < halo_inputs.size(); ++pos) {
     const auto& nbr_field = tmpl.inputs.at(halo_inputs[pos]);
-    neighbor_futures.push_back(fetch_face(Face::Xm, nbr_field.field, nbr_field.version));
+    int32_t step = tmpl.domain.step;
+    int16_t level = tmpl.domain.level;
+    if (nbr_field.domain.has_value()) {
+      step = nbr_field.domain->step;
+      level = nbr_field.domain->level;
+    }
+    neighbor_futures.push_back(fetch_face(Face::Xm, nbr_field.field, nbr_field.version, step, level));
     neighbor_slots.push_back({pos, Face::Xm});
-    neighbor_futures.push_back(fetch_face(Face::Xp, nbr_field.field, nbr_field.version));
+    neighbor_futures.push_back(fetch_face(Face::Xp, nbr_field.field, nbr_field.version, step, level));
     neighbor_slots.push_back({pos, Face::Xp});
-    neighbor_futures.push_back(fetch_face(Face::Ym, nbr_field.field, nbr_field.version));
+    neighbor_futures.push_back(fetch_face(Face::Ym, nbr_field.field, nbr_field.version, step, level));
     neighbor_slots.push_back({pos, Face::Ym});
-    neighbor_futures.push_back(fetch_face(Face::Yp, nbr_field.field, nbr_field.version));
+    neighbor_futures.push_back(fetch_face(Face::Yp, nbr_field.field, nbr_field.version, step, level));
     neighbor_slots.push_back({pos, Face::Yp});
-    neighbor_futures.push_back(fetch_face(Face::Zm, nbr_field.field, nbr_field.version));
+    neighbor_futures.push_back(fetch_face(Face::Zm, nbr_field.field, nbr_field.version, step, level));
     neighbor_slots.push_back({pos, Face::Zm});
-    neighbor_futures.push_back(fetch_face(Face::Zp, nbr_field.field, nbr_field.version));
+    neighbor_futures.push_back(fetch_face(Face::Zp, nbr_field.field, nbr_field.version, step, level));
     neighbor_slots.push_back({pos, Face::Zp});
   }
 
@@ -468,8 +514,13 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
   input_futures.reserve(static_cast<std::size_t>((end - start) * tmpl.inputs.size()));
   for (const auto& input : tmpl.inputs) {
     for (int32_t idx = start; idx < end; ++idx) {
-      ChunkRef cref{tmpl.domain.step, tmpl.domain.level, input.field, input.version,
-                    input_base + idx};
+      int32_t step = tmpl.domain.step;
+      int16_t level = tmpl.domain.level;
+      if (input.domain.has_value()) {
+        step = input.domain->step;
+        level = input.domain->level;
+      }
+      ChunkRef cref{step, level, input.field, input.version, input_base + idx};
       input_futures.push_back(data.get_host(cref));
     }
   }
@@ -732,7 +783,8 @@ hpx::future<void> Executor::run_block_task(const TaskTemplateIR& tmpl, int32_t s
   }
 
   const auto& first_input = tmpl.inputs.front();
-  ChunkRef cref{tmpl.domain.step, tmpl.domain.level, first_input.field, first_input.version, block};
+  const auto loc = resolve_input_location(tmpl, first_input, block);
+  ChunkRef cref{loc.step, loc.level, first_input.field, first_input.version, loc.block};
 
   int target = data_.home_rank(cref);
   int here = hpx::get_locality_id();

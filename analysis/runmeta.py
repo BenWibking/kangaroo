@@ -16,8 +16,8 @@ class BlockBox:
 class LevelGeom:
     dx: tuple[float, float, float]
     x0: tuple[float, float, float]
-    index_origin: tuple[int, int, int]
     ref_ratio: int
+    index_origin: tuple[int, int, int] = (0, 0, 0)
 
 
 @dataclass
