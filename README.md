@@ -78,3 +78,25 @@ C++ build (HPX required)
 HPX autodetect helper
 - Use `scripts/detect_hpx.sh` to verify HPX resolution inside the Pixi env:
   - `HPX_DIR=$(scripts/detect_hpx.sh)`
+
+Kangaroo Dashboard (Bokeh)
+- Run the dashboard (local system metrics only):
+  - `python scripts/kangaroo_dashboard.py`
+- Note: the dashboard requires Python < 3.14 (NumPy/Bokeh crash on 3.14 in current env).
+- Launch a workflow and monitor it (event log + DAG auto-wired):
+  - `python scripts/kangaroo_dashboard.py --run scripts/plotfile_slice_operator_demo.py -- /path/to/plotfile`
+- Provide a JSONL event log for task stream/flamegraph/metrics:
+  - `python scripts/kangaroo_dashboard.py --metrics path/to/events.jsonl`
+- Provide a plan JSON to render a DAG (e.g. `analysis.runtime.plan_to_dict` output):
+  - `python scripts/kangaroo_dashboard.py --plan path/to/plan.json`
+
+Event log schema (one JSON object per line):
+```
+{"type": "metrics", "mem_used_gb": 12.3, "mem_total_gb": 64.0, "cpu_percent": 80.1,
+ "io_read_mbps": 120.0, "io_write_mbps": 55.0, "runtime_s": 42.5}
+{"type": "task", "id": "1:0:0:3", "status": "start", "name": "plotfile_load_b3",
+ "worker": "rank-0", "start": 1700000000.0, "end": 1700000000.0}
+{"type": "task", "id": "1:0:0:3", "status": "end", "name": "plotfile_load_b3",
+ "worker": "rank-0", "start": 1700000000.0, "end": 1700000001.2}
+{"type": "dag", "nodes": [{"id": 0, "name": "stage-a"}], "edges": [[0, 1]]}
+```

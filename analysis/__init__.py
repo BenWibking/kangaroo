@@ -1,5 +1,3 @@
-from .plotfile import PlotfileReader
-
 __all__ = [
     "Runtime",
     "hpx_configuration_string",
@@ -62,4 +60,8 @@ def __getattr__(name):
             "BlockBox": BlockBox,
             "load_runmeta_from_dict": load_runmeta_from_dict,
         }[name]
+    if name == "PlotfileReader":
+        from .plotfile import PlotfileReader
+
+        return PlotfileReader
     raise AttributeError(name)

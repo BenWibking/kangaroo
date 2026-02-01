@@ -4,7 +4,7 @@ channels = ["conda-forge"]
 platforms = ["linux-64", "osx-64", "osx-arm64"]
 
 [dependencies]
-python = ">=3.10"
+python = ">=3.10,<3.14"
 cmake = ">=3.22"
 ninja = "*"
 cxx-compiler = "*"
@@ -14,6 +14,8 @@ msgpack-cxx = "*"
 pip = ">=25.3,<26"
 numpy = "*"
 matplotlib = "*"
+psutil = ">=7.2.2,<8"
+bokeh = ">=3.8.2,<4"
 
 [pypi-dependencies]
 msgpack = "*"
@@ -22,7 +24,7 @@ scikit-build-core = ">=0.9.10"
 nanobind = ">=1.9"
 
 [tasks]
-configure = "bash -lc 'cmake -S cpp -B .pixi/build -DHPX_DIR=$(scripts/detect_hpx.sh) -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -Dnanobind_DIR=$(python -m nanobind --cmake_dir) -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX -DPython_EXECUTABLE=$CONDA_PREFIX/bin/python'"
+configure = "bash -lc 'cmake -S cpp -B .pixi/build -DCMAKE_BUILD_TYPE=Release -DHPX_DIR=$(scripts/detect_hpx.sh) -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -Dnanobind_DIR=$(python -m nanobind --cmake_dir) -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX -DPython_EXECUTABLE=$CONDA_PREFIX/bin/python'"
 build = "cmake --build .pixi/build"
 install = "cmake --install .pixi/build --prefix $CONDA_PREFIX"
 test = "pytest -q"

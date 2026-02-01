@@ -7,9 +7,15 @@
 #include <array>
 #include <cmath>
 #include <cstdlib>
+#include <condition_variable>
+#include <deque>
+#include <fstream>
+#include <iomanip>
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <thread>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_map>
 #include <msgpack.hpp>
@@ -40,6 +46,178 @@ DatasetHandle g_dataset;
 bool g_has_dataset = false;
 KernelRegistry* g_kernel_registry = nullptr;
 std::unordered_map<int32_t, PlanIR> g_plans;
+std::mutex g_event_log_mutex;
+std::string g_event_log_path;
+bool g_event_log_enabled = false;
+
+std::string json_escape(const std::string& value);
+
+struct EventLogWorker {
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::deque<TaskEvent> queue;
+  std::thread thread;
+  bool running = false;
+  bool stop = false;
+  std::string path;
+  bool enabled = false;
+
+  void set_path(const std::string& next_path) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      path = next_path;
+      enabled = !path.empty();
+    }
+    start_if_needed();
+    cv.notify_all();
+  }
+
+  void start_if_needed() {
+    bool should_start = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      should_start = enabled && !running;
+      if (should_start) {
+        running = true;
+      }
+    }
+    if (should_start) {
+      thread = std::thread([this]() { run(); });
+    }
+  }
+
+  void enqueue(TaskEvent event) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!enabled) {
+        return;
+      }
+      queue.push_back(std::move(event));
+    }
+    cv.notify_one();
+  }
+
+  void run() {
+    std::ofstream out;
+    std::string active_path;
+    for (;;) {
+      TaskEvent event;
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [&] {
+          return stop || !queue.empty() || path != active_path;
+        });
+        if (stop && queue.empty()) {
+          break;
+        }
+        if (path != active_path) {
+          active_path = path;
+          out.close();
+          if (!active_path.empty()) {
+            out.open(active_path, std::ios::app);
+          }
+        }
+        if (queue.empty()) {
+          continue;
+        }
+        event = std::move(queue.front());
+        queue.pop_front();
+      }
+      if (!out) {
+        continue;
+      }
+      auto write_string = [&](const char* key, const std::string& value) {
+        out << '"' << key << "\":\"" << json_escape(value) << '"';
+      };
+      out << '{';
+      out << "\"type\":\"task\",";
+      write_string("id", event.id);
+      out << ',';
+      write_string("name", event.name);
+      out << ',';
+      write_string("kernel", event.kernel);
+      out << ',';
+      write_string("plane", event.plane);
+      out << ',';
+      write_string("status", event.status);
+      out << ",\"stage\":" << event.stage;
+      out << ",\"template\":" << event.template_index;
+      out << ",\"block\":" << event.block;
+      out << ",\"step\":" << event.step;
+      out << ",\"level\":" << event.level;
+      out << ",\"locality\":" << event.locality;
+      if (!event.worker_label.empty()) {
+        out << ',';
+        write_string("worker", event.worker_label);
+      } else {
+        out << ",\"worker\":\"worker-" << event.worker << '"';
+      }
+      out << std::fixed << std::setprecision(6);
+      out << ",\"ts\":" << event.ts;
+      out << ",\"start\":" << event.start;
+      out << ",\"end\":" << event.end;
+      out << "}\n";
+      out.flush();
+    }
+  }
+
+  ~EventLogWorker() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      stop = true;
+    }
+    cv.notify_all();
+    if (thread.joinable()) {
+      thread.join();
+    }
+  }
+};
+
+EventLogWorker g_event_log_worker;
+
+std::string json_escape(const std::string& value) {
+  std::string out;
+  out.reserve(value.size());
+  for (char c : value) {
+    switch (c) {
+      case '\\':
+        out += "\\\\";
+        break;
+      case '"':
+        out += "\\\"";
+        break;
+      case '\n':
+        out += "\\n";
+        break;
+      case '\r':
+        out += "\\r";
+        break;
+      case '\t':
+        out += "\\t";
+        break;
+      default:
+        out += c;
+        break;
+    }
+  }
+  return out;
+}
+
+const std::string& event_log_path() {
+  return g_event_log_path;
+}
+
+void init_event_log_from_env() {
+  const char* env = std::getenv("KANGAROO_EVENT_LOG");
+  if (env && *env != '\0') {
+    {
+      std::lock_guard<std::mutex> lock(g_event_log_mutex);
+      g_event_log_path = env;
+      g_event_log_enabled = true;
+    }
+    g_event_log_worker.set_path(g_event_log_path);
+  }
+}
 
 std::shared_ptr<plotfile::PlotfileReader> get_plotfile_reader(const std::string& path) {
   static std::mutex reader_mutex;
@@ -632,6 +810,10 @@ void erase_plan_action(int32_t plan_id) {
   erase_global_plan(plan_id);
 }
 
+void set_event_log_action(const std::string& path) {
+  set_event_log_path(path);
+}
+
 void preload_action(const RunMeta& meta,
                     const DatasetHandle& dataset,
                     const std::vector<int32_t>& fields) {
@@ -645,16 +827,19 @@ HPX_PLAIN_ACTION(kangaroo::set_dataset_action, kangaroo_set_dataset_action)
 HPX_PLAIN_ACTION(kangaroo::set_plan_action, kangaroo_set_plan_action)
 HPX_PLAIN_ACTION(kangaroo::erase_plan_action, kangaroo_erase_plan_action)
 HPX_PLAIN_ACTION(kangaroo::preload_action, kangaroo_preload_action)
+HPX_PLAIN_ACTION(kangaroo::set_event_log_action, kangaroo_set_event_log_action)
 
 namespace kangaroo {
 
 Runtime::Runtime() {
+  init_event_log_from_env();
   set_global_kernel_registry(&kernel_registry_);
   register_default_kernels(kernel_registry_);
 }
 
 Runtime::Runtime(const std::vector<std::string>& hpx_config,
                  const std::vector<std::string>& hpx_cmdline) {
+  init_event_log_from_env();
   if (g_hpx_started) {
     throw std::runtime_error("HPX already started; cannot change config/args");
   }
@@ -701,6 +886,30 @@ KernelRegistry& Runtime::kernels() {
   return kernel_registry_;
 }
 
+void Runtime::set_event_log_path(const std::string& path) {
+  set_event_log_path(path);
+}
+
+void set_event_log_path(const std::string& path) {
+  {
+    std::lock_guard<std::mutex> lock(g_event_log_mutex);
+    g_event_log_path = path;
+    g_event_log_enabled = !path.empty();
+  }
+  g_event_log_worker.set_path(g_event_log_path);
+}
+
+bool has_event_log() {
+  return g_event_log_enabled && !g_event_log_path.empty();
+}
+
+void log_task_event(const TaskEvent& event) {
+  if (!has_event_log()) {
+    return;
+  }
+  g_event_log_worker.enqueue(event);
+}
+
 void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
                               const RunMetaHandle& runmeta,
                               const DatasetHandle& dataset) {
@@ -708,6 +917,9 @@ void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
   PlanIR plan = decode_plan_msgpack(std::span<const std::uint8_t>(packed.data(), packed.size()));
 
   auto localities = hpx::find_all_localities();
+  if (has_event_log()) {
+    hpx::lcos::broadcast<::kangaroo_set_event_log_action>(localities, event_log_path()).get();
+  }
   hpx::lcos::broadcast<::kangaroo_set_runmeta_action>(localities, runmeta.meta).get();
   hpx::lcos::broadcast<::kangaroo_set_dataset_action>(localities, dataset).get();
   int32_t plan_id = next_plan_id_++;

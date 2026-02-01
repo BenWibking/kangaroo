@@ -7,11 +7,16 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
+#include <atomic>
+#include <chrono>
+
 #include <hpx/version.hpp>
 
 namespace nb = nanobind;
 
 namespace {
+
+std::atomic<std::uint64_t> g_py_event_counter{0};
 
 nb::object require_key(const nb::dict& d, const char* key) {
   if (!d.contains(key)) {
@@ -73,10 +78,60 @@ kangaroo::RunMeta parse_runmeta(const nb::object& obj) {
   return meta;
 }
 
+double now_seconds() {
+  auto now = std::chrono::system_clock::now();
+  return std::chrono::duration<double>(now.time_since_epoch()).count();
+}
+
 }  // namespace
 
 NB_MODULE(_core, m) {
   m.def("hpx_configuration_string", []() { return hpx::configuration_string(); });
+  m.def("set_event_log_path", &kangaroo::set_event_log_path);
+  m.def("log_task_event",
+        [](const std::string& name,
+           const std::string& status,
+           nb::object start_obj,
+           nb::object end_obj,
+           nb::object id_obj,
+           nb::object worker_label_obj) {
+          kangaroo::TaskEvent event;
+          event.name = name;
+          event.kernel = name;
+          event.plane = "python";
+          event.status = status;
+          event.stage = -1;
+          event.template_index = -1;
+          event.block = -1;
+          event.step = 0;
+          event.level = 0;
+          event.locality = -1;
+          event.worker = -1;
+          if (!worker_label_obj.is_none()) {
+            event.worker_label = nb::cast<std::string>(worker_label_obj);
+          } else {
+            event.worker_label = "python";
+          }
+
+          if (!id_obj.is_none()) {
+            event.id = nb::cast<std::string>(id_obj);
+          } else {
+            event.id = "py:" + std::to_string(++g_py_event_counter);
+          }
+
+          double start = start_obj.is_none() ? now_seconds() : nb::cast<double>(start_obj);
+          double end = end_obj.is_none() ? start : nb::cast<double>(end_obj);
+          event.ts = end;
+          event.start = start;
+          event.end = end;
+          kangaroo::log_task_event(event);
+        },
+        nb::arg("name"),
+        nb::arg("status"),
+        nb::arg("start") = nb::none(),
+        nb::arg("end") = nb::none(),
+        nb::arg("id") = nb::none(),
+        nb::arg("worker_label") = nb::none());
 
   nb::class_<kangaroo::Runtime>(m, "Runtime")
       .def(nb::init<>())
@@ -105,6 +160,7 @@ NB_MODULE(_core, m) {
       .def("alloc_field_id", &kangaroo::Runtime::alloc_field_id)
       .def("mark_field_persistent", &kangaroo::Runtime::mark_field_persistent)
       .def("kernels", &kangaroo::Runtime::kernels, nb::rv_policy::reference)
+      .def("set_event_log_path", &kangaroo::Runtime::set_event_log_path)
       .def("get_task_chunk",
            [](kangaroo::Runtime& self, int32_t step, int16_t level, int32_t field,
               int32_t version, int32_t block) {

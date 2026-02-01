@@ -7,9 +7,8 @@ import argparse
 import json
 import os
 import sys
-
-import numpy as np
-import matplotlib.pyplot as plt
+import time
+from contextlib import contextmanager
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if REPO_ROOT not in sys.path:
@@ -21,7 +20,7 @@ from analysis.dataset import open_dataset  # noqa: E402
 from analysis.ops import UniformSlice  # noqa: E402
 from analysis.plan import FieldRef  # noqa: E402
 from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta  # noqa: E402
-from analysis.runtime import plan_to_dict  # noqa: E402
+from analysis.runtime import log_task_event, plan_to_dict, set_event_log_path  # noqa: E402
 
 
 def _resolve_component(hdr: dict[str, object], var: str | None) -> tuple[int, str]:
@@ -52,7 +51,38 @@ def _axis_index(axis: str) -> int:
         raise ValueError("axis must be one of x, y, z") from exc
 
 
+class EventLogger:
+    def __init__(self, enabled: bool) -> None:
+        self._enabled = enabled
+        self._counter = 0
+
+    @contextmanager
+    def span(self, name: str):
+        if not self._enabled:
+            yield
+            return
+        self._counter += 1
+        span_id = f"py:{self._counter}:{name}"
+        start = time.time()
+        log_task_event(name, "start", start=start, end=start, event_id=span_id, worker_label="python")
+        try:
+            yield
+        finally:
+            end = time.time()
+            log_task_event(name, "end", start=start, end=end, event_id=span_id, worker_label="python")
+
+
 def main() -> int:
+    event_log_path = os.environ.get("KANGAROO_EVENT_LOG")
+    if event_log_path:
+        set_event_log_path(event_log_path)
+    logger = EventLogger(event_log_path is not None)
+    with logger.span("setup/entrypoint"):
+        pass
+    with logger.span("setup/imports"):
+        global np, plt
+        import numpy as np
+        import matplotlib.pyplot as plt
     parser = argparse.ArgumentParser(description="Run Kangaroo UniformSlice on a plotfile FAB.")
     parser.add_argument("plotfile", help="Path to the plotfile directory.")
     parser.add_argument("--var", help="Variable name or component index to slice.")
@@ -81,22 +111,24 @@ def main() -> int:
         return 1
 
     try:
-        if args.hpx_config or args.hpx_arg or unknown:
-            hpx_args = []
-            if args.hpx_arg:
-                hpx_args.extend(args.hpx_arg)
-            if unknown:
-                hpx_args.extend(unknown)
-            rt = Runtime(hpx_config=args.hpx_config, hpx_args=hpx_args)
-        else:
-            rt = Runtime()
+        with logger.span("setup/runtime_init"):
+            if args.hpx_config or args.hpx_arg or unknown:
+                hpx_args = []
+                if args.hpx_arg:
+                    hpx_args.extend(args.hpx_arg)
+                if unknown:
+                    hpx_args.extend(unknown)
+                rt = Runtime(hpx_config=args.hpx_config, hpx_args=hpx_args)
+            else:
+                rt = Runtime()
     except Exception as exc:
         print("Runtime init failed (is the C++ module built?):", exc)
         return 1
 
-    reader = PlotfileReader(args.plotfile)
-    header = reader.header()
-    meta = reader.metadata()
+    with logger.span("setup/plotfile_open"):
+        reader = PlotfileReader(args.plotfile)
+        header = reader.header()
+        meta = reader.metadata()
     comp_idx, comp_name = _resolve_component(header, args.var)
 
     prob_lo = tuple(meta.get("prob_lo", (0.0, 0.0, 0.0)))
@@ -131,24 +163,27 @@ def main() -> int:
     if len(boxes) != reader.num_fabs(args.level):
         raise RuntimeError("level_boxes count does not match num_fabs for requested level")
 
-    runmeta = RunMeta(
-        steps=[
-            StepMeta(
-                step=0,
-                levels=[
-                    LevelMeta(
-                        geom=LevelGeom(dx=(dx, dx, dx), x0=x0, index_origin=index_origin, ref_ratio=1),
-                        boxes=[BlockBox(tuple(lo), tuple(hi)) for lo, hi in boxes],
-                    )
-                ],
-            )
-        ]
-    )
+    with logger.span("setup/runmeta_dataset"):
+        runmeta = RunMeta(
+            steps=[
+                StepMeta(
+                    step=0,
+                    levels=[
+                        LevelMeta(
+                            geom=LevelGeom(
+                                dx=(dx, dx, dx), x0=x0, index_origin=index_origin, ref_ratio=1
+                            ),
+                            boxes=[BlockBox(tuple(lo), tuple(hi)) for lo, hi in boxes],
+                        )
+                    ],
+                )
+            ]
+        )
 
-    ds = open_dataset("memory://plotfile-slice", runmeta=runmeta, step=0, level=0, runtime=rt)
-    field = ds.field_id(comp_name)
-    dtype = reader.read_fab(args.level, 0, comp_idx, 1).get("dtype", "float32")
-    bytes_per_value = 8 if dtype == "float64" else 4
+        ds = open_dataset("memory://plotfile-slice", runmeta=runmeta, step=0, level=0, runtime=rt)
+        field = ds.field_id(comp_name)
+        dtype = reader.read_fab(args.level, 0, comp_idx, 1).get("dtype", "float32")
+        bytes_per_value = 8 if dtype == "float64" else 4
 
     axis_idx = _axis_index(args.axis)
     if args.coord is None:
@@ -173,70 +208,83 @@ def main() -> int:
         resolution = (ny, nz)
         plane_label = "yz"
 
-    ctx = LoweringContext(runtime=rt._rt, runmeta=runmeta, dataset=ds)
-    load_stage = ctx.stage("plotfile_load")
-    for block_id, (lo, hi) in enumerate(boxes):
-        bx = int(hi[0]) - int(lo[0]) + 1
-        by = int(hi[1]) - int(lo[1]) + 1
-        bz = int(hi[2]) - int(lo[2]) + 1
-        out_bytes = bx * by * bz * bytes_per_value
-        load_stage.map_blocks(
-            name=f"plotfile_load_b{block_id}",
-            kernel="plotfile_load",
-            domain=ctx.domain(step=0, level=0, blocks=[block_id]),
-            inputs=[],
-            outputs=[FieldRef(field)],
-            output_bytes=[out_bytes],
-            deps={"kind": "None"},
-            params={
-                "plotfile": args.plotfile,
-                "level": args.level,
-                "comp": comp_idx,
-                "bytes_per_value": bytes_per_value,
-            },
+    with logger.span("setup/plan_build"):
+        ctx = LoweringContext(runtime=rt._rt, runmeta=runmeta, dataset=ds)
+        load_stage = ctx.stage("plotfile_load")
+        for block_id, (lo, hi) in enumerate(boxes):
+            bx = int(hi[0]) - int(lo[0]) + 1
+            by = int(hi[1]) - int(lo[1]) + 1
+            bz = int(hi[2]) - int(lo[2]) + 1
+            out_bytes = bx * by * bz * bytes_per_value
+            load_stage.map_blocks(
+                name=f"plotfile_load_b{block_id}",
+                kernel="plotfile_load",
+                domain=ctx.domain(step=0, level=0, blocks=[block_id]),
+                inputs=[],
+                outputs=[FieldRef(field)],
+                output_bytes=[out_bytes],
+                deps={"kind": "None"},
+                params={
+                    "plotfile": args.plotfile,
+                    "level": args.level,
+                    "comp": comp_idx,
+                    "bytes_per_value": bytes_per_value,
+                },
+            )
+
+        op = UniformSlice(
+            field=field,
+            axis=args.axis,
+            coord=coord,
+            rect=rect,
+            resolution=resolution,
+            bytes_per_value=bytes_per_value,
         )
+        stages = op.lower(ctx)
+        if stages:
+            stages[0].after.append(load_stage)
+            plan = Plan(stages=[load_stage, *stages])
+        else:
+            plan = Plan(stages=[load_stage])
 
-    op = UniformSlice(
-        field=field,
-        axis=args.axis,
-        coord=coord,
-        rect=rect,
-        resolution=resolution,
-        bytes_per_value=bytes_per_value,
-    )
-    stages = op.lower(ctx)
-    if stages:
-        stages[0].after.append(load_stage)
-        plan = Plan(stages=[load_stage, *stages])
-    else:
-        plan = Plan(stages=[load_stage])
-
+    plan_payload = plan_to_dict(plan)
     print("PlanIR:")
-    print(json.dumps(plan_to_dict(plan), indent=2, sort_keys=True))
+    print(json.dumps(plan_payload, indent=2, sort_keys=True))
+    plan_out = os.environ.get("KANGAROO_DASHBOARD_PLAN")
+    if plan_out:
+        try:
+            with open(plan_out, "w", encoding="utf-8") as handle:
+                json.dump(plan_payload, handle, indent=2, sort_keys=True)
+        except OSError as exc:
+            print(f"Failed to write plan JSON to {plan_out}: {exc}")
 
     try:
-        rt.run(plan, runmeta=runmeta, dataset=ds)
+        with logger.span("runtime/execute_plan"):
+            rt.run(plan, runmeta=runmeta, dataset=ds)
     except Exception as exc:
         print("Runtime executed but raised (kernels may be missing):", exc)
 
     slice_field = plan.stages[-1].templates[0].outputs[0].field
-    raw = rt.get_task_chunk(step=0, level=0, field=slice_field, version=0, block=0)
+    with logger.span("postprocess/fetch_output"):
+        raw = rt.get_task_chunk(step=0, level=0, field=slice_field, version=0, block=0)
     np_dtype = np.float64 if bytes_per_value == 8 else np.float32
-    slice_2d = np.frombuffer(raw, dtype=np_dtype, count=resolution[0] * resolution[1]).reshape(
-        resolution
-    )
+    with logger.span("postprocess/reshape"):
+        slice_2d = np.frombuffer(raw, dtype=np_dtype, count=resolution[0] * resolution[1]).reshape(
+            resolution
+        )
 
-    fig, ax = plt.subplots(figsize=(6, 5))
-    im = ax.imshow(np.log10(slice_2d.T), origin="lower", cmap="viridis")
-    ax.set_title(f"UniformSlice of {comp_name} ({plane_label} plane)")
-    ax.set_xlabel("index 0")
-    ax.set_ylabel("index 1")
-    fig.colorbar(im, ax=ax, label=f"log10({comp_name})")
-    fig.tight_layout()
-    if args.output:
-        fig.savefig(args.output, dpi=150)
-    else:
-        plt.show()
+    with logger.span("postprocess/plot"):
+        fig, ax = plt.subplots(figsize=(6, 5))
+        im = ax.imshow(np.log10(slice_2d.T), origin="lower", cmap="viridis")
+        ax.set_title(f"UniformSlice of {comp_name} ({plane_label} plane)")
+        ax.set_xlabel("index 0")
+        ax.set_ylabel("index 1")
+        fig.colorbar(im, ax=ax, label=f"log10({comp_name})")
+        fig.tight_layout()
+        if args.output:
+            fig.savefig(args.output, dpi=150)
+        else:
+            plt.show()
 
     return 0
 

@@ -60,6 +60,8 @@ class Runtime {
                           int32_t version,
                           int32_t block);
 
+  void set_event_log_path(const std::string& path);
+
  private:
   int32_t next_field_id_ = 1000;
   int32_t next_plan_id_ = 1;
@@ -67,6 +69,29 @@ class Runtime {
 
   KernelRegistry kernel_registry_;
 };
+
+struct TaskEvent {
+  std::string id;
+  std::string name;
+  std::string kernel;
+  std::string plane;
+  std::string status;
+  int32_t stage = -1;
+  int32_t template_index = -1;
+  int32_t block = -1;
+  int32_t step = 0;
+  int32_t level = 0;
+  int32_t locality = -1;
+  int32_t worker = -1;
+  std::string worker_label;
+  double ts = 0.0;
+  double start = 0.0;
+  double end = 0.0;
+};
+
+void set_event_log_path(const std::string& path);
+bool has_event_log();
+void log_task_event(const TaskEvent& event);
 
 void set_global_runmeta(const RunMeta& meta);
 const RunMeta& global_runmeta();
