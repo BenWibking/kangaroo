@@ -159,6 +159,21 @@ class DashboardApp:
             data={"left": [], "right": [], "label": [], "color": [], "duration": []}
         )
         self._task_stream_plot_ref = None
+        self._plan_loaded = False
+        self._dag_plot_ref = None
+        self._dag_source = ColumnDataSource(
+            data={
+                "x": [],
+                "y": [],
+                "name": [],
+                "stage": [],
+                "template": [],
+                "kernel": [],
+                "plane": [],
+                "block": [],
+            }
+        )
+        self._dag_edge_source = ColumnDataSource(data={"x0": [], "y0": [], "x1": [], "y1": []})
 
     def _select_palette(self) -> ColorPalette:
         return list(Category20[20]) + list(Category10[10])
@@ -171,6 +186,7 @@ class DashboardApp:
 
     def _update_metrics(self) -> None:
         self._saw_metrics_event = False
+        self._ensure_plan_loaded()
         if self._log_reader:
             for event in self._log_reader.read_events():
                 self._handle_event(event)
@@ -187,6 +203,175 @@ class DashboardApp:
                 self._sample_metrics_once()
         self._refresh_task_stream()
         self._refresh_flamegraph()
+
+    def _ensure_plan_loaded(self) -> None:
+        if self._plan_loaded:
+            return
+        if self._config.plan_path is None:
+            return
+        if not self._config.plan_path.exists():
+            return
+        try:
+            with self._config.plan_path.open("r", encoding="utf-8") as handle:
+                payload = json.load(handle)
+        except (OSError, json.JSONDecodeError):
+            return
+        stages = payload.get("stages")
+        if not isinstance(stages, list):
+            return
+        self._plan_loaded = True
+        self._update_dag_sources(stages)
+
+    def _update_dag_sources(self, stages: List[Dict[str, Any]]) -> None:
+        depths: List[int] = []
+        stage_parents: List[List[int]] = []
+        for idx, stage in enumerate(stages):
+            after = stage.get("after") or []
+            if not isinstance(after, list):
+                after = []
+            parents: List[int] = []
+            stage_depth = 0
+            for parent in after:
+                try:
+                    parent_idx = int(parent)
+                except (TypeError, ValueError):
+                    continue
+                if 0 <= parent_idx < len(depths):
+                    parents.append(parent_idx)
+                    stage_depth = max(stage_depth, depths[parent_idx] + 1)
+            depths.append(stage_depth)
+            stage_parents.append(parents)
+
+        tasks: List[Dict[str, Any]] = []
+        stage_task_ids: Dict[int, List[int]] = defaultdict(list)
+        for stage_idx, stage in enumerate(stages):
+            stage_name = str(stage.get("name", f"stage-{stage_idx}"))
+            stage_plane = str(stage.get("plane", ""))
+            templates = stage.get("templates") or []
+            if not templates:
+                task_id = len(tasks)
+                tasks.append(
+                    {
+                        "stage_idx": stage_idx,
+                        "name": stage_name,
+                        "stage": stage_name,
+                        "template": "",
+                        "kernel": "",
+                        "plane": stage_plane,
+                        "block": "",
+                    }
+                )
+                stage_task_ids[stage_idx].append(task_id)
+                continue
+            for tmpl_idx, tmpl in enumerate(templates):
+                tmpl_name = str(tmpl.get("name", f"tmpl-{tmpl_idx}"))
+                kernel = str(tmpl.get("kernel", ""))
+                plane = str(tmpl.get("plane", stage_plane))
+                domain = tmpl.get("domain") or {}
+                blocks = domain.get("blocks")
+                if isinstance(blocks, list) and blocks:
+                    for block in blocks:
+                        task_id = len(tasks)
+                        tasks.append(
+                            {
+                                "stage_idx": stage_idx,
+                                "name": f"{tmpl_name}:b{block}",
+                                "stage": stage_name,
+                                "template": tmpl_name,
+                                "kernel": kernel,
+                                "plane": plane,
+                                "block": str(block),
+                            }
+                        )
+                        stage_task_ids[stage_idx].append(task_id)
+                else:
+                    task_id = len(tasks)
+                    tasks.append(
+                        {
+                            "stage_idx": stage_idx,
+                            "name": tmpl_name,
+                            "stage": stage_name,
+                            "template": tmpl_name,
+                            "kernel": kernel,
+                            "plane": plane,
+                            "block": "all",
+                        }
+                    )
+                    stage_task_ids[stage_idx].append(task_id)
+
+        depth_lanes: Dict[int, List[int]] = defaultdict(list)
+        for task_id, task in enumerate(tasks):
+            depth_lanes[depths[task["stage_idx"]]].append(task_id)
+        positions: Dict[int, Tuple[float, float]] = {}
+        for depth, nodes in sorted(depth_lanes.items()):
+            for lane_idx, task_id in enumerate(nodes):
+                positions[task_id] = (float(depth), float(-lane_idx))
+
+        node_x: List[float] = []
+        node_y: List[float] = []
+        names: List[str] = []
+        stage_names: List[str] = []
+        template_names: List[str] = []
+        kernels: List[str] = []
+        planes: List[str] = []
+        blocks: List[str] = []
+        for task_id, task in enumerate(tasks):
+            x, y = positions.get(task_id, (0.0, 0.0))
+            node_x.append(x)
+            node_y.append(y)
+            names.append(task["name"])
+            stage_names.append(task["stage"])
+            template_names.append(task["template"])
+            kernels.append(task["kernel"])
+            planes.append(task["plane"])
+            blocks.append(task["block"])
+
+        edge_x0: List[float] = []
+        edge_y0: List[float] = []
+        edge_x1: List[float] = []
+        edge_y1: List[float] = []
+        for stage_idx, parents in enumerate(stage_parents):
+            if not parents:
+                continue
+            child_tasks = stage_task_ids.get(stage_idx, [])
+            for parent_stage in parents:
+                parent_tasks = stage_task_ids.get(parent_stage, [])
+                for parent_task in parent_tasks:
+                    parent_pos = positions.get(parent_task)
+                    if parent_pos is None:
+                        continue
+                    for child_task in child_tasks:
+                        child_pos = positions.get(child_task)
+                        if child_pos is None:
+                            continue
+                        edge_x0.append(parent_pos[0])
+                        edge_y0.append(parent_pos[1])
+                        edge_x1.append(child_pos[0])
+                        edge_y1.append(child_pos[1])
+
+        self._dag_source.data = {
+            "x": node_x,
+            "y": node_y,
+            "name": names,
+            "stage": stage_names,
+            "template": template_names,
+            "kernel": kernels,
+            "plane": planes,
+            "block": blocks,
+        }
+        self._dag_edge_source.data = {
+            "x0": edge_x0,
+            "y0": edge_y0,
+            "x1": edge_x1,
+            "y1": edge_y1,
+        }
+        if self._dag_plot_ref is not None:
+            if node_x:
+                self._dag_plot_ref.x_range.start = min(node_x) - 0.8
+                self._dag_plot_ref.x_range.end = max(node_x) + 0.8
+            if node_y:
+                self._dag_plot_ref.y_range.start = min(node_y) - 0.8
+                self._dag_plot_ref.y_range.end = max(node_y) + 0.8
 
     def _handle_event(self, event: Dict[str, Any]) -> None:
         etype = event.get("type")
@@ -391,7 +576,6 @@ class DashboardApp:
             "mem_used_gb",
             "mem_total_gb",
         )
-        cpu_plot = self._time_series_plot("CPU Usage (%)", "cpu_percent", None, "cpu_percent", None)
         io_plot = self._time_series_plot(
             "I/O (MB/s)",
             "io_read_mbps",
@@ -399,13 +583,13 @@ class DashboardApp:
             "io_read_mbps",
             "io_write_mbps",
         )
+        dag_plot = self._dag_plot()
         task_stream_plot = self._task_stream_plot()
         flame_plot = self._flamegraph_plot()
 
         grid = gridplot(
             [
-                [mem_plot, cpu_plot],
-                [io_plot, None],
+                [mem_plot, io_plot],
             ],
             sizing_mode="stretch_width",
         )
@@ -416,6 +600,7 @@ class DashboardApp:
                 controls,
                 kpi,
                 grid,
+                dag_plot,
                 row(task_stream_plot, flame_plot, sizing_mode="stretch_width"),
                 sizing_mode="stretch_width",
             )
@@ -590,6 +775,50 @@ class DashboardApp:
         )
         p.add_tools(HoverTool(tooltips=[("task", "@label"), ("duration", "@duration")]))
         p.yaxis.visible = False
+        return p
+
+    def _dag_plot(self):
+        p = figure(
+            title="Task Graph (DAG)",
+            height=280,
+            sizing_mode="stretch_width",
+            tools="pan,wheel_zoom,box_zoom,reset",
+        )
+        p.segment(
+            x0="x0",
+            y0="y0",
+            x1="x1",
+            y1="y1",
+            source=self._dag_edge_source,
+            line_color="#9aa0a6",
+            line_width=1.5,
+        )
+        node_renderer = p.circle(
+            x="x",
+            y="y",
+            source=self._dag_source,
+            size=12,
+            fill_color="#4c78a8",
+            line_color="white",
+            line_width=1,
+        )
+        p.add_tools(
+            HoverTool(
+                tooltips=[
+                    ("task", "@name"),
+                    ("stage", "@stage"),
+                    ("template", "@template"),
+                    ("kernel", "@kernel"),
+                    ("plane", "@plane"),
+                    ("block", "@block"),
+                ],
+                renderers=[node_renderer],
+            )
+        )
+        p.xaxis.axis_label = "stage depth"
+        p.yaxis.visible = False
+        p.grid.visible = False
+        self._dag_plot_ref = p
         return p
 
     @staticmethod
