@@ -72,6 +72,8 @@ target_include_directories(kangaroo_plotfile PUBLIC
 
 target_compile_features(kangaroo_plotfile PUBLIC cxx_std_20)
 
+target_link_libraries(kangaroo_runtime PUBLIC kangaroo_plotfile)
+
 nanobind_add_module(_plotfile src/plotfile_bindings.cpp)
 target_link_libraries(_plotfile PRIVATE kangaroo_plotfile)
 target_compile_definitions(_plotfile PRIVATE KANGAROO_USE_NANOBIND)

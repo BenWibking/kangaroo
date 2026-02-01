@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 
@@ -18,6 +19,7 @@ from analysis import Plan, PlotfileReader, Runtime  # noqa: E402
 from analysis.ctx import LoweringContext  # noqa: E402
 from analysis.dataset import open_dataset  # noqa: E402
 from analysis.ops import UniformSlice  # noqa: E402
+from analysis.plan import FieldRef  # noqa: E402
 from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta  # noqa: E402
 from analysis.runtime import plan_to_dict  # noqa: E402
 
@@ -147,27 +149,8 @@ def main() -> int:
     field = ds.field_id(comp_name)
     dtype = reader.read_fab(args.level, 0, comp_idx, 1).get("dtype", "float32")
     bytes_per_value = 8 if dtype == "float64" else 4
-    for block_id, (lo, hi) in enumerate(boxes):
-        payload = reader.read_fab(args.level, block_id, comp_idx, 1, return_ndarray=True)
-        arr = payload["data"]
-        if arr.ndim != 4:
-            raise RuntimeError(f"unexpected FAB array shape: {arr.shape}")
-        data = arr[0].transpose(2, 1, 0)
-        bx = int(hi[0]) - int(lo[0]) + 1
-        by = int(hi[1]) - int(lo[1]) + 1
-        bz = int(hi[2]) - int(lo[2]) + 1
-        if data.shape != (bx, by, bz):
-            raise RuntimeError(
-                f"FAB {block_id} shape {data.shape} does not match box {lo}..{hi}"
-            )
-        if dtype == "float64":
-            chunk = data.astype(np.float64).tobytes(order="C")
-        else:
-            chunk = data.astype(np.float32).tobytes(order="C")
-        ds.set_chunk(field=field, block=block_id, data=chunk)
 
     axis_idx = _axis_index(args.axis)
-    n_axis = (nx, ny, nz)[axis_idx]
     if args.coord is None:
         mid_idx = (int(domain_lo[axis_idx]) + int(domain_hi[axis_idx])) // 2
         coord = x0[axis_idx] + (mid_idx + 0.5) * dx
@@ -190,6 +173,29 @@ def main() -> int:
         resolution = (ny, nz)
         plane_label = "yz"
 
+    ctx = LoweringContext(runtime=rt._rt, runmeta=runmeta, dataset=ds)
+    load_stage = ctx.stage("plotfile_load")
+    for block_id, (lo, hi) in enumerate(boxes):
+        bx = int(hi[0]) - int(lo[0]) + 1
+        by = int(hi[1]) - int(lo[1]) + 1
+        bz = int(hi[2]) - int(lo[2]) + 1
+        out_bytes = bx * by * bz * bytes_per_value
+        load_stage.map_blocks(
+            name=f"plotfile_load_b{block_id}",
+            kernel="plotfile_load",
+            domain=ctx.domain(step=0, level=0, blocks=[block_id]),
+            inputs=[],
+            outputs=[FieldRef(field)],
+            output_bytes=[out_bytes],
+            deps={"kind": "None"},
+            params={
+                "plotfile": args.plotfile,
+                "level": args.level,
+                "comp": comp_idx,
+                "bytes_per_value": bytes_per_value,
+            },
+        )
+
     op = UniformSlice(
         field=field,
         axis=args.axis,
@@ -198,11 +204,15 @@ def main() -> int:
         resolution=resolution,
         bytes_per_value=bytes_per_value,
     )
-    ctx = LoweringContext(runtime=rt._rt, runmeta=runmeta, dataset=ds)
-    plan = Plan(stages=op.lower(ctx))
+    stages = op.lower(ctx)
+    if stages:
+        stages[0].after.append(load_stage)
+        plan = Plan(stages=[load_stage, *stages])
+    else:
+        plan = Plan(stages=[load_stage])
 
     print("PlanIR:")
-    print(plan_to_dict(plan))
+    print(json.dumps(plan_to_dict(plan), indent=2, sort_keys=True))
 
     try:
         rt.run(plan, runmeta=runmeta, dataset=ds)

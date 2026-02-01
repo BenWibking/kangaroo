@@ -93,9 +93,13 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl, int32_t block,
         std::runtime_error("only chunk plane is implemented"));
   }
 
-  if (tmpl.inputs.empty() || tmpl.outputs.empty()) {
+  if (tmpl.outputs.empty()) {
     return hpx::make_exceptional_future<void>(
-        std::runtime_error("templates must specify inputs and outputs"));
+        std::runtime_error("templates must specify outputs"));
+  }
+  if (tmpl.inputs.empty() && tmpl.deps.kind == "FaceNeighbors") {
+    return hpx::make_exceptional_future<void>(
+        std::runtime_error("FaceNeighbors deps require input fields"));
   }
 
   std::vector<int32_t> halo_inputs;
@@ -508,9 +512,21 @@ hpx::future<void> Executor::run_block_task(const TaskTemplateIR& tmpl, int32_t s
         std::runtime_error("only chunk plane is implemented"));
   }
 
-  if (tmpl.inputs.empty() || tmpl.outputs.empty()) {
+  if (tmpl.outputs.empty()) {
     return hpx::make_exceptional_future<void>(
-        std::runtime_error("templates must specify inputs and outputs"));
+        std::runtime_error("templates must specify outputs"));
+  }
+  if (tmpl.inputs.empty()) {
+    ChunkRef cref{tmpl.domain.step, tmpl.domain.level, tmpl.outputs.front().field,
+                  tmpl.outputs.front().version, block};
+    int target = data_.home_rank(cref);
+    int here = hpx::get_locality_id();
+    if (target == here) {
+      return run_block_task_impl(tmpl, block, meta_, data_, adj_, kernels_);
+    }
+    auto localities = hpx::find_all_localities();
+    return hpx::async<::kangaroo_run_block_task_action>(localities.at(target), plan_id_, stage_idx,
+                                                        tmpl_idx, block);
   }
 
   const auto& first_input = tmpl.inputs.front();
