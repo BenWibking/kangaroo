@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Iterable
+import math
+from typing import Iterable, Optional
 
 from .ctx import LoweringContext
 from .plan import FieldRef
@@ -79,7 +80,7 @@ class UniformSlice:
         resolution: tuple[int, int],
         out_name: str = "slice",
         bytes_per_value: int = 4,
-        reduce_fan_in: int = 8,
+        reduce_fan_in: Optional[int] = None,
     ) -> None:
         self.field = field
         self.axis = axis
@@ -193,8 +194,11 @@ class UniformSlice:
             )
         stages.append(stage)
 
-        fan_in = max(1, int(self.reduce_fan_in))
         num_inputs = len(blocks)
+        if self.reduce_fan_in is None:
+            fan_in = max(2, int(math.sqrt(num_inputs)))
+        else:
+            fan_in = max(1, int(self.reduce_fan_in))
         input_field = block_field
         reduce_idx = 0
         while num_inputs > 1:

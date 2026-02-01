@@ -23,7 +23,7 @@ if sys.version_info >= (3, 14):
     )
 
 from bokeh.layouts import column, gridplot, row
-from bokeh.models import Button, ColumnDataSource, Div, HoverTool, Range1d
+from bokeh.models import Button, ColumnDataSource, Div, HoverTool, Range1d, Spinner
 from bokeh.palettes import Category10, Category20
 from bokeh.plotting import figure
 from bokeh.server.server import Server
@@ -36,6 +36,7 @@ class DashboardConfig:
     metrics_path: Optional[Path] = None
     plan_path: Optional[Path] = None
     run_command: Optional[List[str]] = None
+    threads_per_locality: Optional[int] = None
     update_interval_ms: int = 500
     history_seconds: int = 300
     max_tasks: int = 2000
@@ -435,11 +436,18 @@ class DashboardApp:
         status = Div(text=f"<b>Workflow:</b> {self._proc_status}")
         self._status_div = status
         button = Button(label="Start workflow", button_type="success")
+        threads_spinner = Spinner(
+            title="Threads per locality",
+            low=1,
+            step=1,
+            value=self._config.threads_per_locality or 1,
+            width=160,
+        )
 
         def _start() -> None:
             if self._proc is not None and self._proc.poll() is None:
                 return
-            self._proc = self._launch_workflow()
+            self._proc = self._launch_workflow(int(threads_spinner.value))
             self._proc_status = "running" if self._proc is not None else "failed"
             if self._proc is not None:
                 self._task_by_id.clear()
@@ -453,18 +461,24 @@ class DashboardApp:
             status.text = f"<b>Workflow:</b> {self._proc_status}"
 
         button.on_click(_start)
-        return row(button, status, sizing_mode="stretch_width")
+        return row(button, threads_spinner, status, sizing_mode="stretch_width")
 
-    def _launch_workflow(self) -> Optional[subprocess.Popen[str]]:
+    def _launch_workflow(self, threads_per_locality: Optional[int] = None) -> Optional[subprocess.Popen[str]]:
         if not self._config.run_command:
             return None
+        if threads_per_locality is not None and threads_per_locality < 1:
+            raise ValueError("threads_per_locality must be >= 1")
+        run_command = list(self._config.run_command)
+        if threads_per_locality:
+            if not self._threads_config_present(run_command):
+                run_command = self._inject_threads(run_command, threads_per_locality)
         env = os.environ.copy()
         if self._config.metrics_path:
             env["KANGAROO_EVENT_LOG"] = str(self._config.metrics_path)
         if self._config.plan_path:
             env["KANGAROO_DASHBOARD_PLAN"] = str(self._config.plan_path)
         proc = subprocess.Popen(
-            self._config.run_command,
+            run_command,
             env=env,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -479,6 +493,23 @@ class DashboardApp:
 
         threading.Thread(target=_drain_output, daemon=True).start()
         return proc
+
+    @staticmethod
+    def _threads_config_present(argv: List[str]) -> bool:
+        for idx, arg in enumerate(argv):
+            if "hpx.os_threads" in arg:
+                return True
+            if arg == "--hpx-arg" and idx + 1 < len(argv):
+                if "--hpx:threads" in argv[idx + 1]:
+                    return True
+        return False
+
+    @staticmethod
+    def _inject_threads(argv: List[str], threads: int) -> List[str]:
+        insert_at = len(argv)
+        if "--" in argv:
+            insert_at = argv.index("--") + 1
+        return [*argv[:insert_at], "--hpx-config", f"hpx.os_threads={threads}", *argv[insert_at:]]
 
     def _time_series_plot(
         self,
