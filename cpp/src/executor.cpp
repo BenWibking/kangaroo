@@ -29,6 +29,7 @@ struct GraphReduceParams {
   int32_t num_inputs = 0;
   int32_t input_base = 0;
   int32_t output_base = 0;
+  std::vector<int32_t> input_blocks;
 };
 
 GraphReduceParams parse_graph_reduce_params(const std::vector<std::uint8_t>& params_msgpack) {
@@ -77,12 +78,31 @@ GraphReduceParams parse_graph_reduce_params(const std::vector<std::uint8_t>& par
                                                    base->type == msgpack::type::NEGATIVE_INTEGER)) {
     params.output_base = base->as<int32_t>();
   }
+  if (const auto* blocks = get_key("input_blocks"); blocks && blocks->type == msgpack::type::ARRAY) {
+    params.input_blocks.clear();
+    params.input_blocks.reserve(blocks->via.array.size);
+    for (uint32_t i = 0; i < blocks->via.array.size; ++i) {
+      const auto& entry = blocks->via.array.ptr[i];
+      if (entry.type == msgpack::type::POSITIVE_INTEGER ||
+          entry.type == msgpack::type::NEGATIVE_INTEGER) {
+        params.input_blocks.push_back(entry.as<int32_t>());
+      }
+    }
+  }
 
   if (params.fan_in <= 0) {
     params.fan_in = 1;
   }
   if (params.num_inputs <= 0) {
-    throw std::runtime_error("graph reduce num_inputs must be positive");
+    if (!params.input_blocks.empty()) {
+      params.num_inputs = static_cast<int32_t>(params.input_blocks.size());
+    } else {
+      throw std::runtime_error("graph reduce num_inputs must be positive");
+    }
+  }
+  if (!params.input_blocks.empty() &&
+      params.num_inputs != static_cast<int32_t>(params.input_blocks.size())) {
+    throw std::runtime_error("graph reduce num_inputs must match input_blocks size");
   }
   return params;
 }
@@ -490,11 +510,24 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
   const int32_t num_inputs = params.num_inputs;
   const int32_t input_base = params.input_base;
   const int32_t output_base = params.output_base;
+  const bool debug_reduce = std::getenv("KANGAROO_DEBUG_REDUCE") != nullptr;
 
   const int32_t start = group_idx * fan_in;
   const int32_t end = std::min(start + fan_in, num_inputs);
   if (start >= end) {
     return hpx::make_ready_future();
+  }
+  if (debug_reduce && !params.input_blocks.empty()) {
+    std::ostringstream oss;
+    oss << "[kangaroo] graph_reduce tmpl=" << tmpl.kernel << " group=" << group_idx
+        << " blocks=";
+    for (int32_t idx = start; idx < end; ++idx) {
+      if (idx > start) {
+        oss << ",";
+      }
+      oss << params.input_blocks.at(static_cast<std::size_t>(idx));
+    }
+    std::cout << oss.str() << std::endl;
   }
 
   const int32_t out_block = output_base + group_idx;
@@ -514,13 +547,16 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
   input_futures.reserve(static_cast<std::size_t>((end - start) * tmpl.inputs.size()));
   for (const auto& input : tmpl.inputs) {
     for (int32_t idx = start; idx < end; ++idx) {
+      const int32_t block_id = params.input_blocks.empty()
+                                   ? (input_base + idx)
+                                   : params.input_blocks.at(static_cast<std::size_t>(idx));
       int32_t step = tmpl.domain.step;
       int16_t level = tmpl.domain.level;
       if (input.domain.has_value()) {
         step = input.domain->step;
         level = input.domain->level;
       }
-      ChunkRef cref{step, level, input.field, input.version, input_base + idx};
+      ChunkRef cref{step, level, input.field, input.version, block_id};
       input_futures.push_back(data.get_host(cref));
     }
   }

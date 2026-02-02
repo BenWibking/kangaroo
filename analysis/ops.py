@@ -81,6 +81,7 @@ class UniformSlice:
         out_name: str = "slice",
         bytes_per_value: int = 4,
         reduce_fan_in: Optional[int] = None,
+        amr_cell_average: bool = False,
     ) -> None:
         self.field = field
         self.axis = axis
@@ -90,10 +91,9 @@ class UniformSlice:
         self.out_name = out_name
         self.bytes_per_value = bytes_per_value
         self.reduce_fan_in = reduce_fan_in
+        self.amr_cell_average = amr_cell_average
 
-    def _intersecting_blocks(self, ctx: LoweringContext) -> Iterable[int]:
-        ds = ctx.dataset
-        level_meta = ctx.runmeta.steps[ds.step].levels[ds.level]
+    def _intersecting_blocks_level(self, level_meta, *, plane_index: int | None = None) -> Iterable[int]:
         axis_idx = _axis_index(self.axis)
         u_axis, v_axis = [i for i in range(3) if i != axis_idx]
 
@@ -103,15 +103,19 @@ class UniformSlice:
 
         geom = level_meta.geom
         for i, box in enumerate(level_meta.boxes):
-            ax0, ax1 = _bounds_1d(
-                box.lo[axis_idx],
-                box.hi[axis_idx],
-                geom.x0[axis_idx],
-                geom.dx[axis_idx],
-                geom.index_origin[axis_idx],
-            )
-            if not (ax0 <= self.coord <= ax1):
-                continue
+            if plane_index is not None:
+                if plane_index < box.lo[axis_idx] or plane_index > box.hi[axis_idx]:
+                    continue
+            else:
+                ax0, ax1 = _bounds_1d(
+                    box.lo[axis_idx],
+                    box.hi[axis_idx],
+                    geom.x0[axis_idx],
+                    geom.dx[axis_idx],
+                    geom.index_origin[axis_idx],
+                )
+                if not (ax0 <= self.coord <= ax1):
+                    continue
 
             u0_b, u1_b = _bounds_1d(
                 box.lo[u_axis],
@@ -131,7 +135,180 @@ class UniformSlice:
                 continue
             yield i
 
-    def lower(self, ctx: LoweringContext):
+    def _reduce_fan_in(self, num_inputs: int) -> int:
+        if self.reduce_fan_in is None:
+            return max(2, int(math.sqrt(num_inputs)))
+        return max(1, int(self.reduce_fan_in))
+
+    def _slice_level(self, ctx: LoweringContext, *, level: int, blocks: list[int]) -> tuple[list, FieldRef, int]:
+        ds = ctx.dataset
+        axis_idx = _axis_index(self.axis)
+        u_axis, v_axis = [i for i in range(3) if i != axis_idx]
+        nx, ny = self.resolution
+        out_bytes = nx * ny * self.bytes_per_value
+        out_field = ctx.output_field(self.out_name)
+
+        if len(blocks) == 1:
+            stage = ctx.stage("uniform_slice")
+            for block in blocks:
+                dom = ctx.domain(step=ds.step, level=level, blocks=[block])
+                stage.map_blocks(
+                    name=f"uniform_slice_b{block}",
+                    kernel="uniform_slice",
+                    domain=dom,
+                    inputs=[FieldRef(self.field)],
+                    outputs=[out_field],
+                    output_bytes=[out_bytes],
+                    deps={"kind": "None"},
+                    params={
+                        "axis": axis_idx,
+                        "coord": self.coord,
+                        "rect": list(self.rect),
+                        "resolution": [nx, ny],
+                        "plane_axes": [u_axis, v_axis],
+                        "bytes_per_value": self.bytes_per_value,
+                    },
+                )
+            return [stage], out_field, out_bytes
+
+        block_field = ctx.temp_field(f"{self.out_name}_blocks_l{level}")
+        stages = []
+
+        stage = ctx.stage("uniform_slice")
+        for block in blocks:
+            dom = ctx.domain(step=ds.step, level=level, blocks=[block])
+            stage.map_blocks(
+                name=f"uniform_slice_b{block}",
+                kernel="uniform_slice",
+                domain=dom,
+                inputs=[FieldRef(self.field)],
+                outputs=[block_field],
+                output_bytes=[out_bytes],
+                deps={"kind": "None"},
+                params={
+                    "axis": axis_idx,
+                    "coord": self.coord,
+                    "rect": list(self.rect),
+                    "resolution": [nx, ny],
+                    "plane_axes": [u_axis, v_axis],
+                    "bytes_per_value": self.bytes_per_value,
+                },
+            )
+        stages.append(stage)
+
+        num_inputs = len(blocks)
+        fan_in = self._reduce_fan_in(num_inputs)
+        input_field = block_field
+        reduce_idx = 0
+        while num_inputs > 1:
+            num_groups = (num_inputs + fan_in - 1) // fan_in
+            output_field = out_field if num_groups == 1 else ctx.temp_field(
+                f"{self.out_name}_reduce_{level}_{reduce_idx}"
+            )
+            reduce_stage = ctx.stage("uniform_slice_reduce", plane="graph", after=[stages[-1]])
+            reduce_params = {
+                "graph_kind": "reduce",
+                "fan_in": fan_in,
+                "num_inputs": num_inputs,
+                "input_base": 0,
+                "output_base": 0,
+                "bytes_per_value": self.bytes_per_value,
+            }
+            if reduce_idx == 0:
+                reduce_params["input_blocks"] = list(blocks)
+            reduce_stage.map_blocks(
+                name=f"uniform_slice_reduce_s{reduce_idx}",
+                kernel="uniform_slice_reduce",
+                domain=ctx.domain(step=ds.step, level=level),
+                inputs=[input_field],
+                outputs=[output_field],
+                output_bytes=[out_bytes],
+                deps={"kind": "None"},
+                params=reduce_params,
+            )
+            stages.append(reduce_stage)
+            input_field = output_field
+            num_inputs = num_groups
+            reduce_idx += 1
+
+        return stages, out_field, out_bytes
+
+    def _coarsen_box(
+        self,
+        lo: tuple[int, int, int],
+        hi: tuple[int, int, int],
+        *,
+        ratio: int,
+        fine_origin: tuple[int, int, int],
+        coarse_origin: tuple[int, int, int],
+    ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+        clo = []
+        chi = []
+        for d in range(3):
+            clo.append(int(math.floor((lo[d] - fine_origin[d]) / ratio)) + coarse_origin[d])
+            chi.append(int(math.floor((hi[d] - fine_origin[d] + 1) / ratio)) + coarse_origin[d] - 1)
+        return tuple(clo), tuple(chi)
+
+    def _ref_ratio_between(self, levels, coarse: int, fine: int) -> int:
+        ratio = 1
+        for lev in range(coarse, fine):
+            ratio *= int(levels[lev].geom.ref_ratio)
+        return ratio
+
+    def _cell_index(self, geom, axis: int, coord: float) -> int:
+        x0 = geom.x0[axis]
+        dx = geom.dx[axis]
+        origin = geom.index_origin[axis]
+        if dx == 0.0:
+            return origin
+        idx_f = (coord - x0) / dx
+        return int(math.floor(idx_f)) + origin
+
+    def _covered_boxes_for_level(
+        self,
+        ctx: LoweringContext,
+        *,
+        level: int,
+        axis_idx: int,
+        plane_index_by_level: dict[int, int],
+    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
+        ds = ctx.dataset
+        levels = ctx.runmeta.steps[ds.step].levels
+        coarse_geom = levels[level].geom
+        coarse_k = plane_index_by_level[level]
+        covered: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
+        coarse_origin = levels[level].geom.index_origin
+        for fine in range(level + 1, len(levels)):
+            fine_k = plane_index_by_level[fine]
+            ratio = self._ref_ratio_between(levels, level, fine)
+            fine_origin = levels[fine].geom.index_origin
+            for box in levels[fine].boxes:
+                if fine_k < box.lo[axis_idx] or fine_k > box.hi[axis_idx]:
+                    continue
+                covered.append(
+                    self._coarsen_box(
+                        box.lo,
+                        box.hi,
+                        ratio=ratio,
+                        fine_origin=fine_origin,
+                        coarse_origin=coarse_origin,
+                    )
+                )
+        if not covered:
+            return []
+        clamped: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
+        for lo, hi in covered:
+            if coarse_k < lo[axis_idx] or coarse_k > hi[axis_idx]:
+                continue
+            clo = list(lo)
+            chi = list(hi)
+            clo[axis_idx] = coarse_k
+            chi[axis_idx] = coarse_k
+            clamped.append((tuple(clo), tuple(chi)))
+        return clamped
+        return covered
+
+    def _lower_amr_cell_average(self, ctx: LoweringContext):
         ds = ctx.dataset
         axis_idx = _axis_index(self.axis)
         u_axis, v_axis = [i for i in range(3) if i != axis_idx]
@@ -139,7 +316,214 @@ class UniformSlice:
         if nx <= 0 or ny <= 0:
             raise ValueError("resolution must be positive")
 
-        blocks = list(self._intersecting_blocks(ctx))
+        levels = ctx.runmeta.steps[ds.step].levels
+        base_level = 0
+        base_origin = levels[base_level].geom.index_origin
+        base_k = self._cell_index(levels[base_level].geom, axis_idx, self.coord)
+        plane_index_by_level: dict[int, int] = {}
+        for level_idx in range(len(levels)):
+            ratio = self._ref_ratio_between(levels, base_level, level_idx)
+            origin = levels[level_idx].geom.index_origin
+            plane_index_by_level[level_idx] = (base_k - base_origin[axis_idx]) * ratio + origin[axis_idx]
+        sum_fields: list[tuple[FieldRef, int]] = []
+        area_fields: list[tuple[FieldRef, int]] = []
+        stages: list = []
+
+        out_sum_bytes = nx * ny * 8
+        for level_idx in range(len(levels) - 1, -1, -1):
+            level_meta = levels[level_idx]
+            blocks = list(
+                self._intersecting_blocks_level(
+                    level_meta, plane_index=plane_index_by_level[level_idx]
+                )
+            )
+            if not blocks:
+                continue
+
+            covered_boxes = self._covered_boxes_for_level(
+                ctx,
+                level=level_idx,
+                axis_idx=axis_idx,
+                plane_index_by_level=plane_index_by_level,
+            )
+            covered_payload = [[list(lo), list(hi)] for lo, hi in covered_boxes]
+
+            sum_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
+            area_field = ctx.temp_field(f"{self.out_name}_area_l{level_idx}")
+
+            stage = ctx.stage("uniform_slice_cellavg")
+            for block in blocks:
+                dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
+                stage.map_blocks(
+                    name=f"uniform_slice_cellavg_b{block}",
+                    kernel="uniform_slice_cellavg_accumulate",
+                    domain=dom,
+                    inputs=[FieldRef(self.field)],
+                    outputs=[sum_field, area_field],
+                    output_bytes=[out_sum_bytes, out_sum_bytes],
+                    deps={"kind": "None"},
+                    params={
+                        "axis": axis_idx,
+                        "coord": self.coord,
+                        "plane_index": plane_index_by_level[level_idx],
+                        "rect": list(self.rect),
+                        "resolution": [nx, ny],
+                        "plane_axes": [u_axis, v_axis],
+                        "bytes_per_value": self.bytes_per_value,
+                        "covered_boxes": covered_payload,
+                    },
+                )
+            stages.append(stage)
+
+            num_inputs = len(blocks)
+            fan_in = self._reduce_fan_in(num_inputs)
+            input_sum = sum_field
+            input_area = area_field
+            reduce_idx = 0
+            while num_inputs > 1:
+                num_groups = (num_inputs + fan_in - 1) // fan_in
+                out_sum = sum_field if num_groups == 1 else ctx.temp_field(
+                    f"{self.out_name}_sum_reduce_{level_idx}_{reduce_idx}"
+                )
+                out_area = area_field if num_groups == 1 else ctx.temp_field(
+                    f"{self.out_name}_area_reduce_{level_idx}_{reduce_idx}"
+                )
+                reduce_stage = ctx.stage("uniform_slice_reduce", plane="graph", after=[stages[-1]])
+                sum_params = {
+                    "graph_kind": "reduce",
+                    "fan_in": fan_in,
+                    "num_inputs": num_inputs,
+                    "input_base": 0,
+                    "output_base": 0,
+                    "bytes_per_value": 8,
+                }
+                area_params = {
+                    "graph_kind": "reduce",
+                    "fan_in": fan_in,
+                    "num_inputs": num_inputs,
+                    "input_base": 0,
+                    "output_base": 0,
+                    "bytes_per_value": 8,
+                }
+                if reduce_idx == 0:
+                    sum_params["input_blocks"] = list(blocks)
+                    area_params["input_blocks"] = list(blocks)
+                reduce_stage.map_blocks(
+                    name=f"uniform_slice_sum_reduce_s{reduce_idx}",
+                    kernel="uniform_slice_reduce",
+                    domain=ctx.domain(step=ds.step, level=level_idx),
+                    inputs=[input_sum],
+                    outputs=[out_sum],
+                    output_bytes=[out_sum_bytes],
+                    deps={"kind": "None"},
+                    params=sum_params,
+                )
+                reduce_stage2 = ctx.stage("uniform_slice_reduce", plane="graph", after=[reduce_stage])
+                reduce_stage2.map_blocks(
+                    name=f"uniform_slice_area_reduce_s{reduce_idx}",
+                    kernel="uniform_slice_reduce",
+                    domain=ctx.domain(step=ds.step, level=level_idx),
+                    inputs=[input_area],
+                    outputs=[out_area],
+                    output_bytes=[out_sum_bytes],
+                    deps={"kind": "None"},
+                    params=area_params,
+                )
+                stages.append(reduce_stage)
+                stages.append(reduce_stage2)
+                input_sum = out_sum
+                input_area = out_area
+                num_inputs = num_groups
+                reduce_idx += 1
+
+            sum_fields.append((input_sum, level_idx))
+            area_fields.append((input_area, level_idx))
+
+        if not sum_fields:
+            return ctx.fragment([])
+
+        def reduce_pairwise(fields: list[tuple[FieldRef, int]], name: str) -> tuple[FieldRef, int]:
+            if len(fields) == 1:
+                return fields[0]
+            current = fields
+            reduce_round = 0
+            while len(current) > 1:
+                next_fields: list[tuple[FieldRef, int]] = []
+                for i in range(0, len(current), 2):
+                    if i + 1 >= len(current):
+                        next_fields.append(current[i])
+                        continue
+                    left, left_level = current[i]
+                    right, right_level = current[i + 1]
+                    left_ref = FieldRef(left.field, version=left.version, domain=ctx.domain(step=ds.step, level=left_level))
+                    right_ref = FieldRef(right.field, version=right.version, domain=ctx.domain(step=ds.step, level=right_level))
+                    out_field = ctx.temp_field(f"{self.out_name}_{name}_add_{reduce_round}_{i}")
+                    add_stage = ctx.stage("uniform_slice_add", plane="graph", after=[stages[-1]])
+                    add_stage.map_blocks(
+                        name=f"uniform_slice_add_{name}_{reduce_round}_{i}",
+                        kernel="uniform_slice_add",
+                        domain=ctx.domain(step=ds.step, level=ds.level),
+                        inputs=[left_ref, right_ref],
+                        outputs=[out_field],
+                        output_bytes=[out_sum_bytes],
+                        deps={"kind": "None"},
+                        params={
+                            "graph_kind": "reduce",
+                            "fan_in": 1,
+                            "num_inputs": 1,
+                            "input_base": 0,
+                            "output_base": 0,
+                            "bytes_per_value": 8,
+                        },
+                    )
+                    stages.append(add_stage)
+                    next_fields.append((out_field, ds.level))
+                current = next_fields
+                reduce_round += 1
+            return current[0]
+
+        total_sum, total_sum_level = reduce_pairwise(sum_fields, "sum")
+        total_area, total_area_level = reduce_pairwise(area_fields, "area")
+
+        out_field = ctx.output_field(self.out_name)
+        finalize = ctx.stage("uniform_slice_finalize", plane="graph", after=[stages[-1]])
+        finalize.map_blocks(
+            name="uniform_slice_finalize",
+            kernel="uniform_slice_finalize",
+            domain=ctx.domain(step=ds.step, level=ds.level),
+            inputs=[
+                FieldRef(total_sum.field, version=total_sum.version, domain=ctx.domain(step=ds.step, level=total_sum_level)),
+                FieldRef(total_area.field, version=total_area.version, domain=ctx.domain(step=ds.step, level=total_area_level)),
+            ],
+            outputs=[out_field],
+            output_bytes=[nx * ny * self.bytes_per_value],
+            deps={"kind": "None"},
+            params={
+                "graph_kind": "reduce",
+                "fan_in": 1,
+                "num_inputs": 1,
+                "input_base": 0,
+                "output_base": 0,
+                "bytes_per_value": self.bytes_per_value,
+                "pixel_area": abs((self.rect[2] - self.rect[0]) / nx) * abs((self.rect[3] - self.rect[1]) / ny),
+            },
+        )
+        stages.append(finalize)
+        return ctx.fragment(stages)
+
+    def lower(self, ctx: LoweringContext):
+        if self.amr_cell_average:
+            return self._lower_amr_cell_average(ctx)
+
+        ds = ctx.dataset
+        axis_idx = _axis_index(self.axis)
+        u_axis, v_axis = [i for i in range(3) if i != axis_idx]
+        nx, ny = self.resolution
+        if nx <= 0 or ny <= 0:
+            raise ValueError("resolution must be positive")
+
+        level_meta = ctx.runmeta.steps[ds.step].levels[ds.level]
+        blocks = list(self._intersecting_blocks_level(level_meta))
         if not blocks:
             return ctx.fragment([])
 
@@ -195,10 +579,7 @@ class UniformSlice:
         stages.append(stage)
 
         num_inputs = len(blocks)
-        if self.reduce_fan_in is None:
-            fan_in = max(2, int(math.sqrt(num_inputs)))
-        else:
-            fan_in = max(1, int(self.reduce_fan_in))
+        fan_in = self._reduce_fan_in(num_inputs)
         input_field = block_field
         reduce_idx = 0
         while num_inputs > 1:

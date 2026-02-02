@@ -65,9 +65,23 @@ def main() -> int:
     parser.add_argument("plotfile", help="Path to the plotfile directory.")
     parser.add_argument("--var", help="Variable name or component index to slice.")
     parser.add_argument("--level", type=int, default=0, help="AMR level index.")
+    parser.add_argument(
+        "--amr-cell-average",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable AMR-aware cell-average slicing (default: enabled).",
+    )
     parser.add_argument("--axis", choices=("x", "y", "z"), default="z", help="Slice axis.")
     parser.add_argument("--coord", type=float, help="Slice coordinate in physical units.")
     parser.add_argument("--output", help="Optional path to save the plot as an image.")
+    parser.add_argument(
+        "--resolution",
+        help="Override output resolution as Nx,Ny (e.g. 512,512).",
+    )
+    parser.add_argument(
+        "--dump-area",
+        help="Optional path to save the per-pixel covered area array as a .npy file.",
+    )
     parser.add_argument(
         "--hpx-config",
         action="append",
@@ -104,7 +118,8 @@ def main() -> int:
         return 1
 
     with logger.span("setup/runmeta_dataset"):
-        ds = open_dataset(f"amrex://{args.plotfile}", level=args.level, runtime=rt)
+        base_level = 0 if args.amr_cell_average else args.level
+        ds = open_dataset(f"amrex://{args.plotfile}", level=base_level, runtime=rt)
         
         # Set global dataset to enable early chunk fetching for type detection
         from analysis import _core
@@ -138,11 +153,11 @@ def main() -> int:
 
     prob_lo = meta["prob_lo"]
     prob_hi = meta["prob_hi"]
-    domain_lo, domain_hi = meta["prob_domain"][args.level]
+    domain_lo, domain_hi = meta["prob_domain"][base_level]
     nx = int(domain_hi[0]) - int(domain_lo[0]) + 1
     ny = int(domain_hi[1]) - int(domain_lo[1]) + 1
     nz = int(domain_hi[2]) - int(domain_lo[2]) + 1
-    dx = meta["cell_size"][args.level][0]
+    dx = meta["cell_size"][base_level][0]
 
     axis_idx = _axis_index(args.axis)
     if args.coord is None:
@@ -163,6 +178,14 @@ def main() -> int:
         rect = (prob_lo[1], prob_lo[2], prob_hi[1], prob_hi[2])
         resolution = (ny, nz)
         plane_label = "yz"
+    if args.resolution:
+        try:
+            nx_in, ny_in = (int(v.strip()) for v in args.resolution.split(","))
+            if nx_in <= 0 or ny_in <= 0:
+                raise ValueError
+            resolution = (nx_in, ny_in)
+        except ValueError as exc:
+            raise ValueError("--resolution must be in Nx,Ny format with positive integers") from exc
 
     with logger.span("setup/plan_build"):
         ctx = LoweringContext(runtime=rt._rt, runmeta=runmeta, dataset=ds)
@@ -173,6 +196,7 @@ def main() -> int:
             rect=rect,
             resolution=resolution,
             bytes_per_value=bytes_per_value,
+            amr_cell_average=args.amr_cell_average,
         )
         stages = op.lower(ctx)
         plan = Plan(stages=stages)
@@ -196,16 +220,44 @@ def main() -> int:
 
     with logger.span("postprocess/fetch_output"):
         slice_field = plan.stages[-1].templates[0].outputs[0].field
-        raw = rt.get_task_chunk(step=0, level=args.level, field=slice_field, version=0, block=0)
+        raw = rt.get_task_chunk(step=0, level=base_level, field=slice_field, version=0, block=0)
         np_dtype = np.float64 if bytes_per_value == 8 else np.float32
         slice_2d = np.frombuffer(raw, dtype=np_dtype, count=resolution[0] * resolution[1]).reshape(
             resolution
         )
+        if args.dump_area:
+            area_field = plan.stages[-1].templates[0].inputs[1].field
+            raw_area = rt.get_task_chunk(step=0, level=base_level, field=area_field, version=0, block=0)
+            area_2d = np.frombuffer(raw_area, dtype=np.float64, count=resolution[0] * resolution[1]).reshape(
+                resolution
+            )
+            np.save(args.dump_area, area_2d)
+            area_by_level = {}
+            for stage in plan.stages:
+                for tmpl in stage.templates:
+                    if tmpl.kernel == "uniform_slice_cellavg_accumulate":
+                        lvl = tmpl.domain.level
+                        if len(tmpl.outputs) >= 2:
+                            area_by_level[lvl] = tmpl.outputs[1].field
+                    elif tmpl.kernel == "uniform_slice_reduce" and "area_reduce" in tmpl.name:
+                        lvl = tmpl.domain.level
+                        if tmpl.outputs:
+                            area_by_level[lvl] = tmpl.outputs[0].field
+            if area_by_level:
+                root, ext = os.path.splitext(args.dump_area)
+                for lvl, fid in sorted(area_by_level.items()):
+                    raw_lvl = rt.get_task_chunk(step=0, level=lvl, field=fid, version=0, block=0)
+                    area_lvl = np.frombuffer(raw_lvl, dtype=np.float64, count=resolution[0] * resolution[1]).reshape(
+                        resolution
+                    )
+                    np.save(f"{root}_l{lvl}{ext}", area_lvl)
 
     with logger.span("postprocess/plot"):
         fig, ax = plt.subplots(figsize=(6, 5))
-        im = ax.imshow(np.log10(slice_2d.T), origin="lower", cmap="viridis")
-        ax.set_title(f"UniformSlice of {comp_name} ({plane_label} plane)")
+        log_slice = np.ma.masked_invalid(np.log10(slice_2d.T))
+        im = ax.imshow(log_slice, origin="lower", cmap="viridis")
+        avg_label = "AMR cell-average" if args.amr_cell_average else "UniformSlice"
+        ax.set_title(f"{avg_label} of {comp_name} ({plane_label} plane)")
         ax.set_xlabel("index 0")
         ax.set_ylabel("index 1")
         fig.colorbar(im, ax=ax, label=f"log10({comp_name})")
