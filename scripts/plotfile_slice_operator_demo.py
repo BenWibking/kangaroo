@@ -157,27 +157,49 @@ def main() -> int:
     nx = int(domain_hi[0]) - int(domain_lo[0]) + 1
     ny = int(domain_hi[1]) - int(domain_lo[1]) + 1
     nz = int(domain_hi[2]) - int(domain_lo[2]) + 1
-    dx = meta["cell_size"][base_level][0]
+    cell_size = meta["cell_size"][base_level]
+    dx = cell_size[0]
 
     axis_idx = _axis_index(args.axis)
     if args.coord is None:
         mid_idx = (int(domain_lo[axis_idx]) + int(domain_hi[axis_idx])) // 2
-        coord = prob_lo[axis_idx] + (mid_idx + 0.5) * dx
+        coord = prob_lo[axis_idx] + (mid_idx + 0.5) * cell_size[axis_idx]
     else:
         coord = args.coord
 
+    def _axis_bounds(axis: int, n_cells: int, domain_axis_lo: int) -> tuple[float, float]:
+        dx_axis = float(cell_size[axis])
+        if not np.isfinite(dx_axis) or dx_axis == 0.0:
+            span = float(prob_hi[axis]) - float(prob_lo[axis])
+            if n_cells > 0 and np.isfinite(span) and span != 0.0:
+                dx_axis = span / float(n_cells)
+            else:
+                dx_axis = 1.0
+        lo = float(prob_lo[axis]) + float(domain_axis_lo) * dx_axis
+        hi = lo + dx_axis * float(n_cells)
+        if not np.isfinite(lo) or not np.isfinite(hi) or hi == lo:
+            hi = lo + float(n_cells) if n_cells else lo + 1.0
+        return lo, hi
+
+    x_lo, x_hi = _axis_bounds(0, nx, int(domain_lo[0]))
+    y_lo, y_hi = _axis_bounds(1, ny, int(domain_lo[1]))
+    z_lo, z_hi = _axis_bounds(2, nz, int(domain_lo[2]))
+
     if args.axis == "z":
-        rect = (prob_lo[0], prob_lo[1], prob_hi[0], prob_hi[1])
+        rect = (x_lo, y_lo, x_hi, y_hi)
         resolution = (nx, ny)
         plane_label = "xy"
+        axis_labels = ("x", "y")
     elif args.axis == "y":
-        rect = (prob_lo[0], prob_lo[2], prob_hi[0], prob_hi[2])
+        rect = (x_lo, z_lo, x_hi, z_hi)
         resolution = (nx, nz)
         plane_label = "xz"
+        axis_labels = ("x", "z")
     else:
-        rect = (prob_lo[1], prob_lo[2], prob_hi[1], prob_hi[2])
+        rect = (y_lo, z_lo, y_hi, z_hi)
         resolution = (ny, nz)
         plane_label = "yz"
+        axis_labels = ("y", "z")
     if args.resolution:
         try:
             nx_in, ny_in = (int(v.strip()) for v in args.resolution.split(","))
@@ -255,11 +277,14 @@ def main() -> int:
     with logger.span("postprocess/plot"):
         fig, ax = plt.subplots(figsize=(6, 5))
         log_slice = np.ma.masked_invalid(np.log10(slice_2d.T))
-        im = ax.imshow(log_slice, origin="lower", cmap="viridis")
+        kpc_in_cm = 3.0856775814913673e21
+        rect_kpc = tuple(coord / kpc_in_cm for coord in rect)
+        extent_kpc = (rect_kpc[0], rect_kpc[2], rect_kpc[1], rect_kpc[3])
+        im = ax.imshow(log_slice, origin="lower", cmap="viridis", extent=extent_kpc)
         avg_label = "AMR cell-average" if args.amr_cell_average else "UniformSlice"
         ax.set_title(f"{avg_label} of {comp_name} ({plane_label} plane)")
-        ax.set_xlabel("index 0")
-        ax.set_ylabel("index 1")
+        ax.set_xlabel(f"{axis_labels[0]} [kpc]")
+        ax.set_ylabel(f"{axis_labels[1]} [kpc]")
         fig.colorbar(im, ax=ax, label=f"log10({comp_name})")
         fig.tight_layout()
         if args.output:
