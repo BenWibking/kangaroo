@@ -73,6 +73,12 @@ def main() -> int:
     )
     parser.add_argument("--axis", choices=("x", "y", "z"), default="z", help="Slice axis.")
     parser.add_argument("--coord", type=float, help="Slice coordinate in physical units.")
+    parser.add_argument(
+        "--zoom",
+        type=float,
+        default=1.0,
+        help="Zoom factor (yt-style): >1 zooms in, <1 zooms out (default: 1).",
+    )
     parser.add_argument("--output", help="Optional path to save the plot as an image.")
     parser.add_argument(
         "--resolution",
@@ -208,6 +214,14 @@ def main() -> int:
             resolution = (nx_in, ny_in)
         except ValueError as exc:
             raise ValueError("--resolution must be in Nx,Ny format with positive integers") from exc
+    if args.zoom <= 0:
+        raise ValueError("--zoom must be a positive number")
+    if args.zoom != 1.0:
+        x_mid = 0.5 * (rect[0] + rect[2])
+        y_mid = 0.5 * (rect[1] + rect[3])
+        half_width = 0.5 * (rect[2] - rect[0]) / args.zoom
+        half_height = 0.5 * (rect[3] - rect[1]) / args.zoom
+        rect = (x_mid - half_width, y_mid - half_height, x_mid + half_width, y_mid + half_height)
 
     with logger.span("setup/plan_build"):
         ctx = LoweringContext(runtime=rt._rt, runmeta=runmeta, dataset=ds)
