@@ -238,8 +238,6 @@ def main() -> int:
         plan = Plan(stages=stages)
 
         plan_payload = plan_to_dict(plan)
-        print("PlanIR:")
-        print(json.dumps(plan_payload, indent=2, sort_keys=True))
         plan_out = os.environ.get("KANGAROO_DASHBOARD_PLAN")
         if plan_out:
             try:
