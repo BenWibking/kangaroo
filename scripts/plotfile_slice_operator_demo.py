@@ -290,7 +290,7 @@ def main() -> int:
 
     with logger.span("postprocess/plot"):
         fig, ax = plt.subplots(figsize=(6, 5))
-        log_slice = np.ma.masked_invalid(np.log10(slice_2d.T))
+        log_slice = np.ma.masked_invalid(np.log10(slice_2d))
         kpc_in_cm = 3.0856775814913673e21
         rect_kpc = tuple(coord / kpc_in_cm for coord in rect)
         extent_kpc = (rect_kpc[0], rect_kpc[2], rect_kpc[1], rect_kpc[3])
