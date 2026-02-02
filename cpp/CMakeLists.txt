@@ -34,6 +34,8 @@ find_library(TCMALLOC_MINIMAL_LIB
 
 add_library(kangaroo_runtime STATIC
   src/adjacency.cpp
+  src/backend_memory.cpp
+  src/backend_plotfile.cpp
   src/data_service_local.cpp
   src/executor.cpp
   src/kernel_registry.cpp

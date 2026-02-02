@@ -753,6 +753,7 @@ const RunMeta& global_runmeta() {
 
 void set_global_dataset(const DatasetHandle& dataset) {
   set_dataset_impl(dataset);
+  DataServiceLocal::set_dataset(&g_dataset);
 }
 
 const DatasetHandle& global_dataset() {
@@ -859,19 +860,28 @@ Runtime::Runtime(const std::vector<std::string>& hpx_config,
 }
 
 void DatasetHandle::set_chunk(const ChunkRef& ref, HostView view) {
-  data[ref] = std::move(view);
+  if (!backend) {
+    backend = std::make_shared<MemoryBackend>();
+  }
+  if (auto mem = std::dynamic_pointer_cast<MemoryBackend>(backend)) {
+    mem->set_chunk(ref, std::move(view));
+  } else {
+    throw std::runtime_error("Cannot set_chunk on read-only backend");
+  }
 }
 
 std::optional<HostView> DatasetHandle::get_chunk(const ChunkRef& ref) const {
-  auto it = data.find(ref);
-  if (it == data.end()) {
-    return std::nullopt;
+  if (backend) {
+    return backend->get_chunk(ref);
   }
-  return it->second;
+  return std::nullopt;
 }
 
 bool DatasetHandle::has_chunk(const ChunkRef& ref) const {
-  return data.find(ref) != data.end();
+  if (backend) {
+    return backend->has_chunk(ref);
+  }
+  return false;
 }
 
 int32_t Runtime::alloc_field_id(const std::string&) {

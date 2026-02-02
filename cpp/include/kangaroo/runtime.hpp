@@ -1,16 +1,19 @@
 #pragma once
 
 #include "kangaroo/adjacency.hpp"
+#include "kangaroo/backend_memory.hpp"
+#include "kangaroo/backend_plotfile.hpp"
 #include "kangaroo/data_service.hpp"
 #include "kangaroo/data_service_local.hpp"
+#include "kangaroo/dataset_backend.hpp"
 #include "kangaroo/executor.hpp"
 #include "kangaroo/kernel_registry.hpp"
 #include "kangaroo/runmeta.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 namespace kangaroo {
@@ -23,16 +26,62 @@ struct DatasetHandle {
   std::string uri;
   int32_t step = 0;
   int16_t level = 0;
-  std::unordered_map<ChunkRef, HostView, ChunkRefHash, ChunkRefEq> data;
+
+  std::shared_ptr<DatasetBackend> backend;
 
   void set_chunk(const ChunkRef& ref, HostView view);
   std::optional<HostView> get_chunk(const ChunkRef& ref) const;
   bool has_chunk(const ChunkRef& ref) const;
 
   template <typename Archive>
-  void serialize(Archive& ar, unsigned) {
-    ar& uri& step& level& data;
+  void save(Archive& ar, unsigned) const {
+    ar& uri& step& level;
+
+    bool is_memory = false;
+    bool is_plotfile = false;
+
+    if (backend) {
+      if (auto mem = std::dynamic_pointer_cast<MemoryBackend>(backend)) {
+        is_memory = true;
+        ar& is_memory& is_plotfile;
+        ar& mem->data();
+      } else if (auto plt = std::dynamic_pointer_cast<PlotfileBackend>(backend)) {
+        is_plotfile = true;
+        ar& is_memory& is_plotfile;
+      } else {
+        ar& is_memory& is_plotfile;
+      }
+    } else {
+      ar& is_memory& is_plotfile;
+    }
   }
+
+  template <typename Archive>
+  void load(Archive& ar, unsigned) {
+    ar& uri& step& level;
+
+    bool is_memory = false;
+    bool is_plotfile = false;
+    ar& is_memory& is_plotfile;
+
+    if (is_memory) {
+      auto mem = std::make_shared<MemoryBackend>();
+      std::unordered_map<ChunkRef, HostView, ChunkRefHash, ChunkRefEq> map;
+      ar& map;
+      mem->set_data(std::move(map));
+      backend = mem;
+    } else if (is_plotfile) {
+      std::string path = uri;
+      if (path.rfind("amrex://", 0) == 0) {
+        path = path.substr(8);
+      } else if (path.rfind("file://", 0) == 0) {
+        path = path.substr(7);
+      }
+      backend = std::make_shared<PlotfileBackend>(path);
+    }
+  }
+
+  HPX_SERIALIZATION_SPLIT_MEMBER()
 };
 
 class Runtime {

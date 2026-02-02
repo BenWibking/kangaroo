@@ -88,6 +88,7 @@ double now_seconds() {
 NB_MODULE(_core, m) {
   m.def("hpx_configuration_string", []() { return hpx::configuration_string(); });
   m.def("set_event_log_path", &kangaroo::set_event_log_path);
+  m.def("set_global_dataset", &kangaroo::set_global_dataset);
   m.def("log_task_event",
         [](const std::string& name,
            const std::string& status,
@@ -193,6 +194,63 @@ NB_MODULE(_core, m) {
         self->uri = uri;
         self->step = step;
         self->level = level;
+        
+        if (uri.rfind("amrex://", 0) == 0 || uri.rfind("file://", 0) == 0) {
+            std::string path = uri;
+            if (uri.rfind("amrex://", 0) == 0) {
+                path = uri.substr(8);
+            } else {
+                path = uri.substr(7);
+            }
+            self->backend = std::make_shared<kangaroo::PlotfileBackend>(path);
+        } else if (uri == "memory://local") {
+            self->backend = std::make_shared<kangaroo::MemoryBackend>();
+        }
+      })
+      .def("register_field", [](kangaroo::DatasetHandle& self, int32_t field_id, int32_t component) {
+          if (auto plt = std::dynamic_pointer_cast<kangaroo::PlotfileBackend>(self.backend)) {
+              plt->register_field(field_id, component);
+          }
+      })
+      .def("metadata", [](kangaroo::DatasetHandle& self) -> nb::dict {
+          if (!self.backend) return nb::dict();
+          auto* reader = self.backend->get_plotfile_reader();
+          if (!reader) return nb::dict();
+
+          const auto& hdr = reader->header();
+          nb::dict d;
+          d["var_names"] = hdr.var_names;
+          d["finest_level"] = hdr.finest_level;
+          d["prob_lo"] = hdr.prob_lo;
+          d["prob_hi"] = hdr.prob_hi;
+          d["ref_ratio"] = hdr.ref_ratio;
+          d["cell_size"] = hdr.cell_size;
+          
+          auto to_tuple = [](const kangaroo::plotfile::IntVect& iv) {
+            return nb::make_tuple(iv.x, iv.y, iv.z);
+          };
+          auto box_to_tuple = [&](const kangaroo::plotfile::Box& box) {
+            return nb::make_tuple(to_tuple(box.lo), to_tuple(box.hi));
+          };
+
+          nb::list levels;
+          for (int level = 0; level <= hdr.finest_level; ++level) {
+            nb::list boxes;
+            const auto& vismf = reader->vismf_header(level);
+            for (const auto& box : vismf.box_array.boxes) {
+              boxes.append(box_to_tuple(box));
+            }
+            levels.append(boxes);
+          }
+          d["level_boxes"] = levels;
+
+          nb::list prob_domains;
+          for (const auto& box : hdr.prob_domain) {
+            prob_domains.append(box_to_tuple(box));
+          }
+          d["prob_domain"] = prob_domains;
+
+          return d;
       })
       .def("set_chunk",
            [](kangaroo::DatasetHandle& self, int32_t field, int32_t version, int32_t block,

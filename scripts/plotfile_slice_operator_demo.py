@@ -14,33 +14,11 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from analysis import Plan, PlotfileReader, Runtime  # noqa: E402
+from analysis import Plan, Runtime  # noqa: E402
 from analysis.ctx import LoweringContext  # noqa: E402
 from analysis.dataset import open_dataset  # noqa: E402
 from analysis.ops import UniformSlice  # noqa: E402
-from analysis.plan import FieldRef  # noqa: E402
-from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta  # noqa: E402
 from analysis.runtime import log_task_event, plan_to_dict, set_event_log_path  # noqa: E402
-
-
-def _resolve_component(hdr: dict[str, object], var: str | None) -> tuple[int, str]:
-    names = [str(v) for v in hdr.get("var_names", [])]
-    if not names:
-        raise ValueError("plotfile header has no variable names")
-
-    if var is None:
-        return 0, names[0]
-
-    if var.isdigit():
-        idx = int(var)
-        if idx < 0 or idx >= len(names):
-            raise ValueError(f"component index {idx} out of range (0..{len(names)-1})")
-        return idx, names[idx]
-
-    if var in names:
-        return names.index(var), var
-
-    raise ValueError(f"variable '{var}' not found; available: {', '.join(names)}")
 
 
 def _axis_index(axis: str) -> int:
@@ -125,113 +103,69 @@ def main() -> int:
         print("Runtime init failed (is the C++ module built?):", exc)
         return 1
 
-    with logger.span("setup/plotfile_open"):
-        reader = PlotfileReader(args.plotfile)
-        header = reader.header()
-        meta = reader.metadata()
-    comp_idx, comp_name = _resolve_component(header, args.var)
+    with logger.span("setup/runmeta_dataset"):
+        ds = open_dataset(f"amrex://{args.plotfile}", level=args.level, runtime=rt)
+        
+        # Set global dataset to enable early chunk fetching for type detection
+        from analysis import _core
+        _core.set_global_dataset(ds._h)
+        
+        runmeta = ds.get_runmeta()
+        meta = ds.metadata
 
-    prob_lo = tuple(meta.get("prob_lo", (0.0, 0.0, 0.0)))
-    if len(prob_lo) != 3:
-        raise RuntimeError(f"unexpected prob_lo metadata: {prob_lo}")
+        if args.var:
+            comp_name = args.var
+        else:
+            comp_name = meta["var_names"][0]
+        field = ds.field_id(comp_name)
 
-    prob_domain = meta.get("prob_domain", [])
-    if not prob_domain or args.level >= len(prob_domain):
-        raise RuntimeError("plotfile metadata missing prob_domain for requested level")
-    domain_lo, domain_hi = prob_domain[args.level]
+        # Detect bytes_per_value by reading the first block
+        level_boxes = meta["level_boxes"][args.level]
+        if not level_boxes:
+            raise RuntimeError(f"No boxes found for level {args.level}")
+        
+        b0_lo, b0_hi = level_boxes[0]
+        # box dimensions are inclusive
+        b0_nx = b0_hi[0] - b0_lo[0] + 1
+        b0_ny = b0_hi[1] - b0_lo[1] + 1
+        b0_nz = b0_hi[2] - b0_lo[2] + 1
+        b0_elems = b0_nx * b0_ny * b0_nz
+        
+        b0_chunk = rt.get_task_chunk(step=0, level=args.level, field=field, version=0, block=0)
+        bytes_per_value = len(b0_chunk) // b0_elems
+        if bytes_per_value not in (4, 8):
+             print(f"Warning: detected unusual bytes_per_value: {bytes_per_value}")
+
+    prob_lo = meta["prob_lo"]
+    prob_hi = meta["prob_hi"]
+    domain_lo, domain_hi = meta["prob_domain"][args.level]
     nx = int(domain_hi[0]) - int(domain_lo[0]) + 1
     ny = int(domain_hi[1]) - int(domain_lo[1]) + 1
     nz = int(domain_hi[2]) - int(domain_lo[2]) + 1
-
-    cell_size = meta.get("cell_size", [])
-    if not cell_size:
-        raise RuntimeError("plotfile metadata missing cell_size")
-    dx = float(cell_size[args.level][0])
-
-    # AMReX prob_lo corresponds to the physical location of prob_domain.lo.
-    # Runtime now stores the index origin separately.
-    x0 = prob_lo
-    index_origin = (int(domain_lo[0]), int(domain_lo[1]), int(domain_lo[2]))
-
-    level_boxes = meta.get("level_boxes", [])
-    if not level_boxes or args.level >= len(level_boxes):
-        raise RuntimeError(
-            "plotfile metadata missing level_boxes for requested level. "
-            "Rebuild the _plotfile binding to pick up metadata() updates."
-        )
-    boxes = level_boxes[args.level]
-    if len(boxes) != reader.num_fabs(args.level):
-        raise RuntimeError("level_boxes count does not match num_fabs for requested level")
-
-    with logger.span("setup/runmeta_dataset"):
-        runmeta = RunMeta(
-            steps=[
-                StepMeta(
-                    step=0,
-                    levels=[
-                        LevelMeta(
-                            geom=LevelGeom(
-                                dx=(dx, dx, dx), x0=x0, index_origin=index_origin, ref_ratio=1
-                            ),
-                            boxes=[BlockBox(tuple(lo), tuple(hi)) for lo, hi in boxes],
-                        )
-                    ],
-                )
-            ]
-        )
-
-        ds = open_dataset("memory://plotfile-slice", runmeta=runmeta, step=0, level=0, runtime=rt)
-        field = ds.field_id(comp_name)
-        dtype = reader.read_fab(args.level, 0, comp_idx, 1).get("dtype", "float32")
-        bytes_per_value = 8 if dtype == "float64" else 4
+    dx = meta["cell_size"][args.level][0]
 
     axis_idx = _axis_index(args.axis)
     if args.coord is None:
         mid_idx = (int(domain_lo[axis_idx]) + int(domain_hi[axis_idx])) // 2
-        coord = x0[axis_idx] + (mid_idx + 0.5) * dx
+        coord = prob_lo[axis_idx] + (mid_idx + 0.5) * dx
     else:
         coord = args.coord
 
     if args.axis == "z":
-        prob_hi = tuple(meta.get("prob_hi", (0.0, 0.0, 0.0)))
         rect = (prob_lo[0], prob_lo[1], prob_hi[0], prob_hi[1])
         resolution = (nx, ny)
         plane_label = "xy"
     elif args.axis == "y":
-        prob_hi = tuple(meta.get("prob_hi", (0.0, 0.0, 0.0)))
         rect = (prob_lo[0], prob_lo[2], prob_hi[0], prob_hi[2])
         resolution = (nx, nz)
         plane_label = "xz"
     else:
-        prob_hi = tuple(meta.get("prob_hi", (0.0, 0.0, 0.0)))
         rect = (prob_lo[1], prob_lo[2], prob_hi[1], prob_hi[2])
         resolution = (ny, nz)
         plane_label = "yz"
 
     with logger.span("setup/plan_build"):
         ctx = LoweringContext(runtime=rt._rt, runmeta=runmeta, dataset=ds)
-        load_stage = ctx.stage("plotfile_load")
-        for block_id, (lo, hi) in enumerate(boxes):
-            bx = int(hi[0]) - int(lo[0]) + 1
-            by = int(hi[1]) - int(lo[1]) + 1
-            bz = int(hi[2]) - int(lo[2]) + 1
-            out_bytes = bx * by * bz * bytes_per_value
-            load_stage.map_blocks(
-                name=f"plotfile_load_b{block_id}",
-                kernel="plotfile_load",
-                domain=ctx.domain(step=0, level=0, blocks=[block_id]),
-                inputs=[],
-                outputs=[FieldRef(field)],
-                output_bytes=[out_bytes],
-                deps={"kind": "None"},
-                params={
-                    "plotfile": args.plotfile,
-                    "level": args.level,
-                    "comp": comp_idx,
-                    "bytes_per_value": bytes_per_value,
-                },
-            )
-
         op = UniformSlice(
             field=field,
             axis=args.axis,
@@ -241,22 +175,18 @@ def main() -> int:
             bytes_per_value=bytes_per_value,
         )
         stages = op.lower(ctx)
-        if stages:
-            stages[0].after.append(load_stage)
-            plan = Plan(stages=[load_stage, *stages])
-        else:
-            plan = Plan(stages=[load_stage])
+        plan = Plan(stages=stages)
 
-    plan_payload = plan_to_dict(plan)
-    print("PlanIR:")
-    print(json.dumps(plan_payload, indent=2, sort_keys=True))
-    plan_out = os.environ.get("KANGAROO_DASHBOARD_PLAN")
-    if plan_out:
-        try:
-            with open(plan_out, "w", encoding="utf-8") as handle:
-                json.dump(plan_payload, handle, indent=2, sort_keys=True)
-        except OSError as exc:
-            print(f"Failed to write plan JSON to {plan_out}: {exc}")
+        plan_payload = plan_to_dict(plan)
+        print("PlanIR:")
+        print(json.dumps(plan_payload, indent=2, sort_keys=True))
+        plan_out = os.environ.get("KANGAROO_DASHBOARD_PLAN")
+        if plan_out:
+            try:
+                with open(plan_out, "w", encoding="utf-8") as handle:
+                    json.dump(plan_payload, handle, indent=2, sort_keys=True)
+            except OSError as exc:
+                print(f"Failed to write plan JSON to {plan_out}: {exc}")
 
     try:
         with logger.span("runtime/execute_plan"):
@@ -264,11 +194,10 @@ def main() -> int:
     except Exception as exc:
         print("Runtime executed but raised (kernels may be missing):", exc)
 
-    slice_field = plan.stages[-1].templates[0].outputs[0].field
     with logger.span("postprocess/fetch_output"):
-        raw = rt.get_task_chunk(step=0, level=0, field=slice_field, version=0, block=0)
-    np_dtype = np.float64 if bytes_per_value == 8 else np.float32
-    with logger.span("postprocess/reshape"):
+        slice_field = plan.stages[-1].templates[0].outputs[0].field
+        raw = rt.get_task_chunk(step=0, level=args.level, field=slice_field, version=0, block=0)
+        np_dtype = np.float64 if bytes_per_value == 8 else np.float32
         slice_2d = np.frombuffer(raw, dtype=np_dtype, count=resolution[0] * resolution[1]).reshape(
             resolution
         )
