@@ -649,6 +649,250 @@ void register_default_kernels(KernelRegistry& registry) {
         return hpx::make_ready_future();
       });
   registry.register_kernel(
+      KernelDesc{.name = "uniform_projection_accumulate", .n_inputs = 1, .n_outputs = 1,
+                 .needs_neighbors = false},
+      [](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
+         const NeighborViews&, std::span<HostView> outputs,
+         std::span<const std::uint8_t> params_msgpack) {
+        struct Box3 {
+          std::array<int, 3> lo{0, 0, 0};
+          std::array<int, 3> hi{0, 0, 0};
+        };
+        struct Params {
+          int axis = 2;
+          std::array<double, 2> axis_bounds{0.0, 1.0};
+          std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
+          std::array<int, 2> resolution{1, 1};
+          int bytes_per_value = 4;
+          std::vector<Box3> covered_boxes;
+        } params;
+
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            auto get_key = [&](const char* key) -> const msgpack::object* {
+              for (uint32_t i = 0; i < root.via.map.size; ++i) {
+                const auto& k = root.via.map.ptr[i].key;
+                if (k.type == msgpack::type::STR && k.as<std::string>() == key) {
+                  return &root.via.map.ptr[i].val;
+                }
+              }
+              return nullptr;
+            };
+            if (const auto* axis = get_key("axis"); axis &&
+                                                   (axis->type == msgpack::type::POSITIVE_INTEGER ||
+                                                    axis->type == msgpack::type::NEGATIVE_INTEGER)) {
+              params.axis = axis->as<int>();
+            }
+            if (const auto* bounds = get_key("axis_bounds"); bounds &&
+                                                     bounds->type == msgpack::type::ARRAY &&
+                                                     bounds->via.array.size == 2) {
+              params.axis_bounds[0] = bounds->via.array.ptr[0].as<double>();
+              params.axis_bounds[1] = bounds->via.array.ptr[1].as<double>();
+            }
+            if (const auto* rect = get_key("rect"); rect && rect->type == msgpack::type::ARRAY &&
+                                                   rect->via.array.size == 4) {
+              for (uint32_t i = 0; i < 4; ++i) {
+                params.rect[i] = rect->via.array.ptr[i].as<double>();
+              }
+            }
+            if (const auto* res = get_key("resolution"); res && res->type == msgpack::type::ARRAY &&
+                                                       res->via.array.size == 2) {
+              params.resolution[0] = res->via.array.ptr[0].as<int>();
+              params.resolution[1] = res->via.array.ptr[1].as<int>();
+            }
+            if (const auto* bpv = get_key("bytes_per_value"); bpv &&
+                                                         (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                                                          bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+              params.bytes_per_value = bpv->as<int>();
+            }
+            if (const auto* boxes = get_key("covered_boxes"); boxes &&
+                                                     boxes->type == msgpack::type::ARRAY) {
+              params.covered_boxes.clear();
+              params.covered_boxes.reserve(boxes->via.array.size);
+              for (uint32_t i = 0; i < boxes->via.array.size; ++i) {
+                const auto& entry = boxes->via.array.ptr[i];
+                if (entry.type != msgpack::type::ARRAY || entry.via.array.size != 2) {
+                  continue;
+                }
+                const auto& lo = entry.via.array.ptr[0];
+                const auto& hi = entry.via.array.ptr[1];
+                if (lo.type != msgpack::type::ARRAY || hi.type != msgpack::type::ARRAY ||
+                    lo.via.array.size != 3 || hi.via.array.size != 3) {
+                  continue;
+                }
+                Box3 box;
+                for (uint32_t d = 0; d < 3; ++d) {
+                  box.lo[d] = lo.via.array.ptr[d].as<int>();
+                  box.hi[d] = hi.via.array.ptr[d].as<int>();
+                }
+                params.covered_boxes.push_back(box);
+              }
+            }
+          }
+        }
+
+        const auto out_nx = params.resolution[0];
+        const auto out_ny = params.resolution[1];
+        if (outputs.empty() || inputs.empty() || out_nx <= 0 || out_ny <= 0) {
+          return hpx::make_ready_future();
+        }
+
+        const std::size_t bytes = static_cast<std::size_t>(out_nx) *
+                                  static_cast<std::size_t>(out_ny) * sizeof(double);
+        if (outputs[0].data.size() != bytes) {
+          outputs[0].data.assign(bytes, 0);
+        } else {
+          std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
+        }
+
+        if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
+          return hpx::make_ready_future();
+        }
+
+        const auto& box = level.boxes.at(static_cast<std::size_t>(block));
+        const int nx = box.hi.x - box.lo.x + 1;
+        const int ny = box.hi.y - box.lo.y + 1;
+        const int nz = box.hi.z - box.lo.z + 1;
+        if (nx <= 0 || ny <= 0 || nz <= 0) {
+          return hpx::make_ready_future();
+        }
+
+        const int axis = params.axis;
+        int u_axis = 0;
+        int v_axis = 1;
+        if (axis == 0) {
+          u_axis = 1;
+          v_axis = 2;
+        } else if (axis == 1) {
+          u_axis = 0;
+          v_axis = 2;
+        } else {
+          u_axis = 0;
+          v_axis = 1;
+        }
+
+        const double u0 = params.rect[0];
+        const double v0 = params.rect[1];
+        const double u1 = params.rect[2];
+        const double v1 = params.rect[3];
+        const double umin = std::min(u0, u1);
+        const double umax = std::max(u0, u1);
+        const double vmin = std::min(v0, v1);
+        const double vmax = std::max(v0, v1);
+        const double du = (out_nx > 0) ? (umax - umin) / static_cast<double>(out_nx) : 0.0;
+        const double dv = (out_ny > 0) ? (vmax - vmin) / static_cast<double>(out_ny) : 0.0;
+        if (du == 0.0 || dv == 0.0) {
+          return hpx::make_ready_future();
+        }
+
+        const double a0 = params.axis_bounds[0];
+        const double a1 = params.axis_bounds[1];
+        const double amin = std::min(a0, a1);
+        const double amax = std::max(a0, a1);
+        if (!(amax > amin)) {
+          return hpx::make_ready_future();
+        }
+
+        auto in_index = [&](int i, int j, int k) -> std::size_t {
+          return static_cast<std::size_t>((i * ny + j) * nz + k);
+        };
+
+        auto covered = [&](int ix, int iy, int iz) -> bool {
+          for (const auto& b : params.covered_boxes) {
+            if (ix >= b.lo[0] && ix <= b.hi[0] &&
+                iy >= b.lo[1] && iy <= b.hi[1] &&
+                iz >= b.lo[2] && iz <= b.hi[2]) {
+              return true;
+            }
+          }
+          return false;
+        };
+
+        auto cell_edge = [&](int ax, int idx) -> double {
+          return level.geom.x0[ax] + (idx - level.geom.index_origin[ax]) * level.geom.dx[ax];
+        };
+
+        const auto& in = inputs[0].data;
+        auto* out_sum = reinterpret_cast<double*>(outputs[0].data.data());
+
+        for (int i = 0; i < nx; ++i) {
+          const int gx = box.lo.x + i;
+          for (int j = 0; j < ny; ++j) {
+            const int gy = box.lo.y + j;
+            for (int k = 0; k < nz; ++k) {
+              const int gz = box.lo.z + k;
+              if (covered(gx, gy, gz)) {
+                continue;
+              }
+
+              const int a_global = axis == 0 ? gx : (axis == 1 ? gy : gz);
+              const double a_cell_lo = cell_edge(axis, a_global);
+              const double a_cell_hi = a_cell_lo + level.geom.dx[axis];
+              const double oa = std::max(0.0, std::min(a_cell_hi, amax) - std::max(a_cell_lo, amin));
+              if (oa <= 0.0) {
+                continue;
+              }
+
+              const int u_global = u_axis == 0 ? gx : (u_axis == 1 ? gy : gz);
+              const int v_global = v_axis == 0 ? gx : (v_axis == 1 ? gy : gz);
+              const double u_cell_lo = cell_edge(u_axis, u_global);
+              const double u_cell_hi = u_cell_lo + level.geom.dx[u_axis];
+              const double v_cell_lo = cell_edge(v_axis, v_global);
+              const double v_cell_hi = v_cell_lo + level.geom.dx[v_axis];
+
+              int i0 = static_cast<int>(std::floor((u_cell_lo - umin) / du));
+              int i1 = static_cast<int>(std::floor((u_cell_hi - umin) / du));
+              int j0 = static_cast<int>(std::floor((v_cell_lo - vmin) / dv));
+              int j1 = static_cast<int>(std::floor((v_cell_hi - vmin) / dv));
+              if (i1 < 0 || j1 < 0 || i0 >= out_nx || j0 >= out_ny) {
+                continue;
+              }
+              i0 = std::max(i0, 0);
+              j0 = std::max(j0, 0);
+              i1 = std::min(i1, out_nx - 1);
+              j1 = std::min(j1, out_ny - 1);
+
+              double value = 0.0;
+              const auto data_idx = in_index(i, j, k);
+              if (params.bytes_per_value == 4) {
+                if (data_idx * sizeof(float) < in.size()) {
+                  value = reinterpret_cast<const float*>(in.data())[data_idx];
+                }
+              } else if (params.bytes_per_value == 8) {
+                if (data_idx * sizeof(double) < in.size()) {
+                  value = reinterpret_cast<const double*>(in.data())[data_idx];
+                }
+              }
+
+              for (int jj = j0; jj <= j1; ++jj) {
+                const double pv0 = vmin + static_cast<double>(jj) * dv;
+                const double pv1 = pv0 + dv;
+                const double ov = std::max(0.0, std::min(v_cell_hi, pv1) - std::max(v_cell_lo, pv0));
+                if (ov <= 0.0) {
+                  continue;
+                }
+                for (int ii = i0; ii <= i1; ++ii) {
+                  const double pu0 = umin + static_cast<double>(ii) * du;
+                  const double pu1 = pu0 + du;
+                  const double ou = std::max(0.0, std::min(u_cell_hi, pu1) - std::max(u_cell_lo, pu0));
+                  if (ou <= 0.0) {
+                    continue;
+                  }
+                  const double volume = ou * ov * oa;
+                  const std::size_t out_idx = static_cast<std::size_t>(jj) * out_nx + ii;
+                  out_sum[out_idx] += value * volume;
+                }
+              }
+            }
+          }
+        }
+
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
       KernelDesc{.name = "vorticity_mag", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
       [](const LevelMeta&, int32_t, std::span<const HostView>, const NeighborViews&,
          std::span<HostView> outputs, std::span<const std::uint8_t>) {
