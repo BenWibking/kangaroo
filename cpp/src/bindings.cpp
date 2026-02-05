@@ -202,7 +202,30 @@ NB_MODULE(_core, m) {
             } else {
                 path = uri.substr(7);
             }
-            self->backend = std::make_shared<kangaroo::PlotfileBackend>(path);
+            bool as_parthenon = false;
+#ifdef KANGAROO_USE_PARTHENON_HDF5
+            if (path.size() >= 5) {
+              const auto suffix = path.substr(path.size() - 5);
+              as_parthenon = (suffix == ".phdf" || suffix == ".hdf5");
+            }
+            if (!as_parthenon && path.size() >= 3) {
+              const auto suffix = path.substr(path.size() - 3);
+              as_parthenon = (suffix == ".h5");
+            }
+#endif
+#ifdef KANGAROO_USE_PARTHENON_HDF5
+            if (as_parthenon) {
+              self->backend = std::make_shared<kangaroo::ParthenonBackend>(path);
+            } else
+#endif
+            {
+              self->backend = std::make_shared<kangaroo::PlotfileBackend>(path);
+            }
+#ifdef KANGAROO_USE_PARTHENON_HDF5
+        } else if (uri.rfind("parthenon://", 0) == 0) {
+            std::string path = uri.substr(12);
+            self->backend = std::make_shared<kangaroo::ParthenonBackend>(path);
+#endif
 #ifdef KANGAROO_USE_OPENPMD
         } else if (uri.rfind("openpmd://", 0) == 0) {
             self->backend = std::make_shared<kangaroo::OpenPMDBackend>(uri);
@@ -221,11 +244,17 @@ NB_MODULE(_core, m) {
 #ifdef KANGAROO_USE_OPENPMD
           if (auto opmd = std::dynamic_pointer_cast<kangaroo::OpenPMDBackend>(self.backend)) {
               opmd->register_field(field_id, name);
+              return;
           }
 #else
           (void)self;
           (void)field_id;
           (void)name;
+#endif
+#ifdef KANGAROO_USE_PARTHENON_HDF5
+          if (auto phdf = std::dynamic_pointer_cast<kangaroo::ParthenonBackend>(self.backend)) {
+              phdf->register_field(field_id, name);
+          }
 #endif
       })
       .def("list_meshes", [](kangaroo::DatasetHandle& self) -> nb::list {
@@ -338,6 +367,50 @@ NB_MODULE(_core, m) {
             }
             d["prob_domain"] = prob_domains;
 
+            return d;
+          }
+#endif
+#ifdef KANGAROO_USE_PARTHENON_HDF5
+          if (auto phdf = std::dynamic_pointer_cast<kangaroo::ParthenonBackend>(self.backend)) {
+            auto meta = phdf->metadata();
+            nb::dict d;
+            d["var_names"] = meta.var_names;
+            d["finest_level"] = meta.finest_level;
+            d["prob_lo"] = meta.prob_lo;
+            d["prob_hi"] = meta.prob_hi;
+            d["ref_ratio"] = meta.ref_ratio;
+            d["cell_size"] = meta.cell_size;
+            d["time"] = meta.time;
+
+            nb::dict vinfo;
+            for (const auto& field : meta.fields) {
+              nb::dict entry;
+              entry["num_components"] = field.num_components;
+              entry["component_names"] = field.component_names;
+              entry["type"] = field.type;
+              vinfo[field.name.c_str()] = entry;
+            }
+            d["variable_info"] = vinfo;
+
+            nb::list levels;
+            nb::list prob_domains;
+            for (size_t i = 0; i < meta.level_boxes.size(); ++i) {
+              nb::list boxes;
+              for (const auto& box : meta.level_boxes[i]) {
+                auto lo = nb::make_tuple(box.first[0], box.first[1], box.first[2]);
+                auto hi = nb::make_tuple(box.second[0], box.second[1], box.second[2]);
+                boxes.append(nb::make_tuple(lo, hi));
+              }
+              levels.append(boxes);
+
+              auto dom_lo = nb::make_tuple(meta.prob_domain[i].first[0], meta.prob_domain[i].first[1],
+                                           meta.prob_domain[i].first[2]);
+              auto dom_hi = nb::make_tuple(meta.prob_domain[i].second[0], meta.prob_domain[i].second[1],
+                                           meta.prob_domain[i].second[2]);
+              prob_domains.append(nb::make_tuple(dom_lo, dom_hi));
+            }
+            d["level_boxes"] = levels;
+            d["prob_domain"] = prob_domains;
             return d;
           }
 #endif
