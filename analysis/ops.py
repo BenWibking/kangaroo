@@ -328,6 +328,7 @@ class UniformSlice:
         sum_fields: list[tuple[FieldRef, int]] = []
         area_fields: list[tuple[FieldRef, int]] = []
         stages: list = []
+        producer_stage: dict[int, object] = {}
 
         out_sum_bytes = nx * ny * 8
         for level_idx in range(len(levels) - 1, -1, -1):
@@ -374,6 +375,8 @@ class UniformSlice:
                     },
                 )
             stages.append(stage)
+            producer_stage[sum_field.field] = stage
+            producer_stage[area_field.field] = stage
 
             num_inputs = len(blocks)
             fan_in = self._reduce_fan_in(num_inputs)
@@ -431,6 +434,8 @@ class UniformSlice:
                 )
                 stages.append(reduce_stage)
                 stages.append(reduce_stage2)
+                producer_stage[out_sum.field] = reduce_stage
+                producer_stage[out_area.field] = reduce_stage2
                 input_sum = out_sum
                 input_area = out_area
                 num_inputs = num_groups
@@ -458,7 +463,15 @@ class UniformSlice:
                     left_ref = FieldRef(left.field, version=left.version, domain=ctx.domain(step=ds.step, level=left_level))
                     right_ref = FieldRef(right.field, version=right.version, domain=ctx.domain(step=ds.step, level=right_level))
                     out_field = ctx.temp_field(f"{self.out_name}_{name}_add_{reduce_round}_{i}")
-                    add_stage = ctx.stage("uniform_slice_add", plane="graph", after=[stages[-1]])
+                    deps = [
+                        s
+                        for s in (
+                            producer_stage.get(left.field),
+                            producer_stage.get(right.field),
+                        )
+                        if s is not None
+                    ]
+                    add_stage = ctx.stage("uniform_slice_add", plane="graph", after=deps)
                     add_stage.map_blocks(
                         name=f"uniform_slice_add_{name}_{reduce_round}_{i}",
                         kernel="uniform_slice_add",
@@ -477,6 +490,7 @@ class UniformSlice:
                         },
                     )
                     stages.append(add_stage)
+                    producer_stage[out_field.field] = add_stage
                     next_fields.append((out_field, ds.level))
                 current = next_fields
                 reduce_round += 1
@@ -486,7 +500,15 @@ class UniformSlice:
         total_area, total_area_level = reduce_pairwise(area_fields, "area")
 
         out_field = ctx.output_field(self.out_name)
-        finalize = ctx.stage("uniform_slice_finalize", plane="graph", after=[stages[-1]])
+        finalize_deps = [
+            s
+            for s in (
+                producer_stage.get(total_sum.field),
+                producer_stage.get(total_area.field),
+            )
+            if s is not None
+        ]
+        finalize = ctx.stage("uniform_slice_finalize", plane="graph", after=finalize_deps)
         finalize.map_blocks(
             name="uniform_slice_finalize",
             kernel="uniform_slice_finalize",
@@ -509,6 +531,7 @@ class UniformSlice:
             },
         )
         stages.append(finalize)
+        producer_stage[out_field.field] = finalize
         return ctx.fragment(stages)
 
     def lower(self, ctx: LoweringContext):
@@ -775,6 +798,7 @@ class UniformProjection:
 
         sum_fields: list[tuple[FieldRef, int]] = []
         stages: list = []
+        producer_stage: dict[int, object] = {}
         out_sum_bytes = nx * ny * 8
 
         for level_idx in range(len(levels) - 1, -1, -1):
@@ -815,6 +839,7 @@ class UniformProjection:
                     },
                 )
             stages.append(stage)
+            producer_stage[sum_field.field] = stage
 
             num_inputs = len(blocks)
             fan_in = self._reduce_fan_in(num_inputs)
@@ -847,6 +872,7 @@ class UniformProjection:
                     params=sum_params,
                 )
                 stages.append(reduce_stage)
+                producer_stage[out_sum.field] = reduce_stage
                 input_sum = out_sum
                 num_inputs = num_groups
                 reduce_idx += 1
@@ -872,7 +898,15 @@ class UniformProjection:
                     left_ref = FieldRef(left.field, version=left.version, domain=ctx.domain(step=ds.step, level=left_level))
                     right_ref = FieldRef(right.field, version=right.version, domain=ctx.domain(step=ds.step, level=right_level))
                     out_field = ctx.temp_field(f"{self.out_name}_sum_add_{reduce_round}_{i}")
-                    add_stage = ctx.stage("uniform_projection_add", plane="graph", after=[stages[-1]])
+                    deps = [
+                        s
+                        for s in (
+                            producer_stage.get(left.field),
+                            producer_stage.get(right.field),
+                        )
+                        if s is not None
+                    ]
+                    add_stage = ctx.stage("uniform_projection_add", plane="graph", after=deps)
                     add_stage.map_blocks(
                         name=f"uniform_projection_add_{reduce_round}_{i}",
                         kernel="uniform_slice_add",
@@ -891,6 +925,7 @@ class UniformProjection:
                         },
                     )
                     stages.append(add_stage)
+                    producer_stage[out_field.field] = add_stage
                     next_fields.append((out_field, ds.level))
                 current = next_fields
                 reduce_round += 1
@@ -898,7 +933,8 @@ class UniformProjection:
 
         total_sum, total_sum_level = reduce_pairwise(sum_fields)
         out_field = ctx.output_field(self.out_name)
-        finalize = ctx.stage("uniform_projection_output", plane="graph", after=[stages[-1]])
+        finalize_deps = [s for s in (producer_stage.get(total_sum.field),) if s is not None]
+        finalize = ctx.stage("uniform_projection_output", plane="graph", after=finalize_deps)
         finalize.map_blocks(
             name="uniform_projection_output",
             kernel="uniform_slice_reduce",
@@ -923,6 +959,7 @@ class UniformProjection:
             },
         )
         stages.append(finalize)
+        producer_stage[out_field.field] = finalize
         return ctx.fragment(stages)
 
     def lower(self, ctx: LoweringContext):
