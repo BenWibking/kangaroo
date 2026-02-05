@@ -203,6 +203,10 @@ NB_MODULE(_core, m) {
                 path = uri.substr(7);
             }
             self->backend = std::make_shared<kangaroo::PlotfileBackend>(path);
+#ifdef KANGAROO_USE_OPENPMD
+        } else if (uri.rfind("openpmd://", 0) == 0) {
+            self->backend = std::make_shared<kangaroo::OpenPMDBackend>(uri);
+#endif
         } else if (uri == "memory://local") {
             self->backend = std::make_shared<kangaroo::MemoryBackend>();
         }
@@ -212,45 +216,133 @@ NB_MODULE(_core, m) {
               plt->register_field(field_id, component);
           }
       })
+      .def("register_field", [](kangaroo::DatasetHandle& self, int32_t field_id,
+                                const std::string& name) {
+#ifdef KANGAROO_USE_OPENPMD
+          if (auto opmd = std::dynamic_pointer_cast<kangaroo::OpenPMDBackend>(self.backend)) {
+              opmd->register_field(field_id, name);
+          }
+#else
+          (void)self;
+          (void)field_id;
+          (void)name;
+#endif
+      })
+      .def("list_meshes", [](kangaroo::DatasetHandle& self) -> nb::list {
+#ifdef KANGAROO_USE_OPENPMD
+          if (auto opmd = std::dynamic_pointer_cast<kangaroo::OpenPMDBackend>(self.backend)) {
+              nb::list out;
+              for (const auto& name : opmd->list_meshes(self.step)) {
+                  out.append(name);
+              }
+              return out;
+          }
+#endif
+          return nb::list();
+      })
+      .def("select_mesh", [](kangaroo::DatasetHandle& self, const std::string& name) {
+#ifdef KANGAROO_USE_OPENPMD
+          if (auto opmd = std::dynamic_pointer_cast<kangaroo::OpenPMDBackend>(self.backend)) {
+              opmd->select_mesh(name);
+          }
+#else
+          (void)self;
+          (void)name;
+#endif
+      })
       .def("metadata", [](kangaroo::DatasetHandle& self) -> nb::dict {
           if (!self.backend) return nb::dict();
           auto* reader = self.backend->get_plotfile_reader();
-          if (!reader) return nb::dict();
+          if (reader) {
 
-          const auto& hdr = reader->header();
-          nb::dict d;
-          d["var_names"] = hdr.var_names;
-          d["finest_level"] = hdr.finest_level;
-          d["prob_lo"] = hdr.prob_lo;
-          d["prob_hi"] = hdr.prob_hi;
-          d["ref_ratio"] = hdr.ref_ratio;
-          d["cell_size"] = hdr.cell_size;
-          
-          auto to_tuple = [](const kangaroo::plotfile::IntVect& iv) {
-            return nb::make_tuple(iv.x, iv.y, iv.z);
-          };
-          auto box_to_tuple = [&](const kangaroo::plotfile::Box& box) {
-            return nb::make_tuple(to_tuple(box.lo), to_tuple(box.hi));
-          };
+            const auto& hdr = reader->header();
+            nb::dict d;
+            d["var_names"] = hdr.var_names;
+            d["finest_level"] = hdr.finest_level;
+            d["prob_lo"] = hdr.prob_lo;
+            d["prob_hi"] = hdr.prob_hi;
+            d["ref_ratio"] = hdr.ref_ratio;
+            d["cell_size"] = hdr.cell_size;
+            
+            auto to_tuple = [](const kangaroo::plotfile::IntVect& iv) {
+              return nb::make_tuple(iv.x, iv.y, iv.z);
+            };
+            auto box_to_tuple = [&](const kangaroo::plotfile::Box& box) {
+              return nb::make_tuple(to_tuple(box.lo), to_tuple(box.hi));
+            };
 
-          nb::list levels;
-          for (int level = 0; level <= hdr.finest_level; ++level) {
-            nb::list boxes;
-            const auto& vismf = reader->vismf_header(level);
-            for (const auto& box : vismf.box_array.boxes) {
-              boxes.append(box_to_tuple(box));
+            nb::list levels;
+            for (int level = 0; level <= hdr.finest_level; ++level) {
+              nb::list boxes;
+              const auto& vismf = reader->vismf_header(level);
+              for (const auto& box : vismf.box_array.boxes) {
+                boxes.append(box_to_tuple(box));
+              }
+              levels.append(boxes);
             }
-            levels.append(boxes);
-          }
-          d["level_boxes"] = levels;
+            d["level_boxes"] = levels;
 
-          nb::list prob_domains;
-          for (const auto& box : hdr.prob_domain) {
-            prob_domains.append(box_to_tuple(box));
-          }
-          d["prob_domain"] = prob_domains;
+            nb::list prob_domains;
+            for (const auto& box : hdr.prob_domain) {
+              prob_domains.append(box_to_tuple(box));
+            }
+            d["prob_domain"] = prob_domains;
 
-          return d;
+            return d;
+          }
+
+#ifdef KANGAROO_USE_OPENPMD
+          if (auto opmd = std::dynamic_pointer_cast<kangaroo::OpenPMDBackend>(self.backend)) {
+            auto meta = opmd->metadata(self.step);
+            nb::dict d;
+            nb::list var_names;
+            for (const auto& field : meta.fields) {
+              var_names.append(field.name);
+            }
+            d["var_names"] = var_names;
+            d["mesh_names"] = meta.mesh_names;
+            d["selected_mesh"] = meta.selected_mesh;
+            d["finest_level"] = meta.finest_level;
+            d["prob_lo"] = nb::make_tuple(meta.prob_lo[0], meta.prob_lo[1], meta.prob_lo[2]);
+            d["prob_hi"] = nb::make_tuple(meta.prob_hi[0], meta.prob_hi[1], meta.prob_hi[2]);
+
+            nb::list ref_ratio;
+            for (const auto& ratio : meta.ref_ratio) {
+              ref_ratio.append(ratio[0]);
+            }
+            d["ref_ratio"] = ref_ratio;
+
+            nb::list cell_size;
+            for (const auto& size : meta.cell_size) {
+              cell_size.append(nb::make_tuple(size[0], size[1], size[2]));
+            }
+            d["cell_size"] = cell_size;
+
+            nb::list levels;
+            for (const auto& level_boxes : meta.level_boxes) {
+              nb::list boxes;
+              for (const auto& box : level_boxes) {
+                auto lo = nb::make_tuple(box.first[0], box.first[1], box.first[2]);
+                auto hi = nb::make_tuple(box.second[0], box.second[1], box.second[2]);
+                boxes.append(nb::make_tuple(lo, hi));
+              }
+              levels.append(boxes);
+            }
+            d["level_boxes"] = levels;
+
+            nb::list prob_domains;
+            for (const auto& box : meta.prob_domain) {
+              auto lo = nb::make_tuple(box.first[0], box.first[1], box.first[2]);
+              auto hi = nb::make_tuple(box.second[0], box.second[1], box.second[2]);
+              prob_domains.append(nb::make_tuple(lo, hi));
+            }
+            d["prob_domain"] = prob_domains;
+
+            return d;
+          }
+#endif
+
+          return nb::dict();
       })
       .def("set_chunk",
            [](kangaroo::DatasetHandle& self, int32_t field, int32_t version, int32_t block,

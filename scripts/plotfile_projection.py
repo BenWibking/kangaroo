@@ -39,6 +39,70 @@ def _parse_bounds(bounds: str) -> tuple[float, float]:
     return b0, b1
 
 
+def _resolve_dataset_uri(path: str) -> tuple[str, str]:
+    if path.startswith(("amrex://", "openpmd://", "file://")):
+        kind = "openpmd" if path.startswith("openpmd://") else "amrex"
+        return path, kind
+    if not os.path.exists(path):
+        raise FileNotFoundError(path)
+    if os.path.isdir(path):
+        header_path = os.path.join(path, "Header")
+        if os.path.exists(header_path):
+            return f"amrex://{path}", "amrex"
+        return f"openpmd://{path}", "openpmd"
+    return f"openpmd://{path}", "openpmd"
+
+
+def _resolve_openpmd_var(ds, meta: dict, var: str | None) -> tuple[str, dict]:
+    mesh_names = list(meta.get("mesh_names", []))
+    var_names = list(meta.get("var_names", []))
+
+    if not mesh_names and not var_names:
+        raise RuntimeError("openPMD metadata does not list any meshes or fields")
+
+    if not var:
+        if var_names:
+            return var_names[0], meta
+        raise RuntimeError("openPMD metadata does not list any fields")
+
+    if "/" in var:
+        mesh, comp = var.split("/", 1)
+        if mesh:
+            if mesh_names and mesh not in mesh_names:
+                raise RuntimeError(f"openPMD mesh '{mesh}' not found")
+            ds.select_mesh(mesh)
+            meta = ds.metadata
+            var_names = list(meta.get("var_names", []))
+            if comp:
+                candidate = f"{mesh}/{comp}"
+                if candidate in var_names:
+                    return candidate, meta
+                if comp in var_names:
+                    return comp, meta
+                raise RuntimeError(f"openPMD mesh '{mesh}' does not contain component '{comp}'")
+        if var in var_names:
+            return var, meta
+        raise RuntimeError(f"openPMD field '{var}' not found")
+
+    if var in mesh_names:
+        ds.select_mesh(var)
+        meta = ds.metadata
+        var_names = list(meta.get("var_names", []))
+        if var_names:
+            return var_names[0], meta
+        raise RuntimeError(f"openPMD mesh '{var}' has no fields")
+
+    if var in var_names:
+        return var, meta
+
+    if len(mesh_names) == 1:
+        candidate = f"{mesh_names[0]}/{var}"
+        if candidate in var_names:
+            return candidate, meta
+
+    raise RuntimeError(f"openPMD field '{var}' not found")
+
+
 class EventLogger:
     def __init__(self, enabled: bool) -> None:
         self._enabled = enabled
@@ -72,8 +136,11 @@ def main() -> int:
         import numpy as np
         import matplotlib.pyplot as plt
     parser = argparse.ArgumentParser(description="Run Kangaroo UniformProjection on a plotfile FAB.")
-    parser.add_argument("plotfile", help="Path to the plotfile directory.")
-    parser.add_argument("--var", help="Variable name or component index to project.")
+    parser.add_argument("plotfile", help="Path to a plotfile directory or openPMD dataset.")
+    parser.add_argument(
+        "--var",
+        help="Variable name or component index to project (openPMD: mesh or mesh/component).",
+    )
     parser.add_argument("--level", type=int, default=0, help="AMR level index (for input type detection).")
     parser.add_argument(
         "--amr-cell-average",
@@ -113,7 +180,9 @@ def main() -> int:
     if unknown:
         unknown = [sys.argv[0], *unknown]
 
-    if not os.path.isdir(args.plotfile):
+    try:
+        dataset_uri, dataset_kind = _resolve_dataset_uri(args.plotfile)
+    except FileNotFoundError:
         print(f"Plotfile path does not exist: {args.plotfile}")
         return 1
 
@@ -137,19 +206,18 @@ def main() -> int:
 
     with logger.span("setup/runmeta_dataset"):
         base_level = 0
-        ds = open_dataset(f"amrex://{args.plotfile}", level=base_level, runtime=rt)
+        ds = open_dataset(dataset_uri, level=base_level, runtime=rt)
 
         # Set global dataset to enable early chunk fetching for type detection
         from analysis import _core
         _core.set_global_dataset(ds._h)
 
-        runmeta = ds.get_runmeta()
         meta = ds.metadata
-
-        if args.var:
-            comp_name = args.var
+        if dataset_kind == "openpmd":
+            comp_name, meta = _resolve_openpmd_var(ds, meta, args.var)
         else:
-            comp_name = meta["var_names"][0]
+            comp_name = args.var if args.var else meta["var_names"][0]
+        runmeta = ds.get_runmeta()
         field = ds.field_id(comp_name)
 
         level_boxes = meta["level_boxes"][args.level]

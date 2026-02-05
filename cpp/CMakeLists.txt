@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.22)
 project(kangaroo_runtime LANGUAGES CXX)
 
 option(KANGAROO_ASAN "Enable AddressSanitizer for kangaroo targets" OFF)
+option(KANGAROO_USE_OPENPMD "Enable openPMD reader support" ON)
 
 find_package(HPX REQUIRED)
 find_package(Python REQUIRED COMPONENTS Interpreter Development)
@@ -36,6 +37,7 @@ add_library(kangaroo_runtime STATIC
   src/adjacency.cpp
   src/backend_memory.cpp
   src/backend_plotfile.cpp
+  src/backend_openpmd.cpp
   src/data_service_local.cpp
   src/executor.cpp
   src/kernel_registry.cpp
@@ -48,6 +50,12 @@ target_include_directories(kangaroo_runtime PUBLIC
 )
 
 target_link_libraries(kangaroo_runtime PUBLIC HPX::hpx)
+
+if(KANGAROO_USE_OPENPMD)
+  find_package(openPMD CONFIG REQUIRED)
+  target_compile_definitions(kangaroo_runtime PUBLIC KANGAROO_USE_OPENPMD)
+  target_link_libraries(kangaroo_runtime PUBLIC openPMD::openPMD)
+endif()
 
 if(NOT msgpack-cxx_FOUND AND msgpack_SOURCE_DIR)
   target_include_directories(kangaroo_runtime PUBLIC "${msgpack_SOURCE_DIR}/include")

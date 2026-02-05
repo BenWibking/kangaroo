@@ -39,6 +39,19 @@ class Dataset:
                             name = lines[2 + i].strip()
                             fid = self.field_id(name)
                             self._h.register_field(fid, i)
+        elif self.uri.startswith("openpmd://"):
+            meta = self.metadata
+            for name in meta.get("var_names", []):
+                fid = self.field_id(name)
+                self._h.register_field(fid, name)
+
+    def list_meshes(self) -> list[str]:
+        return list(self._h.list_meshes())
+
+    def select_mesh(self, name: str) -> None:
+        self._h.select_mesh(name)
+        self._fields.clear()
+        self._auto_register()
 
     def register_field(self, name: str, fid: int) -> None:
         self._fields[name] = fid
@@ -52,7 +65,13 @@ class Dataset:
 
     @property
     def metadata(self) -> Dict[str, Any]:
-        return self._h.metadata()
+        try:
+            return self._h.metadata()
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Failed to load dataset metadata for '{self.uri}': {exc}. "
+                "Only cell-centered openPMD mesh records are supported."
+            ) from exc
 
     def get_runmeta(self) -> Any:
         from .runmeta import RunMeta, StepMeta, LevelMeta, LevelGeom, BlockBox

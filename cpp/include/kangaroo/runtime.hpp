@@ -2,6 +2,7 @@
 
 #include "kangaroo/adjacency.hpp"
 #include "kangaroo/backend_memory.hpp"
+#include "kangaroo/backend_openpmd.hpp"
 #include "kangaroo/backend_plotfile.hpp"
 #include "kangaroo/data_service.hpp"
 #include "kangaroo/data_service_local.hpp"
@@ -39,20 +40,26 @@ struct DatasetHandle {
 
     bool is_memory = false;
     bool is_plotfile = false;
+    bool is_openpmd = false;
 
     if (backend) {
       if (auto mem = std::dynamic_pointer_cast<MemoryBackend>(backend)) {
         is_memory = true;
-        ar& is_memory& is_plotfile;
+        ar& is_memory& is_plotfile& is_openpmd;
         ar& mem->data();
       } else if (auto plt = std::dynamic_pointer_cast<PlotfileBackend>(backend)) {
         is_plotfile = true;
-        ar& is_memory& is_plotfile;
+        ar& is_memory& is_plotfile& is_openpmd;
+#ifdef KANGAROO_USE_OPENPMD
+      } else if (auto opmd = std::dynamic_pointer_cast<OpenPMDBackend>(backend)) {
+        is_openpmd = true;
+        ar& is_memory& is_plotfile& is_openpmd;
+#endif
       } else {
-        ar& is_memory& is_plotfile;
+        ar& is_memory& is_plotfile& is_openpmd;
       }
     } else {
-      ar& is_memory& is_plotfile;
+      ar& is_memory& is_plotfile& is_openpmd;
     }
   }
 
@@ -62,7 +69,8 @@ struct DatasetHandle {
 
     bool is_memory = false;
     bool is_plotfile = false;
-    ar& is_memory& is_plotfile;
+    bool is_openpmd = false;
+    ar& is_memory& is_plotfile& is_openpmd;
 
     if (is_memory) {
       auto mem = std::make_shared<MemoryBackend>();
@@ -78,6 +86,12 @@ struct DatasetHandle {
         path = path.substr(7);
       }
       backend = std::make_shared<PlotfileBackend>(path);
+    } else if (is_openpmd) {
+#ifdef KANGAROO_USE_OPENPMD
+      backend = std::make_shared<OpenPMDBackend>(uri);
+#else
+      throw std::runtime_error("openPMD backend not enabled in this build");
+#endif
     }
   }
 
