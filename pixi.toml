@@ -28,4 +28,4 @@ configure = "bash -lc 'cmake -S cpp -B .pixi/build -DCMAKE_BUILD_TYPE=Release -D
 build = "cmake --build .pixi/build"
 install = "cmake --install .pixi/build --prefix $CONDA_PREFIX"
 test = "pytest -q"
-plotfile_projection = "bash -lc 'LD_PRELOAD=$CONDA_PREFIX/lib/libtcmalloc_minimal.so.4 python scripts/plotfile_projection.py'"
+plotfile_projection = "env LD_PRELOAD=$CONDA_PREFIX/lib/libtcmalloc_minimal.so.4 python scripts/plotfile_projection.py"
