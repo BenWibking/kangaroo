@@ -24,15 +24,6 @@ if(NOT msgpack-cxx_FOUND)
   endif()
 endif()
 
-# If HPX is using tcmalloc, try to link it into standalone modules too
-# to keep allocator ownership consistent across extensions.
-find_library(TCMALLOC_MINIMAL_LIB
-  NAMES tcmalloc_minimal
-  HINTS
-    ${CMAKE_PREFIX_PATH}/lib
-    $ENV{CONDA_PREFIX}/lib
-)
-
 add_library(kangaroo_runtime STATIC
   src/adjacency.cpp
   src/backend_memory.cpp
@@ -80,9 +71,6 @@ target_compile_definitions(kangaroo_runtime PUBLIC KANGAROO_USE_MSGPACK)
 nanobind_add_module(_core src/bindings.cpp)
 target_link_libraries(_core PRIVATE kangaroo_runtime)
 target_compile_definitions(_core PRIVATE KANGAROO_USE_NANOBIND)
-if(TCMALLOC_MINIMAL_LIB)
-  target_link_libraries(_core PRIVATE ${TCMALLOC_MINIMAL_LIB})
-endif()
 
 add_library(kangaroo_plotfile STATIC
   src/plotfile_reader.cpp
@@ -99,10 +87,6 @@ target_link_libraries(kangaroo_runtime PUBLIC kangaroo_plotfile)
 nanobind_add_module(_plotfile src/plotfile_bindings.cpp)
 target_link_libraries(_plotfile PRIVATE kangaroo_plotfile)
 target_compile_definitions(_plotfile PRIVATE KANGAROO_USE_NANOBIND)
-if(TCMALLOC_MINIMAL_LIB)
-  target_link_libraries(kangaroo_plotfile PUBLIC ${TCMALLOC_MINIMAL_LIB})
-  target_link_libraries(_plotfile PRIVATE ${TCMALLOC_MINIMAL_LIB})
-endif()
 
 if(KANGAROO_ASAN)
   set(_asan_flags "-fsanitize=address" "-fno-omit-frame-pointer")
