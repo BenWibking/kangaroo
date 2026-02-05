@@ -52,7 +52,19 @@ target_include_directories(kangaroo_runtime PUBLIC
 target_link_libraries(kangaroo_runtime PUBLIC HPX::hpx)
 
 if(KANGAROO_USE_OPENPMD)
-  find_package(openPMD CONFIG REQUIRED)
+  find_package(openPMD CONFIG QUIET)
+  if(NOT openPMD_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(
+      openPMD
+      GIT_REPOSITORY https://github.com/openPMD/openPMD-api.git
+      GIT_TAG v0.17.0
+    )
+    FetchContent_MakeAvailable(openPMD)
+  endif()
+  if(NOT TARGET openPMD::openPMD)
+    message(FATAL_ERROR "openPMD target not available after FetchContent/FindPackage.")
+  endif()
   target_compile_definitions(kangaroo_runtime PUBLIC KANGAROO_USE_OPENPMD)
   target_link_libraries(kangaroo_runtime PUBLIC openPMD::openPMD)
 endif()
