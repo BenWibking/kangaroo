@@ -582,9 +582,10 @@ class DashboardApp:
                 end = cached_end
             if str(event.get("status")) == "start" and end <= start:
                 end = now_epoch
-            if end < window:
-                stale.append(task_id)
-                continue
+            if self._workflow_end_ts is None:
+                if end < window:
+                    stale.append(task_id)
+                    continue
             worker = self._lane_key(event)
             if worker not in self._workers:
                 self._workers[worker] = len(self._workers)
