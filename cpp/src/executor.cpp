@@ -735,14 +735,26 @@ hpx::future<void> Executor::run(const PlanIR& plan) {
     throw std::runtime_error("stage dependency cycle detected");
   }
 
-  hpx::future<void> chain = hpx::make_ready_future();
+  std::vector<hpx::shared_future<void>> stage_futures(nstages);
   for (int32_t stage_idx : order) {
     const auto& stage = plan.stages[stage_idx];
-    chain = chain.then([this, stage, stage_idx](auto&&) {
-      return run_stage(stage_idx, stage);
-    });
+    if (stage.after.empty()) {
+      stage_futures[stage_idx] = run_stage(stage_idx, stage).share();
+      continue;
+    }
+
+    std::vector<hpx::shared_future<void>> deps;
+    deps.reserve(stage.after.size());
+    for (int32_t dep : stage.after) {
+      deps.push_back(stage_futures.at(dep));
+    }
+    stage_futures[stage_idx] =
+        hpx::when_all(deps).then([this, stage, stage_idx](auto&&) {
+          return run_stage(stage_idx, stage);
+        }).share();
   }
-  return chain;
+
+  return hpx::when_all(stage_futures).then([](auto&&) { return; });
 }
 
 hpx::future<void> Executor::run_stage(int32_t stage_idx, const StageIR& stage) {
