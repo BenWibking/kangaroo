@@ -20,6 +20,7 @@ __all__ = [
     "BlockBox",
     "load_runmeta_from_dict",
     "PlotfileReader",
+    "ParthenonHDF5Reader",
 ]
 
 
@@ -68,4 +69,8 @@ def __getattr__(name):
         from .plotfile import PlotfileReader
 
         return PlotfileReader
+    if name == "ParthenonHDF5Reader":
+        from .parthenon_hdf5 import ParthenonHDF5Reader
+
+        return ParthenonHDF5Reader
     raise AttributeError(name)
