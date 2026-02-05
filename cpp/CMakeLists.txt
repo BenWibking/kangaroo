@@ -58,7 +58,7 @@ if(KANGAROO_USE_OPENPMD)
     FetchContent_Declare(
       openPMD
       GIT_REPOSITORY https://github.com/openPMD/openPMD-api.git
-      GIT_TAG v0.17.0
+      GIT_TAG 0.17.0
     )
     FetchContent_MakeAvailable(openPMD)
   endif()
