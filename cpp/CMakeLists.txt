@@ -3,7 +3,7 @@ cmake_minimum_required(VERSION 3.22)
 project(kangaroo_runtime LANGUAGES CXX)
 
 option(KANGAROO_ASAN "Enable AddressSanitizer for kangaroo targets" OFF)
-option(KANGAROO_USE_OPENPMD "Enable openPMD reader support" ON)
+option(KANGAROO_USE_OPENPMD "Enable openPMD reader support" OFF)
 option(KANGAROO_USE_PARTHENON_HDF5 "Enable Parthenon HDF5 reader support" ON)
 
 find_package(HPX REQUIRED)
@@ -25,18 +25,23 @@ if(NOT msgpack-cxx_FOUND)
   endif()
 endif()
 
-add_library(kangaroo_runtime STATIC
+set(KANGAROO_RUNTIME_SOURCES
   src/adjacency.cpp
   src/backend_parthenon.cpp
   src/backend_memory.cpp
   src/backend_plotfile.cpp
-  src/backend_openpmd.cpp
   src/data_service_local.cpp
   src/executor.cpp
   src/kernel_registry.cpp
   src/plan_decode_msgpack.cpp
   src/runtime.cpp
 )
+
+if(KANGAROO_USE_OPENPMD)
+  list(APPEND KANGAROO_RUNTIME_SOURCES src/backend_openpmd.cpp)
+endif()
+
+add_library(kangaroo_runtime STATIC ${KANGAROO_RUNTIME_SOURCES})
 
 target_include_directories(kangaroo_runtime PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
