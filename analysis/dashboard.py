@@ -883,10 +883,11 @@ class DashboardApp:
             line_color="#9aa0a6",
             line_width=1.5,
         )
-        node_renderer = p.circle(
+        node_renderer = p.scatter(
             x="x",
             y="y",
             source=self._dag_source,
+            marker="circle",
             size=12,
             fill_color="#4c78a8",
             line_color="white",

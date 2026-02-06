@@ -819,8 +819,11 @@ hpx::future<void> Executor::run_block_task(const TaskTemplateIR& tmpl, int32_t s
     int target = data_.home_rank(cref);
     int here = hpx::get_locality_id();
     if (target == here) {
-      return run_block_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, block, meta_, data_, adj_,
-                                 kernels_);
+      return hpx::async([this, tmpl, stage_idx, tmpl_idx, block]() mutable {
+        run_block_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, block, meta_, data_, adj_,
+                            kernels_)
+            .get();
+      });
     }
     auto localities = hpx::find_all_localities();
     return hpx::async<::kangaroo_run_block_task_action>(localities.at(target), plan_id_, stage_idx,
@@ -834,8 +837,10 @@ hpx::future<void> Executor::run_block_task(const TaskTemplateIR& tmpl, int32_t s
   int target = data_.home_rank(cref);
   int here = hpx::get_locality_id();
   if (target == here) {
-    return run_block_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, block, meta_, data_, adj_,
-                               kernels_);
+    return hpx::async([this, tmpl, stage_idx, tmpl_idx, block]() mutable {
+      run_block_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, block, meta_, data_, adj_, kernels_)
+          .get();
+    });
   }
 
   auto localities = hpx::find_all_localities();
@@ -863,8 +868,10 @@ hpx::future<void> Executor::run_graph_task(const TaskTemplateIR& tmpl, int32_t s
   int target = data_.home_rank(cref);
   int here = hpx::get_locality_id();
   if (target == here) {
-    return run_graph_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, group_idx, meta_, data_,
-                               kernels_);
+    return hpx::async([this, tmpl, stage_idx, tmpl_idx, group_idx]() mutable {
+      run_graph_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, group_idx, meta_, data_, kernels_)
+          .get();
+    });
   }
 
   auto localities = hpx::find_all_localities();
