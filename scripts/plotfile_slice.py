@@ -317,6 +317,13 @@ def main() -> int:
             except OSError as exc:
                 print(f"Failed to write plan JSON to {plan_out}: {exc}")
 
+    io_mode = os.environ.get("KANGAROO_IO_MODE", "normal").strip().lower()
+    if io_mode == "preload_inputs":
+        with logger.span("setup/preload_inputs"):
+            rt.preload(runmeta=runmeta, dataset=ds, fields=[field])
+    elif io_mode not in {"", "normal"}:
+        raise ValueError("KANGAROO_IO_MODE must be one of: normal, preload_inputs")
+
     try:
         with logger.span("runtime/execute_plan"):
             rt.run(plan, runmeta=runmeta, dataset=ds)
