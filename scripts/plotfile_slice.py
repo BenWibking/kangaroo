@@ -148,6 +148,11 @@ def main() -> int:
     )
     parser.add_argument("--output", help="Optional path to save the plot as an image.")
     parser.add_argument(
+        "--no-plot",
+        action="store_true",
+        help="Skip plotting and image output (useful for compute-only benchmarks).",
+    )
+    parser.add_argument(
         "--resolution",
         help="Override output resolution as Nx,Ny (e.g. 512,512).",
     )
@@ -364,23 +369,24 @@ def main() -> int:
                     )
                     np.save(f"{root}_l{lvl}{ext}", area_lvl)
 
-    with logger.span("postprocess/plot"):
-        fig, ax = plt.subplots(figsize=(6, 5))
-        log_slice = np.ma.masked_invalid(np.log10(slice_2d))
-        kpc_in_cm = 3.0856775814913673e21
-        rect_kpc = tuple(coord / kpc_in_cm for coord in rect)
-        extent_kpc = (rect_kpc[0], rect_kpc[2], rect_kpc[1], rect_kpc[3])
-        im = ax.imshow(log_slice, origin="lower", cmap="viridis", extent=extent_kpc)
-        avg_label = "AMR cell-average" if args.amr_cell_average else "UniformSlice"
-        ax.set_title(f"{avg_label} of {comp_name} ({plane_label} plane)")
-        ax.set_xlabel(f"{axis_labels[0]} [kpc]")
-        ax.set_ylabel(f"{axis_labels[1]} [kpc]")
-        fig.colorbar(im, ax=ax, label=f"log10({comp_name})")
-        fig.tight_layout()
-        if args.output:
-            fig.savefig(args.output, dpi=150)
-        else:
-            plt.show()
+    if not args.no_plot:
+        with logger.span("postprocess/plot"):
+            fig, ax = plt.subplots(figsize=(6, 5))
+            log_slice = np.ma.masked_invalid(np.log10(slice_2d))
+            kpc_in_cm = 3.0856775814913673e21
+            rect_kpc = tuple(coord / kpc_in_cm for coord in rect)
+            extent_kpc = (rect_kpc[0], rect_kpc[2], rect_kpc[1], rect_kpc[3])
+            im = ax.imshow(log_slice, origin="lower", cmap="viridis", extent=extent_kpc)
+            avg_label = "AMR cell-average" if args.amr_cell_average else "UniformSlice"
+            ax.set_title(f"{avg_label} of {comp_name} ({plane_label} plane)")
+            ax.set_xlabel(f"{axis_labels[0]} [kpc]")
+            ax.set_ylabel(f"{axis_labels[1]} [kpc]")
+            fig.colorbar(im, ax=ax, label=f"log10({comp_name})")
+            fig.tight_layout()
+            if args.output:
+                fig.savefig(args.output, dpi=150)
+            else:
+                plt.show()
 
     return 0
 
