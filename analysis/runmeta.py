@@ -18,6 +18,7 @@ class LevelGeom:
     x0: tuple[float, float, float]
     ref_ratio: int
     index_origin: tuple[int, int, int] = (0, 0, 0)
+    is_periodic: tuple[bool, bool, bool] = (False, False, False)
 
 
 @dataclass
@@ -48,6 +49,7 @@ class RunMeta:
                             "dx": lvl.geom.dx,
                             "x0": lvl.geom.x0,
                             "index_origin": lvl.geom.index_origin,
+                            "is_periodic": lvl.geom.is_periodic,
                             "ref_ratio": lvl.geom.ref_ratio,
                         },
                         "boxes": [(b.lo, b.hi) for b in lvl.boxes],
@@ -66,6 +68,7 @@ def load_runmeta_from_dict(payload: Dict[str, Any]) -> RunMeta:
                 dx=tuple(lvl_entry["geom"]["dx"]),
                 x0=tuple(lvl_entry["geom"]["x0"]),
                 index_origin=tuple(lvl_entry["geom"].get("index_origin", (0, 0, 0))),
+                is_periodic=tuple(lvl_entry["geom"].get("is_periodic", (False, False, False))),
                 ref_ratio=int(lvl_entry["geom"]["ref_ratio"]),
             )
             boxes = [BlockBox(tuple(lo), tuple(hi)) for lo, hi in lvl_entry.get("boxes", [])]

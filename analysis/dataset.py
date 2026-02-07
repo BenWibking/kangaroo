@@ -103,11 +103,16 @@ class Dataset:
                 "Only cell-centered openPMD mesh records are supported."
             ) from exc
 
-    def get_runmeta(self) -> Any:
+    def get_runmeta(self, periodic: Optional[tuple[bool, bool, bool]] = None) -> Any:
         from .runmeta import RunMeta, StepMeta, LevelMeta, LevelGeom, BlockBox
         m = self.metadata
         if not m:
             raise RuntimeError("Backend does not provide metadata for RunMeta construction")
+
+        meta_periodic = m.get("is_periodic")
+        is_periodic = tuple(bool(v) for v in meta_periodic) if meta_periodic is not None else (False, False, False)
+        if periodic is not None:
+            is_periodic = periodic
         
         # AMReX-specific RunMeta construction
         steps = []
@@ -120,6 +125,7 @@ class Dataset:
                 dx=(dx, dx, dx),
                 x0=tuple(m["prob_lo"]),
                 index_origin=tuple(m["prob_domain"][lev][0]),
+                is_periodic=is_periodic,
                 ref_ratio=m["ref_ratio"][lev] if lev < len(m["ref_ratio"]) else 1
             )
             boxes = [BlockBox(tuple(lo), tuple(hi)) for lo, hi in m["level_boxes"][lev]]

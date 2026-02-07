@@ -30,6 +30,7 @@ struct LevelGeom {
   double dx[3] = {0.0, 0.0, 0.0};
   double x0[3] = {0.0, 0.0, 0.0};
   int32_t index_origin[3] = {0, 0, 0};
+  bool is_periodic[3] = {false, false, false};
   int ref_ratio = 1;
 
   template <typename Archive>
@@ -41,6 +42,9 @@ struct LevelGeom {
       ar& v;
     }
     for (auto& v : index_origin) {
+      ar& v;
+    }
+    for (auto& v : is_periodic) {
       ar& v;
     }
     ar& ref_ratio;

@@ -55,6 +55,12 @@ kangaroo::RunMeta parse_runmeta(const nb::object& obj) {
         level.geom.index_origin[1] = nb::cast<int32_t>(origin[1]);
         level.geom.index_origin[2] = nb::cast<int32_t>(origin[2]);
       }
+      if (geom_dict.contains("is_periodic")) {
+        auto is_periodic = nb::cast<nb::tuple>(geom_dict["is_periodic"]);
+        level.geom.is_periodic[0] = nb::cast<bool>(is_periodic[0]);
+        level.geom.is_periodic[1] = nb::cast<bool>(is_periodic[1]);
+        level.geom.is_periodic[2] = nb::cast<bool>(is_periodic[2]);
+      }
       level.geom.ref_ratio = nb::cast<int>(require_key(geom_dict, "ref_ratio"));
 
       auto boxes_list = nb::cast<nb::list>(require_key(level_dict, "boxes"));
