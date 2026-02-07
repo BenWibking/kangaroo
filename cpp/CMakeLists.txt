@@ -6,6 +6,12 @@ option(KANGAROO_ASAN "Enable AddressSanitizer for kangaroo targets" OFF)
 option(KANGAROO_USE_OPENPMD "Enable openPMD reader support" OFF)
 option(KANGAROO_USE_PARTHENON_HDF5 "Enable Parthenon HDF5 reader support" ON)
 
+# msgpack-cxx's CMake config can still rely on FindBoost; keep legacy behavior
+# under CMake 4.x to avoid noisy developer warnings.
+if(POLICY CMP0167)
+  cmake_policy(SET CMP0167 OLD)
+endif()
+
 find_package(HPX REQUIRED)
 find_package(Python REQUIRED COMPONENTS Interpreter Development)
 find_package(nanobind CONFIG REQUIRED)

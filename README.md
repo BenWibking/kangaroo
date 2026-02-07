@@ -70,14 +70,14 @@ C++ build (HPX required)
   - C++ dev loop (optional):
     - `pixi run configure`
     - `pixi run build`
-  - `scripts/detect_hpx.sh` will find HPX inside the Pixi/conda prefix automatically.
+  - `scripts/utils/detect_hpx.sh` will find HPX inside the Pixi/conda prefix automatically.
   - Build deps (`scikit-build-core`, `nanobind`) are provided by Pixi; `install` uses `--no-build-isolation`.
   - The C++ msgpack headers come from `msgpack-cxx` in the Pixi env.
   - Run Python with `pixi run python ...` so it picks up the Pixi HPX + extension module.
-  - Note: the conda-forge HPX package used by Pixi may be built without networking enabled, which prevents multi-locality runs. For multi-rank execution, build HPX with `-DHPX_WITH_NETWORKING=On` and point `scripts/detect_hpx.sh` at that install.
+  - Note: the conda-forge HPX package used by Pixi may be built without networking enabled, which prevents multi-locality runs. For multi-rank execution, build HPX with `-DHPX_WITH_NETWORKING=On` and point `scripts/utils/detect_hpx.sh` at that install.
 HPX autodetect helper
-- Use `scripts/detect_hpx.sh` to verify HPX resolution inside the Pixi env:
-  - `HPX_DIR=$(scripts/detect_hpx.sh)`
+- Use `scripts/utils/detect_hpx.sh` to verify HPX resolution inside the Pixi env:
+  - `HPX_DIR=$(scripts/utils/detect_hpx.sh)`
 
 Kangaroo Dashboard (Bokeh)
 - Run the dashboard (local system metrics only):

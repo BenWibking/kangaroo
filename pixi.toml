@@ -29,7 +29,7 @@ scikit-build-core = ">=0.9.10"
 nanobind = ">=1.9"
 
 [tasks]
-configure = "bash -lc 'cmake -S cpp -B .pixi/build -DCMAKE_BUILD_TYPE=Release -DHPX_DIR=$(scripts/detect_hpx.sh) -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -Dnanobind_DIR=$(python -m nanobind --cmake_dir) -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX -DPython_EXECUTABLE=$CONDA_PREFIX/bin/python'"
+configure = "bash -lc 'cmake -S cpp -B .pixi/build -DCMAKE_BUILD_TYPE=Release -DHPX_DIR=$(scripts/utils/detect_hpx.sh) -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -Dnanobind_DIR=$(python -m nanobind --cmake_dir) -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX -DPython_EXECUTABLE=$CONDA_PREFIX/bin/python'"
 build = "cmake --build .pixi/build --parallel"
 install = "cmake --install .pixi/build --prefix $CONDA_PREFIX"
 test = "pytest -q"
