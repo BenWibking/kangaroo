@@ -2106,8 +2106,6 @@ void ensure_hpx_started() {
     hpx::init_params params;
     if (g_hpx_cfg_set && !g_hpx_cfg.empty()) {
       params.cfg = g_hpx_cfg;
-    } else {
-      params.cfg = {"hpx.os_threads=1"};
     }
     hpx::start(nullptr, argc, argv.data(), params);
     g_hpx_started = true;

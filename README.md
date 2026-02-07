@@ -74,6 +74,7 @@ C++ build (HPX required)
   - Build deps (`scikit-build-core`, `nanobind`) are provided by Pixi; `install` uses `--no-build-isolation`.
   - The C++ msgpack headers come from `msgpack-cxx` in the Pixi env.
   - Run Python with `pixi run python ...` so it picks up the Pixi HPX + extension module.
+  - Example (set HPX worker threads): `pixi run python scripts/plotfile_slice.py /path/to/plotfile --var density --hpx:threads=8`
   - Note: the conda-forge HPX package used by Pixi may be built without networking enabled, which prevents multi-locality runs. For multi-rank execution, build HPX with `-DHPX_WITH_NETWORKING=On` and point `scripts/utils/detect_hpx.sh` at that install.
 HPX autodetect helper
 - Use `scripts/utils/detect_hpx.sh` to verify HPX resolution inside the Pixi env:
