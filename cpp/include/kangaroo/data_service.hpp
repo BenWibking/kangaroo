@@ -8,6 +8,21 @@
 
 namespace kangaroo {
 
+struct IndexBox3 {
+  int32_t lo[3] = {0, 0, 0};
+  int32_t hi[3] = {-1, -1, -1};
+
+  template <typename Archive>
+  void serialize(Archive& ar, unsigned) {
+    for (auto& v : lo) {
+      ar& v;
+    }
+    for (auto& v : hi) {
+      ar& v;
+    }
+  }
+};
+
 struct ChunkRef {
   int32_t step = 0;
   int16_t level = 0;
@@ -43,12 +58,36 @@ struct ChunkRefEq {
   }
 };
 
+struct ChunkSubboxRef {
+  ChunkRef chunk;
+  IndexBox3 chunk_box;
+  IndexBox3 request_box;
+  int32_t bytes_per_value = 4;
+
+  template <typename Archive>
+  void serialize(Archive& ar, unsigned) {
+    ar& chunk& chunk_box& request_box& bytes_per_value;
+  }
+};
+
+struct SubboxView {
+  HostView data;
+  IndexBox3 box;
+  int32_t bytes_per_value = 4;
+
+  template <typename Archive>
+  void serialize(Archive& ar, unsigned) {
+    ar& data& box& bytes_per_value;
+  }
+};
+
 class DataService {
  public:
   virtual ~DataService() = default;
   virtual int home_rank(const ChunkRef&) const = 0;
   virtual HostView alloc_host(const ChunkRef&, std::size_t bytes) = 0;
   virtual hpx::future<HostView> get_host(const ChunkRef&) = 0;
+  virtual hpx::future<SubboxView> get_subbox(const ChunkSubboxRef&) = 0;
   virtual hpx::future<void> put_host(const ChunkRef&, HostView) = 0;
 };
 

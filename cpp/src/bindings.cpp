@@ -1,4 +1,5 @@
 #include "kangaroo/runtime.hpp"
+#include "kangaroo/data_service_local.hpp"
 
 #ifdef KANGAROO_USE_NANOBIND
 #include <nanobind/nanobind.h>
@@ -95,6 +96,61 @@ NB_MODULE(_core, m) {
   m.def("hpx_configuration_string", []() { return hpx::configuration_string(); });
   m.def("set_event_log_path", &kangaroo::set_event_log_path);
   m.def("set_global_dataset", &kangaroo::set_global_dataset);
+  m.def("test_get_subbox",
+        [](kangaroo::DatasetHandle& dataset,
+           int32_t step,
+           int16_t level,
+           int32_t field,
+           int32_t version,
+           int32_t block,
+           nb::tuple chunk_lo,
+           nb::tuple chunk_hi,
+           nb::tuple request_lo,
+           nb::tuple request_hi,
+           int32_t bytes_per_value) -> nb::dict {
+          auto parse_box = [](nb::tuple lo, nb::tuple hi) {
+            kangaroo::IndexBox3 b;
+            b.lo[0] = nb::cast<int32_t>(lo[0]);
+            b.lo[1] = nb::cast<int32_t>(lo[1]);
+            b.lo[2] = nb::cast<int32_t>(lo[2]);
+            b.hi[0] = nb::cast<int32_t>(hi[0]);
+            b.hi[1] = nb::cast<int32_t>(hi[1]);
+            b.hi[2] = nb::cast<int32_t>(hi[2]);
+            return b;
+          };
+
+          kangaroo::set_global_dataset(dataset);
+
+          kangaroo::ChunkSubboxRef ref;
+          ref.chunk = kangaroo::ChunkRef{step, level, field, version, block};
+          ref.chunk_box = parse_box(chunk_lo, chunk_hi);
+          ref.request_box = parse_box(request_lo, request_hi);
+          ref.bytes_per_value = bytes_per_value;
+
+          auto out = kangaroo::data_get_subbox_local_impl(ref);
+
+          auto to_tuple = [](const int32_t v[3]) {
+            return nb::make_tuple(v[0], v[1], v[2]);
+          };
+          nb::dict d;
+          d["data"] =
+              nb::bytes(reinterpret_cast<const char*>(out.data.data.data()), out.data.data.size());
+          d["bytes_per_value"] = out.bytes_per_value;
+          d["lo"] = to_tuple(out.box.lo);
+          d["hi"] = to_tuple(out.box.hi);
+          return d;
+        },
+        nb::arg("dataset"),
+        nb::arg("step"),
+        nb::arg("level"),
+        nb::arg("field"),
+        nb::arg("version"),
+        nb::arg("block"),
+        nb::arg("chunk_lo"),
+        nb::arg("chunk_hi"),
+        nb::arg("request_lo"),
+        nb::arg("request_hi"),
+        nb::arg("bytes_per_value"));
   m.def("log_task_event",
         [](const std::string& name,
            const std::string& status,
@@ -431,6 +487,21 @@ NB_MODULE(_core, m) {
              kangaroo::HostView view;
              view.data = std::move(buffer);
              kangaroo::ChunkRef ref{self.step, self.level, field, version, block};
+             self.set_chunk(ref, std::move(view));
+           })
+      .def("set_chunk_ref",
+           [](kangaroo::DatasetHandle& self,
+              int32_t step,
+              int16_t level,
+              int32_t field,
+              int32_t version,
+              int32_t block,
+              nb::bytes payload) {
+             const auto* data = static_cast<const std::uint8_t*>(payload.data());
+             std::vector<std::uint8_t> buffer(data, data + payload.size());
+             kangaroo::HostView view;
+             view.data = std::move(buffer);
+             kangaroo::ChunkRef ref{step, level, field, version, block};
              self.set_chunk(ref, std::move(view));
            });
 

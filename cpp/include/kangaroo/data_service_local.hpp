@@ -14,6 +14,7 @@
 namespace kangaroo {
 
 HostView data_get_local_impl(const ChunkRef& ref);
+SubboxView data_get_subbox_local_impl(const ChunkSubboxRef& ref);
 void data_put_local_impl(const ChunkRef& ref, HostView view);
 struct DatasetHandle;
 struct RunMeta;
@@ -25,6 +26,7 @@ class DataServiceLocal : public DataService {
   int home_rank(const ChunkRef& ref) const override;
   HostView alloc_host(const ChunkRef& ref, std::size_t bytes) override;
   hpx::future<HostView> get_host(const ChunkRef& ref) override;
+  hpx::future<SubboxView> get_subbox(const ChunkSubboxRef& ref) override;
   hpx::future<void> put_host(const ChunkRef& ref, HostView view) override;
   static void set_dataset(const DatasetHandle* dataset);
   static void preload(const RunMeta& meta,
@@ -33,6 +35,7 @@ class DataServiceLocal : public DataService {
 
  private:
   friend HostView data_get_local_impl(const ChunkRef& ref);
+  friend SubboxView data_get_subbox_local_impl(const ChunkSubboxRef& ref);
   friend void data_put_local_impl(const ChunkRef& ref, HostView view);
 
   using MapT = std::unordered_map<ChunkRef, HostView, ChunkRefHash, ChunkRefEq>;

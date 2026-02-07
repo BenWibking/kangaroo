@@ -2,12 +2,15 @@
 
 #include "kangaroo/runtime.hpp"
 
+#include <algorithm>
+#include <cstring>
 #include <functional>
 
 #include <hpx/include/actions.hpp>
 #include <hpx/include/async.hpp>
 
 HPX_PLAIN_ACTION(kangaroo::data_get_local_impl, kangaroo_data_get_local_action)
+HPX_PLAIN_ACTION(kangaroo::data_get_subbox_local_impl, kangaroo_data_get_subbox_local_action)
 HPX_PLAIN_ACTION(kangaroo::data_put_local_impl, kangaroo_data_put_local_action)
 
 namespace kangaroo {
@@ -71,6 +74,93 @@ void data_put_local_impl(const ChunkRef& ref, HostView view) {
   DataServiceLocal::put_local_impl(ref, std::move(view));
 }
 
+SubboxView data_get_subbox_local_impl(const ChunkSubboxRef& ref) {
+  SubboxView out;
+  out.bytes_per_value = ref.bytes_per_value;
+  out.box = ref.request_box;
+
+  const HostView chunk = DataServiceLocal::get_local_impl(ref.chunk);
+  if (chunk.data.empty() || ref.bytes_per_value <= 0) {
+    return out;
+  }
+
+  const int32_t nx = ref.chunk_box.hi[0] - ref.chunk_box.lo[0] + 1;
+  const int32_t ny = ref.chunk_box.hi[1] - ref.chunk_box.lo[1] + 1;
+  const int32_t nz = ref.chunk_box.hi[2] - ref.chunk_box.lo[2] + 1;
+  if (nx <= 0 || ny <= 0 || nz <= 0) {
+    return out;
+  }
+
+  const int32_t ox0 = std::max(ref.chunk_box.lo[0], ref.request_box.lo[0]);
+  const int32_t oy0 = std::max(ref.chunk_box.lo[1], ref.request_box.lo[1]);
+  const int32_t oz0 = std::max(ref.chunk_box.lo[2], ref.request_box.lo[2]);
+  const int32_t ox1 = std::min(ref.chunk_box.hi[0], ref.request_box.hi[0]);
+  const int32_t oy1 = std::min(ref.chunk_box.hi[1], ref.request_box.hi[1]);
+  const int32_t oz1 = std::min(ref.chunk_box.hi[2], ref.request_box.hi[2]);
+
+  if (ox1 < ox0 || oy1 < oy0 || oz1 < oz0) {
+    out.box.hi[0] = out.box.lo[0] - 1;
+    out.box.hi[1] = out.box.lo[1] - 1;
+    out.box.hi[2] = out.box.lo[2] - 1;
+    return out;
+  }
+
+  out.box.lo[0] = ox0;
+  out.box.lo[1] = oy0;
+  out.box.lo[2] = oz0;
+  out.box.hi[0] = ox1;
+  out.box.hi[1] = oy1;
+  out.box.hi[2] = oz1;
+
+  const std::size_t bytes_per = static_cast<std::size_t>(ref.bytes_per_value);
+  const std::size_t elems_total =
+      static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
+  const std::size_t needed = elems_total * bytes_per;
+  if (chunk.data.size() < needed) {
+    return SubboxView{};
+  }
+
+  const int32_t onx = ox1 - ox0 + 1;
+  const int32_t ony = oy1 - oy0 + 1;
+  const int32_t onz = oz1 - oz0 + 1;
+  const std::size_t out_bytes = static_cast<std::size_t>(onx) * static_cast<std::size_t>(ony) *
+                                static_cast<std::size_t>(onz) * bytes_per;
+  out.data.data.resize(out_bytes, 0);
+
+  auto in_index = [&](int32_t i, int32_t j, int32_t k) -> std::size_t {
+    return (static_cast<std::size_t>(i) * static_cast<std::size_t>(ny) +
+            static_cast<std::size_t>(j)) *
+               static_cast<std::size_t>(nz) +
+           static_cast<std::size_t>(k);
+  };
+  auto out_index = [&](int32_t i, int32_t j, int32_t k) -> std::size_t {
+    return (static_cast<std::size_t>(i) * static_cast<std::size_t>(ony) +
+            static_cast<std::size_t>(j)) *
+               static_cast<std::size_t>(onz) +
+           static_cast<std::size_t>(k);
+  };
+
+  const auto* src = chunk.data.data();
+  auto* dst = out.data.data.data();
+  for (int32_t i = 0; i < onx; ++i) {
+    const int32_t gi = ox0 + i;
+    const int32_t li = gi - ref.chunk_box.lo[0];
+    for (int32_t j = 0; j < ony; ++j) {
+      const int32_t gj = oy0 + j;
+      const int32_t lj = gj - ref.chunk_box.lo[1];
+      for (int32_t k = 0; k < onz; ++k) {
+        const int32_t gk = oz0 + k;
+        const int32_t lk = gk - ref.chunk_box.lo[2];
+        const std::size_t src_byte = in_index(li, lj, lk) * bytes_per;
+        const std::size_t dst_byte = out_index(i, j, k) * bytes_per;
+        std::memcpy(dst + dst_byte, src + src_byte, bytes_per);
+      }
+    }
+  }
+
+  return out;
+}
+
 hpx::future<HostView> DataServiceLocal::get_host(const ChunkRef& ref) {
   int target = home_rank(ref);
   int here = hpx::get_locality_id();
@@ -79,6 +169,16 @@ hpx::future<HostView> DataServiceLocal::get_host(const ChunkRef& ref) {
   }
   auto localities = hpx::find_all_localities();
   return hpx::async<::kangaroo_data_get_local_action>(localities.at(target), ref);
+}
+
+hpx::future<SubboxView> DataServiceLocal::get_subbox(const ChunkSubboxRef& ref) {
+  const int target = home_rank(ref.chunk);
+  const int here = hpx::get_locality_id();
+  if (target == here) {
+    return hpx::make_ready_future(data_get_subbox_local_impl(ref));
+  }
+  auto localities = hpx::find_all_localities();
+  return hpx::async<::kangaroo_data_get_subbox_local_action>(localities.at(target), ref);
 }
 
 hpx::future<void> DataServiceLocal::put_host(const ChunkRef& ref, HostView view) {
