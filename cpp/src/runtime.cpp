@@ -15,6 +15,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <iterator>
 #include <thread>
 #include <sstream>
 #include <stdexcept>
@@ -249,17 +250,700 @@ void transpose_plotfile_axes(const InT* in, OutT* out, int nx, int ny, int nz) {
   }
 }
 
+struct SamplePatch {
+  int16_t level = 0;
+  IndexBox3 box;
+  LevelGeom geom;
+  HostView view;
+  int32_t bytes_per_value = 4;
+};
+
+double cell_edge(const LevelGeom& geom, int axis, int idx) {
+  return geom.x0[axis] + (idx - geom.index_origin[axis]) * geom.dx[axis];
+}
+
+double cell_center(const LevelGeom& geom, int axis, int idx) {
+  return cell_edge(geom, axis, idx) + 0.5 * geom.dx[axis];
+}
+
+int32_t coord_to_index(const LevelGeom& geom, int axis, double x) {
+  return static_cast<int32_t>(std::floor((x - geom.x0[axis]) / geom.dx[axis])) + geom.index_origin[axis];
+}
+
+double wrap_coord(double x, double lo, double hi) {
+  const double period = hi - lo;
+  if (!(period > 0.0)) {
+    return x;
+  }
+  double y = std::fmod(x - lo, period);
+  if (y < 0.0) {
+    y += period;
+  }
+  return lo + y;
+}
+
+bool solve_3x3(double a[3][3], double b[3], double x[3]) {
+  double m[3][4] = {
+      {a[0][0], a[0][1], a[0][2], b[0]},
+      {a[1][0], a[1][1], a[1][2], b[1]},
+      {a[2][0], a[2][1], a[2][2], b[2]},
+  };
+
+  for (int col = 0; col < 3; ++col) {
+    int piv = col;
+    double best = std::abs(m[col][col]);
+    for (int r = col + 1; r < 3; ++r) {
+      const double cand = std::abs(m[r][col]);
+      if (cand > best) {
+        best = cand;
+        piv = r;
+      }
+    }
+    if (best < 1e-30) {
+      return false;
+    }
+    if (piv != col) {
+      for (int c = col; c < 4; ++c) {
+        std::swap(m[col][c], m[piv][c]);
+      }
+    }
+    const double inv = 1.0 / m[col][col];
+    for (int c = col; c < 4; ++c) {
+      m[col][c] *= inv;
+    }
+    for (int r = 0; r < 3; ++r) {
+      if (r == col) {
+        continue;
+      }
+      const double f = m[r][col];
+      if (f == 0.0) {
+        continue;
+      }
+      for (int c = col; c < 4; ++c) {
+        m[r][c] -= f * m[col][c];
+      }
+    }
+  }
+
+  x[0] = m[0][3];
+  x[1] = m[1][3];
+  x[2] = m[2][3];
+  return true;
+}
+
+std::optional<double> patch_value_at(const SamplePatch& p, int32_t i, int32_t j, int32_t k) {
+  if (i < p.box.lo[0] || i > p.box.hi[0] || j < p.box.lo[1] || j > p.box.hi[1] ||
+      k < p.box.lo[2] || k > p.box.hi[2]) {
+    return std::nullopt;
+  }
+  const int32_t nx = p.box.hi[0] - p.box.lo[0] + 1;
+  const int32_t ny = p.box.hi[1] - p.box.lo[1] + 1;
+  const int32_t nz = p.box.hi[2] - p.box.lo[2] + 1;
+  if (nx <= 0 || ny <= 0 || nz <= 0 || p.bytes_per_value <= 0) {
+    return std::nullopt;
+  }
+  const int32_t li = i - p.box.lo[0];
+  const int32_t lj = j - p.box.lo[1];
+  const int32_t lk = k - p.box.lo[2];
+  const std::size_t idx = (static_cast<std::size_t>(li) * static_cast<std::size_t>(ny) +
+                           static_cast<std::size_t>(lj)) *
+                              static_cast<std::size_t>(nz) +
+                          static_cast<std::size_t>(lk);
+  if (p.bytes_per_value == 4) {
+    const std::size_t pos = idx * sizeof(float);
+    if (pos + sizeof(float) > p.view.data.size()) {
+      return std::nullopt;
+    }
+    return static_cast<double>(reinterpret_cast<const float*>(p.view.data.data())[idx]);
+  }
+  if (p.bytes_per_value == 8) {
+    const std::size_t pos = idx * sizeof(double);
+    if (pos + sizeof(double) > p.view.data.size()) {
+      return std::nullopt;
+    }
+    return reinterpret_cast<const double*>(p.view.data.data())[idx];
+  }
+  return std::nullopt;
+}
+
+struct SamplePoint {
+  double x = 0.0;
+  double y = 0.0;
+  double z = 0.0;
+  double value = 0.0;
+};
+
+std::optional<SamplePoint> composite_sample_at(
+    std::span<const SamplePatch> patches,
+    int finest_level,
+    const int32_t domain_lo[3],
+    const int32_t domain_hi[3],
+    const bool is_periodic[3],
+    const double domain_lo_edge[3],
+    const double domain_hi_edge[3],
+    double x, double y, double z) {
+  double xyz[3] = {x, y, z};
+  for (int ax = 0; ax < 3; ++ax) {
+    if (is_periodic[ax]) {
+      xyz[ax] = wrap_coord(xyz[ax], domain_lo_edge[ax], domain_hi_edge[ax]);
+    } else if (xyz[ax] < domain_lo_edge[ax] || xyz[ax] >= domain_hi_edge[ax]) {
+      return std::nullopt;
+    }
+  }
+
+  for (int lev = finest_level; lev >= 0; --lev) {
+    for (const auto& p : patches) {
+      if (p.level != lev) {
+        continue;
+      }
+      int32_t idx[3];
+      for (int ax = 0; ax < 3; ++ax) {
+        idx[ax] = coord_to_index(p.geom, ax, xyz[ax]);
+      }
+      if (idx[0] < p.box.lo[0] || idx[0] > p.box.hi[0] || idx[1] < p.box.lo[1] || idx[1] > p.box.hi[1] ||
+          idx[2] < p.box.lo[2] || idx[2] > p.box.hi[2]) {
+        continue;
+      }
+      auto value = patch_value_at(p, idx[0], idx[1], idx[2]);
+      if (!value.has_value()) {
+        continue;
+      }
+      SamplePoint out;
+      out.x = cell_center(p.geom, 0, idx[0]);
+      out.y = cell_center(p.geom, 1, idx[1]);
+      out.z = cell_center(p.geom, 2, idx[2]);
+      out.value = *value;
+      return out;
+    }
+  }
+  return std::nullopt;
+}
+
+std::vector<SamplePatch> unpack_sample_patches(std::span<const std::uint8_t> packed) {
+  std::vector<SamplePatch> patches;
+  if (packed.empty()) {
+    return patches;
+  }
+  auto handle = msgpack::unpack(reinterpret_cast<const char*>(packed.data()), packed.size());
+  auto root = handle.get();
+  if (root.type != msgpack::type::MAP) {
+    return patches;
+  }
+  const msgpack::object* arr_obj = nullptr;
+  for (uint32_t i = 0; i < root.via.map.size; ++i) {
+    const auto& k = root.via.map.ptr[i].key;
+    if (k.type == msgpack::type::STR && k.as<std::string>() == "patches") {
+      arr_obj = &root.via.map.ptr[i].val;
+      break;
+    }
+  }
+  if (arr_obj == nullptr || arr_obj->type != msgpack::type::ARRAY) {
+    return patches;
+  }
+  patches.reserve(arr_obj->via.array.size);
+  for (uint32_t i = 0; i < arr_obj->via.array.size; ++i) {
+    const auto& p = arr_obj->via.array.ptr[i];
+    if (p.type != msgpack::type::MAP) {
+      continue;
+    }
+    SamplePatch patch;
+    for (uint32_t j = 0; j < p.via.map.size; ++j) {
+      const auto& key = p.via.map.ptr[j].key;
+      const auto& val = p.via.map.ptr[j].val;
+      if (key.type != msgpack::type::STR) {
+        continue;
+      }
+      const auto ks = key.as<std::string>();
+      if (ks == "level") {
+        patch.level = val.as<int16_t>();
+      } else if (ks == "lo" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
+        patch.box.lo[0] = val.via.array.ptr[0].as<int32_t>();
+        patch.box.lo[1] = val.via.array.ptr[1].as<int32_t>();
+        patch.box.lo[2] = val.via.array.ptr[2].as<int32_t>();
+      } else if (ks == "hi" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
+        patch.box.hi[0] = val.via.array.ptr[0].as<int32_t>();
+        patch.box.hi[1] = val.via.array.ptr[1].as<int32_t>();
+        patch.box.hi[2] = val.via.array.ptr[2].as<int32_t>();
+      } else if (ks == "dx" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
+        patch.geom.dx[0] = val.via.array.ptr[0].as<double>();
+        patch.geom.dx[1] = val.via.array.ptr[1].as<double>();
+        patch.geom.dx[2] = val.via.array.ptr[2].as<double>();
+      } else if (ks == "x0" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
+        patch.geom.x0[0] = val.via.array.ptr[0].as<double>();
+        patch.geom.x0[1] = val.via.array.ptr[1].as<double>();
+        patch.geom.x0[2] = val.via.array.ptr[2].as<double>();
+      } else if (ks == "index_origin" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
+        patch.geom.index_origin[0] = val.via.array.ptr[0].as<int32_t>();
+        patch.geom.index_origin[1] = val.via.array.ptr[1].as<int32_t>();
+        patch.geom.index_origin[2] = val.via.array.ptr[2].as<int32_t>();
+      } else if (ks == "is_periodic" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
+        patch.geom.is_periodic[0] = val.via.array.ptr[0].as<bool>();
+        patch.geom.is_periodic[1] = val.via.array.ptr[1].as<bool>();
+        patch.geom.is_periodic[2] = val.via.array.ptr[2].as<bool>();
+      } else if (ks == "bytes_per_value") {
+        patch.bytes_per_value = val.as<int32_t>();
+      } else if (ks == "data" && val.type == msgpack::type::BIN) {
+        patch.view.data.assign(val.via.bin.ptr, val.via.bin.ptr + val.via.bin.size);
+      }
+    }
+    if (!patch.view.data.empty()) {
+      patches.push_back(std::move(patch));
+    }
+  }
+  return patches;
+}
+
 void register_default_kernels(KernelRegistry& registry) {
   static const bool log_locality = []() {
     const char* env = std::getenv("KANGAROO_LOG_LOCALITY");
     return env != nullptr && *env != '\0' && *env != '0';
   }();
   registry.register_kernel(
-      KernelDesc{.name = "gradU_stencil", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = true},
-      [](const LevelMeta&, int32_t, std::span<const HostView>, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t>) {
-        if (!outputs.empty()) {
-          outputs[0].data.assign(1, 0);
+      KernelDesc{.name = "amr_subbox_fetch_pack", .n_inputs = 0, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta& level, int32_t block, std::span<const HostView>, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        if (outputs.empty() || block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
+          return hpx::make_ready_future();
+        }
+
+        struct Params {
+          int32_t input_field = -1;
+          int32_t input_version = 0;
+          int32_t input_step = 0;
+          int16_t input_level = 0;
+          int32_t bytes_per_value = 8;
+          int32_t halo_cells = 1;
+        } params;
+
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            auto get_key = [&](const char* key) -> const msgpack::object* {
+              for (uint32_t i = 0; i < root.via.map.size; ++i) {
+                const auto& k = root.via.map.ptr[i].key;
+                if (k.type == msgpack::type::STR && k.as<std::string>() == key) {
+                  return &root.via.map.ptr[i].val;
+                }
+              }
+              return nullptr;
+            };
+            if (const auto* fld = get_key("input_field")) params.input_field = fld->as<int32_t>();
+            if (const auto* ver = get_key("input_version")) params.input_version = ver->as<int32_t>();
+            if (const auto* stp = get_key("input_step")) params.input_step = stp->as<int32_t>();
+            if (const auto* lev = get_key("input_level")) params.input_level = lev->as<int16_t>();
+            if (const auto* bpv = get_key("bytes_per_value")) params.bytes_per_value = bpv->as<int32_t>();
+            if (const auto* halo = get_key("halo_cells")) params.halo_cells = halo->as<int32_t>();
+          }
+        }
+
+        outputs[0].data.clear();
+        if (params.input_field < 0) {
+          return hpx::make_ready_future();
+        }
+        if (params.bytes_per_value != 4 && params.bytes_per_value != 8) {
+          return hpx::make_ready_future();
+        }
+
+        const RunMeta& meta = global_runmeta();
+        if (params.input_step < 0 || static_cast<std::size_t>(params.input_step) >= meta.steps.size()) {
+          return hpx::make_ready_future();
+        }
+        const auto& step_meta = meta.steps.at(static_cast<std::size_t>(params.input_step));
+        if (params.input_level < 0 || static_cast<std::size_t>(params.input_level) >= step_meta.levels.size()) {
+          return hpx::make_ready_future();
+        }
+
+        const auto& box = level.boxes.at(static_cast<std::size_t>(block));
+        const int halo = std::max(1, params.halo_cells);
+        const auto& target_geom = level.geom;
+        double query_lo[3] = {0.0, 0.0, 0.0};
+        double query_hi[3] = {0.0, 0.0, 0.0};
+        for (int ax = 0; ax < 3; ++ax) {
+          const int32_t lo = ax == 0 ? box.lo.x : (ax == 1 ? box.lo.y : box.lo.z);
+          const int32_t hi = ax == 0 ? box.hi.x : (ax == 1 ? box.hi.y : box.hi.z);
+          query_lo[ax] = cell_edge(target_geom, ax, lo) - static_cast<double>(halo) * target_geom.dx[ax];
+          query_hi[ax] = cell_edge(target_geom, ax, hi + 1) + static_cast<double>(halo) * target_geom.dx[ax];
+        }
+
+        struct PackedPatch {
+          int16_t level = 0;
+          IndexBox3 box;
+          LevelGeom geom;
+          int32_t bytes_per_value = 4;
+          HostView data;
+        };
+        std::vector<PackedPatch> packed_patches;
+
+        DataServiceLocal data_service;
+        for (int16_t lev = 0; lev < static_cast<int16_t>(step_meta.levels.size()); ++lev) {
+          const auto& lev_meta = step_meta.levels.at(static_cast<std::size_t>(lev));
+          int32_t req_lo[3];
+          int32_t req_hi[3];
+          for (int ax = 0; ax < 3; ++ax) {
+            req_lo[ax] = coord_to_index(lev_meta.geom, ax, query_lo[ax]);
+            req_hi[ax] = coord_to_index(lev_meta.geom, ax, query_hi[ax]);
+          }
+          for (int32_t b = 0; b < static_cast<int32_t>(lev_meta.boxes.size()); ++b) {
+            if (lev == params.input_level && b == block) {
+              continue;
+            }
+            const auto& ob = lev_meta.boxes.at(static_cast<std::size_t>(b));
+            IndexBox3 request_box;
+            request_box.lo[0] = std::max(ob.lo.x, req_lo[0]);
+            request_box.lo[1] = std::max(ob.lo.y, req_lo[1]);
+            request_box.lo[2] = std::max(ob.lo.z, req_lo[2]);
+            request_box.hi[0] = std::min(ob.hi.x, req_hi[0]);
+            request_box.hi[1] = std::min(ob.hi.y, req_hi[1]);
+            request_box.hi[2] = std::min(ob.hi.z, req_hi[2]);
+            if (request_box.hi[0] < request_box.lo[0] || request_box.hi[1] < request_box.lo[1] ||
+                request_box.hi[2] < request_box.lo[2]) {
+              continue;
+            }
+
+            ChunkSubboxRef ref;
+            ref.chunk = ChunkRef{params.input_step, lev, params.input_field, params.input_version, b};
+            ref.chunk_box.lo[0] = ob.lo.x;
+            ref.chunk_box.lo[1] = ob.lo.y;
+            ref.chunk_box.lo[2] = ob.lo.z;
+            ref.chunk_box.hi[0] = ob.hi.x;
+            ref.chunk_box.hi[1] = ob.hi.y;
+            ref.chunk_box.hi[2] = ob.hi.z;
+            ref.request_box = request_box;
+            ref.bytes_per_value = params.bytes_per_value;
+            auto sub = data_service.get_subbox(ref).get();
+            if (sub.box.hi[0] < sub.box.lo[0] || sub.box.hi[1] < sub.box.lo[1] ||
+                sub.box.hi[2] < sub.box.lo[2] || sub.data.data.empty()) {
+              continue;
+            }
+
+            PackedPatch pp;
+            pp.level = lev;
+            pp.box = sub.box;
+            pp.geom = lev_meta.geom;
+            pp.bytes_per_value = params.bytes_per_value;
+            pp.data = std::move(sub.data);
+            packed_patches.push_back(std::move(pp));
+          }
+        }
+
+        msgpack::sbuffer sbuf;
+        msgpack::packer<msgpack::sbuffer> pk(&sbuf);
+        pk.pack_map(1);
+        pk.pack(std::string("patches"));
+        pk.pack_array(packed_patches.size());
+        for (const auto& p : packed_patches) {
+          pk.pack_map(9);
+          pk.pack(std::string("level"));
+          pk.pack_int16(p.level);
+          pk.pack(std::string("lo"));
+          pk.pack_array(3);
+          pk.pack_int32(p.box.lo[0]);
+          pk.pack_int32(p.box.lo[1]);
+          pk.pack_int32(p.box.lo[2]);
+          pk.pack(std::string("hi"));
+          pk.pack_array(3);
+          pk.pack_int32(p.box.hi[0]);
+          pk.pack_int32(p.box.hi[1]);
+          pk.pack_int32(p.box.hi[2]);
+          pk.pack(std::string("dx"));
+          pk.pack_array(3);
+          pk.pack_double(p.geom.dx[0]);
+          pk.pack_double(p.geom.dx[1]);
+          pk.pack_double(p.geom.dx[2]);
+          pk.pack(std::string("x0"));
+          pk.pack_array(3);
+          pk.pack_double(p.geom.x0[0]);
+          pk.pack_double(p.geom.x0[1]);
+          pk.pack_double(p.geom.x0[2]);
+          pk.pack(std::string("index_origin"));
+          pk.pack_array(3);
+          pk.pack_int32(p.geom.index_origin[0]);
+          pk.pack_int32(p.geom.index_origin[1]);
+          pk.pack_int32(p.geom.index_origin[2]);
+          pk.pack(std::string("is_periodic"));
+          pk.pack_array(3);
+          pk.pack(static_cast<bool>(p.geom.is_periodic[0]));
+          pk.pack(static_cast<bool>(p.geom.is_periodic[1]));
+          pk.pack(static_cast<bool>(p.geom.is_periodic[2]));
+          pk.pack(std::string("bytes_per_value"));
+          pk.pack_int32(p.bytes_per_value);
+          pk.pack(std::string("data"));
+          pk.pack_bin(p.data.data.size());
+          if (!p.data.data.empty()) {
+            pk.pack_bin_body(reinterpret_cast<const char*>(p.data.data.data()), p.data.data.size());
+          }
+        }
+
+        outputs[0].data.assign(sbuf.data(), sbuf.data() + sbuf.size());
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "gradU_stencil", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta& level, int32_t block, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        if (inputs.size() < 2 || outputs.empty() || block < 0 ||
+            static_cast<std::size_t>(block) >= level.boxes.size()) {
+          return hpx::make_ready_future();
+        }
+
+        struct Params {
+          int32_t input_field = -1;
+          int32_t input_version = 0;
+          int32_t input_step = 0;
+          int16_t input_level = 0;
+          int32_t bytes_per_value = 0;
+          int32_t stencil_radius = 1;
+        } params;
+
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            auto get_key = [&](const char* key) -> const msgpack::object* {
+              for (uint32_t i = 0; i < root.via.map.size; ++i) {
+                const auto& k = root.via.map.ptr[i].key;
+                if (k.type == msgpack::type::STR && k.as<std::string>() == key) {
+                  return &root.via.map.ptr[i].val;
+                }
+              }
+              return nullptr;
+            };
+            if (const auto* fld = get_key("input_field"); fld &&
+                                                       (fld->type == msgpack::type::POSITIVE_INTEGER ||
+                                                        fld->type == msgpack::type::NEGATIVE_INTEGER)) {
+              params.input_field = fld->as<int32_t>();
+            }
+            if (const auto* ver = get_key("input_version"); ver &&
+                                                          (ver->type == msgpack::type::POSITIVE_INTEGER ||
+                                                           ver->type == msgpack::type::NEGATIVE_INTEGER)) {
+              params.input_version = ver->as<int32_t>();
+            }
+            if (const auto* stp = get_key("input_step"); stp &&
+                                                        (stp->type == msgpack::type::POSITIVE_INTEGER ||
+                                                         stp->type == msgpack::type::NEGATIVE_INTEGER)) {
+              params.input_step = stp->as<int32_t>();
+            }
+            if (const auto* lev = get_key("input_level"); lev &&
+                                                         (lev->type == msgpack::type::POSITIVE_INTEGER ||
+                                                          lev->type == msgpack::type::NEGATIVE_INTEGER)) {
+              params.input_level = lev->as<int16_t>();
+            }
+            if (const auto* bpv = get_key("bytes_per_value"); bpv &&
+                                                         (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                                                          bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+              params.bytes_per_value = bpv->as<int32_t>();
+            }
+            if (const auto* sr = get_key("stencil_radius"); sr &&
+                                                      (sr->type == msgpack::type::POSITIVE_INTEGER ||
+                                                       sr->type == msgpack::type::NEGATIVE_INTEGER)) {
+              params.stencil_radius = sr->as<int32_t>();
+            }
+          }
+        }
+
+        const auto& box = level.boxes.at(static_cast<std::size_t>(block));
+        const int32_t nx = box.hi.x - box.lo.x + 1;
+        const int32_t ny = box.hi.y - box.lo.y + 1;
+        const int32_t nz = box.hi.z - box.lo.z + 1;
+        if (nx <= 0 || ny <= 0 || nz <= 0) {
+          return hpx::make_ready_future();
+        }
+
+        const auto& in = inputs[0].data;
+        int32_t bytes_per_value = params.bytes_per_value;
+        if (bytes_per_value <= 0) {
+          const std::size_t npts = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) *
+                                   static_cast<std::size_t>(nz);
+          if (npts > 0) {
+            const std::size_t guess = in.size() / npts;
+            if (guess == 4 || guess == 8) {
+              bytes_per_value = static_cast<int32_t>(guess);
+            }
+          }
+        }
+        if (bytes_per_value != 4 && bytes_per_value != 8) {
+          return hpx::make_ready_future();
+        }
+        const int32_t stencil_radius = std::max(1, params.stencil_radius);
+
+        const std::size_t out_bytes =
+            static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz) *
+            3 * sizeof(double);
+        outputs[0].data.assign(out_bytes, 0);
+        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+
+        SamplePatch self;
+        self.level = 0;
+        self.box.lo[0] = box.lo.x;
+        self.box.lo[1] = box.lo.y;
+        self.box.lo[2] = box.lo.z;
+        self.box.hi[0] = box.hi.x;
+        self.box.hi[1] = box.hi.y;
+        self.box.hi[2] = box.hi.z;
+        self.geom = level.geom;
+        self.view = inputs[0];
+        self.bytes_per_value = bytes_per_value;
+
+        const RunMeta& meta = global_runmeta();
+        if (params.input_step < 0 || static_cast<std::size_t>(params.input_step) >= meta.steps.size()) {
+          return hpx::make_ready_future();
+        }
+        const auto& step_meta = meta.steps.at(static_cast<std::size_t>(params.input_step));
+        const int16_t target_level = params.input_level;
+        if (target_level < 0 || static_cast<std::size_t>(target_level) >= step_meta.levels.size()) {
+          return hpx::make_ready_future();
+        }
+
+        std::vector<SamplePatch> patches;
+        patches.reserve(64);
+        self.level = target_level;
+        patches.push_back(std::move(self));
+        if (!inputs[1].data.empty()) {
+          auto prefetched = unpack_sample_patches(inputs[1].data);
+          patches.insert(patches.end(),
+                         std::make_move_iterator(prefetched.begin()),
+                         std::make_move_iterator(prefetched.end()));
+        }
+
+        const auto& target_geom = level.geom;
+        double query_lo[3] = {0.0, 0.0, 0.0};
+        double query_hi[3] = {0.0, 0.0, 0.0};
+        for (int ax = 0; ax < 3; ++ax) {
+          const int32_t lo = ax == 0 ? box.lo.x : (ax == 1 ? box.lo.y : box.lo.z);
+          const int32_t hi = ax == 0 ? box.hi.x : (ax == 1 ? box.hi.y : box.hi.z);
+          query_lo[ax] = cell_edge(target_geom, ax, lo) - target_geom.dx[ax];
+          query_hi[ax] = cell_edge(target_geom, ax, hi + 1) + target_geom.dx[ax];
+        }
+
+        int32_t domain_lo[3] = {std::numeric_limits<int32_t>::max(),
+                                std::numeric_limits<int32_t>::max(),
+                                std::numeric_limits<int32_t>::max()};
+        int32_t domain_hi[3] = {std::numeric_limits<int32_t>::min(),
+                                std::numeric_limits<int32_t>::min(),
+                                std::numeric_limits<int32_t>::min()};
+        if (step_meta.levels.empty()) {
+          return hpx::make_ready_future();
+        }
+        if (!step_meta.levels.empty()) {
+          for (const auto& b : step_meta.levels.front().boxes) {
+            domain_lo[0] = std::min(domain_lo[0], b.lo.x);
+            domain_lo[1] = std::min(domain_lo[1], b.lo.y);
+            domain_lo[2] = std::min(domain_lo[2], b.lo.z);
+            domain_hi[0] = std::max(domain_hi[0], b.hi.x);
+            domain_hi[1] = std::max(domain_hi[1], b.hi.y);
+            domain_hi[2] = std::max(domain_hi[2], b.hi.z);
+          }
+        }
+        if (domain_hi[0] < domain_lo[0] || domain_hi[1] < domain_lo[1] || domain_hi[2] < domain_lo[2]) {
+          return hpx::make_ready_future();
+        }
+        bool is_periodic[3] = {level.geom.is_periodic[0], level.geom.is_periodic[1], level.geom.is_periodic[2]};
+        double domain_lo_edge[3] = {
+            cell_edge(step_meta.levels.front().geom, 0, domain_lo[0]),
+            cell_edge(step_meta.levels.front().geom, 1, domain_lo[1]),
+            cell_edge(step_meta.levels.front().geom, 2, domain_lo[2]),
+        };
+        double domain_hi_edge[3] = {
+            cell_edge(step_meta.levels.front().geom, 0, domain_hi[0] + 1),
+            cell_edge(step_meta.levels.front().geom, 1, domain_hi[1] + 1),
+            cell_edge(step_meta.levels.front().geom, 2, domain_hi[2] + 1),
+        };
+
+        auto self_index = [&](int i, int j, int k) -> std::size_t {
+          return (static_cast<std::size_t>(i) * static_cast<std::size_t>(ny) + static_cast<std::size_t>(j)) *
+                     static_cast<std::size_t>(nz) +
+                 static_cast<std::size_t>(k);
+        };
+        auto read_self = [&](std::size_t idx) -> double {
+          if (bytes_per_value == 4) {
+            return static_cast<double>(reinterpret_cast<const float*>(in.data())[idx]);
+          }
+          return reinterpret_cast<const double*>(in.data())[idx];
+        };
+
+        for (int i = 0; i < nx; ++i) {
+          const int32_t gi = box.lo.x + i;
+          const double xc = cell_center(target_geom, 0, gi);
+          for (int j = 0; j < ny; ++j) {
+            const int32_t gj = box.lo.y + j;
+            const double yc = cell_center(target_geom, 1, gj);
+            for (int k = 0; k < nz; ++k) {
+              const int32_t gk = box.lo.z + k;
+              const double zc = cell_center(target_geom, 2, gk);
+              const std::size_t idx = self_index(i, j, k);
+              const double f0 = read_self(idx);
+
+              std::vector<SamplePoint> samples;
+              const int32_t width = 2 * stencil_radius + 1;
+              samples.reserve(static_cast<std::size_t>(width * width * width - 1));
+              for (int ox = -stencil_radius; ox <= stencil_radius; ++ox) {
+                for (int oy = -stencil_radius; oy <= stencil_radius; ++oy) {
+                  for (int oz = -stencil_radius; oz <= stencil_radius; ++oz) {
+                    if (ox == 0 && oy == 0 && oz == 0) {
+                      continue;
+                    }
+                    const double xp = xc + static_cast<double>(ox) * target_geom.dx[0];
+                    const double yp = yc + static_cast<double>(oy) * target_geom.dx[1];
+                    const double zp = zc + static_cast<double>(oz) * target_geom.dx[2];
+                    auto s = composite_sample_at(patches, static_cast<int>(step_meta.levels.size()) - 1,
+                                                 domain_lo, domain_hi, is_periodic,
+                                                 domain_lo_edge, domain_hi_edge, xp, yp, zp);
+                    if (!s.has_value()) {
+                      continue;
+                    }
+                    bool duplicate = false;
+                    for (const auto& existing : samples) {
+                      if (std::abs(existing.x - s->x) < 1e-14 && std::abs(existing.y - s->y) < 1e-14 &&
+                          std::abs(existing.z - s->z) < 1e-14) {
+                        duplicate = true;
+                        break;
+                      }
+                    }
+                    if (!duplicate) {
+                      samples.push_back(*s);
+                    }
+                  }
+                }
+              }
+
+              double grad[3] = {0.0, 0.0, 0.0};
+              if (samples.size() >= 3) {
+                double a[3][3] = {{0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}, {0.0, 0.0, 0.0}};
+                double bvec[3] = {0.0, 0.0, 0.0};
+                for (const auto& s : samples) {
+                  const double rx = s.x - xc;
+                  const double ry = s.y - yc;
+                  const double rz = s.z - zc;
+                  const double df = s.value - f0;
+                  const double r2 = rx * rx + ry * ry + rz * rz;
+                  if (r2 <= 0.0) {
+                    continue;
+                  }
+                  const double w = 1.0 / (r2 + 1e-30);
+                  a[0][0] += w * rx * rx;
+                  a[0][1] += w * rx * ry;
+                  a[0][2] += w * rx * rz;
+                  a[1][0] += w * ry * rx;
+                  a[1][1] += w * ry * ry;
+                  a[1][2] += w * ry * rz;
+                  a[2][0] += w * rz * rx;
+                  a[2][1] += w * rz * ry;
+                  a[2][2] += w * rz * rz;
+                  bvec[0] += w * rx * df;
+                  bvec[1] += w * ry * df;
+                  bvec[2] += w * rz * df;
+                }
+                solve_3x3(a, bvec, grad);
+              }
+
+              out[3 * idx + 0] = grad[0];
+              out[3 * idx + 1] = grad[1];
+              out[3 * idx + 2] = grad[2];
+            }
+          }
         }
         return hpx::make_ready_future();
       });
@@ -894,10 +1578,61 @@ void register_default_kernels(KernelRegistry& registry) {
       });
   registry.register_kernel(
       KernelDesc{.name = "vorticity_mag", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView>, const NeighborViews&,
+      [](const LevelMeta& level, int32_t block, std::span<const HostView> inputs, const NeighborViews&,
          std::span<HostView> outputs, std::span<const std::uint8_t>) {
-        if (!outputs.empty()) {
-          outputs[0].data.assign(1, 0);
+        if (outputs.empty() || block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
+          return hpx::make_ready_future();
+        }
+        const auto& box = level.boxes.at(static_cast<std::size_t>(block));
+        const int32_t nx = box.hi.x - box.lo.x + 1;
+        const int32_t ny = box.hi.y - box.lo.y + 1;
+        const int32_t nz = box.hi.z - box.lo.z + 1;
+        if (nx <= 0 || ny <= 0 || nz <= 0) {
+          return hpx::make_ready_future();
+        }
+        const std::size_t ncell =
+            static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
+        outputs[0].data.assign(ncell * sizeof(double), 0);
+        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+
+        // Preferred path: three scalar gradient inputs [grad(vx), grad(vy), grad(vz)].
+        if (inputs.size() >= 3) {
+          const auto& gx = inputs[0].data;
+          const auto& gy = inputs[1].data;
+          const auto& gz = inputs[2].data;
+          if (gx.size() >= ncell * 3 * sizeof(double) && gy.size() >= ncell * 3 * sizeof(double) &&
+              gz.size() >= ncell * 3 * sizeof(double)) {
+            const auto* du = reinterpret_cast<const double*>(gx.data());
+            const auto* dv = reinterpret_cast<const double*>(gy.data());
+            const auto* dw = reinterpret_cast<const double*>(gz.data());
+            for (std::size_t idx = 0; idx < ncell; ++idx) {
+              const double dudy = du[3 * idx + 1];
+              const double dudz = du[3 * idx + 2];
+              const double dvdx = dv[3 * idx + 0];
+              const double dvdz = dv[3 * idx + 2];
+              const double dwdx = dw[3 * idx + 0];
+              const double dwdy = dw[3 * idx + 1];
+              const double wx = dwdy - dvdz;
+              const double wy = dudz - dwdx;
+              const double wz = dvdx - dudy;
+              out[idx] = std::sqrt(wx * wx + wy * wy + wz * wz);
+            }
+            return hpx::make_ready_future();
+          }
+        }
+
+        // Backward-compatible fallback: one scalar gradient input -> |grad(S)|.
+        if (!inputs.empty()) {
+          const auto& g = inputs[0].data;
+          if (g.size() >= ncell * 3 * sizeof(double)) {
+            const auto* grad = reinterpret_cast<const double*>(g.data());
+            for (std::size_t idx = 0; idx < ncell; ++idx) {
+              const double gx = grad[3 * idx + 0];
+              const double gy = grad[3 * idx + 1];
+              const double gz = grad[3 * idx + 2];
+              out[idx] = std::sqrt(gx * gx + gy * gy + gz * gz);
+            }
+          }
         }
         return hpx::make_ready_future();
       });

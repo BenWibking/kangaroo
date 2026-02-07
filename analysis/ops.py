@@ -8,40 +8,78 @@ from .plan import FieldRef
 
 
 class VorticityMag:
-    def __init__(self, vel_field: int, out_name: str = "vortmag") -> None:
+    def __init__(
+        self,
+        vel_field: int | tuple[int, int, int],
+        out_name: str = "vortmag",
+        stencil_radius: int = 1,
+    ) -> None:
         self.vel_field = vel_field
         self.out_name = out_name
+        self.stencil_radius = stencil_radius
 
     def lower(self, ctx: LoweringContext):
         ds = ctx.dataset
         dom = ctx.domain(step=ds.step, level=ds.level)
 
-        grad_u = ctx.temp_field("gradU")
+        grad_fields: list[FieldRef] = []
         vort = ctx.output_field(self.out_name)
 
-        s1 = ctx.stage("gradients")
-        s1.map_blocks(
-            name="gradU",
-            kernel="gradU_stencil",
-            domain=dom,
-            inputs=[FieldRef(self.vel_field)],
-            outputs=[grad_u],
-            deps={"kind": "FaceNeighbors", "width": 1, "faces": [1, 1, 1, 1, 1, 1]},
-            params={"order": 2},
-        )
+        s0 = ctx.stage("neighbor_fetch")
+        s1 = ctx.stage("gradients", after=[s0])
+        if isinstance(self.vel_field, tuple):
+            component_fields = list(self.vel_field)
+        else:
+            component_fields = [self.vel_field]
+
+        for comp, field_id in enumerate(component_fields):
+            fetch_f = ctx.temp_field(f"nbrPatches_{comp}")
+            s0.map_blocks(
+                name=f"fetch_nbr_{comp}",
+                kernel="amr_subbox_fetch_pack",
+                domain=dom,
+                inputs=[],
+                outputs=[fetch_f],
+                deps={"kind": "None"},
+                params={
+                    "input_field": field_id,
+                    "input_version": 0,
+                    "input_step": ds.step,
+                    "input_level": ds.level,
+                    "halo_cells": self.stencil_radius,
+                },
+            )
+            grad_f = ctx.temp_field(f"gradU_{comp}")
+            grad_fields.append(grad_f)
+            s1.map_blocks(
+                name=f"gradU_{comp}",
+                kernel="gradU_stencil",
+                domain=dom,
+                inputs=[FieldRef(field_id), fetch_f],
+                outputs=[grad_f],
+                deps={"kind": "None"},
+                params={
+                    "order": 2,
+                    "input_field": field_id,
+                    "input_version": 0,
+                    "input_step": ds.step,
+                    "input_level": ds.level,
+                    "stencil_radius": self.stencil_radius,
+                },
+            )
 
         s2 = ctx.stage("vortmag", after=[s1])
         s2.map_blocks(
             name="vortmag",
             kernel="vorticity_mag",
             domain=dom,
-            inputs=[grad_u],
+            inputs=grad_fields,
             outputs=[vort],
             deps={"kind": "None"},
             params={},
         )
 
-        return ctx.fragment([s1, s2])
+        return ctx.fragment([s0, s1, s2])
 
 
 def _axis_index(axis: str | int) -> int:
