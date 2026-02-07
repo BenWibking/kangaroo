@@ -14,10 +14,9 @@ REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 
-from analysis import Plan, Runtime  # noqa: E402
-from analysis.ctx import LoweringContext  # noqa: E402
+from analysis import Runtime  # noqa: E402
+from analysis.pipeline import pipeline  # noqa: E402
 from analysis.dataset import open_dataset  # noqa: E402
-from analysis.ops import UniformSlice  # noqa: E402
 from analysis.runtime import log_task_event, plan_to_dict, set_event_log_path  # noqa: E402
 
 
@@ -297,18 +296,18 @@ def main() -> int:
         rect = (x_mid - half_width, y_mid - half_height, x_mid + half_width, y_mid + half_height)
 
     with logger.span("setup/plan_build"):
-        ctx = LoweringContext(runtime=rt._rt, runmeta=runmeta, dataset=ds)
-        op = UniformSlice(
-            field=field,
+        pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+        slice_out = pipe.uniform_slice(
+            field=pipe.field(field),
             axis=args.axis,
             coord=coord,
             rect=rect,
             resolution=resolution,
+            out="slice",
             bytes_per_value=bytes_per_value,
             amr_cell_average=args.amr_cell_average,
         )
-        stages = op.lower(ctx)
-        plan = Plan(stages=stages)
+        plan = pipe.plan()
 
         plan_payload = plan_to_dict(plan)
         #print("PlanIR:")
@@ -336,7 +335,7 @@ def main() -> int:
         print("Runtime executed but raised (kernels may be missing):", exc)
 
     with logger.span("postprocess/fetch_output"):
-        slice_field = plan.stages[-1].templates[0].outputs[0].field
+        slice_field = slice_out.field
         raw = rt.get_task_chunk(step=0, level=base_level, field=slice_field, version=0, block=0)
         np_dtype = np.float64 if bytes_per_value == 8 else np.float32
         slice_2d = np.frombuffer(raw, dtype=np_dtype, count=resolution[0] * resolution[1]).reshape(

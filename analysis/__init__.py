@@ -20,6 +20,9 @@ __all__ = [
     "BlockBox",
     "load_runmeta_from_dict",
     "PlotfileReader",
+    "Pipeline",
+    "FieldHandle",
+    "pipeline",
 ]
 
 
@@ -68,4 +71,12 @@ def __getattr__(name):
         from .plotfile import PlotfileReader
 
         return PlotfileReader
+    if name in {"Pipeline", "FieldHandle", "pipeline"}:
+        from .pipeline import FieldHandle, Pipeline, pipeline
+
+        return {
+            "Pipeline": Pipeline,
+            "FieldHandle": FieldHandle,
+            "pipeline": pipeline,
+        }[name]
     raise AttributeError(name)
