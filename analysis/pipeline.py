@@ -24,6 +24,9 @@ class Pipeline:
         self.runtime = runtime
         self.runmeta = runmeta
         self.dataset = dataset
+        bind_dataset = getattr(runtime, "_bind_dataset_handle", None)
+        if callable(bind_dataset):
+            bind_dataset(dataset)
         core_runtime = getattr(runtime, "_rt", runtime)
         self._ctx = LoweringContext(runtime=core_runtime, runmeta=runmeta, dataset=dataset)
         self._stages: list[Stage] = []
@@ -125,9 +128,8 @@ class Pipeline:
         rect: tuple[float, float, float, float],
         resolution: tuple[int, int],
         out: str | None = None,
-        bytes_per_value: int = 4,
+        bytes_per_value: int | None = None,
         reduce_fan_in: int | None = None,
-        amr_cell_average: bool = False,
     ) -> FieldHandle:
         out_name = out or self._unique_name("slice")
         fragment = UniformSlice(
@@ -139,7 +141,6 @@ class Pipeline:
             out_name=out_name,
             bytes_per_value=bytes_per_value,
             reduce_fan_in=reduce_fan_in,
-            amr_cell_average=amr_cell_average,
         ).lower(self._ctx)
         self._append_fragment(fragment)
         out_field = self._sink_fields(fragment)[-1]
@@ -154,7 +155,7 @@ class Pipeline:
         rect: tuple[float, float, float, float],
         resolution: tuple[int, int],
         out: str | None = None,
-        bytes_per_value: int = 4,
+        bytes_per_value: int | None = None,
         reduce_fan_in: int | None = None,
         amr_cell_average: bool = True,
     ) -> FieldHandle:

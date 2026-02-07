@@ -107,6 +107,25 @@ def _overlaps_1d(a0: float, a1: float, b0: float, b1: float) -> bool:
     return not (a1 < b0 or b1 < a0)
 
 
+def _resolve_bytes_per_value(
+    ctx: LoweringContext,
+    *,
+    field: int,
+    bytes_per_value: int | None,
+    level: int = 0,
+) -> int:
+    if bytes_per_value is not None:
+        return int(bytes_per_value)
+
+    ds = ctx.dataset
+    runtime = getattr(ds, "runtime", None)
+    if runtime is None:
+        raise RuntimeError(
+            "bytes_per_value was not provided and could not be inferred: dataset runtime is missing"
+        )
+    return int(ds.infer_bytes_per_value(runtime, field=field, level=level, step=ds.step))
+
+
 class UniformSlice:
     def __init__(
         self,
@@ -117,9 +136,8 @@ class UniformSlice:
         rect: tuple[float, float, float, float],
         resolution: tuple[int, int],
         out_name: str = "slice",
-        bytes_per_value: int = 4,
+        bytes_per_value: int | None = None,
         reduce_fan_in: Optional[int] = None,
-        amr_cell_average: bool = False,
     ) -> None:
         self.field = field
         self.axis = axis
@@ -129,7 +147,6 @@ class UniformSlice:
         self.out_name = out_name
         self.bytes_per_value = bytes_per_value
         self.reduce_fan_in = reduce_fan_in
-        self.amr_cell_average = amr_cell_average
 
     def _intersecting_blocks_level(self, level_meta, *, plane_index: int | None = None) -> Iterable[int]:
         axis_idx = _axis_index(self.axis)
@@ -177,99 +194,6 @@ class UniformSlice:
         if self.reduce_fan_in is None:
             return max(2, int(math.sqrt(num_inputs)))
         return max(1, int(self.reduce_fan_in))
-
-    def _slice_level(self, ctx: LoweringContext, *, level: int, blocks: list[int]) -> tuple[list, FieldRef, int]:
-        ds = ctx.dataset
-        axis_idx = _axis_index(self.axis)
-        u_axis, v_axis = [i for i in range(3) if i != axis_idx]
-        nx, ny = self.resolution
-        out_bytes = nx * ny * self.bytes_per_value
-        out_field = ctx.output_field(self.out_name)
-
-        if len(blocks) == 1:
-            stage = ctx.stage("uniform_slice")
-            for block in blocks:
-                dom = ctx.domain(step=ds.step, level=level, blocks=[block])
-                stage.map_blocks(
-                    name=f"uniform_slice_b{block}",
-                    kernel="uniform_slice",
-                    domain=dom,
-                    inputs=[FieldRef(self.field)],
-                    outputs=[out_field],
-                    output_bytes=[out_bytes],
-                    deps={"kind": "None"},
-                    params={
-                        "axis": axis_idx,
-                        "coord": self.coord,
-                        "rect": list(self.rect),
-                        "resolution": [nx, ny],
-                        "plane_axes": [u_axis, v_axis],
-                        "bytes_per_value": self.bytes_per_value,
-                    },
-                )
-            return [stage], out_field, out_bytes
-
-        block_field = ctx.temp_field(f"{self.out_name}_blocks_l{level}")
-        stages = []
-
-        stage = ctx.stage("uniform_slice")
-        for block in blocks:
-            dom = ctx.domain(step=ds.step, level=level, blocks=[block])
-            stage.map_blocks(
-                name=f"uniform_slice_b{block}",
-                kernel="uniform_slice",
-                domain=dom,
-                inputs=[FieldRef(self.field)],
-                outputs=[block_field],
-                output_bytes=[out_bytes],
-                deps={"kind": "None"},
-                params={
-                    "axis": axis_idx,
-                    "coord": self.coord,
-                    "rect": list(self.rect),
-                    "resolution": [nx, ny],
-                    "plane_axes": [u_axis, v_axis],
-                    "bytes_per_value": self.bytes_per_value,
-                },
-            )
-        stages.append(stage)
-
-        num_inputs = len(blocks)
-        fan_in = self._reduce_fan_in(num_inputs)
-        input_field = block_field
-        reduce_idx = 0
-        while num_inputs > 1:
-            num_groups = (num_inputs + fan_in - 1) // fan_in
-            output_field = out_field if num_groups == 1 else ctx.temp_field(
-                f"{self.out_name}_reduce_{level}_{reduce_idx}"
-            )
-            reduce_stage = ctx.stage("uniform_slice_reduce", plane="graph", after=[stages[-1]])
-            reduce_params = {
-                "graph_kind": "reduce",
-                "fan_in": fan_in,
-                "num_inputs": num_inputs,
-                "input_base": 0,
-                "output_base": 0,
-                "bytes_per_value": self.bytes_per_value,
-            }
-            if reduce_idx == 0:
-                reduce_params["input_blocks"] = list(blocks)
-            reduce_stage.map_blocks(
-                name=f"uniform_slice_reduce_s{reduce_idx}",
-                kernel="uniform_slice_reduce",
-                domain=ctx.domain(step=ds.step, level=level),
-                inputs=[input_field],
-                outputs=[output_field],
-                output_bytes=[out_bytes],
-                deps={"kind": "None"},
-                params=reduce_params,
-            )
-            stages.append(reduce_stage)
-            input_field = output_field
-            num_inputs = num_groups
-            reduce_idx += 1
-
-        return stages, out_field, out_bytes
 
     def _coarsen_box(
         self,
@@ -351,6 +275,7 @@ class UniformSlice:
         axis_idx = _axis_index(self.axis)
         u_axis, v_axis = [i for i in range(3) if i != axis_idx]
         nx, ny = self.resolution
+        bpv = _resolve_bytes_per_value(ctx, field=self.field, bytes_per_value=self.bytes_per_value)
         if nx <= 0 or ny <= 0:
             raise ValueError("resolution must be positive")
 
@@ -408,7 +333,7 @@ class UniformSlice:
                         "rect": list(self.rect),
                         "resolution": [nx, ny],
                         "plane_axes": [u_axis, v_axis],
-                        "bytes_per_value": self.bytes_per_value,
+                        "bytes_per_value": bpv,
                         "covered_boxes": covered_payload,
                     },
                 )
@@ -556,7 +481,7 @@ class UniformSlice:
                 FieldRef(total_area.field, version=total_area.version, domain=ctx.domain(step=ds.step, level=total_area_level)),
             ],
             outputs=[out_field],
-            output_bytes=[nx * ny * self.bytes_per_value],
+            output_bytes=[nx * ny * bpv],
             deps={"kind": "None"},
             params={
                 "graph_kind": "reduce",
@@ -564,7 +489,7 @@ class UniformSlice:
                 "num_inputs": 1,
                 "input_base": 0,
                 "output_base": 0,
-                "bytes_per_value": self.bytes_per_value,
+                "bytes_per_value": bpv,
                 "pixel_area": abs((self.rect[2] - self.rect[0]) / nx) * abs((self.rect[3] - self.rect[1]) / ny),
             },
         )
@@ -573,105 +498,7 @@ class UniformSlice:
         return ctx.fragment(stages)
 
     def lower(self, ctx: LoweringContext):
-        if self.amr_cell_average:
-            return self._lower_amr_cell_average(ctx)
-
-        ds = ctx.dataset
-        axis_idx = _axis_index(self.axis)
-        u_axis, v_axis = [i for i in range(3) if i != axis_idx]
-        nx, ny = self.resolution
-        if nx <= 0 or ny <= 0:
-            raise ValueError("resolution must be positive")
-
-        level_meta = ctx.runmeta.steps[ds.step].levels[ds.level]
-        blocks = list(self._intersecting_blocks_level(level_meta))
-        if not blocks:
-            return ctx.fragment([])
-
-        out_bytes = nx * ny * self.bytes_per_value
-        out_field = ctx.output_field(self.out_name)
-
-        if len(blocks) == 1:
-            stage = ctx.stage("uniform_slice")
-            for block in blocks:
-                dom = ctx.domain(step=ds.step, level=ds.level, blocks=[block])
-                stage.map_blocks(
-                    name=f"uniform_slice_b{block}",
-                    kernel="uniform_slice",
-                    domain=dom,
-                    inputs=[FieldRef(self.field)],
-                    outputs=[out_field],
-                    output_bytes=[out_bytes],
-                    deps={"kind": "None"},
-                    params={
-                        "axis": axis_idx,
-                        "coord": self.coord,
-                        "rect": list(self.rect),
-                        "resolution": [nx, ny],
-                        "plane_axes": [u_axis, v_axis],
-                        "bytes_per_value": self.bytes_per_value,
-                    },
-                )
-            return ctx.fragment([stage])
-
-        block_field = ctx.temp_field(f"{self.out_name}_blocks")
-        stages = []
-
-        stage = ctx.stage("uniform_slice")
-        for block in blocks:
-            dom = ctx.domain(step=ds.step, level=ds.level, blocks=[block])
-            stage.map_blocks(
-                name=f"uniform_slice_b{block}",
-                kernel="uniform_slice",
-                domain=dom,
-                inputs=[FieldRef(self.field)],
-                outputs=[block_field],
-                output_bytes=[out_bytes],
-                deps={"kind": "None"},
-                params={
-                    "axis": axis_idx,
-                    "coord": self.coord,
-                    "rect": list(self.rect),
-                    "resolution": [nx, ny],
-                    "plane_axes": [u_axis, v_axis],
-                    "bytes_per_value": self.bytes_per_value,
-                },
-            )
-        stages.append(stage)
-
-        num_inputs = len(blocks)
-        fan_in = self._reduce_fan_in(num_inputs)
-        input_field = block_field
-        reduce_idx = 0
-        while num_inputs > 1:
-            num_groups = (num_inputs + fan_in - 1) // fan_in
-            output_field = out_field if num_groups == 1 else ctx.temp_field(
-                f"{self.out_name}_reduce_{reduce_idx}"
-            )
-            reduce_stage = ctx.stage("uniform_slice_reduce", plane="graph", after=[stages[-1]])
-            reduce_stage.map_blocks(
-                name=f"uniform_slice_reduce_s{reduce_idx}",
-                kernel="uniform_slice_reduce",
-                domain=ctx.domain(step=ds.step, level=ds.level),
-                inputs=[input_field],
-                outputs=[output_field],
-                output_bytes=[out_bytes],
-                deps={"kind": "None"},
-                params={
-                    "graph_kind": "reduce",
-                    "fan_in": fan_in,
-                    "num_inputs": num_inputs,
-                    "input_base": 0,
-                    "output_base": 0,
-                    "bytes_per_value": self.bytes_per_value,
-                },
-            )
-            stages.append(reduce_stage)
-            input_field = output_field
-            num_inputs = num_groups
-            reduce_idx += 1
-
-        return ctx.fragment(stages)
+        return self._lower_amr_cell_average(ctx)
 
 
 class UniformProjection:
@@ -684,7 +511,7 @@ class UniformProjection:
         rect: tuple[float, float, float, float],
         resolution: tuple[int, int],
         out_name: str = "projection",
-        bytes_per_value: int = 4,
+        bytes_per_value: int | None = None,
         reduce_fan_in: Optional[int] = None,
         amr_cell_average: bool = True,
     ) -> None:
@@ -823,6 +650,7 @@ class UniformProjection:
         ds = ctx.dataset
         axis_idx = _axis_index(self.axis)
         nx, ny = self.resolution
+        bpv = _resolve_bytes_per_value(ctx, field=self.field, bytes_per_value=self.bytes_per_value)
         if nx <= 0 or ny <= 0:
             raise ValueError("resolution must be positive")
 
@@ -872,7 +700,7 @@ class UniformProjection:
                         "axis_bounds": [float(self.axis_bounds[0]), float(self.axis_bounds[1])],
                         "rect": list(self.rect),
                         "resolution": [nx, ny],
-                        "bytes_per_value": self.bytes_per_value,
+                        "bytes_per_value": bpv,
                         "covered_boxes": covered_payload,
                     },
                 )

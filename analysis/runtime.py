@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import sys
 from typing import Any
 
 import importlib.util
 from pathlib import Path
-import sys
 
 import msgpack
+import numpy as np
 
 from .plan import Plan
 
@@ -55,6 +56,30 @@ class Runtime:
         else:
             self._rt = _core.Runtime()
 
+    @classmethod
+    def from_parsed_args(
+        cls,
+        parsed_args: Any,
+        *,
+        unknown_args: list[str] | None = None,
+        argv0: str | None = None,
+    ) -> "Runtime":
+        hpx_config = getattr(parsed_args, "hpx_config", None)
+        hpx_args = list(getattr(parsed_args, "hpx_arg", None) or [])
+        unknown = list(unknown_args or [])
+        if unknown:
+            hpx_args.extend([argv0 or sys.argv[0], *unknown])
+        if hpx_config or hpx_args:
+            return cls(hpx_config=hpx_config, hpx_args=hpx_args)
+        return cls()
+
+    @staticmethod
+    def _bind_dataset_handle(dataset: Any | None) -> None:
+        if dataset is None or not hasattr(dataset, "_h"):
+            return
+        if hasattr(_core, "set_global_dataset"):
+            _core.set_global_dataset(dataset._h)
+
     @property
     def kernels(self):
         return self._rt.kernels()
@@ -66,6 +91,7 @@ class Runtime:
         self._rt.mark_field_persistent(fid, name)
 
     def run(self, plan: Plan, *, runmeta, dataset) -> None:
+        self._bind_dataset_handle(dataset)
         packed = msgpack.packb(plan_to_dict(plan), use_bin_type=True)
         self._rt.run_packed_plan(packed, runmeta._h, dataset._h)
 
@@ -73,6 +99,7 @@ class Runtime:
         self._rt.set_event_log_path(path)
 
     def preload(self, *, runmeta, dataset, fields: list[int]) -> None:
+        self._bind_dataset_handle(dataset)
         self._rt.preload_dataset(runmeta._h, dataset._h, list(fields))
 
     def get_task_chunk(
@@ -83,8 +110,46 @@ class Runtime:
         field: int,
         version: int = 0,
         block: int,
+        dataset: Any | None = None,
     ) -> bytes:
+        self._bind_dataset_handle(dataset)
         return self._rt.get_task_chunk(step, level, field, version, block)
+
+    def get_task_chunk_array(
+        self,
+        *,
+        step: int,
+        level: int,
+        field: int,
+        shape: tuple[int, ...],
+        version: int = 0,
+        block: int,
+        dtype: Any | None = None,
+        bytes_per_value: int | None = None,
+        dataset: Any | None = None,
+    ) -> np.ndarray:
+        count = int(np.prod(shape))
+        if count <= 0:
+            raise ValueError("shape must have a positive number of elements")
+
+        raw = self.get_task_chunk(
+            step=step,
+            level=level,
+            field=field,
+            version=version,
+            block=block,
+            dataset=dataset,
+        )
+        if dtype is None:
+            if bytes_per_value is None:
+                bytes_per_value = len(raw) // count
+            if bytes_per_value == 8:
+                dtype = np.float64
+            elif bytes_per_value == 4:
+                dtype = np.float32
+            else:
+                raise ValueError(f"unsupported bytes_per_value: {bytes_per_value}")
+        return np.frombuffer(raw, dtype=dtype, count=count).reshape(shape)
 
 
 def plan_to_dict(plan: Plan) -> dict:
