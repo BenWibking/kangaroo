@@ -1,4 +1,4 @@
-# Kangaroo
+# Kangaroo [experimental]
 
 ![image](logo.png)
 
