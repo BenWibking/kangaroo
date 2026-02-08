@@ -1,116 +1,171 @@
-Kangaroo prototype runtime
+# Kangaroo
 
-This repo contains a prototype implementation of the distributed task runtime described in `PLAN.md`.
-The Python side provides a DSL to author operators and plans, and the C++ side (HPX-based) provides
-execution, data services, adjacency, and kernel registry scaffolding. Output buffers are allocated
-by the DataService, with optional per-output sizes provided in the plan.
+Kangaroo is a prototype distributed analysis runtime with:
+- a Python API/DSL in `analysis/`
+- an HPX/C++ runtime in `cpp/`
+- plotfile-focused workflows in `scripts/plotfile_*.py`
 
-Status
-- Python DSL: implemented in `analysis/`
-- C++ runtime: scaffolded in `cpp/` (HPX target with local adjacency/data services)
-- Msgpack decoding: wired via msgpack-c (required)
+The current recommended usage pattern is:
+1. create a `Runtime` (typically via `Runtime.from_parsed_args(...)`),
+2. open a dataset with `open_dataset(...)`,
+3. derive geometry with dataset helpers (`metadata_bundle`, `resolve_field`, `plane_geometry`),
+4. build operations with the imperative pipeline API (`pipeline(...).uniform_slice(...)`, `uniform_projection(...)`),
+5. run and fetch output bytes/arrays via `Runtime`.
 
-Python quickstart (prototype)
+## Requirements
+
+- Python 3.10-3.13
+- CMake + C++ toolchain
+- HPX (Pixi-managed by default)
+
+## Setup and Build
+
+Using Pixi (recommended):
+
+```bash
+pixi install
+pixi run configure
+pixi run build
+pixi run install
 ```
-from analysis import Runtime, Plan
-from analysis.ctx import LoweringContext
-from analysis.ops import VorticityMag
-from analysis.runmeta import RunMeta, StepMeta, LevelMeta, LevelGeom, BlockBox
-from analysis.dataset import open_dataset
 
-runmeta = RunMeta(steps=[
-    StepMeta(step=0, levels=[
-        LevelMeta(
-            geom=LevelGeom(dx=(1.0, 1.0, 1.0), x0=(0.0, 0.0, 0.0), ref_ratio=1),
-            boxes=[BlockBox((0, 0, 0), (7, 7, 7)), BlockBox((8, 0, 0), (15, 7, 7))],
-        )
-    ])
-])
+Run tests:
+
+```bash
+pixi run test
+```
+
+If `analysis._core` fails to import, install the extension module with `pixi run install`.
+
+## Plotfile Scripts (Current Workflows)
+
+All examples below assume:
+
+```bash
+pixi run python ...
+```
+
+### 1) Uniform slice with Kangaroo
+
+```bash
+pixi run python scripts/plotfile_slice.py /path/to/plotfile \
+  --var density \
+  --axis z \
+  --coord 0.0 \
+  --zoom 1.0 \
+  --resolution 1024,1024 \
+  --output slice.png
+```
+
+Notes:
+- `--var` defaults to the first dataset variable if omitted.
+- `--axis` is one of `x|y|z`.
+- `--resolution` is `Nx,Ny`.
+- unknown CLI args are forwarded to HPX through `Runtime.from_parsed_args(...)`, so flags like `--hpx:threads=8` can be passed directly.
+
+### 2) Uniform projection with Kangaroo
+
+```bash
+pixi run python scripts/plotfile_projection.py /path/to/plotfile \
+  --var density \
+  --axis z \
+  --axis-bounds 0.0,3.0e22 \
+  --zoom 1.0 \
+  --resolution 1024,1024 \
+  --output projection.png
+```
+
+Notes:
+- projection currently requires AMR cell-average semantics (`--amr-cell-average`, enabled by default).
+- byte width is inferred from dataset chunks via `Dataset.infer_bytes_per_value(...)`.
+
+### 3) Per-FAB min/max inspection
+
+```bash
+pixi run python scripts/plotfile_fab_minmax.py /path/to/plotfile --level 0 --fab 0
+```
+
+This uses `analysis.PlotfileReader` directly to inspect component-wise min/max values per FAB.
+
+### 4) yt reference/benchmark slice path
+
+```bash
+pixi run python scripts/plotfile_slice_yt.py /path/to/plotfile \
+  --var density \
+  --axis z \
+  --resolution 1024,1024
+```
+
+This is useful for comparison/benchmarking against Kangaroo slice behavior.
+
+## Pipeline API Example (Recommended)
+
+```python
+from analysis import Runtime
+from analysis.dataset import open_dataset
+from analysis.pipeline import pipeline
 
 rt = Runtime()
+ds = open_dataset("/path/to/plotfile", runtime=rt)
 
-ds = open_dataset("memory://example", runmeta=runmeta, step=0, level=0, runtime=rt)
-vel = ds.field_id("vel")
+metadata = ds.metadata_bundle()
+runmeta = metadata.runmeta
+comp, field_id, _ = ds.resolve_field("density")
 
-op = VorticityMag(vel_field=vel)
-ctx = LoweringContext(runtime=rt._rt, runmeta=runmeta._h, dataset=ds)
-plan = Plan(stages=op.lower(ctx))
+view = ds.plane_geometry(axis="z", level=0, coord=None, zoom=1.0, resolution="512,512")
 
-rt.run(plan, runmeta=runmeta, dataset=ds)
-```
+pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+out = pipe.uniform_slice(
+    field=pipe.field(field_id),
+    axis="z",
+    coord=view["coord"],
+    rect=view["rect"],
+    resolution=view["resolution"],
+    out="slice",
+)
 
-Output allocation
-- Outputs are allocated by the DataService.
-- In Python, supply `output_bytes` in `map_blocks(...)` to request sizes per output.
-- If omitted, outputs are allocated with size 0 (kernels may resize if desired).
-
-Example:
-```
-s1.map_blocks(
-    name="gradU",
-    kernel="gradU_stencil",
-    domain=dom,
-    inputs=[FieldRef(self.vel_field)],
-    outputs=[gradU],
-    output_bytes=[1024],
-    deps={"kind": "FaceNeighbors", "width": 1, "faces": [1, 1, 1, 1, 1, 1]},
-    params={"order": 2},
+rt.run(pipe.plan(), runmeta=runmeta, dataset=ds)
+arr = rt.get_task_chunk_array(
+    step=0,
+    level=0,
+    field=out.field,
+    version=0,
+    block=0,
+    shape=view["resolution"],
+    dataset=ds,
 )
 ```
 
-C++ build (HPX required)
-- Configure and build in `cpp/` using CMake. The runtime builds as a static library and installs the `_core` module plus `analysis/` into site-packages.
-- msgpack-c is required and fetched automatically if not found.
-- Python bindings are required and build via nanobind.
-- Pixi environment (recommended for HPX):
-  - Minimal (Python + extension):
-    - `pixi install`
-    - `pixi run install`
-    - `pixi run test`
-  - C++ dev loop (optional):
-    - `pixi run configure`
-    - `pixi run build`
-  - `scripts/utils/detect_hpx.sh` will find HPX inside the Pixi/conda prefix automatically.
-  - Build deps (`scikit-build-core`, `nanobind`) are provided by Pixi; `install` uses `--no-build-isolation`.
-  - The C++ msgpack headers come from `msgpack-cxx` in the Pixi env.
-  - Run Python with `pixi run python ...` so it picks up the Pixi HPX + extension module.
-  - Example (set HPX worker threads): `pixi run python scripts/plotfile_slice.py /path/to/plotfile --var density --hpx:threads=8`
-  - Note: the conda-forge HPX package used by Pixi may be built without networking enabled, which prevents multi-locality runs. For multi-rank execution, build HPX with `-DHPX_WITH_NETWORKING=On` and point `scripts/utils/detect_hpx.sh` at that install.
-HPX autodetect helper
-- Use `scripts/utils/detect_hpx.sh` to verify HPX resolution inside the Pixi env:
-  - `HPX_DIR=$(scripts/utils/detect_hpx.sh)`
+To forward HPX flags from CLI scripts, use `argparse.parse_known_args()` and pass unknown args into `Runtime.from_parsed_args(...)` (as done by `scripts/plotfile_slice.py` and `scripts/plotfile_projection.py`).
 
-Kangaroo Dashboard (Bokeh)
-- Run the dashboard (local system metrics only):
-  - `python scripts/kangaroo_dashboard.py`
-- Note: the dashboard requires Python < 3.14 (NumPy/Bokeh crash on 3.14 in current env).
-- Launch a workflow and monitor it (event log + DAG auto-wired):
-  - `python scripts/kangaroo_dashboard.py --run scripts/plotfile_slice_operator_demo.py -- /path/to/plotfile`
-- Provide a JSONL event log for task stream/flamegraph/metrics:
-  - `python scripts/kangaroo_dashboard.py --metrics path/to/events.jsonl`
-- Provide a plan JSON to render a DAG (e.g. `analysis.runtime.plan_to_dict` output):
-  - `python scripts/kangaroo_dashboard.py --plan path/to/plan.json`
+## Data Sources
 
-Kangaroo Dashboard (C++/Clay) timeline notes
-- The task timeline uses runtime `0` as the earliest task start (`min(task.start)`), not wall-clock epoch.
-- Tasks are grouped by `worker`; each worker is rendered on its own vertical lane.
-- Bar x-positions are computed from `(task_start_runtime, task_end_runtime)` and must remain linear in time.
-- Lane width must be at least the visible lane viewport width:
-  - `timeline_draw_width_px = max(span_s * base_pixels_per_second, visible_lane_width_px)`.
-- Rendering and drag-to-zoom must use the exact same pixels-per-second scale (`timeline_pixels_per_second`).
-- Drag x-to-runtime conversion must account for horizontal scroll with the correct sign:
-  - `content_x = mouse_x - timeline_origin_x + scroll_x`.
-- Drag selection should clamp to `[0, timeline_draw_width_px]`, then map to runtime and clamp to current view.
-- Selection start can begin anywhere in the task panel; right-click in panel resets zoom.
-- Keep a visible drag rectangle overlay to verify hit-testing/extent while debugging.
+`open_dataset(...)` resolves these forms:
+- AMReX plotfile directory paths (auto-resolved to `amrex://...`)
+- `amrex://...`
+- `openpmd://...`
+- `parthenon://...` (including `.phdf/.h5/.hdf5` files)
+- `memory://...` (for synthetic/in-memory testing)
 
-Event log schema (one JSON object per line):
+## Dashboard
+
+Run the local dashboard:
+
+```bash
+pixi run python scripts/kangaroo_dashboard.py
 ```
-{"type": "metrics", "mem_used_gb": 12.3, "mem_total_gb": 64.0, "cpu_percent": 80.1,
- "io_read_mbps": 120.0, "io_write_mbps": 55.0, "runtime_s": 42.5}
-{"type": "task", "id": "1:0:0:3", "status": "start", "name": "plotfile_load_b3",
- "worker": "rank-0", "start": 1700000000.0, "end": 1700000000.0}
-{"type": "task", "id": "1:0:0:3", "status": "end", "name": "plotfile_load_b3",
- "worker": "rank-0", "start": 1700000000.0, "end": 1700000001.2}
-{"type": "dag", "nodes": [{"id": 0, "name": "stage-a"}], "edges": [[0, 1]]}
+
+Run a workflow under the dashboard:
+
+```bash
+pixi run python scripts/kangaroo_dashboard.py \
+  --run scripts/plotfile_slice.py -- /path/to/plotfile --var density
 ```
+
+## Development Notes
+
+- Python tests live in `tests/` and run with `pytest -q`.
+- Main implementation areas:
+  - Python API: `analysis/`
+  - runtime/bindings: `cpp/`
+- Additional design context: `PLAN.md` and `TRACKED_GAPS.md`.
