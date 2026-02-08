@@ -1,10 +1,11 @@
 cmake_minimum_required(VERSION 3.22)
 
-project(kangaroo_runtime LANGUAGES CXX)
+project(kangaroo_runtime LANGUAGES C CXX)
 
 option(KANGAROO_ASAN "Enable AddressSanitizer for kangaroo targets" OFF)
 option(KANGAROO_USE_OPENPMD "Enable openPMD reader support" OFF)
 option(KANGAROO_USE_PARTHENON_HDF5 "Enable Parthenon HDF5 reader support" ON)
+option(KANGAROO_BUILD_CLAY_DASHBOARD "Build native Clay dashboard app" ON)
 
 # msgpack-cxx's CMake config can still rely on FindBoost; keep legacy behavior
 # under CMake 4.x to avoid noisy developer warnings.
@@ -134,3 +135,51 @@ install(TARGETS _core _plotfile LIBRARY DESTINATION "${KANGAROO_PYTHON_SITE}/ana
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../analysis/"
         DESTINATION "${KANGAROO_PYTHON_SITE}/analysis"
         FILES_MATCHING PATTERN "*.py")
+
+if(KANGAROO_BUILD_CLAY_DASHBOARD)
+  include(FetchContent)
+
+  FetchContent_Declare(
+    nlohmann_json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG v3.11.3
+    GIT_SHALLOW TRUE
+  )
+  FetchContent_MakeAvailable(nlohmann_json)
+
+  FetchContent_Declare(
+    SDL
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL.git
+    GIT_TAG release-3.2.4
+    GIT_SHALLOW TRUE
+  )
+  FetchContent_MakeAvailable(SDL)
+  set_property(DIRECTORY "${sdl_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL TRUE)
+
+  FetchContent_Declare(
+    SDL_ttf
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL_ttf.git
+    GIT_TAG release-3.2.2
+    GIT_SHALLOW TRUE
+  )
+  FetchContent_MakeAvailable(SDL_ttf)
+  set_property(DIRECTORY "${sdl_ttf_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL TRUE)
+
+  FetchContent_Declare(
+    SDL_image
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL_image.git
+    GIT_TAG release-3.2.0
+    GIT_SHALLOW TRUE
+  )
+  FetchContent_MakeAvailable(SDL_image)
+  set_property(DIRECTORY "${SDL_image_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL TRUE)
+
+  add_executable(kangaroo_dashboard_clay src/kangaroo_dashboard_clay.cpp)
+  target_compile_features(kangaroo_dashboard_clay PRIVATE cxx_std_20)
+  target_link_libraries(kangaroo_dashboard_clay PRIVATE
+    nlohmann_json::nlohmann_json
+    SDL3::SDL3
+    SDL3_ttf::SDL3_ttf
+    SDL3_image::SDL3_image
+  )
+endif()

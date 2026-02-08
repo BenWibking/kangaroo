@@ -91,6 +91,19 @@ Kangaroo Dashboard (Bokeh)
 - Provide a plan JSON to render a DAG (e.g. `analysis.runtime.plan_to_dict` output):
   - `python scripts/kangaroo_dashboard.py --plan path/to/plan.json`
 
+Kangaroo Dashboard (C++/Clay) timeline notes
+- The task timeline uses runtime `0` as the earliest task start (`min(task.start)`), not wall-clock epoch.
+- Tasks are grouped by `worker`; each worker is rendered on its own vertical lane.
+- Bar x-positions are computed from `(task_start_runtime, task_end_runtime)` and must remain linear in time.
+- Lane width must be at least the visible lane viewport width:
+  - `timeline_draw_width_px = max(span_s * base_pixels_per_second, visible_lane_width_px)`.
+- Rendering and drag-to-zoom must use the exact same pixels-per-second scale (`timeline_pixels_per_second`).
+- Drag x-to-runtime conversion must account for horizontal scroll with the correct sign:
+  - `content_x = mouse_x - timeline_origin_x + scroll_x`.
+- Drag selection should clamp to `[0, timeline_draw_width_px]`, then map to runtime and clamp to current view.
+- Selection start can begin anywhere in the task panel; right-click in panel resets zoom.
+- Keep a visible drag rectangle overlay to verify hit-testing/extent while debugging.
+
 Event log schema (one JSON object per line):
 ```
 {"type": "metrics", "mem_used_gb": 12.3, "mem_total_gb": 64.0, "cpu_percent": 80.1,
