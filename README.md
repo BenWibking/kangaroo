@@ -1,5 +1,7 @@
 # Kangaroo
 
+![image](logo.png)
+
 Kangaroo is a prototype distributed analysis runtime with:
 - a Python API/DSL in `analysis/`
 - an HPX/C++ runtime in `cpp/`
