@@ -20,7 +20,7 @@ The current recommended usage pattern is:
 
 ## Setup and Build
 
-Using Pixi (recommended):
+Using [Pixi](https://prefix.dev/) (recommended):
 
 ```bash
 pixi install
