@@ -14,6 +14,8 @@ The current recommended usage pattern is:
 4. build operations with the imperative pipeline API (`pipeline(...).uniform_slice(...)`, `uniform_projection(...)`),
 5. run and fetch output bytes/arrays via `Runtime`.
 
+**Please note: pull requests are not accepted for this repository, and will be automatically closed.**
+
 ## Requirements
 
 - Python 3.10-3.13
