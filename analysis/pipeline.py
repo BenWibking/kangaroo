@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -94,6 +94,8 @@ class Pipeline:
         self._particle_max_chunks: int = 1
         self._particle_executed: bool = False
         self._particle_cache: dict[int, list[np.ndarray]] = {}
+        self._derived_builders: dict[str, Callable[["Pipeline"], int | FieldHandle]] = {}
+        self._derived_cache: dict[str, FieldHandle] = {}
 
     def _unique_name(self, base: str) -> str:
         idx = self._name_counters.get(base, 0)
@@ -132,6 +134,15 @@ class Pipeline:
 
     def _alloc_runtime_field(self, prefix: str) -> int:
         return int(self.runtime.alloc_field_id(f"{prefix}_{self._unique_name('particle')}"))
+
+    def _alloc_field_id(self, name: str) -> int:
+        alloc = getattr(self.runtime, "alloc_field_id", None)
+        if callable(alloc):
+            return int(alloc(name))
+        core_rt = getattr(self.runtime, "_rt", None)
+        if core_rt is not None and hasattr(core_rt, "alloc_field_id"):
+            return int(core_rt.alloc_field_id(name))
+        raise RuntimeError("runtime does not provide alloc_field_id")
 
     def _append_particle_stage(self, stage: Stage, *, chunk_count: int) -> None:
         if self._particle_frontier:
@@ -335,11 +346,160 @@ class Pipeline:
         self._stages.extend(fragment)
         self._frontier = self._leaf_stages(fragment)
 
+    def _infer_field_bytes_per_value(self, field: int, *, level: int) -> int:
+        infer = getattr(self.dataset, "infer_bytes_per_value", None)
+        if callable(infer):
+            try:
+                return int(infer(self.runtime, field=int(field), level=int(level), step=int(self.dataset.step)))
+            except Exception:
+                pass
+        return 8
+
+    def field_expr(
+        self,
+        expression: str,
+        variables: dict[str, int | FieldHandle],
+        *,
+        out: str | None = None,
+        bytes_per_value: int | None = None,
+    ) -> FieldHandle:
+        expr = str(expression).strip()
+        if not expr:
+            raise ValueError("expression must be non-empty")
+        if not variables:
+            raise ValueError("variables must be non-empty")
+
+        ordered_vars = list(variables.items())
+        var_names = [str(name) for name, _ in ordered_vars]
+        if any(not name for name in var_names):
+            raise ValueError("variable names must be non-empty strings")
+        input_fields = [self._as_field_id(value) for _, value in ordered_vars]
+        out_name = out or self._unique_name("field_expr")
+        out_fid = self._alloc_field_id(out_name)
+        out_bpv = int(bytes_per_value) if bytes_per_value is not None else 8
+
+        ds = self.dataset
+        stage = Stage(name=self._unique_name("field_expr"))
+        for level_idx, level_meta in enumerate(self.runmeta.steps[ds.step].levels):
+            input_bpvs = [self._infer_field_bytes_per_value(fid, level=level_idx) for fid in input_fields]
+            for block_idx, box in enumerate(level_meta.boxes):
+                ncell = (
+                    (int(box.hi[0]) - int(box.lo[0]) + 1)
+                    * (int(box.hi[1]) - int(box.lo[1]) + 1)
+                    * (int(box.hi[2]) - int(box.lo[2]) + 1)
+                )
+                stage.map_blocks(
+                    name=f"field_expr_l{level_idx}_b{block_idx}",
+                    kernel="field_expr",
+                    domain=Domain(step=ds.step, level=level_idx, blocks=[block_idx]),
+                    inputs=[FieldRef(fid) for fid in input_fields],
+                    outputs=[FieldRef(out_fid)],
+                    output_bytes=[int(ncell) * out_bpv],
+                    deps={"kind": "None"},
+                    params={
+                        "expression": expr,
+                        "variables": var_names,
+                        "input_bytes_per_value": input_bpvs,
+                        "out_bytes_per_value": out_bpv,
+                    },
+                )
+        self._append_fragment([stage])
+        return FieldHandle(self, out_fid, out_name)
+
+    def register_derived_field(
+        self,
+        name: str,
+        builder: Callable[["Pipeline"], int | FieldHandle],
+        *,
+        overwrite: bool = False,
+    ) -> None:
+        if (not overwrite) and name in self._derived_builders:
+            raise ValueError(f"derived field '{name}' is already registered")
+        self._derived_builders[name] = builder
+        self._derived_cache.pop(name, None)
+
+    def derived_field(self, name: str, *, recache: bool = False) -> FieldHandle:
+        if name not in self._derived_builders:
+            raise KeyError(f"unknown derived field '{name}'")
+        if (not recache) and name in self._derived_cache:
+            return self._derived_cache[name]
+        built = self._derived_builders[name](self)
+        if isinstance(built, FieldHandle):
+            if built.pipeline is not self:
+                raise ValueError("derived field handle belongs to a different pipeline")
+            out = built
+        else:
+            out = FieldHandle(self, int(built), name)
+        self._derived_cache[name] = out
+        return out
+
     def field(self, name_or_id: str | int) -> FieldHandle:
         if isinstance(name_or_id, str):
+            if name_or_id in self._derived_builders:
+                return self.derived_field(name_or_id)
             fid = int(self.dataset.field_id(name_or_id))
             return FieldHandle(self, fid, name_or_id)
         return FieldHandle(self, int(name_or_id), None)
+
+    def field_add(
+        self,
+        left: int | FieldHandle,
+        right: int | FieldHandle,
+        *,
+        out: str | None = None,
+        bytes_per_value: int | None = None,
+    ) -> FieldHandle:
+        return self.field_expr(
+            "a + b",
+            {"a": left, "b": right},
+            out=out or self._unique_name("field_add"),
+            bytes_per_value=bytes_per_value,
+        )
+
+    def field_subtract(
+        self,
+        left: int | FieldHandle,
+        right: int | FieldHandle,
+        *,
+        out: str | None = None,
+        bytes_per_value: int | None = None,
+    ) -> FieldHandle:
+        return self.field_expr(
+            "a - b",
+            {"a": left, "b": right},
+            out=out or self._unique_name("field_subtract"),
+            bytes_per_value=bytes_per_value,
+        )
+
+    def field_multiply(
+        self,
+        left: int | FieldHandle,
+        right: int | FieldHandle,
+        *,
+        out: str | None = None,
+        bytes_per_value: int | None = None,
+    ) -> FieldHandle:
+        return self.field_expr(
+            "a * b",
+            {"a": left, "b": right},
+            out=out or self._unique_name("field_multiply"),
+            bytes_per_value=bytes_per_value,
+        )
+
+    def field_divide(
+        self,
+        left: int | FieldHandle,
+        right: int | FieldHandle,
+        *,
+        out: str | None = None,
+        bytes_per_value: int | None = None,
+    ) -> FieldHandle:
+        return self.field_expr(
+            "a / b",
+            {"a": left, "b": right},
+            out=out or self._unique_name("field_divide"),
+            bytes_per_value=bytes_per_value,
+        )
 
     def vorticity_mag(
         self,

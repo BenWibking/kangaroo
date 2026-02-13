@@ -243,3 +243,54 @@ def test_pipeline_histogram2d_weight_mode_wiring() -> None:
     assert acc
     assert all(len(tmpl.inputs) == 2 for tmpl in acc)
     assert all(tmpl.params["weight_mode"] == "cell_mass" for tmpl in acc)
+
+
+def test_pipeline_field_expr_lowering_wiring() -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_runmeta()
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+
+    rho = pipe.field("density")
+    mx = pipe.field("xmom")
+    vx = pipe.field_expr("mx / rho", {"mx": mx, "rho": rho}, out="velx")
+    assert isinstance(vx, FieldHandle)
+
+    plan = pipe.plan()
+    expr_templates = [
+        tmpl
+        for stage in plan.topo_stages()
+        for tmpl in stage.templates
+        if tmpl.kernel == "field_expr"
+    ]
+    assert expr_templates
+    assert all(tmpl.params["expression"] == "mx / rho" for tmpl in expr_templates)
+    assert all(tmpl.params["variables"] == ["mx", "rho"] for tmpl in expr_templates)
+
+
+def test_pipeline_register_derived_field_cached() -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_runmeta()
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+
+    pipe.register_derived_field(
+        "velocity_x",
+        lambda p: p.field_expr("mx / rho", {"mx": p.field("xmom"), "rho": p.field("density")}, out="velocity_x"),
+    )
+    v1 = pipe.derived_field("velocity_x")
+    v2 = pipe.derived_field("velocity_x")
+    v3 = pipe.field("velocity_x")
+
+    assert isinstance(v1, FieldHandle)
+    assert v1.field == v2.field
+    assert v1.field == v3.field
+
+    plan = pipe.plan()
+    expr_templates = [
+        tmpl
+        for stage in plan.topo_stages()
+        for tmpl in stage.templates
+        if tmpl.kernel == "field_expr"
+    ]
+    assert len(expr_templates) == 1

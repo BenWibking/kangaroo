@@ -2,6 +2,7 @@
 
 #include "kangaroo/plan_decode.hpp"
 #include "kangaroo/plotfile_reader.hpp"
+#include "amrexpr.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1575,6 +1576,166 @@ void register_default_kernels(KernelRegistry& registry) {
           }
         }
 
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "field_expr", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        struct Params {
+          std::string expression;
+          std::vector<std::string> variables;
+          std::vector<int> input_bytes_per_value;
+          int out_bytes_per_value = 8;
+        } params;
+
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            auto get_key = [&](const char* key) -> const msgpack::object* {
+              for (uint32_t i = 0; i < root.via.map.size; ++i) {
+                const auto& k = root.via.map.ptr[i].key;
+                if (k.type == msgpack::type::STR && k.as<std::string>() == key) {
+                  return &root.via.map.ptr[i].val;
+                }
+              }
+              return nullptr;
+            };
+            if (const auto* expr = get_key("expression"); expr && expr->type == msgpack::type::STR) {
+              params.expression = expr->as<std::string>();
+            }
+            if (const auto* vars = get_key("variables"); vars && vars->type == msgpack::type::ARRAY) {
+              params.variables.clear();
+              params.variables.reserve(vars->via.array.size);
+              for (uint32_t i = 0; i < vars->via.array.size; ++i) {
+                const auto& v = vars->via.array.ptr[i];
+                if (v.type == msgpack::type::STR) {
+                  params.variables.push_back(v.as<std::string>());
+                }
+              }
+            }
+            if (const auto* in_bpv = get_key("input_bytes_per_value");
+                in_bpv && in_bpv->type == msgpack::type::ARRAY) {
+              params.input_bytes_per_value.clear();
+              params.input_bytes_per_value.reserve(in_bpv->via.array.size);
+              for (uint32_t i = 0; i < in_bpv->via.array.size; ++i) {
+                const auto& v = in_bpv->via.array.ptr[i];
+                if (v.type == msgpack::type::POSITIVE_INTEGER ||
+                    v.type == msgpack::type::NEGATIVE_INTEGER) {
+                  params.input_bytes_per_value.push_back(v.as<int>());
+                }
+              }
+            }
+            if (const auto* out_bpv = get_key("out_bytes_per_value");
+                out_bpv &&
+                (out_bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                 out_bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+              params.out_bytes_per_value = out_bpv->as<int>();
+            }
+          }
+        }
+
+        if (outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        if (params.expression.empty()) {
+          throw std::runtime_error("field_expr requires a non-empty expression");
+        }
+        if (params.variables.empty()) {
+          throw std::runtime_error("field_expr requires at least one variable");
+        }
+        if (params.variables.size() != inputs.size()) {
+          throw std::runtime_error("field_expr variables/input size mismatch");
+        }
+        if (params.variables.size() > 8) {
+          throw std::runtime_error("field_expr currently supports at most 8 variables");
+        }
+        if (params.out_bytes_per_value != 4 && params.out_bytes_per_value != 8) {
+          throw std::runtime_error("field_expr out_bytes_per_value must be 4 or 8");
+        }
+
+        if (params.input_bytes_per_value.size() < inputs.size()) {
+          params.input_bytes_per_value.resize(inputs.size(), 8);
+        }
+
+        auto read_value = [&](int iv, std::size_t idx) -> double {
+          const auto& data = inputs[static_cast<std::size_t>(iv)].data;
+          const int bpv = params.input_bytes_per_value[static_cast<std::size_t>(iv)];
+          if (bpv == 4) {
+            const std::size_t pos = idx * sizeof(float);
+            if (pos < data.size()) {
+              return static_cast<double>(reinterpret_cast<const float*>(data.data())[idx]);
+            }
+          } else if (bpv == 8) {
+            const std::size_t pos = idx * sizeof(double);
+            if (pos < data.size()) {
+              return reinterpret_cast<const double*>(data.data())[idx];
+            }
+          }
+          return 0.0;
+        };
+
+        std::size_t n = std::numeric_limits<std::size_t>::max();
+        for (std::size_t iv = 0; iv < inputs.size(); ++iv) {
+          const auto& in = inputs[iv].data;
+          const int bpv = params.input_bytes_per_value[iv];
+          if (bpv != 4 && bpv != 8) {
+            throw std::runtime_error("field_expr input_bytes_per_value must be 4 or 8");
+          }
+          const std::size_t count = in.size() / static_cast<std::size_t>(bpv);
+          n = std::min(n, count);
+        }
+        if (n == std::numeric_limits<std::size_t>::max()) {
+          n = 0;
+        }
+
+        const std::size_t out_bytes = n * static_cast<std::size_t>(params.out_bytes_per_value);
+        outputs[0].data.assign(out_bytes, 0);
+        auto write_value = [&](std::size_t idx, double value) {
+          if (params.out_bytes_per_value == 8) {
+            reinterpret_cast<double*>(outputs[0].data.data())[idx] = value;
+          } else {
+            reinterpret_cast<float*>(outputs[0].data.data())[idx] = static_cast<float>(value);
+          }
+        };
+
+        amrexpr::Parser parser;
+        try {
+          parser.define(params.expression);
+          parser.registerVariables(params.variables);
+        } catch (const std::runtime_error& e) {
+          throw std::runtime_error(std::string("field_expr parse failed: ") + e.what());
+        }
+
+#define KANGAROO_FIELD_EXPR_CASE(N)                                                      \
+        case N: {                                                                        \
+          auto exe = parser.compileHost<N>();                                            \
+          for (std::size_t idx = 0; idx < n; ++idx) {                                   \
+            double vars[N];                                                              \
+            for (int iv = 0; iv < N; ++iv) {                                             \
+              vars[iv] = read_value(iv, idx);                                            \
+            }                                                                            \
+            write_value(idx, exe(vars));                                                 \
+          }                                                                              \
+          break;                                                                         \
+        }
+
+        switch (static_cast<int>(params.variables.size())) {
+          KANGAROO_FIELD_EXPR_CASE(1)
+          KANGAROO_FIELD_EXPR_CASE(2)
+          KANGAROO_FIELD_EXPR_CASE(3)
+          KANGAROO_FIELD_EXPR_CASE(4)
+          KANGAROO_FIELD_EXPR_CASE(5)
+          KANGAROO_FIELD_EXPR_CASE(6)
+          KANGAROO_FIELD_EXPR_CASE(7)
+          KANGAROO_FIELD_EXPR_CASE(8)
+          default:
+            throw std::runtime_error("field_expr variable count is out of range");
+        }
+
+#undef KANGAROO_FIELD_EXPR_CASE
         return hpx::make_ready_future();
       });
   registry.register_kernel(

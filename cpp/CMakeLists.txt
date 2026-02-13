@@ -16,6 +16,7 @@ endif()
 find_package(HPX REQUIRED)
 find_package(Python REQUIRED COMPONENTS Interpreter Development)
 find_package(nanobind CONFIG REQUIRED)
+find_package(amrexpr CONFIG QUIET)
 find_package(msgpack-cxx CONFIG QUIET)
 if(NOT msgpack-cxx_FOUND)
   # CMake 4.x requires a policy minimum for older subprojects like msgpack.
@@ -30,6 +31,16 @@ if(NOT msgpack-cxx_FOUND)
   if(NOT TARGET msgpackc-cxx AND TARGET msgpack-cxx)
     add_library(msgpackc-cxx ALIAS msgpack-cxx)
   endif()
+endif()
+
+if(NOT amrexpr_FOUND)
+  include(FetchContent)
+  FetchContent_Declare(
+    amrexpr
+    GIT_REPOSITORY https://github.com/AMReX-Codes/amrex-parser.git
+    GIT_TAG 9af95c252c25c95371f655d40d3a4bfb1de2dab3
+  )
+  FetchContent_MakeAvailable(amrexpr)
 endif()
 
 set(KANGAROO_RUNTIME_SOURCES
@@ -55,6 +66,13 @@ target_include_directories(kangaroo_runtime PUBLIC
 )
 
 target_link_libraries(kangaroo_runtime PUBLIC HPX::hpx)
+if(TARGET amrexpr::amrexpr)
+  target_link_libraries(kangaroo_runtime PUBLIC amrexpr::amrexpr)
+elseif(TARGET amrexpr)
+  target_link_libraries(kangaroo_runtime PUBLIC amrexpr)
+else()
+  message(FATAL_ERROR "amrexpr target not available after FindPackage/FetchContent.")
+endif()
 
 if(KANGAROO_USE_PARTHENON_HDF5)
   find_package(HDF5 COMPONENTS C QUIET)
