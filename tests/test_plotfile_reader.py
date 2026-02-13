@@ -65,3 +65,35 @@ assert arr.dtype == expected
         raise AssertionError(
             f"ndarray subprocess failed: {result.returncode}\n{result.stdout}\n{result.stderr}"
         )
+
+
+def test_plotfile_reader_particles_diskgalaxy() -> None:
+    from analysis import PlotfileReader
+
+    if not os.path.isdir(PLOTFILE):
+        pytest.skip("DiskGalaxy example plotfile not found")
+
+    reader = PlotfileReader(PLOTFILE)
+    particle_types = reader.particle_types()
+    assert "CIC_particles" in particle_types
+    assert "StochasticStellarPop_particles" in particle_types
+
+    cic_fields = reader.particle_fields("CIC_particles")
+    assert "x" in cic_fields
+    assert "mass" in cic_fields
+    assert "vx" in cic_fields
+
+    stars_fields = reader.particle_fields("StochasticStellarPop_particles")
+    assert "evolution_stage" in stars_fields
+    assert "birth_time" in stars_fields
+
+    mass = reader.read_particle_field("CIC_particles", "mass", return_ndarray=True)
+    assert mass["dtype"] in {"float32", "float64"}
+    assert int(mass["count"]) == mass["data"].shape[0]
+    assert mass["data"].shape[0] > 0
+
+    stage = reader.read_particle_field(
+        "StochasticStellarPop_particles", "evolution_stage", return_ndarray=True
+    )
+    assert stage["dtype"] == "int64"
+    assert int(stage["count"]) == stage["data"].shape[0]

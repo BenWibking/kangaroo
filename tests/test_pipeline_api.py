@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from analysis.pipeline import FieldHandle, Pipeline
+from analysis.pipeline import FieldHandle, Histogram1DHandle, Histogram2DHandle, Pipeline
 
 
 class _FakeCoreRuntime:
@@ -88,6 +88,25 @@ def _single_level_runmeta() -> _RunMeta:
     )
 
 
+def _single_level_two_block_runmeta() -> _RunMeta:
+    return _RunMeta(
+        steps=[
+            _Step(
+                step=0,
+                levels=[
+                    _Level(
+                        geom=_Geom(dx=(1.0, 1.0, 1.0), x0=(0.0, 0.0, 0.0), index_origin=(0, 0, 0)),
+                        boxes=[
+                            _Box((0, 0, 0), (3, 7, 7)),
+                            _Box((4, 0, 0), (7, 7, 7)),
+                        ],
+                    )
+                ],
+            )
+        ]
+    )
+
+
 def test_pipeline_vorticity_fragment_and_run_submission() -> None:
     rt = _FakeRuntime()
     runmeta = _single_level_runmeta()
@@ -137,3 +156,90 @@ def test_pipeline_imperative_chaining_adds_cross_fragment_edge() -> None:
     vort_stage = next(stage for stage in topo if stage.name == "vortmag")
     slice_stage = next(stage for stage in topo if stage.name == "uniform_slice")
     assert vort_stage in slice_stage.after
+
+
+def test_pipeline_histogram1d_lowering_and_result_shape() -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_two_block_runmeta()
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+
+    scalar = pipe.field("scalar")
+    hist = pipe.histogram1d(
+        scalar,
+        hist_range=(0.0, 1.0),
+        bins=8,
+        out="hist_scalar",
+    )
+    assert isinstance(hist, Histogram1DHandle)
+    assert hist.bins == 8
+    assert len(hist.edges) == 9
+
+    plan = pipe.plan()
+    templates = [tmpl for stage in plan.topo_stages() for tmpl in stage.templates]
+    acc = [tmpl for tmpl in templates if tmpl.kernel == "histogram1d_accumulate"]
+    red = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
+    assert len(acc) == 2
+    assert red
+    assert all(tmpl.params["bins"] == 8 for tmpl in acc)
+    assert all(tmpl.params["range"] == [0.0, 1.0] for tmpl in acc)
+
+
+def test_pipeline_histogram2d_weighted_input_wiring() -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_runmeta()
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+
+    x = pipe.field("density")
+    y = pipe.field("temperature")
+    w = pipe.field("mass")
+    hist = pipe.histogram2d(
+        x,
+        y,
+        x_range=(0.0, 2.0),
+        y_range=(1.0, 3.0),
+        bins=(4, 5),
+        weights=w,
+        out="phase",
+    )
+    assert isinstance(hist, Histogram2DHandle)
+    x_edges, y_edges = hist.edges
+    assert len(x_edges) == 5
+    assert len(y_edges) == 6
+
+    plan = pipe.plan()
+    templates = [tmpl for stage in plan.topo_stages() for tmpl in stage.templates]
+    acc = [tmpl for tmpl in templates if tmpl.kernel == "histogram2d_accumulate"]
+    assert acc
+    assert all(len(tmpl.inputs) == 3 for tmpl in acc)
+    assert all(tmpl.params["bins"] == [4, 5] for tmpl in acc)
+
+
+def test_pipeline_histogram2d_weight_mode_wiring() -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_runmeta()
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+
+    x = pipe.field("density")
+    y = pipe.field("temperature")
+    pipe.histogram2d(
+        x,
+        y,
+        x_range=(0.0, 1.0),
+        y_range=(0.0, 1.0),
+        bins=(8, 8),
+        weight_mode="cell_mass",
+        out="phase_mass",
+    )
+    plan = pipe.plan()
+    acc = [
+        tmpl
+        for stage in plan.topo_stages()
+        for tmpl in stage.templates
+        if tmpl.kernel == "histogram2d_accumulate"
+    ]
+    assert acc
+    assert all(len(tmpl.inputs) == 2 for tmpl in acc)
+    assert all(tmpl.params["weight_mode"] == "cell_mass" for tmpl in acc)

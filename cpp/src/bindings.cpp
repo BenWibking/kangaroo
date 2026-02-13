@@ -28,7 +28,17 @@ nb::object require_key(const nb::dict& d, const char* key) {
 
 kangaroo::RunMeta parse_runmeta(const nb::object& obj) {
   kangaroo::RunMeta meta;
-  auto steps_list = nb::cast<nb::list>(obj);
+  nb::list steps_list;
+  nb::object particle_obj = nb::none();
+  if (nb::isinstance<nb::dict>(obj)) {
+    auto root = nb::cast<nb::dict>(obj);
+    steps_list = nb::cast<nb::list>(require_key(root, "steps"));
+    if (root.contains("particle_species")) {
+      particle_obj = root[nb::str("particle_species")];
+    }
+  } else {
+    steps_list = nb::cast<nb::list>(obj);
+  }
   meta.steps.reserve(steps_list.size());
   for (auto step_item : steps_list) {
     auto step_dict = nb::cast<nb::dict>(step_item);
@@ -80,6 +90,29 @@ kangaroo::RunMeta parse_runmeta(const nb::object& obj) {
     }
 
     meta.steps.push_back(std::move(step));
+  }
+
+  if (!particle_obj.is_none()) {
+    if (nb::isinstance<nb::dict>(particle_obj)) {
+      auto d = nb::cast<nb::dict>(particle_obj);
+      for (auto item : d) {
+        auto key = nb::cast<std::string>(item.first);
+        auto value = nb::cast<int64_t>(item.second);
+        meta.particle_species.emplace_back(std::move(key), value);
+      }
+    } else if (nb::isinstance<nb::list>(particle_obj)) {
+      auto entries = nb::cast<nb::list>(particle_obj);
+      meta.particle_species.reserve(entries.size());
+      for (auto item : entries) {
+        auto pair = nb::cast<nb::tuple>(item);
+        if (pair.size() != 2) {
+          throw std::runtime_error("particle_species list entries must be (name, count)");
+        }
+        meta.particle_species.emplace_back(nb::cast<std::string>(pair[0]), nb::cast<int64_t>(pair[1]));
+      }
+    } else {
+      throw std::runtime_error("particle_species must be a dict or list");
+    }
   }
 
   return meta;
@@ -341,6 +374,84 @@ NB_MODULE(_core, m) {
           (void)name;
 #endif
       })
+      .def("list_particle_types", [](kangaroo::DatasetHandle& self) -> nb::list {
+          nb::list out;
+          if (!self.backend) {
+            return out;
+          }
+          if (auto* reader = self.backend->get_plotfile_reader()) {
+            for (const auto& name : reader->particle_types()) {
+              out.append(name);
+            }
+          }
+          return out;
+      })
+      .def("list_particle_fields", [](kangaroo::DatasetHandle& self, const std::string& particle_type) -> nb::list {
+          nb::list out;
+          if (!self.backend) {
+            return out;
+          }
+          if (auto* reader = self.backend->get_plotfile_reader()) {
+            for (const auto& name : reader->particle_fields(particle_type)) {
+              out.append(name);
+            }
+          }
+          return out;
+      }, nb::arg("particle_type"))
+      .def("read_particle_field",
+           [](kangaroo::DatasetHandle& self, const std::string& particle_type,
+              const std::string& field_name) -> nb::dict {
+             if (!self.backend) {
+               throw std::runtime_error("dataset backend is not initialized");
+             }
+             auto* reader = self.backend->get_plotfile_reader();
+             if (!reader) {
+               throw std::runtime_error("particle field access is only supported for AMReX plotfiles");
+             }
+             auto data = reader->read_particle_field(particle_type, field_name);
+             nb::dict out;
+             out["count"] = data.count;
+             out["dtype"] = data.dtype;
+             out["data"] = nb::bytes(reinterpret_cast<const char*>(data.bytes.data()), data.bytes.size());
+             return out;
+           },
+           nb::arg("particle_type"),
+           nb::arg("field_name"))
+      .def("particle_chunk_count",
+           [](kangaroo::DatasetHandle& self, const std::string& particle_type) -> int64_t {
+             if (!self.backend) {
+               throw std::runtime_error("dataset backend is not initialized");
+             }
+             auto* reader = self.backend->get_plotfile_reader();
+             if (!reader) {
+               throw std::runtime_error(
+                   "particle chunk metadata is only supported for AMReX plotfiles");
+             }
+             return reader->particle_chunk_count(particle_type);
+           },
+           nb::arg("particle_type"))
+      .def("read_particle_field_chunk",
+           [](kangaroo::DatasetHandle& self, const std::string& particle_type,
+              const std::string& field_name, int64_t chunk_index) -> nb::dict {
+             if (!self.backend) {
+               throw std::runtime_error("dataset backend is not initialized");
+             }
+             auto* reader = self.backend->get_plotfile_reader();
+             if (!reader) {
+               throw std::runtime_error(
+                   "particle chunked field access is only supported for AMReX plotfiles");
+             }
+             auto data = reader->read_particle_field_chunk(particle_type, field_name, chunk_index);
+             nb::dict out;
+             out["count"] = data.count;
+             out["dtype"] = data.dtype;
+             out["data"] =
+                 nb::bytes(reinterpret_cast<const char*>(data.bytes.data()), data.bytes.size());
+             return out;
+           },
+           nb::arg("particle_type"),
+           nb::arg("field_name"),
+           nb::arg("chunk_index"))
       .def("metadata", [](kangaroo::DatasetHandle& self) -> nb::dict {
           if (!self.backend) return nb::dict();
           auto* reader = self.backend->get_plotfile_reader();
@@ -350,6 +461,7 @@ NB_MODULE(_core, m) {
             nb::dict d;
             d["var_names"] = hdr.var_names;
             d["finest_level"] = hdr.finest_level;
+            d["time"] = hdr.time;
             d["prob_lo"] = hdr.prob_lo;
             d["prob_hi"] = hdr.prob_hi;
             d["ref_ratio"] = hdr.ref_ratio;

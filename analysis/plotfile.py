@@ -50,6 +50,38 @@ class PlotfileReader:
     def num_fabs(self, level: int) -> int:
         return self._reader.num_fabs(level)
 
+    def particle_types(self) -> list[str]:
+        return list(self._reader.particle_types())
+
+    def particle_fields(self, particle_type: str) -> list[str]:
+        return list(self._reader.particle_fields(particle_type))
+
+    def read_particle_field(
+        self,
+        particle_type: str,
+        field_name: str,
+        *,
+        return_ndarray: bool = False,
+    ) -> dict[str, Any]:
+        payload = self._reader.read_particle_field(particle_type, field_name)
+        if not return_ndarray:
+            return payload
+
+        import numpy as np
+
+        dtype = payload["dtype"]
+        np_dtype: Any
+        if dtype == "float32":
+            np_dtype = np.float32
+        elif dtype == "float64":
+            np_dtype = np.float64
+        elif dtype == "int64":
+            np_dtype = np.int64
+        else:
+            raise RuntimeError(f"unsupported particle dtype '{dtype}'")
+        payload["data"] = np.frombuffer(payload["data"], dtype=np_dtype)
+        return payload
+
     def read_fab(
         self,
         level: int,

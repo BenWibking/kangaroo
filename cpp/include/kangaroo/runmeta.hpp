@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstdint>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace kangaroo {
@@ -73,10 +75,11 @@ struct StepMeta {
 
 struct RunMeta {
   std::vector<StepMeta> steps;
+  std::vector<std::pair<std::string, int64_t>> particle_species;
 
   template <typename Archive>
   void serialize(Archive& ar, unsigned) {
-    ar& steps;
+    ar& steps& particle_species;
   }
 };
 

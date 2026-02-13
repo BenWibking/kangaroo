@@ -142,6 +142,46 @@ arr = rt.get_task_chunk_array(
 
 To forward HPX flags from CLI scripts, use `argparse.parse_known_args()` and pass unknown args into `Runtime.from_parsed_args(...)` (as done by `scripts/plotfile_slice.py` and `scripts/plotfile_projection.py`).
 
+## Histogram API
+
+The pipeline also supports global histogram reductions:
+
+```python
+from analysis import cdf_from_histogram
+
+hist1 = pipe.histogram1d(
+    pipe.field("density"),
+    hist_range=(1.0e-30, 1.0e-20),
+    bins=128,
+    out="density_hist",
+)
+
+hist2 = pipe.histogram2d(
+    pipe.field("density"),
+    pipe.field("temperature"),
+    x_range=(1.0e-30, 1.0e-20),
+    y_range=(1.0, 1.0e8),
+    bins=(256, 256),
+    weights=pipe.field("cell_mass"),
+    out="phase_hist",
+)
+
+pipe.run()
+
+h1 = rt.get_task_chunk_array(
+    step=ds.step,
+    level=ds.level,
+    field=hist1.counts.field,
+    block=0,
+    shape=(hist1.bins,),
+    dtype=float,
+    dataset=ds,
+)
+cdf = cdf_from_histogram(h1)
+```
+
+Histogram accumulation is AMR-aware and uses global graph reductions across all blocks/levels.
+
 ## Data Sources
 
 `open_dataset(...)` resolves these forms:

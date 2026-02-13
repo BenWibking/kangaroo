@@ -36,6 +36,7 @@ class StepMeta:
 @dataclass
 class RunMeta:
     steps: List[StepMeta]
+    particle_species: Dict[str, int] = field(default_factory=dict)
     _h: Any = field(init=False)
 
     def __post_init__(self) -> None:
@@ -74,4 +75,7 @@ def load_runmeta_from_dict(payload: Dict[str, Any]) -> RunMeta:
             boxes = [BlockBox(tuple(lo), tuple(hi)) for lo, hi in lvl_entry.get("boxes", [])]
             levels.append(LevelMeta(geom=geom, boxes=boxes))
         steps.append(StepMeta(step=int(step_entry["step"]), levels=levels))
-    return RunMeta(steps=steps)
+    particle_species = {
+        str(name): int(count) for name, count in payload.get("particle_species", {}).items()
+    }
+    return RunMeta(steps=steps, particle_species=particle_species)

@@ -88,6 +88,29 @@ struct FabData {
   RealType type{RealType::kFloat64};
 };
 
+struct ParticleHeader {
+  std::string version;
+  int32_t spatial_dim{0};
+  int32_t num_real{0};
+  int32_t num_int{0};
+  int32_t finest_level{0};
+  bool is_single{false};
+  bool is_checkpoint{false};
+  bool legacy{false};
+  std::vector<std::string> real_names;
+  std::vector<std::string> int_names;
+  std::vector<int32_t> num_grids;
+  std::vector<std::vector<int32_t>> file_nums;
+  std::vector<std::vector<int32_t>> particle_counts;
+  std::vector<std::vector<int64_t>> offsets;
+};
+
+struct ParticleArrayData {
+  std::vector<std::uint8_t> bytes;
+  std::string dtype;
+  int64_t count{0};
+};
+
 PlotfileHeader parse_plotfile_header(const std::string& plotfile_dir);
 VisMFHeader parse_vismf_header(const std::string& cell_h_path);
 FabHeader read_fab_header(std::istream& is);
@@ -105,11 +128,29 @@ public:
   int32_t num_fabs(int level) const;
 
   FabData read_fab(int level, int fab_index, int comp_start, int comp_count);
+  std::vector<std::string> particle_types() const;
+  std::vector<std::string> particle_fields(const std::string& particle_type) const;
+  int64_t particle_chunk_count(const std::string& particle_type) const;
+  ParticleArrayData read_particle_field(const std::string& particle_type,
+                                        const std::string& field_name) const;
+  ParticleArrayData read_particle_field_chunk(const std::string& particle_type,
+                                              const std::string& field_name,
+                                              int64_t chunk_index) const;
 
 private:
+  struct ParticleSpecies {
+    std::string name;
+    std::string dir;
+    ParticleHeader header;
+  };
+
+  void discover_particles();
+  const ParticleSpecies& get_particle_species(const std::string& particle_type) const;
+
   std::string plotfile_dir_;
   PlotfileHeader header_;
   std::vector<VisMFHeader> vismf_headers_;
+  std::vector<ParticleSpecies> particles_;
 };
 
 }  // namespace kangaroo::plotfile

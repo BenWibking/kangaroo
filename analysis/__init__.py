@@ -22,7 +22,13 @@ __all__ = [
     "PlotfileReader",
     "Pipeline",
     "FieldHandle",
+    "Histogram1DHandle",
+    "Histogram2DHandle",
+    "ParticleArrayHandle",
+    "ParticleMaskHandle",
     "pipeline",
+    "cdf_from_histogram",
+    "cdf_from_samples",
 ]
 
 
@@ -71,12 +77,39 @@ def __getattr__(name):
         from .plotfile import PlotfileReader
 
         return PlotfileReader
-    if name in {"Pipeline", "FieldHandle", "pipeline"}:
-        from .pipeline import FieldHandle, Pipeline, pipeline
+    if name in {
+        "Pipeline",
+        "FieldHandle",
+        "Histogram1DHandle",
+        "Histogram2DHandle",
+        "ParticleArrayHandle",
+        "ParticleMaskHandle",
+        "pipeline",
+    }:
+        from .pipeline import (
+            FieldHandle,
+            Histogram1DHandle,
+            Histogram2DHandle,
+            ParticleArrayHandle,
+            ParticleMaskHandle,
+            Pipeline,
+            pipeline,
+        )
 
         return {
             "Pipeline": Pipeline,
             "FieldHandle": FieldHandle,
+            "Histogram1DHandle": Histogram1DHandle,
+            "Histogram2DHandle": Histogram2DHandle,
+            "ParticleArrayHandle": ParticleArrayHandle,
+            "ParticleMaskHandle": ParticleMaskHandle,
             "pipeline": pipeline,
+        }[name]
+    if name in {"cdf_from_histogram", "cdf_from_samples"}:
+        from .ops import cdf_from_histogram, cdf_from_samples
+
+        return {
+            "cdf_from_histogram": cdf_from_histogram,
+            "cdf_from_samples": cdf_from_samples,
         }[name]
     raise AttributeError(name)

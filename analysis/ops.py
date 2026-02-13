@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable, Optional
+from typing import Iterable, Optional, Sequence
 
 from .ctx import LoweringContext
 from .plan import FieldRef
@@ -123,7 +123,29 @@ def _resolve_bytes_per_value(
         raise RuntimeError(
             "bytes_per_value was not provided and could not be inferred: dataset runtime is missing"
         )
-    return int(ds.infer_bytes_per_value(runtime, field=field, level=level, step=ds.step))
+    infer = getattr(ds, "infer_bytes_per_value", None)
+    if callable(infer):
+        try:
+            return int(infer(runtime, field=field, level=level, step=ds.step))
+        except Exception:
+            pass
+    return 8
+
+
+def _coarsen_box(
+    lo: tuple[int, int, int],
+    hi: tuple[int, int, int],
+    *,
+    ratio: int,
+    fine_origin: tuple[int, int, int],
+    coarse_origin: tuple[int, int, int],
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    clo = []
+    chi = []
+    for d in range(3):
+        clo.append(int(math.floor((lo[d] - fine_origin[d]) / ratio)) + coarse_origin[d])
+        chi.append(int(math.floor((hi[d] - fine_origin[d] + 1) / ratio)) + coarse_origin[d] - 1)
+    return tuple(clo), tuple(chi)
 
 
 class UniformSlice:
@@ -315,7 +337,7 @@ class UniformSlice:
             sum_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
             area_field = ctx.temp_field(f"{self.out_name}_area_l{level_idx}")
 
-            stage = ctx.stage("uniform_slice_cellavg")
+            stage = ctx.stage("uniform_slice")
             for block in blocks:
                 dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
                 stage.map_blocks(
@@ -832,3 +854,525 @@ class UniformProjection:
         if not self.amr_cell_average:
             raise ValueError("UniformProjection requires amr_cell_average semantics")
         return self._lower_amr_projection(ctx)
+
+
+class Histogram1D:
+    def __init__(
+        self,
+        field: int,
+        *,
+        hist_range: tuple[float, float],
+        bins: int,
+        out_name: str = "histogram1d",
+        weight_field: int | None = None,
+        bytes_per_value: int | None = None,
+        reduce_fan_in: Optional[int] = None,
+    ) -> None:
+        self.field = field
+        self.hist_range = hist_range
+        self.bins = bins
+        self.out_name = out_name
+        self.weight_field = weight_field
+        self.bytes_per_value = bytes_per_value
+        self.reduce_fan_in = reduce_fan_in
+
+    def _reduce_fan_in(self, num_inputs: int) -> int:
+        if self.reduce_fan_in is None:
+            return max(2, int(math.sqrt(num_inputs)))
+        return max(1, int(self.reduce_fan_in))
+
+    def _ref_ratio_between(self, levels, coarse: int, fine: int) -> int:
+        ratio = 1
+        for lev in range(coarse, fine):
+            ratio *= int(levels[lev].geom.ref_ratio)
+        return ratio
+
+    def _covered_boxes_for_level(
+        self,
+        ctx: LoweringContext,
+        *,
+        level: int,
+    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
+        ds = ctx.dataset
+        levels = ctx.runmeta.steps[ds.step].levels
+        coarse_origin = levels[level].geom.index_origin
+        covered: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
+        for fine in range(level + 1, len(levels)):
+            ratio = self._ref_ratio_between(levels, level, fine)
+            fine_origin = levels[fine].geom.index_origin
+            for box in levels[fine].boxes:
+                covered.append(
+                    _coarsen_box(
+                        box.lo,
+                        box.hi,
+                        ratio=ratio,
+                        fine_origin=fine_origin,
+                        coarse_origin=coarse_origin,
+                    )
+                )
+        return covered
+
+    def lower(self, ctx: LoweringContext):
+        ds = ctx.dataset
+        if self.bins <= 0:
+            raise ValueError("bins must be positive")
+        lo, hi = self.hist_range
+        if not math.isfinite(lo) or not math.isfinite(hi) or hi <= lo:
+            raise ValueError("hist_range must be finite and increasing")
+
+        bpv = _resolve_bytes_per_value(ctx, field=self.field, bytes_per_value=self.bytes_per_value)
+        levels = ctx.runmeta.steps[ds.step].levels
+        out_bytes = self.bins * 8
+
+        hist_fields: list[tuple[FieldRef, int]] = []
+        stages: list = []
+        producer_stage: dict[int, object] = {}
+
+        for level_idx in range(len(levels) - 1, -1, -1):
+            level_meta = levels[level_idx]
+            blocks = list(range(len(level_meta.boxes)))
+            if not blocks:
+                continue
+
+            covered_boxes = self._covered_boxes_for_level(ctx, level=level_idx)
+            covered_payload = [[list(c_lo), list(c_hi)] for c_lo, c_hi in covered_boxes]
+            hist_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
+
+            stage = ctx.stage("histogram1d")
+            for block in blocks:
+                dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
+                inputs = [FieldRef(self.field)]
+                if self.weight_field is not None:
+                    inputs.append(FieldRef(self.weight_field))
+                stage.map_blocks(
+                    name=f"histogram1d_b{block}",
+                    kernel="histogram1d_accumulate",
+                    domain=dom,
+                    inputs=inputs,
+                    outputs=[hist_field],
+                    output_bytes=[out_bytes],
+                    deps={"kind": "None"},
+                    params={
+                        "range": [float(lo), float(hi)],
+                        "bins": int(self.bins),
+                        "bytes_per_value": int(bpv),
+                        "covered_boxes": covered_payload,
+                    },
+                )
+            stages.append(stage)
+            producer_stage[hist_field.field] = stage
+
+            num_inputs = len(blocks)
+            fan_in = self._reduce_fan_in(num_inputs)
+            input_hist = hist_field
+            reduce_idx = 0
+            while num_inputs > 1:
+                num_groups = (num_inputs + fan_in - 1) // fan_in
+                out_hist = hist_field if num_groups == 1 else ctx.temp_field(
+                    f"{self.out_name}_sum_reduce_{level_idx}_{reduce_idx}"
+                )
+                reduce_stage = ctx.stage("histogram1d_reduce", plane="graph", after=[stages[-1]])
+                reduce_params = {
+                    "graph_kind": "reduce",
+                    "fan_in": fan_in,
+                    "num_inputs": num_inputs,
+                    "input_base": 0,
+                    "output_base": 0,
+                    "bytes_per_value": 8,
+                }
+                if reduce_idx == 0:
+                    reduce_params["input_blocks"] = list(blocks)
+                reduce_stage.map_blocks(
+                    name=f"histogram1d_reduce_s{reduce_idx}",
+                    kernel="uniform_slice_reduce",
+                    domain=ctx.domain(step=ds.step, level=level_idx),
+                    inputs=[input_hist],
+                    outputs=[out_hist],
+                    output_bytes=[out_bytes],
+                    deps={"kind": "None"},
+                    params=reduce_params,
+                )
+                stages.append(reduce_stage)
+                producer_stage[out_hist.field] = reduce_stage
+                input_hist = out_hist
+                num_inputs = num_groups
+                reduce_idx += 1
+
+            hist_fields.append((input_hist, level_idx))
+
+        if not hist_fields:
+            return ctx.fragment([])
+
+        def reduce_pairwise(fields: list[tuple[FieldRef, int]]) -> tuple[FieldRef, int]:
+            if len(fields) == 1:
+                return fields[0]
+            current = fields
+            reduce_round = 0
+            while len(current) > 1:
+                next_fields: list[tuple[FieldRef, int]] = []
+                for i in range(0, len(current), 2):
+                    if i + 1 >= len(current):
+                        next_fields.append(current[i])
+                        continue
+                    left, left_level = current[i]
+                    right, right_level = current[i + 1]
+                    left_ref = FieldRef(
+                        left.field,
+                        version=left.version,
+                        domain=ctx.domain(step=ds.step, level=left_level),
+                    )
+                    right_ref = FieldRef(
+                        right.field,
+                        version=right.version,
+                        domain=ctx.domain(step=ds.step, level=right_level),
+                    )
+                    out_field = ctx.temp_field(f"{self.out_name}_sum_add_{reduce_round}_{i}")
+                    deps = [
+                        s
+                        for s in (
+                            producer_stage.get(left.field),
+                            producer_stage.get(right.field),
+                        )
+                        if s is not None
+                    ]
+                    add_stage = ctx.stage("histogram1d_add", plane="graph", after=deps)
+                    add_stage.map_blocks(
+                        name=f"histogram1d_add_{reduce_round}_{i}",
+                        kernel="uniform_slice_add",
+                        domain=ctx.domain(step=ds.step, level=ds.level),
+                        inputs=[left_ref, right_ref],
+                        outputs=[out_field],
+                        output_bytes=[out_bytes],
+                        deps={"kind": "None"},
+                        params={
+                            "graph_kind": "reduce",
+                            "fan_in": 1,
+                            "num_inputs": 1,
+                            "input_base": 0,
+                            "output_base": 0,
+                            "bytes_per_value": 8,
+                        },
+                    )
+                    stages.append(add_stage)
+                    producer_stage[out_field.field] = add_stage
+                    next_fields.append((out_field, ds.level))
+                current = next_fields
+                reduce_round += 1
+            return current[0]
+
+        total_hist, total_hist_level = reduce_pairwise(hist_fields)
+        out_field = ctx.output_field(self.out_name)
+        finalize_deps = [s for s in (producer_stage.get(total_hist.field),) if s is not None]
+        finalize = ctx.stage("histogram1d_output", plane="graph", after=finalize_deps)
+        finalize.map_blocks(
+            name="histogram1d_output",
+            kernel="uniform_slice_reduce",
+            domain=ctx.domain(step=ds.step, level=ds.level),
+            inputs=[
+                FieldRef(
+                    total_hist.field,
+                    version=total_hist.version,
+                    domain=ctx.domain(step=ds.step, level=total_hist_level),
+                )
+            ],
+            outputs=[out_field],
+            output_bytes=[out_bytes],
+            deps={"kind": "None"},
+            params={
+                "graph_kind": "reduce",
+                "fan_in": 1,
+                "num_inputs": 1,
+                "input_base": 0,
+                "output_base": 0,
+                "bytes_per_value": 8,
+            },
+        )
+        stages.append(finalize)
+        return ctx.fragment(stages)
+
+
+class Histogram2D:
+    def __init__(
+        self,
+        x_field: int,
+        y_field: int,
+        *,
+        x_range: tuple[float, float],
+        y_range: tuple[float, float],
+        bins: tuple[int, int],
+        out_name: str = "histogram2d",
+        weight_field: int | None = None,
+        weight_mode: str = "input",
+        bytes_per_value: int | None = None,
+        reduce_fan_in: Optional[int] = None,
+    ) -> None:
+        self.x_field = x_field
+        self.y_field = y_field
+        self.x_range = x_range
+        self.y_range = y_range
+        self.bins = bins
+        self.out_name = out_name
+        self.weight_field = weight_field
+        self.weight_mode = weight_mode
+        self.bytes_per_value = bytes_per_value
+        self.reduce_fan_in = reduce_fan_in
+
+    def _reduce_fan_in(self, num_inputs: int) -> int:
+        if self.reduce_fan_in is None:
+            return max(2, int(math.sqrt(num_inputs)))
+        return max(1, int(self.reduce_fan_in))
+
+    def _ref_ratio_between(self, levels, coarse: int, fine: int) -> int:
+        ratio = 1
+        for lev in range(coarse, fine):
+            ratio *= int(levels[lev].geom.ref_ratio)
+        return ratio
+
+    def _covered_boxes_for_level(
+        self,
+        ctx: LoweringContext,
+        *,
+        level: int,
+    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
+        ds = ctx.dataset
+        levels = ctx.runmeta.steps[ds.step].levels
+        coarse_origin = levels[level].geom.index_origin
+        covered: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
+        for fine in range(level + 1, len(levels)):
+            ratio = self._ref_ratio_between(levels, level, fine)
+            fine_origin = levels[fine].geom.index_origin
+            for box in levels[fine].boxes:
+                covered.append(
+                    _coarsen_box(
+                        box.lo,
+                        box.hi,
+                        ratio=ratio,
+                        fine_origin=fine_origin,
+                        coarse_origin=coarse_origin,
+                    )
+                )
+        return covered
+
+    def lower(self, ctx: LoweringContext):
+        ds = ctx.dataset
+        nx, ny = self.bins
+        if nx <= 0 or ny <= 0:
+            raise ValueError("bins must be positive")
+        x0, x1 = self.x_range
+        y0, y1 = self.y_range
+        if not (math.isfinite(x0) and math.isfinite(x1) and math.isfinite(y0) and math.isfinite(y1)):
+            raise ValueError("histogram ranges must be finite")
+        if x1 <= x0 or y1 <= y0:
+            raise ValueError("histogram ranges must be increasing")
+
+        bpv = _resolve_bytes_per_value(ctx, field=self.x_field, bytes_per_value=self.bytes_per_value)
+        levels = ctx.runmeta.steps[ds.step].levels
+        out_bytes = nx * ny * 8
+
+        hist_fields: list[tuple[FieldRef, int]] = []
+        stages: list = []
+        producer_stage: dict[int, object] = {}
+
+        for level_idx in range(len(levels) - 1, -1, -1):
+            level_meta = levels[level_idx]
+            blocks = list(range(len(level_meta.boxes)))
+            if not blocks:
+                continue
+
+            covered_boxes = self._covered_boxes_for_level(ctx, level=level_idx)
+            covered_payload = [[list(c_lo), list(c_hi)] for c_lo, c_hi in covered_boxes]
+            hist_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
+
+            stage = ctx.stage("histogram2d")
+            for block in blocks:
+                dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
+                inputs = [FieldRef(self.x_field), FieldRef(self.y_field)]
+                if self.weight_field is not None:
+                    inputs.append(FieldRef(self.weight_field))
+                stage.map_blocks(
+                    name=f"histogram2d_b{block}",
+                    kernel="histogram2d_accumulate",
+                    domain=dom,
+                    inputs=inputs,
+                    outputs=[hist_field],
+                    output_bytes=[out_bytes],
+                    deps={"kind": "None"},
+                    params={
+                        "x_range": [float(x0), float(x1)],
+                        "y_range": [float(y0), float(y1)],
+                        "bins": [int(nx), int(ny)],
+                        "bytes_per_value": int(bpv),
+                        "weight_mode": self.weight_mode,
+                        "covered_boxes": covered_payload,
+                    },
+                )
+            stages.append(stage)
+            producer_stage[hist_field.field] = stage
+
+            num_inputs = len(blocks)
+            fan_in = self._reduce_fan_in(num_inputs)
+            input_hist = hist_field
+            reduce_idx = 0
+            while num_inputs > 1:
+                num_groups = (num_inputs + fan_in - 1) // fan_in
+                out_hist = hist_field if num_groups == 1 else ctx.temp_field(
+                    f"{self.out_name}_sum_reduce_{level_idx}_{reduce_idx}"
+                )
+                reduce_stage = ctx.stage("histogram2d_reduce", plane="graph", after=[stages[-1]])
+                reduce_params = {
+                    "graph_kind": "reduce",
+                    "fan_in": fan_in,
+                    "num_inputs": num_inputs,
+                    "input_base": 0,
+                    "output_base": 0,
+                    "bytes_per_value": 8,
+                }
+                if reduce_idx == 0:
+                    reduce_params["input_blocks"] = list(blocks)
+                reduce_stage.map_blocks(
+                    name=f"histogram2d_reduce_s{reduce_idx}",
+                    kernel="uniform_slice_reduce",
+                    domain=ctx.domain(step=ds.step, level=level_idx),
+                    inputs=[input_hist],
+                    outputs=[out_hist],
+                    output_bytes=[out_bytes],
+                    deps={"kind": "None"},
+                    params=reduce_params,
+                )
+                stages.append(reduce_stage)
+                producer_stage[out_hist.field] = reduce_stage
+                input_hist = out_hist
+                num_inputs = num_groups
+                reduce_idx += 1
+
+            hist_fields.append((input_hist, level_idx))
+
+        if not hist_fields:
+            return ctx.fragment([])
+
+        def reduce_pairwise(fields: list[tuple[FieldRef, int]]) -> tuple[FieldRef, int]:
+            if len(fields) == 1:
+                return fields[0]
+            current = fields
+            reduce_round = 0
+            while len(current) > 1:
+                next_fields: list[tuple[FieldRef, int]] = []
+                for i in range(0, len(current), 2):
+                    if i + 1 >= len(current):
+                        next_fields.append(current[i])
+                        continue
+                    left, left_level = current[i]
+                    right, right_level = current[i + 1]
+                    left_ref = FieldRef(
+                        left.field,
+                        version=left.version,
+                        domain=ctx.domain(step=ds.step, level=left_level),
+                    )
+                    right_ref = FieldRef(
+                        right.field,
+                        version=right.version,
+                        domain=ctx.domain(step=ds.step, level=right_level),
+                    )
+                    out_field = ctx.temp_field(f"{self.out_name}_sum_add_{reduce_round}_{i}")
+                    deps = [
+                        s
+                        for s in (
+                            producer_stage.get(left.field),
+                            producer_stage.get(right.field),
+                        )
+                        if s is not None
+                    ]
+                    add_stage = ctx.stage("histogram2d_add", plane="graph", after=deps)
+                    add_stage.map_blocks(
+                        name=f"histogram2d_add_{reduce_round}_{i}",
+                        kernel="uniform_slice_add",
+                        domain=ctx.domain(step=ds.step, level=ds.level),
+                        inputs=[left_ref, right_ref],
+                        outputs=[out_field],
+                        output_bytes=[out_bytes],
+                        deps={"kind": "None"},
+                        params={
+                            "graph_kind": "reduce",
+                            "fan_in": 1,
+                            "num_inputs": 1,
+                            "input_base": 0,
+                            "output_base": 0,
+                            "bytes_per_value": 8,
+                        },
+                    )
+                    stages.append(add_stage)
+                    producer_stage[out_field.field] = add_stage
+                    next_fields.append((out_field, ds.level))
+                current = next_fields
+                reduce_round += 1
+            return current[0]
+
+        total_hist, total_hist_level = reduce_pairwise(hist_fields)
+        out_field = ctx.output_field(self.out_name)
+        finalize_deps = [s for s in (producer_stage.get(total_hist.field),) if s is not None]
+        finalize = ctx.stage("histogram2d_output", plane="graph", after=finalize_deps)
+        finalize.map_blocks(
+            name="histogram2d_output",
+            kernel="uniform_slice_reduce",
+            domain=ctx.domain(step=ds.step, level=ds.level),
+            inputs=[
+                FieldRef(
+                    total_hist.field,
+                    version=total_hist.version,
+                    domain=ctx.domain(step=ds.step, level=total_hist_level),
+                )
+            ],
+            outputs=[out_field],
+            output_bytes=[out_bytes],
+            deps={"kind": "None"},
+            params={
+                "graph_kind": "reduce",
+                "fan_in": 1,
+                "num_inputs": 1,
+                "input_base": 0,
+                "output_base": 0,
+                "bytes_per_value": 8,
+            },
+        )
+        stages.append(finalize)
+        return ctx.fragment(stages)
+
+
+def histogram_edges_1d(hist_range: tuple[float, float], bins: int) -> list[float]:
+    if bins <= 0:
+        raise ValueError("bins must be positive")
+    lo, hi = hist_range
+    if hi <= lo:
+        raise ValueError("hist_range must be increasing")
+    dx = (hi - lo) / bins
+    return [lo + i * dx for i in range(bins + 1)]
+
+
+def histogram_edges_2d(
+    x_range: tuple[float, float],
+    y_range: tuple[float, float],
+    bins: tuple[int, int],
+) -> tuple[list[float], list[float]]:
+    nx, ny = bins
+    return histogram_edges_1d(x_range, nx), histogram_edges_1d(y_range, ny)
+
+
+def cdf_from_histogram(counts: Sequence[float], *, normalize: bool = True) -> list[float]:
+    total = float(sum(float(v) for v in counts))
+    out: list[float] = []
+    accum = 0.0
+    for value in counts:
+        accum += float(value)
+        out.append(accum)
+    if normalize and total > 0.0:
+        out = [v / total for v in out]
+    return out
+
+
+def cdf_from_samples(samples: Sequence[float]) -> tuple[list[float], list[float]]:
+    if not samples:
+        return [], []
+    xs = sorted(float(v) for v in samples)
+    n = len(xs)
+    cdf = [(i + 1) / n for i in range(n)]
+    return xs, cdf

@@ -13,6 +13,7 @@
 #include <iomanip>
 #include <iostream>
 #include <limits>
+#include <cstring>
 #include <memory>
 #include <mutex>
 #include <iterator>
@@ -1865,6 +1866,1001 @@ void register_default_kernels(KernelRegistry& registry) {
                 }
               }
               out_d[static_cast<std::size_t>(j) * out_nx + i] = value;
+            }
+          }
+        }
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_load_field_chunk_f64", .n_inputs = 0, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t block, std::span<const HostView>, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        if (outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        std::string particle_type;
+        std::string field_name;
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            for (uint32_t i = 0; i < root.via.map.size; ++i) {
+              const auto& k = root.via.map.ptr[i].key;
+              if (k.type != msgpack::type::STR) {
+                continue;
+              }
+              const auto key = k.as<std::string>();
+              if (key == "particle_type") {
+                particle_type = root.via.map.ptr[i].val.as<std::string>();
+              } else if (key == "field_name") {
+                field_name = root.via.map.ptr[i].val.as<std::string>();
+              }
+            }
+          }
+        }
+        if (particle_type.empty() || field_name.empty()) {
+          throw std::runtime_error("particle_load_field_chunk_f64 requires particle_type and field_name");
+        }
+
+        const auto& dataset = global_dataset();
+        if (!dataset.backend) {
+          throw std::runtime_error("particle_load_field_chunk_f64: missing dataset backend");
+        }
+        const auto* reader = dataset.backend->get_plotfile_reader();
+        if (reader == nullptr) {
+          throw std::runtime_error(
+              "particle_load_field_chunk_f64 requires an AMReX plotfile-backed dataset");
+        }
+        auto data = reader->read_particle_field_chunk(particle_type, field_name, block);
+        const std::size_t n = static_cast<std::size_t>(std::max<int64_t>(0, data.count));
+        outputs[0].data.resize(n * sizeof(double));
+        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+
+        if (data.dtype == "float64") {
+          if (data.bytes.size() < n * sizeof(double)) {
+            throw std::runtime_error("particle_load_field_chunk_f64: short float64 payload");
+          }
+          std::memcpy(out, data.bytes.data(), n * sizeof(double));
+        } else if (data.dtype == "float32") {
+          if (data.bytes.size() < n * sizeof(float)) {
+            throw std::runtime_error("particle_load_field_chunk_f64: short float32 payload");
+          }
+          const auto* in = reinterpret_cast<const float*>(data.bytes.data());
+          for (std::size_t i = 0; i < n; ++i) {
+            out[i] = static_cast<double>(in[i]);
+          }
+        } else if (data.dtype == "int64") {
+          if (data.bytes.size() < n * sizeof(int64_t)) {
+            throw std::runtime_error("particle_load_field_chunk_f64: short int64 payload");
+          }
+          const auto* in = reinterpret_cast<const int64_t*>(data.bytes.data());
+          for (std::size_t i = 0; i < n; ++i) {
+            out[i] = static_cast<double>(in[i]);
+          }
+        } else {
+          throw std::runtime_error("particle_load_field_chunk_f64: unsupported particle dtype '" +
+                                   data.dtype + "'");
+        }
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_eq_mask", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        double scalar = 0.0;
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            for (uint32_t i = 0; i < root.via.map.size; ++i) {
+              const auto& k = root.via.map.ptr[i].key;
+              if (k.type == msgpack::type::STR && k.as<std::string>() == "scalar") {
+                scalar = root.via.map.ptr[i].val.as<double>();
+              }
+            }
+          }
+        }
+        if (inputs.empty() || outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        const auto& in = inputs[0].data;
+        const std::size_t n = in.size() / sizeof(double);
+        outputs[0].data.resize(n);
+        const auto* in_d = reinterpret_cast<const double*>(in.data());
+        auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+        for (std::size_t i = 0; i < n; ++i) {
+          out[i] = (in_d[i] == scalar) ? 1 : 0;
+        }
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_isin_mask", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        std::vector<double> values;
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            for (uint32_t i = 0; i < root.via.map.size; ++i) {
+              const auto& k = root.via.map.ptr[i].key;
+              if (k.type == msgpack::type::STR && k.as<std::string>() == "values") {
+                const auto& v = root.via.map.ptr[i].val;
+                if (v.type == msgpack::type::ARRAY) {
+                  values.reserve(v.via.array.size);
+                  for (uint32_t j = 0; j < v.via.array.size; ++j) {
+                    values.push_back(v.via.array.ptr[j].as<double>());
+                  }
+                }
+              }
+            }
+          }
+        }
+        if (inputs.empty() || outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        const auto& in = inputs[0].data;
+        const std::size_t n = in.size() / sizeof(double);
+        outputs[0].data.resize(n);
+        const auto* in_d = reinterpret_cast<const double*>(in.data());
+        auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+        for (std::size_t i = 0; i < n; ++i) {
+          bool found = false;
+          for (double x : values) {
+            if (in_d[i] == x) {
+              found = true;
+              break;
+            }
+          }
+          out[i] = found ? 1 : 0;
+        }
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_isfinite_mask", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+        if (inputs.empty() || outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        const auto& in = inputs[0].data;
+        const std::size_t n = in.size() / sizeof(double);
+        outputs[0].data.resize(n);
+        const auto* in_d = reinterpret_cast<const double*>(in.data());
+        auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+        for (std::size_t i = 0; i < n; ++i) {
+          out[i] = std::isfinite(in_d[i]) ? 1 : 0;
+        }
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_abs_lt_mask", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        double scalar = 0.0;
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            for (uint32_t i = 0; i < root.via.map.size; ++i) {
+              const auto& k = root.via.map.ptr[i].key;
+              if (k.type == msgpack::type::STR && k.as<std::string>() == "scalar") {
+                scalar = root.via.map.ptr[i].val.as<double>();
+              }
+            }
+          }
+        }
+        if (inputs.empty() || outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        const auto& in = inputs[0].data;
+        const std::size_t n = in.size() / sizeof(double);
+        outputs[0].data.resize(n);
+        const auto* in_d = reinterpret_cast<const double*>(in.data());
+        auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+        for (std::size_t i = 0; i < n; ++i) {
+          out[i] = (std::abs(in_d[i]) < scalar) ? 1 : 0;
+        }
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_le_mask", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        double scalar = 0.0;
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            for (uint32_t i = 0; i < root.via.map.size; ++i) {
+              const auto& k = root.via.map.ptr[i].key;
+              if (k.type == msgpack::type::STR && k.as<std::string>() == "scalar") {
+                scalar = root.via.map.ptr[i].val.as<double>();
+              }
+            }
+          }
+        }
+        if (inputs.empty() || outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        const auto& in = inputs[0].data;
+        const std::size_t n = in.size() / sizeof(double);
+        outputs[0].data.resize(n);
+        const auto* in_d = reinterpret_cast<const double*>(in.data());
+        auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+        for (std::size_t i = 0; i < n; ++i) {
+          out[i] = (in_d[i] <= scalar) ? 1 : 0;
+        }
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_gt_mask", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        double scalar = 0.0;
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            for (uint32_t i = 0; i < root.via.map.size; ++i) {
+              const auto& k = root.via.map.ptr[i].key;
+              if (k.type == msgpack::type::STR && k.as<std::string>() == "scalar") {
+                scalar = root.via.map.ptr[i].val.as<double>();
+              }
+            }
+          }
+        }
+        if (inputs.empty() || outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        const auto& in = inputs[0].data;
+        const std::size_t n = in.size() / sizeof(double);
+        outputs[0].data.resize(n);
+        const auto* in_d = reinterpret_cast<const double*>(in.data());
+        auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+        for (std::size_t i = 0; i < n; ++i) {
+          out[i] = (in_d[i] > scalar) ? 1 : 0;
+        }
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_and_mask", .n_inputs = 2, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+        if (inputs.size() < 2 || outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        const auto& a = inputs[0].data;
+        const auto& b = inputs[1].data;
+        const std::size_t n = std::min(a.size(), b.size());
+        outputs[0].data.resize(n);
+        auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+        const auto* a_u = reinterpret_cast<const std::uint8_t*>(a.data());
+        const auto* b_u = reinterpret_cast<const std::uint8_t*>(b.data());
+        for (std::size_t i = 0; i < n; ++i) {
+          out[i] = (a_u[i] != 0 && b_u[i] != 0) ? 1 : 0;
+        }
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_filter", .n_inputs = 2, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+        if (inputs.size() < 2 || outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        const auto& values = inputs[0].data;
+        const auto& mask = inputs[1].data;
+        const std::size_t n = std::min(values.size() / sizeof(double), mask.size());
+        const auto* in_d = reinterpret_cast<const double*>(values.data());
+        const auto* m_u = reinterpret_cast<const std::uint8_t*>(mask.data());
+        std::size_t count = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+          if (m_u[i] != 0) {
+            ++count;
+          }
+        }
+        outputs[0].data.resize(count * sizeof(double));
+        auto* out_d = reinterpret_cast<double*>(outputs[0].data.data());
+        std::size_t out_idx = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+          if (m_u[i] != 0) {
+            out_d[out_idx++] = in_d[i];
+          }
+        }
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_subtract", .n_inputs = 2, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+        if (inputs.size() < 2 || outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        const auto& a = inputs[0].data;
+        const auto& b = inputs[1].data;
+        const std::size_t n = std::min(a.size(), b.size()) / sizeof(double);
+        outputs[0].data.resize(n * sizeof(double));
+        const auto* a_d = reinterpret_cast<const double*>(a.data());
+        const auto* b_d = reinterpret_cast<const double*>(b.data());
+        auto* out_d = reinterpret_cast<double*>(outputs[0].data.data());
+        for (std::size_t i = 0; i < n; ++i) {
+          out_d[i] = a_d[i] - b_d[i];
+        }
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_distance3", .n_inputs = 6, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+        if (inputs.size() < 6 || outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        const std::size_t n = std::min(
+            {inputs[0].data.size(), inputs[1].data.size(), inputs[2].data.size(),
+             inputs[3].data.size(), inputs[4].data.size(), inputs[5].data.size()}) /
+            sizeof(double);
+        outputs[0].data.resize(n * sizeof(double));
+        const auto* ax = reinterpret_cast<const double*>(inputs[0].data.data());
+        const auto* ay = reinterpret_cast<const double*>(inputs[1].data.data());
+        const auto* az = reinterpret_cast<const double*>(inputs[2].data.data());
+        const auto* bx = reinterpret_cast<const double*>(inputs[3].data.data());
+        const auto* by = reinterpret_cast<const double*>(inputs[4].data.data());
+        const auto* bz = reinterpret_cast<const double*>(inputs[5].data.data());
+        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+        for (std::size_t i = 0; i < n; ++i) {
+          const double dx = ax[i] - bx[i];
+          const double dy = ay[i] - by[i];
+          const double dz = az[i] - bz[i];
+          out[i] = std::sqrt(dx * dx + dy * dy + dz * dz);
+        }
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_sum", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+        if (inputs.empty() || outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        const auto& in = inputs[0].data;
+        const std::size_t n = in.size() / sizeof(double);
+        const auto* in_d = reinterpret_cast<const double*>(in.data());
+        double sum = 0.0;
+        for (std::size_t i = 0; i < n; ++i) {
+          sum += in_d[i];
+        }
+        outputs[0].data.resize(sizeof(double));
+        *reinterpret_cast<double*>(outputs[0].data.data()) = sum;
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_count", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+        if (inputs.empty() || outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        const auto& in = inputs[0].data;
+        const std::size_t n = in.size();
+        const auto* in_u = reinterpret_cast<const std::uint8_t*>(in.data());
+        int64_t count = 0;
+        for (std::size_t i = 0; i < n; ++i) {
+          if (in_u[i] != 0) {
+            ++count;
+          }
+        }
+        outputs[0].data.resize(sizeof(int64_t));
+        *reinterpret_cast<int64_t*>(outputs[0].data.data()) = count;
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_len_f64", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+        if (inputs.empty() || outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        const int64_t n = static_cast<int64_t>(inputs[0].data.size() / sizeof(double));
+        outputs[0].data.resize(sizeof(int64_t));
+        *reinterpret_cast<int64_t*>(outputs[0].data.data()) = n;
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_min", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        bool finite_only = true;
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            for (uint32_t i = 0; i < root.via.map.size; ++i) {
+              const auto& k = root.via.map.ptr[i].key;
+              if (k.type == msgpack::type::STR && k.as<std::string>() == "finite_only") {
+                finite_only = root.via.map.ptr[i].val.as<bool>();
+              }
+            }
+          }
+        }
+        if (inputs.empty() || outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        const auto& in = inputs[0].data;
+        const std::size_t n = in.size() / sizeof(double);
+        const auto* in_d = reinterpret_cast<const double*>(in.data());
+        double out_v = std::numeric_limits<double>::infinity();
+        bool any = false;
+        for (std::size_t i = 0; i < n; ++i) {
+          const double v = in_d[i];
+          if (finite_only && !std::isfinite(v)) {
+            continue;
+          }
+          if (!any || v < out_v) {
+            out_v = v;
+            any = true;
+          }
+        }
+        outputs[0].data.resize(sizeof(double));
+        *reinterpret_cast<double*>(outputs[0].data.data()) =
+            any ? out_v : std::numeric_limits<double>::infinity();
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_max", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        bool finite_only = true;
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            for (uint32_t i = 0; i < root.via.map.size; ++i) {
+              const auto& k = root.via.map.ptr[i].key;
+              if (k.type == msgpack::type::STR && k.as<std::string>() == "finite_only") {
+                finite_only = root.via.map.ptr[i].val.as<bool>();
+              }
+            }
+          }
+        }
+        if (inputs.empty() || outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        const auto& in = inputs[0].data;
+        const std::size_t n = in.size() / sizeof(double);
+        const auto* in_d = reinterpret_cast<const double*>(in.data());
+        double out_v = -std::numeric_limits<double>::infinity();
+        bool any = false;
+        for (std::size_t i = 0; i < n; ++i) {
+          const double v = in_d[i];
+          if (finite_only && !std::isfinite(v)) {
+            continue;
+          }
+          if (!any || v > out_v) {
+            out_v = v;
+            any = true;
+          }
+        }
+        outputs[0].data.resize(sizeof(double));
+        *reinterpret_cast<double*>(outputs[0].data.data()) =
+            any ? out_v : -std::numeric_limits<double>::infinity();
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_histogram1d", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        std::vector<double> edges;
+        bool density = false;
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            for (uint32_t i = 0; i < root.via.map.size; ++i) {
+              const auto& k = root.via.map.ptr[i].key;
+              if (k.type == msgpack::type::STR && k.as<std::string>() == "edges") {
+                const auto& v = root.via.map.ptr[i].val;
+                if (v.type == msgpack::type::ARRAY) {
+                  edges.reserve(v.via.array.size);
+                  for (uint32_t j = 0; j < v.via.array.size; ++j) {
+                    edges.push_back(v.via.array.ptr[j].as<double>());
+                  }
+                }
+              }
+              if (k.type == msgpack::type::STR && k.as<std::string>() == "density") {
+                density = root.via.map.ptr[i].val.as<bool>();
+              }
+            }
+          }
+        }
+        if (inputs.empty() || outputs.empty() || edges.size() < 2) {
+          return hpx::make_ready_future();
+        }
+        const std::size_t bins = edges.size() - 1;
+        outputs[0].data.resize(bins * sizeof(double));
+        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+        std::fill(out, out + bins, 0.0);
+        const auto& values = inputs[0].data;
+        const std::size_t n = values.size() / sizeof(double);
+        const auto* in_d = reinterpret_cast<const double*>(values.data());
+        const bool weighted = inputs.size() >= 2;
+        const auto* w_d = weighted ? reinterpret_cast<const double*>(inputs[1].data.data()) : nullptr;
+        const std::size_t nw = weighted ? (inputs[1].data.size() / sizeof(double)) : 0;
+        for (std::size_t i = 0; i < n; ++i) {
+          const double x = in_d[i];
+          if (!std::isfinite(x) || x < edges.front() || x > edges.back()) {
+            continue;
+          }
+          std::size_t idx = bins - 1;
+          if (x != edges.back()) {
+            auto it = std::upper_bound(edges.begin(), edges.end(), x);
+            idx = static_cast<std::size_t>(std::distance(edges.begin(), it) - 1);
+          }
+          if (idx >= bins) {
+            continue;
+          }
+          double w = 1.0;
+          if (weighted && i < nw) {
+            w = w_d[i];
+            if (!std::isfinite(w)) {
+              continue;
+            }
+          }
+          out[idx] += w;
+        }
+        if (density) {
+          double total = 0.0;
+          for (std::size_t i = 0; i < bins; ++i) {
+            total += out[i];
+          }
+          if (total > 0.0) {
+            for (std::size_t i = 0; i < bins; ++i) {
+              const double width = edges[i + 1] - edges[i];
+              if (width > 0.0) {
+                out[i] /= (total * width);
+              }
+            }
+          }
+        }
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_int64_sum_reduce", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+        if (outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        int64_t total = 0;
+        for (const auto& in_view : inputs) {
+          const auto& in = in_view.data;
+          if (in.size() < sizeof(int64_t)) {
+            continue;
+          }
+          total += *reinterpret_cast<const int64_t*>(in.data());
+        }
+        outputs[0].data.resize(sizeof(int64_t));
+        *reinterpret_cast<int64_t*>(outputs[0].data.data()) = total;
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_scalar_min_reduce", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+        if (outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        double out_v = std::numeric_limits<double>::infinity();
+        bool any = false;
+        for (const auto& in_view : inputs) {
+          const auto& in = in_view.data;
+          if (in.size() < sizeof(double)) {
+            continue;
+          }
+          const double v = *reinterpret_cast<const double*>(in.data());
+          if (!std::isfinite(v)) {
+            continue;
+          }
+          if (!any || v < out_v) {
+            out_v = v;
+            any = true;
+          }
+        }
+        outputs[0].data.resize(sizeof(double));
+        *reinterpret_cast<double*>(outputs[0].data.data()) =
+            any ? out_v : std::numeric_limits<double>::infinity();
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_scalar_max_reduce", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+        if (outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        double out_v = -std::numeric_limits<double>::infinity();
+        bool any = false;
+        for (const auto& in_view : inputs) {
+          const auto& in = in_view.data;
+          if (in.size() < sizeof(double)) {
+            continue;
+          }
+          const double v = *reinterpret_cast<const double*>(in.data());
+          if (!std::isfinite(v)) {
+            continue;
+          }
+          if (!any || v > out_v) {
+            out_v = v;
+            any = true;
+          }
+        }
+        outputs[0].data.resize(sizeof(double));
+        *reinterpret_cast<double*>(outputs[0].data.data()) =
+            any ? out_v : -std::numeric_limits<double>::infinity();
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "histogram1d_accumulate", .n_inputs = 1, .n_outputs = 1,
+                 .needs_neighbors = false},
+      [](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
+         const NeighborViews&, std::span<HostView> outputs,
+         std::span<const std::uint8_t> params_msgpack) {
+        struct Box3 {
+          std::array<int, 3> lo{0, 0, 0};
+          std::array<int, 3> hi{0, 0, 0};
+        };
+        struct Params {
+          std::array<double, 2> range{0.0, 1.0};
+          int bins = 1;
+          int bytes_per_value = 4;
+          std::vector<Box3> covered_boxes;
+        } params;
+
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            auto get_key = [&](const char* key) -> const msgpack::object* {
+              for (uint32_t i = 0; i < root.via.map.size; ++i) {
+                const auto& k = root.via.map.ptr[i].key;
+                if (k.type == msgpack::type::STR && k.as<std::string>() == key) {
+                  return &root.via.map.ptr[i].val;
+                }
+              }
+              return nullptr;
+            };
+            if (const auto* range = get_key("range"); range &&
+                                                    range->type == msgpack::type::ARRAY &&
+                                                    range->via.array.size == 2) {
+              params.range[0] = range->via.array.ptr[0].as<double>();
+              params.range[1] = range->via.array.ptr[1].as<double>();
+            }
+            if (const auto* bins = get_key("bins"); bins &&
+                                                   (bins->type == msgpack::type::POSITIVE_INTEGER ||
+                                                    bins->type == msgpack::type::NEGATIVE_INTEGER)) {
+              params.bins = bins->as<int>();
+            }
+            if (const auto* bpv = get_key("bytes_per_value"); bpv &&
+                                                         (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                                                          bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+              params.bytes_per_value = bpv->as<int>();
+            }
+            if (const auto* boxes = get_key("covered_boxes"); boxes &&
+                                                     boxes->type == msgpack::type::ARRAY) {
+              params.covered_boxes.clear();
+              params.covered_boxes.reserve(boxes->via.array.size);
+              for (uint32_t i = 0; i < boxes->via.array.size; ++i) {
+                const auto& entry = boxes->via.array.ptr[i];
+                if (entry.type != msgpack::type::ARRAY || entry.via.array.size != 2) {
+                  continue;
+                }
+                const auto& lo = entry.via.array.ptr[0];
+                const auto& hi = entry.via.array.ptr[1];
+                if (lo.type != msgpack::type::ARRAY || hi.type != msgpack::type::ARRAY ||
+                    lo.via.array.size != 3 || hi.via.array.size != 3) {
+                  continue;
+                }
+                Box3 box_data;
+                for (uint32_t d = 0; d < 3; ++d) {
+                  box_data.lo[d] = lo.via.array.ptr[d].as<int>();
+                  box_data.hi[d] = hi.via.array.ptr[d].as<int>();
+                }
+                params.covered_boxes.push_back(box_data);
+              }
+            }
+          }
+        }
+
+        if (outputs.empty() || inputs.empty() || params.bins <= 0) {
+          return hpx::make_ready_future();
+        }
+        const double lo = params.range[0];
+        const double hi = params.range[1];
+        if (!std::isfinite(lo) || !std::isfinite(hi) || hi <= lo) {
+          return hpx::make_ready_future();
+        }
+
+        const std::size_t out_bytes = static_cast<std::size_t>(params.bins) * sizeof(double);
+        if (outputs[0].data.size() != out_bytes) {
+          outputs[0].data.assign(out_bytes, 0);
+        } else {
+          std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
+        }
+
+        if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
+          return hpx::make_ready_future();
+        }
+        const auto& box = level.boxes.at(static_cast<std::size_t>(block));
+        const int nx = box.hi.x - box.lo.x + 1;
+        const int ny = box.hi.y - box.lo.y + 1;
+        const int nz = box.hi.z - box.lo.z + 1;
+        if (nx <= 0 || ny <= 0 || nz <= 0) {
+          return hpx::make_ready_future();
+        }
+
+        auto covered = [&](int ix, int iy, int iz) -> bool {
+          for (const auto& b : params.covered_boxes) {
+            if (ix >= b.lo[0] && ix <= b.hi[0] &&
+                iy >= b.lo[1] && iy <= b.hi[1] &&
+                iz >= b.lo[2] && iz <= b.hi[2]) {
+              return true;
+            }
+          }
+          return false;
+        };
+        auto in_index = [&](int i, int j, int k) -> std::size_t {
+          return static_cast<std::size_t>((i * ny + j) * nz + k);
+        };
+        auto read_value = [&](const HostView& view, std::size_t idx) -> double {
+          const auto& data = view.data;
+          if (params.bytes_per_value == 4) {
+            if (idx * sizeof(float) < data.size()) {
+              return static_cast<double>(reinterpret_cast<const float*>(data.data())[idx]);
+            }
+          } else if (params.bytes_per_value == 8) {
+            if (idx * sizeof(double) < data.size()) {
+              return reinterpret_cast<const double*>(data.data())[idx];
+            }
+          }
+          return 0.0;
+        };
+
+        const bool weighted = inputs.size() >= 2;
+        const double inv_dx = static_cast<double>(params.bins) / (hi - lo);
+        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+
+        for (int i = 0; i < nx; ++i) {
+          const int gi = box.lo.x + i;
+          for (int j = 0; j < ny; ++j) {
+            const int gj = box.lo.y + j;
+            for (int k = 0; k < nz; ++k) {
+              const int gk = box.lo.z + k;
+              if (covered(gi, gj, gk)) {
+                continue;
+              }
+              const auto idx = in_index(i, j, k);
+              const double value = read_value(inputs[0], idx);
+              if (!std::isfinite(value) || value < lo || value > hi) {
+                continue;
+              }
+              int bin = 0;
+              if (value == hi) {
+                bin = params.bins - 1;
+              } else {
+                bin = static_cast<int>(std::floor((value - lo) * inv_dx));
+              }
+              if (bin < 0 || bin >= params.bins) {
+                continue;
+              }
+              double weight = 1.0;
+              if (weighted) {
+                weight = read_value(inputs[1], idx);
+                if (!std::isfinite(weight)) {
+                  continue;
+                }
+              }
+              out[static_cast<std::size_t>(bin)] += weight;
+            }
+          }
+        }
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "histogram2d_accumulate", .n_inputs = 2, .n_outputs = 1,
+                 .needs_neighbors = false},
+      [](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
+         const NeighborViews&, std::span<HostView> outputs,
+         std::span<const std::uint8_t> params_msgpack) {
+        struct Box3 {
+          std::array<int, 3> lo{0, 0, 0};
+          std::array<int, 3> hi{0, 0, 0};
+        };
+        struct Params {
+          std::array<double, 2> x_range{0.0, 1.0};
+          std::array<double, 2> y_range{0.0, 1.0};
+          std::array<int, 2> bins{1, 1};
+          int bytes_per_value = 4;
+          std::string weight_mode{"input"};
+          std::vector<Box3> covered_boxes;
+        } params;
+
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            auto get_key = [&](const char* key) -> const msgpack::object* {
+              for (uint32_t i = 0; i < root.via.map.size; ++i) {
+                const auto& k = root.via.map.ptr[i].key;
+                if (k.type == msgpack::type::STR && k.as<std::string>() == key) {
+                  return &root.via.map.ptr[i].val;
+                }
+              }
+              return nullptr;
+            };
+            if (const auto* x_range = get_key("x_range"); x_range &&
+                                                        x_range->type == msgpack::type::ARRAY &&
+                                                        x_range->via.array.size == 2) {
+              params.x_range[0] = x_range->via.array.ptr[0].as<double>();
+              params.x_range[1] = x_range->via.array.ptr[1].as<double>();
+            }
+            if (const auto* y_range = get_key("y_range"); y_range &&
+                                                        y_range->type == msgpack::type::ARRAY &&
+                                                        y_range->via.array.size == 2) {
+              params.y_range[0] = y_range->via.array.ptr[0].as<double>();
+              params.y_range[1] = y_range->via.array.ptr[1].as<double>();
+            }
+            if (const auto* bins = get_key("bins"); bins && bins->type == msgpack::type::ARRAY &&
+                                                   bins->via.array.size == 2) {
+              params.bins[0] = bins->via.array.ptr[0].as<int>();
+              params.bins[1] = bins->via.array.ptr[1].as<int>();
+            }
+            if (const auto* bpv = get_key("bytes_per_value"); bpv &&
+                                                         (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                                                          bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+              params.bytes_per_value = bpv->as<int>();
+            }
+            if (const auto* mode = get_key("weight_mode"); mode && mode->type == msgpack::type::STR) {
+              params.weight_mode = mode->as<std::string>();
+            }
+            if (const auto* boxes = get_key("covered_boxes"); boxes &&
+                                                     boxes->type == msgpack::type::ARRAY) {
+              params.covered_boxes.clear();
+              params.covered_boxes.reserve(boxes->via.array.size);
+              for (uint32_t i = 0; i < boxes->via.array.size; ++i) {
+                const auto& entry = boxes->via.array.ptr[i];
+                if (entry.type != msgpack::type::ARRAY || entry.via.array.size != 2) {
+                  continue;
+                }
+                const auto& lo = entry.via.array.ptr[0];
+                const auto& hi = entry.via.array.ptr[1];
+                if (lo.type != msgpack::type::ARRAY || hi.type != msgpack::type::ARRAY ||
+                    lo.via.array.size != 3 || hi.via.array.size != 3) {
+                  continue;
+                }
+                Box3 box_data;
+                for (uint32_t d = 0; d < 3; ++d) {
+                  box_data.lo[d] = lo.via.array.ptr[d].as<int>();
+                  box_data.hi[d] = hi.via.array.ptr[d].as<int>();
+                }
+                params.covered_boxes.push_back(box_data);
+              }
+            }
+          }
+        }
+
+        const int nx_bins = params.bins[0];
+        const int ny_bins = params.bins[1];
+        if (outputs.empty() || inputs.size() < 2 || nx_bins <= 0 || ny_bins <= 0) {
+          return hpx::make_ready_future();
+        }
+        const double xlo = params.x_range[0];
+        const double xhi = params.x_range[1];
+        const double ylo = params.y_range[0];
+        const double yhi = params.y_range[1];
+        if (!std::isfinite(xlo) || !std::isfinite(xhi) || !std::isfinite(ylo) || !std::isfinite(yhi) ||
+            xhi <= xlo || yhi <= ylo) {
+          return hpx::make_ready_future();
+        }
+
+        const std::size_t out_bytes = static_cast<std::size_t>(nx_bins) *
+                                      static_cast<std::size_t>(ny_bins) * sizeof(double);
+        if (outputs[0].data.size() != out_bytes) {
+          outputs[0].data.assign(out_bytes, 0);
+        } else {
+          std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
+        }
+
+        if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
+          return hpx::make_ready_future();
+        }
+        const auto& box = level.boxes.at(static_cast<std::size_t>(block));
+        const int nx = box.hi.x - box.lo.x + 1;
+        const int ny = box.hi.y - box.lo.y + 1;
+        const int nz = box.hi.z - box.lo.z + 1;
+        if (nx <= 0 || ny <= 0 || nz <= 0) {
+          return hpx::make_ready_future();
+        }
+
+        auto covered = [&](int ix, int iy, int iz) -> bool {
+          for (const auto& b : params.covered_boxes) {
+            if (ix >= b.lo[0] && ix <= b.hi[0] &&
+                iy >= b.lo[1] && iy <= b.hi[1] &&
+                iz >= b.lo[2] && iz <= b.hi[2]) {
+              return true;
+            }
+          }
+          return false;
+        };
+        auto in_index = [&](int i, int j, int k) -> std::size_t {
+          return static_cast<std::size_t>((i * ny + j) * nz + k);
+        };
+        auto read_value = [&](const HostView& view, std::size_t idx) -> double {
+          const auto& data = view.data;
+          if (params.bytes_per_value == 4) {
+            if (idx * sizeof(float) < data.size()) {
+              return static_cast<double>(reinterpret_cast<const float*>(data.data())[idx]);
+            }
+          } else if (params.bytes_per_value == 8) {
+            if (idx * sizeof(double) < data.size()) {
+              return reinterpret_cast<const double*>(data.data())[idx];
+            }
+          }
+          return 0.0;
+        };
+
+        const bool weighted = inputs.size() >= 3;
+        const double cell_volume = level.geom.dx[0] * level.geom.dx[1] * level.geom.dx[2];
+        const double inv_dx = static_cast<double>(nx_bins) / (xhi - xlo);
+        const double inv_dy = static_cast<double>(ny_bins) / (yhi - ylo);
+        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+
+        for (int i = 0; i < nx; ++i) {
+          const int gi = box.lo.x + i;
+          for (int j = 0; j < ny; ++j) {
+            const int gj = box.lo.y + j;
+            for (int k = 0; k < nz; ++k) {
+              const int gk = box.lo.z + k;
+              if (covered(gi, gj, gk)) {
+                continue;
+              }
+              const auto idx = in_index(i, j, k);
+              const double x = read_value(inputs[0], idx);
+              const double y = read_value(inputs[1], idx);
+              if (!std::isfinite(x) || !std::isfinite(y) || x < xlo || x > xhi || y < ylo || y > yhi) {
+                continue;
+              }
+              int ix = (x == xhi) ? (nx_bins - 1) : static_cast<int>(std::floor((x - xlo) * inv_dx));
+              int iy = (y == yhi) ? (ny_bins - 1) : static_cast<int>(std::floor((y - ylo) * inv_dy));
+              if (ix < 0 || ix >= nx_bins || iy < 0 || iy >= ny_bins) {
+                continue;
+              }
+              double weight = 1.0;
+              if (weighted) {
+                weight = read_value(inputs[2], idx);
+                if (!std::isfinite(weight)) {
+                  continue;
+                }
+              } else if (params.weight_mode == "cell_mass") {
+                weight = x * cell_volume;
+                if (!std::isfinite(weight)) {
+                  continue;
+                }
+              } else if (params.weight_mode == "cell_volume") {
+                weight = cell_volume;
+              }
+              out[static_cast<std::size_t>(iy) * static_cast<std::size_t>(nx_bins) +
+                  static_cast<std::size_t>(ix)] += weight;
             }
           }
         }

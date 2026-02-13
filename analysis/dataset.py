@@ -94,6 +94,53 @@ class Dataset:
         self._fields.clear()
         self._auto_register()
 
+    def list_particle_types(self) -> list[str]:
+        if not hasattr(self._h, "list_particle_types"):
+            return []
+        return list(self._h.list_particle_types())
+
+    def list_particle_fields(self, particle_type: str) -> list[str]:
+        if not hasattr(self._h, "list_particle_fields"):
+            return []
+        return list(self._h.list_particle_fields(particle_type))
+
+    def get_particle_array(self, particle_type: str, field: str) -> np.ndarray:
+        if not hasattr(self._h, "read_particle_field"):
+            raise RuntimeError("Particle field access is not available in this runtime")
+        payload = self._h.read_particle_field(particle_type, field)
+        dtype = payload["dtype"]
+        raw = payload["data"]
+        if dtype == "float32":
+            np_dtype = np.float32
+        elif dtype == "float64":
+            np_dtype = np.float64
+        elif dtype == "int64":
+            np_dtype = np.int64
+        else:
+            raise RuntimeError(f"unsupported particle dtype '{dtype}'")
+        return np.frombuffer(raw, dtype=np_dtype)
+
+    def get_particle_chunk_count(self, particle_type: str) -> int:
+        if not hasattr(self._h, "particle_chunk_count"):
+            raise RuntimeError("Particle chunk metadata is not available in this runtime")
+        return int(self._h.particle_chunk_count(particle_type))
+
+    def get_particle_chunk_array(self, particle_type: str, field: str, chunk_index: int) -> np.ndarray:
+        if not hasattr(self._h, "read_particle_field_chunk"):
+            raise RuntimeError("Particle chunk field access is not available in this runtime")
+        payload = self._h.read_particle_field_chunk(particle_type, field, int(chunk_index))
+        dtype = payload["dtype"]
+        raw = payload["data"]
+        if dtype == "float32":
+            np_dtype = np.float32
+        elif dtype == "float64":
+            np_dtype = np.float64
+        elif dtype == "int64":
+            np_dtype = np.int64
+        else:
+            raise RuntimeError(f"unsupported particle dtype '{dtype}'")
+        return np.frombuffer(raw, dtype=np_dtype)
+
     def register_field(self, name: str, fid: int) -> None:
         self._fields[name] = fid
         if self._kind in {"openpmd", "parthenon"}:
@@ -150,7 +197,13 @@ class Dataset:
             levels.append(LevelMeta(geom=geom, boxes=boxes))
         
         steps.append(StepMeta(step=self.step, levels=levels))
-        return RunMeta(steps=steps)
+        particle_species: Dict[str, int] = {}
+        for ptype in self.list_particle_types():
+            try:
+                particle_species[ptype] = self.get_particle_chunk_count(ptype)
+            except Exception:
+                continue
+        return RunMeta(steps=steps, particle_species=particle_species)
 
     def resolve_field(self, var: str | None) -> tuple[str, int, Dict[str, Any]]:
         meta = self.metadata
