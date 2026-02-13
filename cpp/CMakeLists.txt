@@ -157,6 +157,14 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../analysis/"
 if(KANGAROO_BUILD_CLAY_DASHBOARD)
   include(FetchContent)
 
+  function(kangaroo_suppress_deprecation_warnings target_name)
+    if(APPLE AND CMAKE_C_COMPILER_ID MATCHES "Clang")
+      if(TARGET "${target_name}")
+        target_compile_options("${target_name}" PRIVATE "-Wno-deprecated-declarations")
+      endif()
+    endif()
+  endfunction()
+
   FetchContent_Declare(
     nlohmann_json
     GIT_REPOSITORY https://github.com/nlohmann/json.git
@@ -173,6 +181,9 @@ if(KANGAROO_BUILD_CLAY_DASHBOARD)
   )
   FetchContent_MakeAvailable(SDL)
   set_property(DIRECTORY "${sdl_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL TRUE)
+  kangaroo_suppress_deprecation_warnings(SDL3-shared)
+  kangaroo_suppress_deprecation_warnings(SDL3-static)
+  kangaroo_suppress_deprecation_warnings(SDL_uclibc)
 
   FetchContent_Declare(
     SDL_ttf
@@ -182,6 +193,8 @@ if(KANGAROO_BUILD_CLAY_DASHBOARD)
   )
   FetchContent_MakeAvailable(SDL_ttf)
   set_property(DIRECTORY "${sdl_ttf_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL TRUE)
+  kangaroo_suppress_deprecation_warnings(SDL3_ttf-shared)
+  kangaroo_suppress_deprecation_warnings(SDL3_ttf-static)
 
   FetchContent_Declare(
     SDL_image
@@ -191,6 +204,8 @@ if(KANGAROO_BUILD_CLAY_DASHBOARD)
   )
   FetchContent_MakeAvailable(SDL_image)
   set_property(DIRECTORY "${SDL_image_SOURCE_DIR}" PROPERTY EXCLUDE_FROM_ALL TRUE)
+  kangaroo_suppress_deprecation_warnings(SDL3_image-shared)
+  kangaroo_suppress_deprecation_warnings(SDL3_image-static)
 
   add_executable(kangaroo_dashboard_clay src/kangaroo_dashboard_clay.cpp)
   target_compile_features(kangaroo_dashboard_clay PRIVATE cxx_std_20)

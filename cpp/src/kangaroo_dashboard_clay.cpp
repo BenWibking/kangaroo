@@ -961,7 +961,7 @@ void DrawMetricsPanel(const DashboardState& state) {
   }
 
   CLAY(CLAY_ID("metrics_panel"), {
-    .layout = {.layoutDirection = CLAY_TOP_TO_BOTTOM, .padding = CLAY_PADDING_ALL(12), .childGap = 10, .sizing = {.width = CLAY_SIZING_GROW(0)}},
+    .layout = {.sizing = {.width = CLAY_SIZING_GROW(0)}, .padding = CLAY_PADDING_ALL(12), .childGap = 10, .layoutDirection = CLAY_TOP_TO_BOTTOM},
     .backgroundColor = kPanel,
     .cornerRadius = CLAY_CORNER_RADIUS(10)
   }) {
@@ -973,11 +973,11 @@ void DrawMetricsPanel(const DashboardState& state) {
 
     CLAY(CLAY_ID("cpu_bars"), {
       .layout = {
-        .layoutDirection = CLAY_LEFT_TO_RIGHT,
         .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED(64)},
-        .childGap = 2,
         .padding = CLAY_PADDING_ALL(6),
-        .childAlignment = {.y = CLAY_ALIGN_Y_BOTTOM}
+        .childGap = 2,
+        .childAlignment = {.y = CLAY_ALIGN_Y_BOTTOM},
+        .layoutDirection = CLAY_LEFT_TO_RIGHT
       },
       .backgroundColor = kPanelAlt,
       .cornerRadius = CLAY_CORNER_RADIUS(6)
@@ -1072,13 +1072,13 @@ void DrawTaskStreamPanel(const DashboardState& state) {
   g_task_timeline_view.pixels_per_second = timeline_pixels_per_second;
 
   CLAY(CLAY_ID("tasks_panel"), {
-    .layout = {.layoutDirection = CLAY_TOP_TO_BOTTOM, .padding = CLAY_PADDING_ALL(12), .childGap = 10, .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED(360)}},
+    .layout = {.sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED(360)}, .padding = CLAY_PADDING_ALL(12), .childGap = 10, .layoutDirection = CLAY_TOP_TO_BOTTOM},
     .backgroundColor = kPanel,
     .cornerRadius = CLAY_CORNER_RADIUS(10)
   }) {
     DrawTextLine("Task Stream", kText, 18);
     CLAY(CLAY_ID("tasks_panel_controls"), {
-      .layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .childGap = 8, .sizing = {.width = CLAY_SIZING_GROW(0)}}
+      .layout = {.sizing = {.width = CLAY_SIZING_GROW(0)}, .childGap = 8, .layoutDirection = CLAY_LEFT_TO_RIGHT}
     }) {
       DrawTextLine("Drag to zoom timeline, right-click to reset zoom", kMuted, 12);
       DrawButton(
@@ -1087,19 +1087,19 @@ void DrawTaskStreamPanel(const DashboardState& state) {
           kPanelAlt);
     }
     CLAY(CLAY_ID("tasks_scroll"), {
-      .layout = {.layoutDirection = CLAY_TOP_TO_BOTTOM, .childGap = 6, .padding = CLAY_PADDING_ALL(8), .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_GROW(0)}},
-      .clip = {.horizontal = true, .vertical = true, .childOffset = Clay_GetScrollOffset()},
+      .layout = {.sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_GROW(0)}, .padding = CLAY_PADDING_ALL(8), .childGap = 6, .layoutDirection = CLAY_TOP_TO_BOTTOM},
       .backgroundColor = kPanelAlt,
-      .cornerRadius = CLAY_CORNER_RADIUS(6)
+      .cornerRadius = CLAY_CORNER_RADIUS(6),
+      .clip = {.horizontal = true, .vertical = true, .childOffset = Clay_GetScrollOffset()}
     }) {
       CLAY(CLAY_ID("task_time_axis_row"), {
-        .layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .childGap = 8, .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED(28)}}
+        .layout = {.sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED(28)}, .childGap = 8, .layoutDirection = CLAY_LEFT_TO_RIGHT}
       }) {
         CLAY(CLAY_ID("task_time_axis_label_spacer"), {
           .layout = {.sizing = {.width = CLAY_SIZING_FIXED(kLaneLabelWidthPx), .height = CLAY_SIZING_GROW(0)}}
         }) {}
         CLAY(CLAY_ID("task_time_axis"), {
-          .layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {.width = CLAY_SIZING_FIXED(timeline_draw_width_px), .height = CLAY_SIZING_GROW(0)}}
+          .layout = {.sizing = {.width = CLAY_SIZING_FIXED(timeline_draw_width_px), .height = CLAY_SIZING_GROW(0)}, .layoutDirection = CLAY_LEFT_TO_RIGHT}
         }) {
           const double tick_step = NiceTickStep(span_s, 8);
           const double start_tick = std::ceil(view_start_runtime / tick_step) * tick_step;
@@ -1119,16 +1119,16 @@ void DrawTaskStreamPanel(const DashboardState& state) {
               .backgroundColor = kMuted
             }) {
               CLAY(CLAY_IDI("task_tick_label", tick_idx), {
-                .layout = {.padding = CLAY_PADDING_ALL(2), .sizing = {.width = CLAY_SIZING_FIT(0), .height = CLAY_SIZING_FIT(0)}},
+                .layout = {.sizing = {.width = CLAY_SIZING_FIT(0), .height = CLAY_SIZING_FIT(0)}, .padding = CLAY_PADDING_ALL(2)},
+                .backgroundColor = Clay_Color{20, 24, 30, 220},
+                .cornerRadius = CLAY_CORNER_RADIUS(3),
                 .floating = {
                   .offset = {0, -4},
                   .zIndex = 30000,
                   .attachPoints = {.element = CLAY_ATTACH_POINT_LEFT_BOTTOM, .parent = CLAY_ATTACH_POINT_LEFT_TOP},
                   .pointerCaptureMode = CLAY_POINTER_CAPTURE_MODE_PASSTHROUGH,
                   .attachTo = CLAY_ATTACH_TO_PARENT
-                },
-                .backgroundColor = Clay_Color{20, 24, 30, 220},
-                .cornerRadius = CLAY_CORNER_RADIUS(3)
+                }
               }) {
                 DrawTextLine(FormatRuntimeTick(tick_runtime), kMuted, 11);
               }
@@ -1149,7 +1149,7 @@ void DrawTaskStreamPanel(const DashboardState& state) {
       int32_t row_idx = 0;
       for (const auto& [worker, lane_tasks] : lanes) {
         CLAY(CLAY_IDI("task_lane_row", row_idx), {
-          .layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .childGap = 8, .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED(kBarHeightPx)}}
+          .layout = {.sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED(kBarHeightPx)}, .childGap = 8, .layoutDirection = CLAY_LEFT_TO_RIGHT}
         }) {
           CLAY(CLAY_IDI("task_lane_label", row_idx), {
             .layout = {.sizing = {.width = CLAY_SIZING_FIXED(kLaneLabelWidthPx), .height = CLAY_SIZING_FIXED(kBarHeightPx)}}
@@ -1157,7 +1157,7 @@ void DrawTaskStreamPanel(const DashboardState& state) {
             DrawTextLine(worker, kMuted, 12);
           }
           CLAY(CLAY_IDI("task_lane_timeline", row_idx), {
-            .layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {.width = CLAY_SIZING_FIXED(timeline_draw_width_px), .height = CLAY_SIZING_FIXED(kBarHeightPx)}}
+            .layout = {.sizing = {.width = CLAY_SIZING_FIXED(timeline_draw_width_px), .height = CLAY_SIZING_FIXED(kBarHeightPx)}, .layoutDirection = CLAY_LEFT_TO_RIGHT}
           }) {
             int32_t lane_task_idx = 0;
             double cursor_runtime = view_start_runtime;
@@ -1191,7 +1191,9 @@ void DrawTaskStreamPanel(const DashboardState& state) {
               }) {
                 if (Clay_Hovered()) {
                   CLAY(CLAY_IDI("task_tooltip", row_idx * 10000 + lane_task_idx), {
-                    .layout = {.padding = CLAY_PADDING_ALL(6), .sizing = {.width = CLAY_SIZING_FIT(0), .height = CLAY_SIZING_FIT(0)}},
+                    .layout = {.sizing = {.width = CLAY_SIZING_FIT(0), .height = CLAY_SIZING_FIT(0)}, .padding = CLAY_PADDING_ALL(6)},
+                    .backgroundColor = kBg,
+                    .cornerRadius = CLAY_CORNER_RADIUS(5),
                     .floating = {
                       .offset = {0, -6},
                       .zIndex = 32000,
@@ -1199,8 +1201,6 @@ void DrawTaskStreamPanel(const DashboardState& state) {
                       .pointerCaptureMode = CLAY_POINTER_CAPTURE_MODE_PASSTHROUGH,
                       .attachTo = CLAY_ATTACH_TO_PARENT
                     },
-                    .backgroundColor = kBg,
-                    .cornerRadius = CLAY_CORNER_RADIUS(5),
                     .border = {.color = kMuted, .width = {1, 1, 1, 1, 0}}
                   }) {
                     DrawTextLine(rt.name + "  [" + rt.worker + "]  " + FormatDouble(full_dur_runtime * 1000.0, 1) + " ms", kText, 12);
@@ -1233,13 +1233,13 @@ void DrawFlamePanel(const DashboardState& state) {
   }
 
   CLAY(CLAY_ID("flame_panel"), {
-    .layout = {.layoutDirection = CLAY_TOP_TO_BOTTOM, .padding = CLAY_PADDING_ALL(12), .childGap = 8, .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED(240)}},
+    .layout = {.sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED(240)}, .padding = CLAY_PADDING_ALL(12), .childGap = 8, .layoutDirection = CLAY_TOP_TO_BOTTOM},
     .backgroundColor = kPanel,
     .cornerRadius = CLAY_CORNER_RADIUS(10)
   }) {
     DrawTextLine("Flamegraph (total durations)", kText, 18);
     CLAY(CLAY_ID("flame_bar"), {
-      .layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED(18)}, .childGap = 1, .padding = CLAY_PADDING_ALL(2)},
+      .layout = {.sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED(18)}, .padding = CLAY_PADDING_ALL(2), .childGap = 1, .layoutDirection = CLAY_LEFT_TO_RIGHT},
       .backgroundColor = kPanelAlt,
       .cornerRadius = CLAY_CORNER_RADIUS(6)
     }) {
@@ -1257,7 +1257,7 @@ void DrawFlamePanel(const DashboardState& state) {
     }
 
     CLAY(CLAY_ID("flame_list"), {
-      .layout = {.layoutDirection = CLAY_TOP_TO_BOTTOM, .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_GROW(0)}, .childGap = 4},
+      .layout = {.sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_GROW(0)}, .childGap = 4, .layoutDirection = CLAY_TOP_TO_BOTTOM},
       .clip = {.vertical = true, .childOffset = Clay_GetScrollOffset()}
     }) {
       for (const auto& [name, duration] : totals) {
@@ -1272,7 +1272,7 @@ void DrawDagPanel(const DashboardState& state) {
   const auto edges = state.dag_edges();
 
   CLAY(CLAY_ID("dag_panel"), {
-    .layout = {.layoutDirection = CLAY_TOP_TO_BOTTOM, .padding = CLAY_PADDING_ALL(12), .childGap = 10, .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED(260)}},
+    .layout = {.sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_FIXED(260)}, .padding = CLAY_PADDING_ALL(12), .childGap = 10, .layoutDirection = CLAY_TOP_TO_BOTTOM},
     .backgroundColor = kPanel,
     .cornerRadius = CLAY_CORNER_RADIUS(10)
   }) {
@@ -1280,14 +1280,14 @@ void DrawDagPanel(const DashboardState& state) {
     DrawTextLine("Nodes: " + std::to_string(nodes.size()) + "  Edges: " + std::to_string(edges.size()), kMuted, 13);
 
     CLAY(CLAY_ID("dag_scroll"), {
-      .layout = {.layoutDirection = CLAY_TOP_TO_BOTTOM, .childGap = 5, .padding = CLAY_PADDING_ALL(8), .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_GROW(0)}},
-      .clip = {.vertical = true, .childOffset = Clay_GetScrollOffset()},
+      .layout = {.sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_GROW(0)}, .padding = CLAY_PADDING_ALL(8), .childGap = 5, .layoutDirection = CLAY_TOP_TO_BOTTOM},
       .backgroundColor = kPanelAlt,
-      .cornerRadius = CLAY_CORNER_RADIUS(6)
+      .cornerRadius = CLAY_CORNER_RADIUS(6),
+      .clip = {.vertical = true, .childOffset = Clay_GetScrollOffset()}
     }) {
       for (size_t i = 0; i < nodes.size(); ++i) {
         const auto& n = nodes[i];
-        CLAY(CLAY_IDI("dag_row", static_cast<int32_t>(i)), {.layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .childGap = 6, .sizing = {.width = CLAY_SIZING_GROW(0)}}}) {
+        CLAY(CLAY_IDI("dag_row", static_cast<int32_t>(i)), {.layout = {.sizing = {.width = CLAY_SIZING_GROW(0)}, .childGap = 6, .layoutDirection = CLAY_LEFT_TO_RIGHT}}) {
           CLAY(CLAY_IDI("dag_indent", static_cast<int32_t>(i)), {.layout = {.sizing = {.width = CLAY_SIZING_FIXED(static_cast<float>(n.depth * 16)), .height = CLAY_SIZING_FIXED(1)}}}) {}
           DrawTextLine(n.label, kMuted, 13);
         }
@@ -1303,11 +1303,11 @@ Clay_RenderCommandArray BuildLayout(DashboardState& state, UiActions* actions) {
   Clay_BeginLayout();
 
   CLAY(CLAY_ID("root"), {
-    .layout = {.layoutDirection = CLAY_TOP_TO_BOTTOM, .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_GROW(0)}, .padding = CLAY_PADDING_ALL(12), .childGap = 10},
+    .layout = {.sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_GROW(0)}, .padding = CLAY_PADDING_ALL(12), .childGap = 10, .layoutDirection = CLAY_TOP_TO_BOTTOM},
     .backgroundColor = kBg
   }) {
     CLAY(CLAY_ID("header"), {
-      .layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {.width = CLAY_SIZING_GROW(0)}, .childGap = 12, .padding = CLAY_PADDING_ALL(10), .childAlignment = {.y = CLAY_ALIGN_Y_CENTER}},
+      .layout = {.sizing = {.width = CLAY_SIZING_GROW(0)}, .padding = CLAY_PADDING_ALL(10), .childGap = 12, .childAlignment = {.y = CLAY_ALIGN_Y_CENTER}, .layoutDirection = CLAY_LEFT_TO_RIGHT},
       .backgroundColor = kPanel,
       .cornerRadius = CLAY_CORNER_RADIUS(10)
     }) {
@@ -1322,14 +1322,14 @@ Clay_RenderCommandArray BuildLayout(DashboardState& state, UiActions* actions) {
     }
 
     CLAY(CLAY_ID("top_row"), {
-      .layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {.width = CLAY_SIZING_GROW(0)}, .childGap = 10}
+      .layout = {.sizing = {.width = CLAY_SIZING_GROW(0)}, .childGap = 10, .layoutDirection = CLAY_LEFT_TO_RIGHT}
     }) {
       DrawMetricsPanel(state);
       DrawDagPanel(state);
     }
 
     CLAY(CLAY_ID("bottom_row"), {
-      .layout = {.layoutDirection = CLAY_LEFT_TO_RIGHT, .sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_GROW(0)}, .childGap = 10}
+      .layout = {.sizing = {.width = CLAY_SIZING_GROW(0), .height = CLAY_SIZING_GROW(0)}, .childGap = 10, .layoutDirection = CLAY_LEFT_TO_RIGHT}
     }) {
       DrawTaskStreamPanel(state);
       DrawFlamePanel(state);
