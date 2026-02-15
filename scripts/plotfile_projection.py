@@ -90,8 +90,13 @@ def main() -> int:
 
     import matplotlib.pyplot as plt
 
-    # uniform_projection of density [g cm^-3] over path length [cm] gives [g cm^-2];
-    # convert to [Msun pc^-2].
+    # uniform_projection accumulates value * dV onto each image pixel, so divide by
+    # pixel area to recover a column integral (for density: [g cm^-2]), then convert
+    # to [Msun pc^-2].
+    nx, ny = res
+    pixel_area = abs((rect[2] - rect[0]) / nx) * abs((rect[3] - rect[1]) / ny)
+    arr = arr / pixel_area
+
     msun_g = 1.98847e33
     pc_cm = 3.0856775814913673e18
     cgs_surface_density_to_msun_pc2 = (pc_cm**2) / msun_g
