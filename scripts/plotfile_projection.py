@@ -90,14 +90,21 @@ def main() -> int:
 
     import matplotlib.pyplot as plt
 
+    # uniform_projection of density [g cm^-3] over path length [cm] gives [g cm^-2];
+    # convert to [Msun pc^-2].
+    msun_g = 1.98847e33
+    pc_cm = 3.0856775814913673e18
+    cgs_surface_density_to_msun_pc2 = (pc_cm**2) / msun_g
+    arr = arr * cgs_surface_density_to_msun_pc2
+
     fig, axp = plt.subplots(figsize=(6, 5))
-    kpc = 3.0856775814913673e21
+    kpc = 1.0e3 * pc_cm
     extent = (rect[0] / kpc, rect[2] / kpc, rect[1] / kpc, rect[3] / kpc)
     im = axp.imshow(np.ma.masked_invalid(np.log10(arr)), origin="lower", cmap="viridis", extent=extent)
-    axp.set_title(f"AMR projection of {comp} ({plane} plane)")
+    axp.set_title(f"AMR projection of {comp} [{r'Msun pc^{-2}'}] ({plane} plane)")
     axp.set_xlabel(f"{labels[0]} [kpc]")
     axp.set_ylabel(f"{labels[1]} [kpc]")
-    fig.colorbar(im, ax=axp, label=f"log10({comp})")
+    fig.colorbar(im, ax=axp, label=f"log10({comp} [Msun pc^-2])")
     fig.tight_layout()
     fig.savefig(a.output, dpi=150) if a.output else plt.show()
 
