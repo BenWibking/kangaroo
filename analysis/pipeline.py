@@ -590,6 +590,7 @@ class Pipeline:
         axis_bounds: tuple[float, float],
         rect: tuple[float, float, float, float],
         resolution: tuple[int, int],
+        mass_max: float | None = None,
         out: str | None = None,
         reduce_fan_in: int | None = None,
     ) -> FieldHandle:
@@ -601,6 +602,7 @@ class Pipeline:
             axis=axis,
             axis_bounds=axis_bounds,
             rect=rect,
+            mass_max=mass_max,
             out_name=grid_name,
         ).lower(self._ctx)
         self._append_fragment(grid_fragment)

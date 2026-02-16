@@ -865,6 +865,7 @@ class ParticleCICProjection:
         axis_bounds: tuple[float, float],
         rect: tuple[float, float, float, float],
         resolution: tuple[int, int],
+        mass_max: float | None = None,
         out_name: str = "particle_cic_projection",
         reduce_fan_in: Optional[int] = None,
     ) -> None:
@@ -873,6 +874,7 @@ class ParticleCICProjection:
         self.axis_bounds = axis_bounds
         self.rect = rect
         self.resolution = resolution
+        self.mass_max = mass_max
         self.out_name = out_name
         self.reduce_fan_in = reduce_fan_in
 
@@ -1021,6 +1023,16 @@ class ParticleCICProjection:
             stage = ctx.stage("particle_cic_projection")
             for block in blocks:
                 dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
+                params = {
+                    "particle_type": self.particle_type,
+                    "axis": axis_idx,
+                    "axis_bounds": [float(self.axis_bounds[0]), float(self.axis_bounds[1])],
+                    "rect": list(self.rect),
+                    "resolution": [nx, ny],
+                    "covered_boxes": covered_payload,
+                }
+                if self.mass_max is not None:
+                    params["mass_max"] = float(self.mass_max)
                 stage.map_blocks(
                     name=f"particle_cic_projection_b{block}",
                     kernel="particle_cic_projection_accumulate",
@@ -1029,14 +1041,7 @@ class ParticleCICProjection:
                     outputs=[sum_field],
                     output_bytes=[out_sum_bytes],
                     deps={"kind": "None"},
-                    params={
-                        "particle_type": self.particle_type,
-                        "axis": axis_idx,
-                        "axis_bounds": [float(self.axis_bounds[0]), float(self.axis_bounds[1])],
-                        "rect": list(self.rect),
-                        "resolution": [nx, ny],
-                        "covered_boxes": covered_payload,
-                    },
+                    params=params,
                 )
             stages.append(stage)
             producer_stage[sum_field.field] = stage
@@ -1170,12 +1175,14 @@ class ParticleCICGrid:
         axis: str | int,
         axis_bounds: tuple[float, float],
         rect: tuple[float, float, float, float],
+        mass_max: float | None = None,
         out_name: str = "particle_cic_grid",
     ) -> None:
         self.particle_type = particle_type
         self.axis = axis
         self.axis_bounds = axis_bounds
         self.rect = rect
+        self.mass_max = mass_max
         self.out_name = out_name
 
     def _intersecting_blocks_level(
@@ -1311,6 +1318,14 @@ class ParticleCICGrid:
             stage = ctx.stage("particle_cic_grid")
             for block in blocks:
                 dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
+                params = {
+                    "particle_type": self.particle_type,
+                    "axis": axis_idx,
+                    "axis_bounds": [float(self.axis_bounds[0]), float(self.axis_bounds[1])],
+                    "covered_boxes": covered_payload,
+                }
+                if self.mass_max is not None:
+                    params["mass_max"] = float(self.mass_max)
                 stage.map_blocks(
                     name=f"particle_cic_grid_b{block}",
                     kernel="particle_cic_grid_accumulate",
@@ -1319,12 +1334,7 @@ class ParticleCICGrid:
                     outputs=[grid_field],
                     output_bytes=[0],
                     deps={"kind": "None"},
-                    params={
-                        "particle_type": self.particle_type,
-                        "axis": axis_idx,
-                        "axis_bounds": [float(self.axis_bounds[0]), float(self.axis_bounds[1])],
-                        "covered_boxes": covered_payload,
-                    },
+                    params=params,
                 )
             stages.append(stage)
 

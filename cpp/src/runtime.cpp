@@ -2114,6 +2114,7 @@ void register_default_kernels(KernelRegistry& registry) {
           std::string particle_type;
           int axis = 2;
           std::array<double, 2> axis_bounds{0.0, 0.0};
+          double mass_max = std::numeric_limits<double>::quiet_NaN();
           std::vector<std::array<std::array<int, 3>, 2>> covered_boxes;
         } params;
 
@@ -2139,6 +2140,11 @@ void register_default_kernels(KernelRegistry& registry) {
                          v.via.array.size == 2) {
                 params.axis_bounds[0] = v.via.array.ptr[0].as<double>();
                 params.axis_bounds[1] = v.via.array.ptr[1].as<double>();
+              } else if (key == "mass_max" &&
+                         (v.type == msgpack::type::POSITIVE_INTEGER ||
+                          v.type == msgpack::type::NEGATIVE_INTEGER ||
+                          v.type == msgpack::type::FLOAT)) {
+                params.mass_max = v.as<double>();
               } else if (key == "covered_boxes" && v.type == msgpack::type::ARRAY) {
                 params.covered_boxes.clear();
                 params.covered_boxes.reserve(v.via.array.size);
@@ -2347,6 +2353,9 @@ void register_default_kernels(KernelRegistry& registry) {
           if (m <= 0.0) {
             continue;
           }
+          if (std::isfinite(params.mass_max) && m > params.mass_max) {
+            continue;
+          }
           if (a < a_lo || a > a_hi) {
             continue;
           }
@@ -2381,6 +2390,7 @@ void register_default_kernels(KernelRegistry& registry) {
           std::array<double, 2> axis_bounds{0.0, 0.0};
           std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
           std::array<int, 2> resolution{1, 1};
+          double mass_max = std::numeric_limits<double>::quiet_NaN();
           std::vector<std::array<std::array<int, 3>, 2>> covered_boxes;
         } params;
 
@@ -2415,6 +2425,11 @@ void register_default_kernels(KernelRegistry& registry) {
                          v.via.array.size == 2) {
                 params.resolution[0] = v.via.array.ptr[0].as<int>();
                 params.resolution[1] = v.via.array.ptr[1].as<int>();
+              } else if (key == "mass_max" &&
+                         (v.type == msgpack::type::POSITIVE_INTEGER ||
+                          v.type == msgpack::type::NEGATIVE_INTEGER ||
+                          v.type == msgpack::type::FLOAT)) {
+                params.mass_max = v.as<double>();
               } else if (key == "covered_boxes" && v.type == msgpack::type::ARRAY) {
                 params.covered_boxes.clear();
                 params.covered_boxes.reserve(v.via.array.size);
@@ -2629,6 +2644,9 @@ void register_default_kernels(KernelRegistry& registry) {
             continue;
           }
           if (m <= 0.0) {
+            continue;
+          }
+          if (std::isfinite(params.mass_max) && m > params.mass_max) {
             continue;
           }
           if (a < a_lo || a > a_hi) {

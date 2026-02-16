@@ -32,6 +32,11 @@ def main() -> int:
     p.add_argument("--output")
     p.add_argument("--resolution")
     p.add_argument(
+        "--mass-max",
+        type=float,
+        help="Only accumulate particles with mass <= this threshold [Msun].",
+    )
+    p.add_argument(
         "--particle-type",
         "--particles",
         dest="particle_type",
@@ -66,6 +71,13 @@ def main() -> int:
             f"particle type '{a.particle_type}' not found in plotfile; available: {available}"
         )
 
+    mass_max = None
+    if a.mass_max is not None:
+        if a.mass_max <= 0.0:
+            raise ValueError("--mass-max must be positive when specified")
+        msun_g = 1.98847e33
+        mass_max = a.mass_max * msun_g
+
     pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
     out = pipe.particle_cic_projection(
         particle_type=a.particle_type,
@@ -73,6 +85,7 @@ def main() -> int:
         axis_bounds=axis_bounds,
         rect=rect,
         resolution=res,
+        mass_max=mass_max,
         out="stellar_projection",
     )
     rt.run(pipe.plan(), runmeta=runmeta, dataset=ds)
