@@ -28,20 +28,12 @@ def main() -> int:
     p.add_argument("plotfile")
     p.add_argument("--var")
     p.add_argument("--level", type=int, default=0)
-    p.add_argument(
-        "--amr-cell-average",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-    )
     p.add_argument("--axis", choices=("x", "y", "z"), default="z")
     p.add_argument("--axis-bounds")
     p.add_argument("--zoom", type=float, default=1.0)
     p.add_argument("--output")
     p.add_argument("--resolution")
     a, u = p.parse_known_args()
-
-    if not a.amr_cell_average:
-        raise ValueError("UniformProjection requires AMR-aware cell-average semantics")
 
     rt = Runtime.from_parsed_args(a, unknown_args=u)
 
@@ -73,7 +65,7 @@ def main() -> int:
         resolution=res,
         out="projection",
         bytes_per_value=bytes_per_value,
-        amr_cell_average=a.amr_cell_average,
+        amr_cell_average=True,
     )
     rt.run(pipe.plan(), runmeta=runmeta, dataset=ds)
 

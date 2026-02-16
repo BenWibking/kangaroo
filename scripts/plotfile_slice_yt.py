@@ -62,13 +62,6 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run yt slice on a plotfile.")
     parser.add_argument("plotfile", help="Path to a plotfile directory.")
     parser.add_argument("--var", help="Field name to slice (e.g. density or boxlib,density).")
-    parser.add_argument("--level", type=int, default=0, help="AMR level index (used when --no-amr-cell-average).")
-    parser.add_argument(
-        "--amr-cell-average",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Keep CLI parity with plotfile_slice.py (default: enabled).",
-    )
     parser.add_argument("--axis", choices=("x", "y", "z"), default="z", help="Slice axis.")
     parser.add_argument("--coord", type=float, help="Slice coordinate in physical (code_length) units.")
     parser.add_argument(
@@ -147,14 +140,7 @@ def main() -> int:
     domain_left = ds.domain_left_edge.to_value("code_length")
     domain_right = ds.domain_right_edge.to_value("code_length")
     domain_dims0 = np.array(ds.domain_dimensions, dtype=int)
-    refine_by = int(getattr(ds, "refine_by", 2))
-
-    if args.amr_cell_average:
-        dims = domain_dims0
-    else:
-        if args.level < 0:
-            raise ValueError("--level must be non-negative")
-        dims = domain_dims0 * (refine_by ** args.level)
+    dims = domain_dims0
 
     x_lo, y_lo, z_lo = domain_left
     x_hi, y_hi, z_hi = domain_right
@@ -239,9 +225,8 @@ def main() -> int:
         rect_kpc = tuple(c / kpc_in_cm for c in rect)
         extent_kpc = (rect_kpc[0], rect_kpc[2], rect_kpc[1], rect_kpc[3])
         im = ax.imshow(log_slice, origin="lower", cmap="viridis", extent=extent_kpc)
-        avg_label = "AMR cell-average" if args.amr_cell_average else f"Level {args.level}"
         field_label = field[1] if isinstance(field, tuple) else str(field)
-        ax.set_title(f"yt {avg_label} slice of {field_label} ({plane_label} plane)")
+        ax.set_title(f"yt AMR cell-average slice of {field_label} ({plane_label} plane)")
         ax.set_xlabel(f"{axis_labels[0]} [kpc]")
         ax.set_ylabel(f"{axis_labels[1]} [kpc]")
         fig.colorbar(im, ax=ax, label=f"log10({field_label})")

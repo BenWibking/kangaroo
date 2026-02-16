@@ -80,7 +80,7 @@ pixi run python scripts/plotfile_projection.py /path/to/plotfile \
 ```
 
 Notes:
-- projection currently requires AMR cell-average semantics (`--amr-cell-average`, enabled by default).
+- projection always uses AMR cell-average semantics.
 - byte width is inferred from dataset chunks via `Dataset.infer_bytes_per_value(...)`.
 
 ### 3) Per-FAB min/max inspection
