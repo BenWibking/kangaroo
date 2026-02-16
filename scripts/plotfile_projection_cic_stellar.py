@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Project a plotfile FAB along an axis with AMR-aware column integration."""
+"""Project stellar particle density with native-grid CIC deposition."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ import numpy as np
 from analysis import Runtime  # noqa: E402
 from analysis.dataset import open_dataset  # noqa: E402
 from analysis.pipeline import pipeline  # noqa: E402
-
 
 
 def _parse_bounds(bounds: str) -> tuple[float, float]:
@@ -22,27 +21,31 @@ def _parse_bounds(bounds: str) -> tuple[float, float]:
     return b0, b1
 
 
-
 def main() -> int:
-    p = argparse.ArgumentParser(description="Run Kangaroo UniformProjection on a plotfile FAB.")
+    p = argparse.ArgumentParser(
+        description="Deposit stellar particles with CIC on native 2D AMR grids, then project."
+    )
     p.add_argument("plotfile")
-    p.add_argument("--var")
-    p.add_argument("--level", type=int, default=0)
     p.add_argument("--axis", choices=("x", "y", "z"), default="z")
     p.add_argument("--axis-bounds")
     p.add_argument("--zoom", type=float, default=1.0)
     p.add_argument("--output")
     p.add_argument("--resolution")
-    a, u = p.parse_known_args()
+    p.add_argument(
+        "--particle-type",
+        "--particles",
+        dest="particle_type",
+        choices=("CIC_particles", "StochasticStellarPop_particles"),
+        default="StochasticStellarPop_particles",
+        help="Particle species to deposit.",
+    )
+    a = p.parse_args()
 
-    rt = Runtime.from_parsed_args(a, unknown_args=u)
+    rt = Runtime.from_parsed_args(a, unknown_args=[])
 
     base_level = 0
     ds = open_dataset(a.plotfile, level=base_level, runtime=rt)
-    metadata = ds.metadata_bundle()
-    runmeta = metadata.runmeta
-    comp, field, _ = ds.resolve_field(a.var)
-    bytes_per_value = ds.infer_bytes_per_value(rt, field=field, level=a.level)
+    runmeta = ds.metadata_bundle().runmeta
 
     view = ds.plane_geometry(
         axis=a.axis,
@@ -56,16 +59,21 @@ def main() -> int:
     plane = view["plane"]
     axis_bounds = _parse_bounds(a.axis_bounds) if a.axis_bounds else view["axis_bounds"]
 
+    particle_types = ds.list_particle_types()
+    if a.particle_type not in particle_types:
+        available = ", ".join(particle_types) if particle_types else "<none>"
+        raise RuntimeError(
+            f"particle type '{a.particle_type}' not found in plotfile; available: {available}"
+        )
+
     pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
-    out = pipe.uniform_projection(
-        field=pipe.field(field),
+    out = pipe.particle_cic_projection(
+        particle_type=a.particle_type,
         axis=a.axis,
         axis_bounds=axis_bounds,
         rect=rect,
         resolution=res,
-        out="projection",
-        bytes_per_value=bytes_per_value,
-        amr_cell_average=True,
+        out="stellar_projection",
     )
     rt.run(pipe.plan(), runmeta=runmeta, dataset=ds)
 
@@ -76,15 +84,10 @@ def main() -> int:
         version=0,
         block=0,
         shape=res,
-        bytes_per_value=bytes_per_value,
+        bytes_per_value=8,
         dataset=ds,
     )
 
-    import matplotlib.pyplot as plt
-
-    # uniform_projection accumulates value * dV onto each image pixel, so divide by
-    # pixel area to recover a column integral (for density: [g cm^-2]), then convert
-    # to [Msun pc^-2].
     nx, ny = res
     pixel_area = abs((rect[2] - rect[0]) / nx) * abs((rect[3] - rect[1]) / ny)
     arr = arr / pixel_area
@@ -94,14 +97,24 @@ def main() -> int:
     cgs_surface_density_to_msun_pc2 = (pc_cm**2) / msun_g
     arr = arr * cgs_surface_density_to_msun_pc2
 
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import SymLogNorm
+
     fig, axp = plt.subplots(figsize=(6, 5))
     kpc = 1.0e3 * pc_cm
     extent = (rect[0] / kpc, rect[2] / kpc, rect[1] / kpc, rect[3] / kpc)
-    im = axp.imshow(np.ma.masked_invalid(np.log10(arr)), origin="lower", cmap="viridis", extent=extent)
-    axp.set_title(f"AMR projection of {comp} ({plane} plane)")
+    masked = np.ma.masked_invalid(arr)
+    vmax = np.nanmax(arr)
+    if not np.isfinite(vmax) or vmax <= 0.0:
+        vmax = 1.0
+    norm = SymLogNorm(linthresh=1.0e-2, vmin=0.0, vmax=vmax)
+    im = axp.imshow(masked, origin="lower", cmap="viridis", extent=extent, norm=norm)
+    axp.set_title(
+        f"CIC stellar projection [{a.particle_type}] ({plane} plane)"
+    )
     axp.set_xlabel(f"{labels[0]} [kpc]")
     axp.set_ylabel(f"{labels[1]} [kpc]")
-    fig.colorbar(im, ax=axp, label=f"log10({comp} [Msun pc^-2])")
+    fig.colorbar(im, ax=axp, label=f"{a.particle_type} [Msun pc^-2] (symlog)")
     fig.tight_layout()
     fig.savefig(a.output, dpi=150) if a.output else plt.show()
 

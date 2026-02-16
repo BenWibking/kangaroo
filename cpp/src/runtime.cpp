@@ -2106,6 +2106,621 @@ void register_default_kernels(KernelRegistry& registry) {
         return hpx::make_ready_future();
       });
   registry.register_kernel(
+      KernelDesc{.name = "particle_cic_grid_accumulate", .n_inputs = 0, .n_outputs = 1,
+                 .needs_neighbors = false},
+      [](const LevelMeta& level, int32_t block, std::span<const HostView>, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        struct Params {
+          std::string particle_type;
+          int axis = 2;
+          std::array<double, 2> axis_bounds{0.0, 0.0};
+          std::vector<std::array<std::array<int, 3>, 2>> covered_boxes;
+        } params;
+
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            for (uint32_t i = 0; i < root.via.map.size; ++i) {
+              const auto& k = root.via.map.ptr[i].key;
+              if (k.type != msgpack::type::STR) {
+                continue;
+              }
+              const auto key = k.as<std::string>();
+              const auto& v = root.via.map.ptr[i].val;
+              if (key == "particle_type" && v.type == msgpack::type::STR) {
+                params.particle_type = v.as<std::string>();
+              } else if (key == "axis" &&
+                         (v.type == msgpack::type::POSITIVE_INTEGER ||
+                          v.type == msgpack::type::NEGATIVE_INTEGER)) {
+                params.axis = v.as<int>();
+              } else if (key == "axis_bounds" && v.type == msgpack::type::ARRAY &&
+                         v.via.array.size == 2) {
+                params.axis_bounds[0] = v.via.array.ptr[0].as<double>();
+                params.axis_bounds[1] = v.via.array.ptr[1].as<double>();
+              } else if (key == "covered_boxes" && v.type == msgpack::type::ARRAY) {
+                params.covered_boxes.clear();
+                params.covered_boxes.reserve(v.via.array.size);
+                for (uint32_t bi = 0; bi < v.via.array.size; ++bi) {
+                  const auto& box_val = v.via.array.ptr[bi];
+                  if (box_val.type != msgpack::type::ARRAY || box_val.via.array.size != 2) {
+                    continue;
+                  }
+                  std::array<std::array<int, 3>, 2> box{};
+                  bool ok = true;
+                  for (uint32_t side = 0; side < 2 && ok; ++side) {
+                    const auto& side_val = box_val.via.array.ptr[side];
+                    if (side_val.type != msgpack::type::ARRAY || side_val.via.array.size != 3) {
+                      ok = false;
+                      break;
+                    }
+                    for (uint32_t d = 0; d < 3; ++d) {
+                      box[side][d] = side_val.via.array.ptr[d].as<int>();
+                    }
+                  }
+                  if (ok) {
+                    params.covered_boxes.push_back(box);
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        if (outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        if (params.particle_type.empty()) {
+          throw std::runtime_error("particle_cic_grid_accumulate: missing particle_type");
+        }
+        if (params.axis < 0 || params.axis > 2) {
+          throw std::runtime_error("particle_cic_grid_accumulate: axis must be 0, 1, or 2");
+        }
+        if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
+          throw std::runtime_error("particle_cic_grid_accumulate: block index out of range");
+        }
+
+        const auto& dataset = global_dataset();
+        if (!dataset.backend) {
+          throw std::runtime_error("particle_cic_grid_accumulate: missing dataset backend");
+        }
+        const auto* reader = dataset.backend->get_plotfile_reader();
+        if (reader == nullptr) {
+          throw std::runtime_error(
+              "particle_cic_grid_accumulate requires an AMReX plotfile-backed dataset");
+        }
+
+        auto cast_to_f64 = [](const plotfile::ParticleArrayData& data,
+                              const std::string& name) -> std::vector<double> {
+          const std::size_t n = static_cast<std::size_t>(std::max<int64_t>(0, data.count));
+          std::vector<double> out_vals(n, 0.0);
+          if (data.dtype == "float64") {
+            if (data.bytes.size() < n * sizeof(double)) {
+              throw std::runtime_error("particle_cic_grid_accumulate: short float64 payload for " +
+                                       name);
+            }
+            const auto* in = reinterpret_cast<const double*>(data.bytes.data());
+            std::copy(in, in + n, out_vals.begin());
+          } else if (data.dtype == "float32") {
+            if (data.bytes.size() < n * sizeof(float)) {
+              throw std::runtime_error("particle_cic_grid_accumulate: short float32 payload for " +
+                                       name);
+            }
+            const auto* in = reinterpret_cast<const float*>(data.bytes.data());
+            for (std::size_t i = 0; i < n; ++i) {
+              out_vals[i] = static_cast<double>(in[i]);
+            }
+          } else if (data.dtype == "int64") {
+            if (data.bytes.size() < n * sizeof(int64_t)) {
+              throw std::runtime_error("particle_cic_grid_accumulate: short int64 payload for " +
+                                       name);
+            }
+            const auto* in = reinterpret_cast<const int64_t*>(data.bytes.data());
+            for (std::size_t i = 0; i < n; ++i) {
+              out_vals[i] = static_cast<double>(in[i]);
+            }
+          } else {
+            throw std::runtime_error("particle_cic_grid_accumulate: unsupported dtype '" +
+                                     data.dtype + "' for " + name);
+          }
+          return out_vals;
+        };
+
+        const auto x_data = reader->read_particle_field(params.particle_type, "x");
+        const auto y_data = reader->read_particle_field(params.particle_type, "y");
+        const auto z_data = reader->read_particle_field(params.particle_type, "z");
+        const auto m_data = reader->read_particle_field(params.particle_type, "mass");
+        auto px = cast_to_f64(x_data, "x");
+        auto py = cast_to_f64(y_data, "y");
+        auto pz = cast_to_f64(z_data, "z");
+        auto pm = cast_to_f64(m_data, "mass");
+
+        const std::size_t n =
+            std::min(std::min(px.size(), py.size()), std::min(pz.size(), pm.size()));
+        px.resize(n);
+        py.resize(n);
+        pz.resize(n);
+        pm.resize(n);
+
+        const int axis = params.axis;
+        const int u_axis = (axis == 0) ? 1 : 0;
+        const int v_axis = (axis == 2) ? 1 : 2;
+
+        const auto& box = level.boxes[static_cast<std::size_t>(block)];
+        const int box_lo[3] = {box.lo.x, box.lo.y, box.lo.z};
+        const int box_hi[3] = {box.hi.x, box.hi.y, box.hi.z};
+        const int nx = box_hi[0] - box_lo[0] + 1;
+        const int ny = box_hi[1] - box_lo[1] + 1;
+        const int nz = box_hi[2] - box_lo[2] + 1;
+        if (nx <= 0 || ny <= 0 || nz <= 0) {
+          return hpx::make_ready_future();
+        }
+
+        const double x0[3] = {level.geom.x0[0], level.geom.x0[1], level.geom.x0[2]};
+        const double dx[3] = {level.geom.dx[0], level.geom.dx[1], level.geom.dx[2]};
+        const int origin[3] = {level.geom.index_origin[0], level.geom.index_origin[1],
+                               level.geom.index_origin[2]};
+        if (dx[0] == 0.0 || dx[1] == 0.0 || dx[2] == 0.0) {
+          return hpx::make_ready_future();
+        }
+
+        const std::size_t out_elems =
+            static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) *
+            static_cast<std::size_t>(nz);
+        outputs[0].data.resize(out_elems * sizeof(double));
+        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+        std::fill(out, out + out_elems, 0.0);
+
+        const double cell_volume = dx[0] * dx[1] * dx[2];
+        if (!(cell_volume > 0.0)) {
+          return hpx::make_ready_future();
+        }
+
+        const double a_lo = std::min(params.axis_bounds[0], params.axis_bounds[1]);
+        const double a_hi = std::max(params.axis_bounds[0], params.axis_bounds[1]);
+
+        auto covered = [&](int i, int j, int k) -> bool {
+          for (const auto& b : params.covered_boxes) {
+            if (i >= b[0][0] && i <= b[1][0] && j >= b[0][1] && j <= b[1][1] && k >= b[0][2] &&
+                k <= b[1][2]) {
+              return true;
+            }
+          }
+          return false;
+        };
+
+        auto out_index = [ny, nz](int i, int j, int k) -> std::size_t {
+          return static_cast<std::size_t>((i * ny + j) * nz + k);
+        };
+
+        const double* coord[3] = {px.data(), py.data(), pz.data()};
+        const double du = dx[u_axis];
+        const double dv = dx[v_axis];
+        const double da = dx[axis];
+
+        const double u_center0 = x0[u_axis] + (0.5 - static_cast<double>(origin[u_axis])) * du;
+        const double v_center0 = x0[v_axis] + (0.5 - static_cast<double>(origin[v_axis])) * dv;
+        const double a_cell_lo = x0[axis] + (static_cast<double>(box_lo[axis] - origin[axis])) * da;
+        const double a_cell_hi =
+            x0[axis] + (static_cast<double>(box_hi[axis] + 1 - origin[axis])) * da;
+
+        auto add_density = [&](int iu, int iv, int ia, double wmass) {
+          int ii = 0;
+          int jj = 0;
+          int kk = 0;
+          if (axis == 0) {
+            ii = ia;
+            jj = iu;
+            kk = iv;
+          } else if (axis == 1) {
+            ii = iu;
+            jj = ia;
+            kk = iv;
+          } else {
+            ii = iu;
+            jj = iv;
+            kk = ia;
+          }
+          if (ii < box_lo[0] || ii > box_hi[0] || jj < box_lo[1] || jj > box_hi[1] || kk < box_lo[2] ||
+              kk > box_hi[2] || covered(ii, jj, kk)) {
+            return;
+          }
+          const int i_local = ii - box_lo[0];
+          const int j_local = jj - box_lo[1];
+          const int k_local = kk - box_lo[2];
+          if (i_local < 0 || i_local >= nx || j_local < 0 || j_local >= ny || k_local < 0 ||
+              k_local >= nz) {
+            return;
+          }
+          out[out_index(i_local, j_local, k_local)] += wmass / cell_volume;
+        };
+
+        for (std::size_t p = 0; p < n; ++p) {
+          const double u = coord[u_axis][p];
+          const double v = coord[v_axis][p];
+          const double a = coord[axis][p];
+          const double m = pm[p];
+          if (!std::isfinite(u) || !std::isfinite(v) || !std::isfinite(a) || !std::isfinite(m)) {
+            continue;
+          }
+          if (m <= 0.0) {
+            continue;
+          }
+          if (a < a_lo || a > a_hi) {
+            continue;
+          }
+          if (a < a_cell_lo || a >= a_cell_hi) {
+            continue;
+          }
+
+          const double su = (u - u_center0) / du;
+          const double sv = (v - v_center0) / dv;
+          const int iu0 = static_cast<int>(std::floor(su));
+          const int iv0 = static_cast<int>(std::floor(sv));
+          const double tu = su - static_cast<double>(iu0);
+          const double tv = sv - static_cast<double>(iv0);
+          const int ia = static_cast<int>(std::floor((a - x0[axis]) / da)) + origin[axis];
+
+          add_density(iu0, iv0, ia, m * (1.0 - tu) * (1.0 - tv));
+          add_density(iu0 + 1, iv0, ia, m * tu * (1.0 - tv));
+          add_density(iu0, iv0 + 1, ia, m * (1.0 - tu) * tv);
+          add_density(iu0 + 1, iv0 + 1, ia, m * tu * tv);
+        }
+
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_cic_projection_accumulate", .n_inputs = 0, .n_outputs = 1,
+                 .needs_neighbors = false},
+      [](const LevelMeta& level, int32_t block, std::span<const HostView>, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        struct Params {
+          std::string particle_type;
+          int axis = 2;
+          std::array<double, 2> axis_bounds{0.0, 0.0};
+          std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
+          std::array<int, 2> resolution{1, 1};
+          std::vector<std::array<std::array<int, 3>, 2>> covered_boxes;
+        } params;
+
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            for (uint32_t i = 0; i < root.via.map.size; ++i) {
+              const auto& k = root.via.map.ptr[i].key;
+              if (k.type != msgpack::type::STR) {
+                continue;
+              }
+              const auto key = k.as<std::string>();
+              const auto& v = root.via.map.ptr[i].val;
+              if (key == "particle_type" && v.type == msgpack::type::STR) {
+                params.particle_type = v.as<std::string>();
+              } else if (key == "axis" &&
+                         (v.type == msgpack::type::POSITIVE_INTEGER ||
+                          v.type == msgpack::type::NEGATIVE_INTEGER)) {
+                params.axis = v.as<int>();
+              } else if (key == "axis_bounds" && v.type == msgpack::type::ARRAY &&
+                         v.via.array.size == 2) {
+                params.axis_bounds[0] = v.via.array.ptr[0].as<double>();
+                params.axis_bounds[1] = v.via.array.ptr[1].as<double>();
+              } else if (key == "rect" && v.type == msgpack::type::ARRAY &&
+                         v.via.array.size == 4) {
+                for (uint32_t j = 0; j < 4; ++j) {
+                  params.rect[j] = v.via.array.ptr[j].as<double>();
+                }
+              } else if (key == "resolution" && v.type == msgpack::type::ARRAY &&
+                         v.via.array.size == 2) {
+                params.resolution[0] = v.via.array.ptr[0].as<int>();
+                params.resolution[1] = v.via.array.ptr[1].as<int>();
+              } else if (key == "covered_boxes" && v.type == msgpack::type::ARRAY) {
+                params.covered_boxes.clear();
+                params.covered_boxes.reserve(v.via.array.size);
+                for (uint32_t bi = 0; bi < v.via.array.size; ++bi) {
+                  const auto& box_val = v.via.array.ptr[bi];
+                  if (box_val.type != msgpack::type::ARRAY || box_val.via.array.size != 2) {
+                    continue;
+                  }
+                  std::array<std::array<int, 3>, 2> box{};
+                  bool ok = true;
+                  for (uint32_t side = 0; side < 2 && ok; ++side) {
+                    const auto& side_val = box_val.via.array.ptr[side];
+                    if (side_val.type != msgpack::type::ARRAY || side_val.via.array.size != 3) {
+                      ok = false;
+                      break;
+                    }
+                    for (uint32_t d = 0; d < 3; ++d) {
+                      box[side][d] = side_val.via.array.ptr[d].as<int>();
+                    }
+                  }
+                  if (ok) {
+                    params.covered_boxes.push_back(box);
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        if (outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        const int out_nx = params.resolution[0];
+        const int out_ny = params.resolution[1];
+        if (out_nx <= 0 || out_ny <= 0) {
+          throw std::runtime_error("particle_cic_projection_accumulate: invalid resolution");
+        }
+        outputs[0].data.resize(static_cast<std::size_t>(out_nx) * static_cast<std::size_t>(out_ny) *
+                               sizeof(double));
+        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+        std::fill(out, out + static_cast<std::size_t>(out_nx) * static_cast<std::size_t>(out_ny), 0.0);
+
+        if (params.particle_type.empty()) {
+          throw std::runtime_error("particle_cic_projection_accumulate: missing particle_type");
+        }
+        if (params.axis < 0 || params.axis > 2) {
+          throw std::runtime_error("particle_cic_projection_accumulate: axis must be 0, 1, or 2");
+        }
+        if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
+          throw std::runtime_error("particle_cic_projection_accumulate: block index out of range");
+        }
+
+        const auto& dataset = global_dataset();
+        if (!dataset.backend) {
+          throw std::runtime_error("particle_cic_projection_accumulate: missing dataset backend");
+        }
+        const auto* reader = dataset.backend->get_plotfile_reader();
+        if (reader == nullptr) {
+          throw std::runtime_error(
+              "particle_cic_projection_accumulate requires an AMReX plotfile-backed dataset");
+        }
+
+        auto cast_to_f64 = [](const plotfile::ParticleArrayData& data,
+                              const std::string& name) -> std::vector<double> {
+          const std::size_t n = static_cast<std::size_t>(std::max<int64_t>(0, data.count));
+          std::vector<double> out_vals(n, 0.0);
+          if (data.dtype == "float64") {
+            if (data.bytes.size() < n * sizeof(double)) {
+              throw std::runtime_error("particle_cic_projection_accumulate: short float64 payload for " +
+                                       name);
+            }
+            const auto* in = reinterpret_cast<const double*>(data.bytes.data());
+            std::copy(in, in + n, out_vals.begin());
+          } else if (data.dtype == "float32") {
+            if (data.bytes.size() < n * sizeof(float)) {
+              throw std::runtime_error("particle_cic_projection_accumulate: short float32 payload for " +
+                                       name);
+            }
+            const auto* in = reinterpret_cast<const float*>(data.bytes.data());
+            for (std::size_t i = 0; i < n; ++i) {
+              out_vals[i] = static_cast<double>(in[i]);
+            }
+          } else if (data.dtype == "int64") {
+            if (data.bytes.size() < n * sizeof(int64_t)) {
+              throw std::runtime_error("particle_cic_projection_accumulate: short int64 payload for " +
+                                       name);
+            }
+            const auto* in = reinterpret_cast<const int64_t*>(data.bytes.data());
+            for (std::size_t i = 0; i < n; ++i) {
+              out_vals[i] = static_cast<double>(in[i]);
+            }
+          } else {
+            throw std::runtime_error("particle_cic_projection_accumulate: unsupported dtype '" +
+                                     data.dtype + "' for " + name);
+          }
+          return out_vals;
+        };
+
+        const auto x_data = reader->read_particle_field(params.particle_type, "x");
+        const auto y_data = reader->read_particle_field(params.particle_type, "y");
+        const auto z_data = reader->read_particle_field(params.particle_type, "z");
+        const auto m_data = reader->read_particle_field(params.particle_type, "mass");
+        auto px = cast_to_f64(x_data, "x");
+        auto py = cast_to_f64(y_data, "y");
+        auto pz = cast_to_f64(z_data, "z");
+        auto pm = cast_to_f64(m_data, "mass");
+
+        const std::size_t n =
+            std::min(std::min(px.size(), py.size()), std::min(pz.size(), pm.size()));
+        px.resize(n);
+        py.resize(n);
+        pz.resize(n);
+        pm.resize(n);
+
+        const int axis = params.axis;
+        const int u_axis = (axis == 0) ? 1 : 0;
+        const int v_axis = (axis == 2) ? 1 : 2;
+
+        const auto& box = level.boxes[static_cast<std::size_t>(block)];
+        const int box_lo[3] = {box.lo.x, box.lo.y, box.lo.z};
+        const int box_hi[3] = {box.hi.x, box.hi.y, box.hi.z};
+
+        const double x0[3] = {level.geom.x0[0], level.geom.x0[1], level.geom.x0[2]};
+        const double dx[3] = {level.geom.dx[0], level.geom.dx[1], level.geom.dx[2]};
+        const int origin[3] = {level.geom.index_origin[0], level.geom.index_origin[1],
+                               level.geom.index_origin[2]};
+        if (dx[0] == 0.0 || dx[1] == 0.0 || dx[2] == 0.0) {
+          return hpx::make_ready_future();
+        }
+
+        const int nu = box_hi[u_axis] - box_lo[u_axis] + 1;
+        const int nv = box_hi[v_axis] - box_lo[v_axis] + 1;
+        if (nu <= 0 || nv <= 0) {
+          return hpx::make_ready_future();
+        }
+
+        const double a_lo = std::min(params.axis_bounds[0], params.axis_bounds[1]);
+        const double a_hi = std::max(params.axis_bounds[0], params.axis_bounds[1]);
+        const double rect_u_lo = std::min(params.rect[0], params.rect[2]);
+        const double rect_u_hi = std::max(params.rect[0], params.rect[2]);
+        const double rect_v_lo = std::min(params.rect[1], params.rect[3]);
+        const double rect_v_hi = std::max(params.rect[1], params.rect[3]);
+        const double out_du = (rect_u_hi - rect_u_lo) / static_cast<double>(out_nx);
+        const double out_dv = (rect_v_hi - rect_v_lo) / static_cast<double>(out_ny);
+        if (out_du <= 0.0 || out_dv <= 0.0) {
+          return hpx::make_ready_future();
+        }
+        const double inv_out_du = 1.0 / out_du;
+        const double inv_out_dv = 1.0 / out_dv;
+
+        auto covered = [&](int i, int j, int k) -> bool {
+          for (const auto& b : params.covered_boxes) {
+            if (i >= b[0][0] && i <= b[1][0] && j >= b[0][1] && j <= b[1][1] && k >= b[0][2] &&
+                k <= b[1][2]) {
+              return true;
+            }
+          }
+          return false;
+        };
+
+        std::vector<double> native_mass(static_cast<std::size_t>(nu) * static_cast<std::size_t>(nv), 0.0);
+        auto native_index = [nu](int iu_local, int iv_local) -> std::size_t {
+          return static_cast<std::size_t>(iv_local) * static_cast<std::size_t>(nu) +
+                 static_cast<std::size_t>(iu_local);
+        };
+        auto native_add = [&](int iu, int iv, int ia, double wmass) {
+          int ii = 0;
+          int jj = 0;
+          int kk = 0;
+          if (axis == 0) {
+            ii = ia;
+            jj = iu;
+            kk = iv;
+          } else if (axis == 1) {
+            ii = iu;
+            jj = ia;
+            kk = iv;
+          } else {
+            ii = iu;
+            jj = iv;
+            kk = ia;
+          }
+          if (ii < box_lo[0] || ii > box_hi[0] || jj < box_lo[1] || jj > box_hi[1] || kk < box_lo[2] ||
+              kk > box_hi[2] || covered(ii, jj, kk)) {
+            return;
+          }
+          const int iu_local = iu - box_lo[u_axis];
+          const int iv_local = iv - box_lo[v_axis];
+          if (iu_local < 0 || iu_local >= nu || iv_local < 0 || iv_local >= nv) {
+            return;
+          }
+          native_mass[native_index(iu_local, iv_local)] += wmass;
+        };
+
+        const double* coord[3] = {px.data(), py.data(), pz.data()};
+        const double du = dx[u_axis];
+        const double dv = dx[v_axis];
+        const double da = dx[axis];
+
+        const double u_center0 = x0[u_axis] + (0.5 - static_cast<double>(origin[u_axis])) * du;
+        const double v_center0 = x0[v_axis] + (0.5 - static_cast<double>(origin[v_axis])) * dv;
+        const double a_cell_lo = x0[axis] + (static_cast<double>(box_lo[axis] - origin[axis])) * da;
+        const double a_cell_hi =
+            x0[axis] + (static_cast<double>(box_hi[axis] + 1 - origin[axis])) * da;
+
+        for (std::size_t p = 0; p < n; ++p) {
+          const double u = coord[u_axis][p];
+          const double v = coord[v_axis][p];
+          const double a = coord[axis][p];
+          const double m = pm[p];
+          if (!std::isfinite(u) || !std::isfinite(v) || !std::isfinite(a) || !std::isfinite(m)) {
+            continue;
+          }
+          if (m <= 0.0) {
+            continue;
+          }
+          if (a < a_lo || a > a_hi) {
+            continue;
+          }
+          if (a < a_cell_lo || a >= a_cell_hi) {
+            continue;
+          }
+
+          const double su = (u - u_center0) / du;
+          const double sv = (v - v_center0) / dv;
+          const int iu0 = static_cast<int>(std::floor(su));
+          const int iv0 = static_cast<int>(std::floor(sv));
+          const double tu = su - static_cast<double>(iu0);
+          const double tv = sv - static_cast<double>(iv0);
+          const int ia = static_cast<int>(std::floor((a - x0[axis]) / da)) + origin[axis];
+
+          native_add(iu0, iv0, ia, m * (1.0 - tu) * (1.0 - tv));
+          native_add(iu0 + 1, iv0, ia, m * tu * (1.0 - tv));
+          native_add(iu0, iv0 + 1, ia, m * (1.0 - tu) * tv);
+          native_add(iu0 + 1, iv0 + 1, ia, m * tu * tv);
+        }
+
+        const double cell_area = du * dv;
+        if (cell_area <= 0.0) {
+          return hpx::make_ready_future();
+        }
+
+        for (int iv_local = 0; iv_local < nv; ++iv_local) {
+          const int iv = box_lo[v_axis] + iv_local;
+          const double v_center =
+              x0[v_axis] + (static_cast<double>(iv - origin[v_axis]) + 0.5) * dv;
+          const double v_lo = v_center - 0.5 * dv;
+          const double v_hi = v_center + 0.5 * dv;
+          if (v_hi <= rect_v_lo || v_lo >= rect_v_hi) {
+            continue;
+          }
+
+          int iy_lo = static_cast<int>(std::floor((v_lo - rect_v_lo) * inv_out_dv));
+          int iy_hi = static_cast<int>(std::floor((v_hi - rect_v_lo) * inv_out_dv));
+          if (iy_hi < 0 || iy_lo >= out_ny) {
+            continue;
+          }
+          iy_lo = std::max(0, iy_lo);
+          iy_hi = std::min(out_ny - 1, iy_hi);
+
+          for (int iu_local = 0; iu_local < nu; ++iu_local) {
+            const double mass = native_mass[native_index(iu_local, iv_local)];
+            if (mass == 0.0) {
+              continue;
+            }
+            const int iu = box_lo[u_axis] + iu_local;
+            const double u_center =
+                x0[u_axis] + (static_cast<double>(iu - origin[u_axis]) + 0.5) * du;
+            const double u_lo = u_center - 0.5 * du;
+            const double u_hi = u_center + 0.5 * du;
+            if (u_hi <= rect_u_lo || u_lo >= rect_u_hi) {
+              continue;
+            }
+
+            int ix_lo = static_cast<int>(std::floor((u_lo - rect_u_lo) * inv_out_du));
+            int ix_hi = static_cast<int>(std::floor((u_hi - rect_u_lo) * inv_out_du));
+            if (ix_hi < 0 || ix_lo >= out_nx) {
+              continue;
+            }
+            ix_lo = std::max(0, ix_lo);
+            ix_hi = std::min(out_nx - 1, ix_hi);
+
+            for (int iy = iy_lo; iy <= iy_hi; ++iy) {
+              const double pv_lo = rect_v_lo + static_cast<double>(iy) * out_dv;
+              const double pv_hi = pv_lo + out_dv;
+              const double ov = std::max(0.0, std::min(v_hi, pv_hi) - std::max(v_lo, pv_lo));
+              if (ov <= 0.0) {
+                continue;
+              }
+              const std::size_t row = static_cast<std::size_t>(iy) * static_cast<std::size_t>(out_nx);
+              for (int ix = ix_lo; ix <= ix_hi; ++ix) {
+                const double pu_lo = rect_u_lo + static_cast<double>(ix) * out_du;
+                const double pu_hi = pu_lo + out_du;
+                const double ou = std::max(0.0, std::min(u_hi, pu_hi) - std::max(u_lo, pu_lo));
+                if (ou <= 0.0) {
+                  continue;
+                }
+                const double w = (ou * ov) / cell_area;
+                out[row + static_cast<std::size_t>(ix)] += mass * w;
+              }
+            }
+          }
+        }
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
       KernelDesc{.name = "particle_eq_mask", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
       [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
          std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {

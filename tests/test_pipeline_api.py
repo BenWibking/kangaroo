@@ -245,6 +245,34 @@ def test_pipeline_histogram2d_weight_mode_wiring() -> None:
     assert all(tmpl.params["weight_mode"] == "cell_mass" for tmpl in acc)
 
 
+def test_pipeline_particle_cic_projection_lowering_wiring() -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_two_block_runmeta()
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+
+    out = pipe.particle_cic_projection(
+        particle_type="StochasticStellarPop_particles",
+        axis="z",
+        axis_bounds=(0.0, 8.0),
+        rect=(0.0, 0.0, 8.0, 8.0),
+        resolution=(16, 16),
+        out="stars",
+    )
+    assert isinstance(out, FieldHandle)
+
+    plan = pipe.plan()
+    templates = [tmpl for stage in plan.topo_stages() for tmpl in stage.templates]
+    grid = [tmpl for tmpl in templates if tmpl.kernel == "particle_cic_grid_accumulate"]
+    acc = [tmpl for tmpl in templates if tmpl.kernel == "uniform_projection_accumulate"]
+    red = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
+    assert len(grid) == 2
+    assert len(acc) == 2
+    assert red
+    assert all(tmpl.params["particle_type"] == "StochasticStellarPop_particles" for tmpl in grid)
+    assert all(tmpl.params["resolution"] == [16, 16] for tmpl in acc)
+
+
 def test_pipeline_field_expr_lowering_wiring() -> None:
     rt = _FakeRuntime()
     runmeta = _single_level_runmeta()
