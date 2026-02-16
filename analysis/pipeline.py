@@ -1044,6 +1044,41 @@ class Pipeline:
         )
         return int(self._particle_scalar_from_field(reduced, dtype="int64"))
 
+    def particle_topk_modes(
+        self,
+        particle_type: str,
+        field: str,
+        *,
+        k: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        if k <= 0:
+            return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+        fid = self._alloc_runtime_field("particle_topk")
+        stage = Stage(name=self._unique_name("particle_topk"))
+        stage.map_blocks(
+            name="particle_topk_modes",
+            kernel="particle_topk_modes",
+            domain=Domain(step=0, level=0, blocks=[0]),
+            inputs=[],
+            outputs=[FieldRef(fid)],
+            output_bytes=[int(k) * 2 * 8],
+            deps={"kind": "None"},
+            params={
+                "particle_type": particle_type,
+                "field_name": field,
+                "k": int(k),
+            },
+        )
+        self._append_particle_stage(stage, chunk_count=1)
+        self._ensure_particle_executed()
+        raw = self.runtime.get_task_chunk(step=0, level=0, field=fid, version=0, block=0, dataset=self.dataset)
+        arr = np.frombuffer(raw, dtype=np.float64)
+        if arr.size < 2 * int(k):
+            return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+        values = arr[: int(k)].copy()
+        counts = arr[int(k) : 2 * int(k)].copy()
+        return values, counts
+
     def particle_histogram1d(
         self,
         values: ParticleArrayHandle | np.ndarray,

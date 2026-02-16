@@ -3210,6 +3210,117 @@ void register_default_kernels(KernelRegistry& registry) {
         return hpx::make_ready_future();
       });
   registry.register_kernel(
+      KernelDesc{.name = "particle_topk_modes", .n_inputs = 0, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView>, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        if (outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        std::string particle_type;
+        std::string field_name;
+        int64_t k = 0;
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            for (uint32_t i = 0; i < root.via.map.size; ++i) {
+              const auto& k_msg = root.via.map.ptr[i].key;
+              if (k_msg.type != msgpack::type::STR) {
+                continue;
+              }
+              const auto key = k_msg.as<std::string>();
+              if (key == "particle_type") {
+                particle_type = root.via.map.ptr[i].val.as<std::string>();
+              } else if (key == "field_name") {
+                field_name = root.via.map.ptr[i].val.as<std::string>();
+              } else if (key == "k") {
+                k = root.via.map.ptr[i].val.as<int64_t>();
+              }
+            }
+          }
+        }
+        if (particle_type.empty() || field_name.empty() || k <= 0) {
+          outputs[0].data.clear();
+          return hpx::make_ready_future();
+        }
+
+        const auto& dataset = global_dataset();
+        if (!dataset.backend) {
+          throw std::runtime_error("particle_topk_modes: missing dataset backend");
+        }
+        const auto* reader = dataset.backend->get_plotfile_reader();
+        if (reader == nullptr) {
+          throw std::runtime_error(
+              "particle_topk_modes requires an AMReX plotfile-backed dataset");
+        }
+        auto data = reader->read_particle_field(particle_type, field_name);
+        const std::size_t n = static_cast<std::size_t>(std::max<int64_t>(0, data.count));
+        std::vector<double> values;
+        values.reserve(n);
+        if (data.dtype == "float64") {
+          if (data.bytes.size() < n * sizeof(double)) {
+            throw std::runtime_error("particle_topk_modes: short float64 payload");
+          }
+          const auto* in = reinterpret_cast<const double*>(data.bytes.data());
+          values.assign(in, in + n);
+        } else if (data.dtype == "float32") {
+          if (data.bytes.size() < n * sizeof(float)) {
+            throw std::runtime_error("particle_topk_modes: short float32 payload");
+          }
+          const auto* in = reinterpret_cast<const float*>(data.bytes.data());
+          for (std::size_t i = 0; i < n; ++i) {
+            values.push_back(static_cast<double>(in[i]));
+          }
+        } else if (data.dtype == "int64") {
+          if (data.bytes.size() < n * sizeof(int64_t)) {
+            throw std::runtime_error("particle_topk_modes: short int64 payload");
+          }
+          const auto* in = reinterpret_cast<const int64_t*>(data.bytes.data());
+          for (std::size_t i = 0; i < n; ++i) {
+            values.push_back(static_cast<double>(in[i]));
+          }
+        } else {
+          throw std::runtime_error("particle_topk_modes: unsupported particle dtype '" +
+                                   data.dtype + "'");
+        }
+
+        std::unordered_map<double, int64_t> counts;
+        counts.reserve(values.size());
+        for (double v : values) {
+          if (!std::isfinite(v)) {
+            continue;
+          }
+          counts[v] += 1;
+        }
+        std::vector<std::pair<double, int64_t>> modes;
+        modes.reserve(counts.size());
+        for (const auto& it : counts) {
+          modes.emplace_back(it.first, it.second);
+        }
+        std::sort(modes.begin(), modes.end(),
+                  [](const auto& a, const auto& b) {
+                    if (a.second != b.second) {
+                      return a.second > b.second;
+                    }
+                    return a.first > b.first;
+                  });
+
+        const std::size_t out_len = static_cast<std::size_t>(k);
+        outputs[0].data.resize(out_len * 2 * sizeof(double));
+        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+        for (std::size_t i = 0; i < out_len; ++i) {
+          if (i < modes.size()) {
+            out[i] = modes[i].first;
+            out[out_len + i] = static_cast<double>(modes[i].second);
+          } else {
+            out[i] = std::numeric_limits<double>::quiet_NaN();
+            out[out_len + i] = 0.0;
+          }
+        }
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
       KernelDesc{.name = "particle_int64_sum_reduce", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
       [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
          std::span<HostView> outputs, std::span<const std::uint8_t>) {
