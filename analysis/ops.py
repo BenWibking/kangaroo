@@ -1830,6 +1830,8 @@ def histogram_edges_1d(hist_range: tuple[float, float], bins: int) -> list[float
     if bins <= 0:
         raise ValueError("bins must be positive")
     lo, hi = hist_range
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        raise ValueError("hist_range bounds must be finite")
     if hi <= lo:
         raise ValueError("hist_range must be increasing")
     dx = (hi - lo) / bins

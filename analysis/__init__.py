@@ -27,6 +27,8 @@ __all__ = [
     "ParticleArrayHandle",
     "ParticleMaskHandle",
     "pipeline",
+    "histogram_edges_1d",
+    "histogram_edges_2d",
     "cdf_from_histogram",
     "cdf_from_samples",
 ]
@@ -105,10 +107,12 @@ def __getattr__(name):
             "ParticleMaskHandle": ParticleMaskHandle,
             "pipeline": pipeline,
         }[name]
-    if name in {"cdf_from_histogram", "cdf_from_samples"}:
-        from .ops import cdf_from_histogram, cdf_from_samples
+    if name in {"histogram_edges_1d", "histogram_edges_2d", "cdf_from_histogram", "cdf_from_samples"}:
+        from .ops import histogram_edges_1d, histogram_edges_2d, cdf_from_histogram, cdf_from_samples
 
         return {
+            "histogram_edges_1d": histogram_edges_1d,
+            "histogram_edges_2d": histogram_edges_2d,
             "cdf_from_histogram": cdf_from_histogram,
             "cdf_from_samples": cdf_from_samples,
         }[name]

@@ -57,7 +57,11 @@ class RunMeta:
                     }
                 )
             steps_payload.append({"step": step.step, "levels": levels_payload})
-        self._h = _core.RunMetaHandle(steps_payload)
+        payload = {
+            "steps": steps_payload,
+            "particle_species": dict(self.particle_species),
+        }
+        self._h = _core.RunMetaHandle(payload)
 
 
 def load_runmeta_from_dict(payload: Dict[str, Any]) -> RunMeta:

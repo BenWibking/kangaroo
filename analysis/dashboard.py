@@ -160,6 +160,7 @@ class DashboardApp:
         )
         self._task_stream_plot_ref = None
         self._plan_loaded = False
+        self._plan_error: Optional[str] = None
         self._dag_plot_ref = None
         self._dag_source = ColumnDataSource(
             data={
@@ -186,7 +187,12 @@ class DashboardApp:
 
     def _update_metrics(self) -> None:
         self._saw_metrics_event = False
-        self._ensure_plan_loaded()
+        try:
+            self._ensure_plan_loaded()
+        except RuntimeError as exc:
+            if self._status_div is not None:
+                self._status_div.text = f"<b>Error:</b> {exc}"
+            raise
         if self._log_reader:
             for event in self._log_reader.read_events():
                 self._handle_event(event)
@@ -207,6 +213,8 @@ class DashboardApp:
     def _ensure_plan_loaded(self) -> None:
         if self._plan_loaded:
             return
+        if self._plan_error is not None:
+            raise RuntimeError(self._plan_error)
         if self._config.plan_path is None:
             return
         if not self._config.plan_path.exists():
@@ -214,11 +222,22 @@ class DashboardApp:
         try:
             with self._config.plan_path.open("r", encoding="utf-8") as handle:
                 payload = json.load(handle)
-        except (OSError, json.JSONDecodeError):
-            return
+        except OSError as exc:
+            self._plan_error = f"failed to read plan file '{self._config.plan_path}': {exc}"
+            self._plan_loaded = True
+            raise RuntimeError(self._plan_error) from exc
+        except json.JSONDecodeError as exc:
+            self._plan_error = (
+                f"invalid JSON in plan file '{self._config.plan_path}': {exc.msg} "
+                f"(line {exc.lineno}, column {exc.colno})"
+            )
+            self._plan_loaded = True
+            raise RuntimeError(self._plan_error) from exc
         stages = payload.get("stages")
         if not isinstance(stages, list):
-            return
+            self._plan_error = "malformed plan payload: expected top-level 'stages' list"
+            self._plan_loaded = True
+            raise RuntimeError(self._plan_error)
         self._plan_loaded = True
         self._update_dag_sources(stages)
 
