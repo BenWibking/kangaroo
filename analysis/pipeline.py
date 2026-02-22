@@ -61,7 +61,16 @@ class ParticleArrayHandle:
 
     @property
     def values(self) -> np.ndarray:
-        return self.pipeline._particle_materialize_array(self)
+        raise RuntimeError(
+            "Full particle array materialization is disabled. "
+            "Use iter_chunks() and reduction operators."
+        )
+
+    def iter_chunks(self) -> list[np.ndarray]:
+        dtype = "int64" if self.dtype == "int64" else "float64"
+        return self.pipeline._particle_materialize_chunks(
+            self.field, chunk_count=self.chunk_count, dtype=dtype
+        )
 
 
 @dataclass(frozen=True)
@@ -72,7 +81,15 @@ class ParticleMaskHandle:
 
     @property
     def values(self) -> np.ndarray:
-        return self.pipeline._particle_materialize_mask(self)
+        raise RuntimeError(
+            "Full particle mask materialization is disabled. "
+            "Use iter_chunks() and reduction operators."
+        )
+
+    def iter_chunks(self) -> list[np.ndarray]:
+        return self.pipeline._particle_materialize_chunks(
+            self.field, chunk_count=self.chunk_count, dtype="mask_u8"
+        )
 
 
 class Pipeline:
@@ -270,20 +287,6 @@ class Pipeline:
                 raise ValueError(f"unsupported particle dtype '{dtype}'")
         self._particle_cache[key] = out
         return out
-
-    def _particle_materialize_array(self, handle: ParticleArrayHandle) -> np.ndarray:
-        chunks = self._particle_materialize_chunks(
-            handle.field, chunk_count=handle.chunk_count, dtype=("int64" if handle.dtype == "int64" else "float64")
-        )
-        if not chunks:
-            return np.zeros(0, dtype=np.float64)
-        return np.concatenate(chunks)
-
-    def _particle_materialize_mask(self, handle: ParticleMaskHandle) -> np.ndarray:
-        chunks = self._particle_materialize_chunks(handle.field, chunk_count=handle.chunk_count, dtype="mask_u8")
-        if not chunks:
-            return np.zeros(0, dtype=bool)
-        return np.concatenate(chunks).astype(bool, copy=False)
 
     def _ensure_particle_executed(self) -> None:
         if self._particle_executed:

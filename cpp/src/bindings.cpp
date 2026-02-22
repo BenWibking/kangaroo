@@ -289,7 +289,7 @@ NB_MODULE(_core, m) {
         self->uri = uri;
         self->step = step;
         self->level = level;
-        
+
         if (uri.rfind("amrex://", 0) == 0 || uri.rfind("file://", 0) == 0) {
             std::string path = uri;
             if (uri.rfind("amrex://", 0) == 0) {
@@ -298,7 +298,6 @@ NB_MODULE(_core, m) {
                 path = uri.substr(7);
             }
             bool as_parthenon = false;
-#ifdef KANGAROO_USE_PARTHENON_HDF5
             if (path.size() >= 5) {
               const auto suffix = path.substr(path.size() - 5);
               as_parthenon = (suffix == ".phdf" || suffix == ".hdf5");
@@ -307,26 +306,32 @@ NB_MODULE(_core, m) {
               const auto suffix = path.substr(path.size() - 3);
               as_parthenon = (suffix == ".h5");
             }
-#endif
-#ifdef KANGAROO_USE_PARTHENON_HDF5
             if (as_parthenon) {
+#ifdef KANGAROO_USE_PARTHENON_HDF5
               self->backend = std::make_shared<kangaroo::ParthenonBackend>(path);
-            } else
+#else
+              throw std::runtime_error("Parthenon backend not enabled in this build");
 #endif
-            {
+            } else {
               self->backend = std::make_shared<kangaroo::PlotfileBackend>(path);
             }
-#ifdef KANGAROO_USE_PARTHENON_HDF5
         } else if (uri.rfind("parthenon://", 0) == 0) {
+#ifdef KANGAROO_USE_PARTHENON_HDF5
             std::string path = uri.substr(12);
             self->backend = std::make_shared<kangaroo::ParthenonBackend>(path);
+#else
+            throw std::runtime_error("Parthenon backend not enabled in this build");
 #endif
-#ifdef KANGAROO_USE_OPENPMD
         } else if (uri.rfind("openpmd://", 0) == 0) {
+#ifdef KANGAROO_USE_OPENPMD
             self->backend = std::make_shared<kangaroo::OpenPMDBackend>(uri);
+#else
+            throw std::runtime_error("openPMD backend not enabled in this build");
 #endif
-        } else if (uri == "memory://local") {
+        } else if (uri.rfind("memory://", 0) == 0) {
             self->backend = std::make_shared<kangaroo::MemoryBackend>();
+        } else {
+            throw std::runtime_error("unsupported dataset URI scheme: " + uri);
         }
       })
       .def("register_field", [](kangaroo::DatasetHandle& self, int32_t field_id, int32_t component) {
@@ -398,25 +403,6 @@ NB_MODULE(_core, m) {
           }
           return out;
       }, nb::arg("particle_type"))
-      .def("read_particle_field",
-           [](kangaroo::DatasetHandle& self, const std::string& particle_type,
-              const std::string& field_name) -> nb::dict {
-             if (!self.backend) {
-               throw std::runtime_error("dataset backend is not initialized");
-             }
-             auto* reader = self.backend->get_plotfile_reader();
-             if (!reader) {
-               throw std::runtime_error("particle field access is only supported for AMReX plotfiles");
-             }
-             auto data = reader->read_particle_field(particle_type, field_name);
-             nb::dict out;
-             out["count"] = data.count;
-             out["dtype"] = data.dtype;
-             out["data"] = nb::bytes(reinterpret_cast<const char*>(data.bytes.data()), data.bytes.size());
-             return out;
-           },
-           nb::arg("particle_type"),
-           nb::arg("field_name"))
       .def("particle_chunk_count",
            [](kangaroo::DatasetHandle& self, const std::string& particle_type) -> int64_t {
              if (!self.backend) {

@@ -27,27 +27,36 @@ def test_dataset_particle_api_diskgalaxy() -> None:
     assert "evolution_stage" in pfields
     assert "x" in pfields
 
-    x = ds.get_particle_array("StochasticStellarPop_particles", "x")
-    stage = ds.get_particle_array("StochasticStellarPop_particles", "evolution_stage")
-    mass = ds.get_particle_array("StochasticStellarPop_particles", "mass")
     nchunks = ds.get_particle_chunk_count("StochasticStellarPop_particles")
-
-    assert isinstance(x, np.ndarray)
-    assert isinstance(stage, np.ndarray)
-    assert isinstance(mass, np.ndarray)
-    assert x.ndim == 1
-    assert x.shape == stage.shape
-    assert mass.shape == stage.shape
-    assert stage.dtype == np.int64
-    assert x.dtype in (np.float32, np.float64)
     assert nchunks >= 1
 
-    parts = [
+    with pytest.raises(RuntimeError, match="disabled"):
+        ds.get_particle_array("StochasticStellarPop_particles", "mass")
+
+    x_parts = [
+        ds.get_particle_chunk_array("StochasticStellarPop_particles", "x", i)
+        for i in range(nchunks)
+    ]
+    stage_parts = [
+        ds.get_particle_chunk_array("StochasticStellarPop_particles", "evolution_stage", i)
+        for i in range(nchunks)
+    ]
+    mass_parts = [
         ds.get_particle_chunk_array("StochasticStellarPop_particles", "mass", i)
         for i in range(nchunks)
     ]
-    mass_chunked = np.concatenate(parts) if parts else np.zeros(0, dtype=mass.dtype)
-    np.testing.assert_allclose(mass_chunked, mass)
+    assert len(x_parts) == nchunks
+    assert len(stage_parts) == nchunks
+    assert len(mass_parts) == nchunks
+    assert all(isinstance(chunk, np.ndarray) and chunk.ndim == 1 for chunk in x_parts)
+    assert all(isinstance(chunk, np.ndarray) and chunk.ndim == 1 for chunk in stage_parts)
+    assert all(isinstance(chunk, np.ndarray) and chunk.ndim == 1 for chunk in mass_parts)
+    assert all(chunk.dtype in (np.float32, np.float64) for chunk in x_parts)
+    assert all(chunk.dtype == np.int64 for chunk in stage_parts)
+    assert all(chunk.dtype in (np.float32, np.float64) for chunk in mass_parts)
+    assert all(
+        x_parts[i].shape == stage_parts[i].shape == mass_parts[i].shape for i in range(nchunks)
+    )
 
 
 def test_pipeline_particle_field_uses_runtime_diskgalaxy() -> None:
@@ -63,5 +72,9 @@ def test_pipeline_particle_field_uses_runtime_diskgalaxy() -> None:
 
     ds.get_particle_array = _forbidden  # type: ignore[assignment]
     masses = p.particle_field("StochasticStellarPop_particles", "mass")
-    assert isinstance(masses.values, np.ndarray)
-    assert masses.values.ndim == 1
+    with pytest.raises(RuntimeError, match="disabled"):
+        _ = masses.values
+    chunks = masses.iter_chunks()
+    assert isinstance(chunks, list)
+    assert chunks
+    assert all(isinstance(chunk, np.ndarray) and chunk.ndim == 1 for chunk in chunks)

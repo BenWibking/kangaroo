@@ -131,8 +131,6 @@ public:
   std::vector<std::string> particle_types() const;
   std::vector<std::string> particle_fields(const std::string& particle_type) const;
   int64_t particle_chunk_count(const std::string& particle_type) const;
-  ParticleArrayData read_particle_field(const std::string& particle_type,
-                                        const std::string& field_name) const;
   ParticleArrayData read_particle_field_chunk(const std::string& particle_type,
                                               const std::string& field_name,
                                               int64_t chunk_index) const;

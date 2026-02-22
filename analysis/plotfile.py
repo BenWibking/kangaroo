@@ -56,14 +56,18 @@ class PlotfileReader:
     def particle_fields(self, particle_type: str) -> list[str]:
         return list(self._reader.particle_fields(particle_type))
 
-    def read_particle_field(
+    def particle_chunk_count(self, particle_type: str) -> int:
+        return int(self._reader.particle_chunk_count(particle_type))
+
+    def read_particle_field_chunk(
         self,
         particle_type: str,
         field_name: str,
+        chunk_index: int,
         *,
         return_ndarray: bool = False,
     ) -> dict[str, Any]:
-        payload = self._reader.read_particle_field(particle_type, field_name)
+        payload = self._reader.read_particle_field_chunk(particle_type, field_name, int(chunk_index))
         if not return_ndarray:
             return payload
 

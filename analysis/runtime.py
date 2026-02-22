@@ -55,6 +55,7 @@ class Runtime:
             self._rt = _core.Runtime(hpx_config or [], hpx_args or [])
         else:
             self._rt = _core.Runtime()
+        self._run_in_progress = False
 
     @classmethod
     def from_parsed_args(
@@ -91,9 +92,15 @@ class Runtime:
         self._rt.mark_field_persistent(fid, name)
 
     def run(self, plan: Plan, *, runmeta, dataset) -> None:
+        if self._run_in_progress:
+            raise RuntimeError("runtime run is already in progress")
         self._bind_dataset_handle(dataset)
         packed = msgpack.packb(plan_to_dict(plan), use_bin_type=True)
-        self._rt.run_packed_plan(packed, runmeta._h, dataset._h)
+        self._run_in_progress = True
+        try:
+            self._rt.run_packed_plan(packed, runmeta._h, dataset._h)
+        finally:
+            self._run_in_progress = False
 
     def set_event_log_path(self, path: str) -> None:
         self._rt.set_event_log_path(path)
@@ -112,6 +119,8 @@ class Runtime:
         block: int,
         dataset: Any | None = None,
     ) -> bytes:
+        if self._run_in_progress:
+            raise RuntimeError("output retrieval is not allowed while a plan run is in progress")
         self._bind_dataset_handle(dataset)
         return self._rt.get_task_chunk(step, level, field, version, block)
 

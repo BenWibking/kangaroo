@@ -87,13 +87,23 @@ def test_plotfile_reader_particles_diskgalaxy() -> None:
     assert "evolution_stage" in stars_fields
     assert "birth_time" in stars_fields
 
-    mass = reader.read_particle_field("CIC_particles", "mass", return_ndarray=True)
-    assert mass["dtype"] in {"float32", "float64"}
-    assert int(mass["count"]) == mass["data"].shape[0]
-    assert mass["data"].shape[0] > 0
+    if not hasattr(reader._reader, "particle_chunk_count") or not hasattr(
+        reader._reader, "read_particle_field_chunk"
+    ):
+        pytest.skip("plotfile extension missing particle chunk APIs; rebuild extensions")
 
-    stage = reader.read_particle_field(
-        "StochasticStellarPop_particles", "evolution_stage", return_ndarray=True
+    nchunks = reader.particle_chunk_count("CIC_particles")
+    assert nchunks > 0
+
+    mass_chunk = reader.read_particle_field_chunk(
+        "CIC_particles", "mass", 0, return_ndarray=True
     )
-    assert stage["dtype"] == "int64"
-    assert int(stage["count"]) == stage["data"].shape[0]
+    assert mass_chunk["dtype"] in {"float32", "float64"}
+    assert int(mass_chunk["count"]) == mass_chunk["data"].shape[0]
+    assert mass_chunk["data"].shape[0] > 0
+
+    stage_chunk = reader.read_particle_field_chunk(
+        "StochasticStellarPop_particles", "evolution_stage", 0, return_ndarray=True
+    )
+    assert stage_chunk["dtype"] == "int64"
+    assert int(stage_chunk["count"]) == stage_chunk["data"].shape[0]

@@ -74,10 +74,11 @@ NB_MODULE(_plotfile, m) {
       .def("num_fabs", &kangaroo::plotfile::PlotfileReader::num_fabs)
       .def("particle_types", &kangaroo::plotfile::PlotfileReader::particle_types)
       .def("particle_fields", &kangaroo::plotfile::PlotfileReader::particle_fields)
-      .def("read_particle_field",
+      .def("particle_chunk_count", &kangaroo::plotfile::PlotfileReader::particle_chunk_count)
+      .def("read_particle_field_chunk",
            [](const kangaroo::plotfile::PlotfileReader& reader, const std::string& particle_type,
-              const std::string& field_name) {
-             auto data = reader.read_particle_field(particle_type, field_name);
+              const std::string& field_name, int64_t chunk_index) {
+             auto data = reader.read_particle_field_chunk(particle_type, field_name, chunk_index);
              nb::dict out;
              out["count"] = data.count;
              out["dtype"] = data.dtype;
@@ -86,7 +87,8 @@ NB_MODULE(_plotfile, m) {
              return out;
            },
            nb::arg("particle_type"),
-           nb::arg("field_name"))
+           nb::arg("field_name"),
+           nb::arg("chunk_index"))
       .def("read_fab",
            [](kangaroo::plotfile::PlotfileReader& reader, int level, int fab, int comp_start,
               int comp_count) {

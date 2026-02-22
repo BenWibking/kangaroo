@@ -5,6 +5,7 @@
 #include "amrexpr.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cmath>
 #include <cstdlib>
@@ -53,6 +54,57 @@ std::unordered_map<int32_t, PlanIR> g_plans;
 std::mutex g_event_log_mutex;
 std::string g_event_log_path;
 bool g_event_log_enabled = false;
+std::atomic<int32_t> g_active_plan_runs{0};
+
+struct ActivePlanRunGuard {
+  ActivePlanRunGuard() { g_active_plan_runs.fetch_add(1, std::memory_order_acq_rel); }
+  ~ActivePlanRunGuard() { g_active_plan_runs.fetch_sub(1, std::memory_order_acq_rel); }
+};
+
+void append_particle_values_as_f64(const plotfile::ParticleArrayData& data, const std::string& name,
+                                   const std::string& context, std::vector<double>& out_vals) {
+  const std::size_t n = static_cast<std::size_t>(std::max<int64_t>(0, data.count));
+  const std::size_t start = out_vals.size();
+  out_vals.resize(start + n, 0.0);
+  if (data.dtype == "float64") {
+    if (data.bytes.size() < n * sizeof(double)) {
+      throw std::runtime_error(context + ": short float64 payload for " + name);
+    }
+    const auto* in = reinterpret_cast<const double*>(data.bytes.data());
+    std::copy(in, in + n, out_vals.begin() + static_cast<std::ptrdiff_t>(start));
+  } else if (data.dtype == "float32") {
+    if (data.bytes.size() < n * sizeof(float)) {
+      throw std::runtime_error(context + ": short float32 payload for " + name);
+    }
+    const auto* in = reinterpret_cast<const float*>(data.bytes.data());
+    for (std::size_t i = 0; i < n; ++i) {
+      out_vals[start + i] = static_cast<double>(in[i]);
+    }
+  } else if (data.dtype == "int64") {
+    if (data.bytes.size() < n * sizeof(int64_t)) {
+      throw std::runtime_error(context + ": short int64 payload for " + name);
+    }
+    const auto* in = reinterpret_cast<const int64_t*>(data.bytes.data());
+    for (std::size_t i = 0; i < n; ++i) {
+      out_vals[start + i] = static_cast<double>(in[i]);
+    }
+  } else {
+    throw std::runtime_error(context + ": unsupported dtype '" + data.dtype + "' for " + name);
+  }
+}
+
+std::vector<double> read_particle_field_chunks_as_f64(const plotfile::PlotfileReader& reader,
+                                                      const std::string& particle_type,
+                                                      const std::string& field_name,
+                                                      const std::string& context) {
+  const int64_t nchunks = reader.particle_chunk_count(particle_type);
+  std::vector<double> out_vals;
+  for (int64_t chunk = 0; chunk < nchunks; ++chunk) {
+    const auto data = reader.read_particle_field_chunk(particle_type, field_name, chunk);
+    append_particle_values_as_f64(data, field_name, context, out_vals);
+  }
+  return out_vals;
+}
 
 std::string json_escape(const std::string& value);
 
@@ -2197,50 +2249,14 @@ void register_default_kernels(KernelRegistry& registry) {
               "particle_cic_grid_accumulate requires an AMReX plotfile-backed dataset");
         }
 
-        auto cast_to_f64 = [](const plotfile::ParticleArrayData& data,
-                              const std::string& name) -> std::vector<double> {
-          const std::size_t n = static_cast<std::size_t>(std::max<int64_t>(0, data.count));
-          std::vector<double> out_vals(n, 0.0);
-          if (data.dtype == "float64") {
-            if (data.bytes.size() < n * sizeof(double)) {
-              throw std::runtime_error("particle_cic_grid_accumulate: short float64 payload for " +
-                                       name);
-            }
-            const auto* in = reinterpret_cast<const double*>(data.bytes.data());
-            std::copy(in, in + n, out_vals.begin());
-          } else if (data.dtype == "float32") {
-            if (data.bytes.size() < n * sizeof(float)) {
-              throw std::runtime_error("particle_cic_grid_accumulate: short float32 payload for " +
-                                       name);
-            }
-            const auto* in = reinterpret_cast<const float*>(data.bytes.data());
-            for (std::size_t i = 0; i < n; ++i) {
-              out_vals[i] = static_cast<double>(in[i]);
-            }
-          } else if (data.dtype == "int64") {
-            if (data.bytes.size() < n * sizeof(int64_t)) {
-              throw std::runtime_error("particle_cic_grid_accumulate: short int64 payload for " +
-                                       name);
-            }
-            const auto* in = reinterpret_cast<const int64_t*>(data.bytes.data());
-            for (std::size_t i = 0; i < n; ++i) {
-              out_vals[i] = static_cast<double>(in[i]);
-            }
-          } else {
-            throw std::runtime_error("particle_cic_grid_accumulate: unsupported dtype '" +
-                                     data.dtype + "' for " + name);
-          }
-          return out_vals;
-        };
-
-        const auto x_data = reader->read_particle_field(params.particle_type, "x");
-        const auto y_data = reader->read_particle_field(params.particle_type, "y");
-        const auto z_data = reader->read_particle_field(params.particle_type, "z");
-        const auto m_data = reader->read_particle_field(params.particle_type, "mass");
-        auto px = cast_to_f64(x_data, "x");
-        auto py = cast_to_f64(y_data, "y");
-        auto pz = cast_to_f64(z_data, "z");
-        auto pm = cast_to_f64(m_data, "mass");
+        auto px = read_particle_field_chunks_as_f64(*reader, params.particle_type, "x",
+                                                    "particle_cic_grid_accumulate");
+        auto py = read_particle_field_chunks_as_f64(*reader, params.particle_type, "y",
+                                                    "particle_cic_grid_accumulate");
+        auto pz = read_particle_field_chunks_as_f64(*reader, params.particle_type, "z",
+                                                    "particle_cic_grid_accumulate");
+        auto pm = read_particle_field_chunks_as_f64(*reader, params.particle_type, "mass",
+                                                    "particle_cic_grid_accumulate");
 
         const std::size_t n =
             std::min(std::min(px.size(), py.size()), std::min(pz.size(), pm.size()));
@@ -2492,50 +2508,14 @@ void register_default_kernels(KernelRegistry& registry) {
               "particle_cic_projection_accumulate requires an AMReX plotfile-backed dataset");
         }
 
-        auto cast_to_f64 = [](const plotfile::ParticleArrayData& data,
-                              const std::string& name) -> std::vector<double> {
-          const std::size_t n = static_cast<std::size_t>(std::max<int64_t>(0, data.count));
-          std::vector<double> out_vals(n, 0.0);
-          if (data.dtype == "float64") {
-            if (data.bytes.size() < n * sizeof(double)) {
-              throw std::runtime_error("particle_cic_projection_accumulate: short float64 payload for " +
-                                       name);
-            }
-            const auto* in = reinterpret_cast<const double*>(data.bytes.data());
-            std::copy(in, in + n, out_vals.begin());
-          } else if (data.dtype == "float32") {
-            if (data.bytes.size() < n * sizeof(float)) {
-              throw std::runtime_error("particle_cic_projection_accumulate: short float32 payload for " +
-                                       name);
-            }
-            const auto* in = reinterpret_cast<const float*>(data.bytes.data());
-            for (std::size_t i = 0; i < n; ++i) {
-              out_vals[i] = static_cast<double>(in[i]);
-            }
-          } else if (data.dtype == "int64") {
-            if (data.bytes.size() < n * sizeof(int64_t)) {
-              throw std::runtime_error("particle_cic_projection_accumulate: short int64 payload for " +
-                                       name);
-            }
-            const auto* in = reinterpret_cast<const int64_t*>(data.bytes.data());
-            for (std::size_t i = 0; i < n; ++i) {
-              out_vals[i] = static_cast<double>(in[i]);
-            }
-          } else {
-            throw std::runtime_error("particle_cic_projection_accumulate: unsupported dtype '" +
-                                     data.dtype + "' for " + name);
-          }
-          return out_vals;
-        };
-
-        const auto x_data = reader->read_particle_field(params.particle_type, "x");
-        const auto y_data = reader->read_particle_field(params.particle_type, "y");
-        const auto z_data = reader->read_particle_field(params.particle_type, "z");
-        const auto m_data = reader->read_particle_field(params.particle_type, "mass");
-        auto px = cast_to_f64(x_data, "x");
-        auto py = cast_to_f64(y_data, "y");
-        auto pz = cast_to_f64(z_data, "z");
-        auto pm = cast_to_f64(m_data, "mass");
+        auto px = read_particle_field_chunks_as_f64(*reader, params.particle_type, "x",
+                                                    "particle_cic_projection_accumulate");
+        auto py = read_particle_field_chunks_as_f64(*reader, params.particle_type, "y",
+                                                    "particle_cic_projection_accumulate");
+        auto pz = read_particle_field_chunks_as_f64(*reader, params.particle_type, "z",
+                                                    "particle_cic_projection_accumulate");
+        auto pm = read_particle_field_chunks_as_f64(*reader, params.particle_type, "mass",
+                                                    "particle_cic_projection_accumulate");
 
         const std::size_t n =
             std::min(std::min(px.size(), py.size()), std::min(pz.size(), pm.size()));
@@ -3272,44 +3252,18 @@ void register_default_kernels(KernelRegistry& registry) {
           throw std::runtime_error(
               "particle_topk_modes requires an AMReX plotfile-backed dataset");
         }
-        auto data = reader->read_particle_field(particle_type, field_name);
-        const std::size_t n = static_cast<std::size_t>(std::max<int64_t>(0, data.count));
-        std::vector<double> values;
-        values.reserve(n);
-        if (data.dtype == "float64") {
-          if (data.bytes.size() < n * sizeof(double)) {
-            throw std::runtime_error("particle_topk_modes: short float64 payload");
-          }
-          const auto* in = reinterpret_cast<const double*>(data.bytes.data());
-          values.assign(in, in + n);
-        } else if (data.dtype == "float32") {
-          if (data.bytes.size() < n * sizeof(float)) {
-            throw std::runtime_error("particle_topk_modes: short float32 payload");
-          }
-          const auto* in = reinterpret_cast<const float*>(data.bytes.data());
-          for (std::size_t i = 0; i < n; ++i) {
-            values.push_back(static_cast<double>(in[i]));
-          }
-        } else if (data.dtype == "int64") {
-          if (data.bytes.size() < n * sizeof(int64_t)) {
-            throw std::runtime_error("particle_topk_modes: short int64 payload");
-          }
-          const auto* in = reinterpret_cast<const int64_t*>(data.bytes.data());
-          for (std::size_t i = 0; i < n; ++i) {
-            values.push_back(static_cast<double>(in[i]));
-          }
-        } else {
-          throw std::runtime_error("particle_topk_modes: unsupported particle dtype '" +
-                                   data.dtype + "'");
-        }
-
         std::unordered_map<double, int64_t> counts;
-        counts.reserve(values.size());
-        for (double v : values) {
-          if (!std::isfinite(v)) {
-            continue;
+        const int64_t nchunks = reader->particle_chunk_count(particle_type);
+        for (int64_t chunk = 0; chunk < nchunks; ++chunk) {
+          const auto data = reader->read_particle_field_chunk(particle_type, field_name, chunk);
+          std::vector<double> values;
+          append_particle_values_as_f64(data, field_name, "particle_topk_modes", values);
+          for (double v : values) {
+            if (!std::isfinite(v)) {
+              continue;
+            }
+            counts[v] += 1;
           }
-          counts[v] += 1;
         }
         std::vector<std::pair<double, int64_t>> modes;
         modes.reserve(counts.size());
@@ -4209,6 +4163,7 @@ void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
                               const RunMetaHandle& runmeta,
                               const DatasetHandle& dataset) {
   ensure_hpx_started();
+  ActivePlanRunGuard active_run_guard;
   PlanIR plan = decode_plan_msgpack(std::span<const std::uint8_t>(packed.data(), packed.size()));
 
   auto localities = hpx::find_all_localities();
@@ -4244,6 +4199,10 @@ HostView Runtime::get_task_chunk(int32_t step,
                                  int32_t version,
                                  int32_t block) {
   ensure_hpx_started();
+  if (g_active_plan_runs.load(std::memory_order_acquire) > 0) {
+    throw std::runtime_error(
+        "output retrieval is not allowed while a plan run is in progress");
+  }
   DataServiceLocal data;
   ChunkRef ref{step, level, field, version, block};
   return data.get_host(ref).get();

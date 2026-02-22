@@ -105,20 +105,10 @@ class Dataset:
         return list(self._h.list_particle_fields(particle_type))
 
     def get_particle_array(self, particle_type: str, field: str) -> np.ndarray:
-        if not hasattr(self._h, "read_particle_field"):
-            raise RuntimeError("Particle field access is not available in this runtime")
-        payload = self._h.read_particle_field(particle_type, field)
-        dtype = payload["dtype"]
-        raw = payload["data"]
-        if dtype == "float32":
-            np_dtype = np.float32
-        elif dtype == "float64":
-            np_dtype = np.float64
-        elif dtype == "int64":
-            np_dtype = np.int64
-        else:
-            raise RuntimeError(f"unsupported particle dtype '{dtype}'")
-        return np.frombuffer(raw, dtype=np_dtype)
+        raise RuntimeError(
+            "Full particle array materialization is disabled. "
+            "Use get_particle_chunk_count() and get_particle_chunk_array()."
+        )
 
     def get_particle_chunk_count(self, particle_type: str) -> int:
         if not hasattr(self._h, "particle_chunk_count"):
