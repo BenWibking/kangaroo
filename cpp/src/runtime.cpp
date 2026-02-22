@@ -4175,12 +4175,24 @@ void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
   int32_t plan_id = next_plan_id_++;
   hpx::lcos::broadcast<::kangaroo_set_plan_action>(localities, plan_id, plan).get();
 
-  DataServiceLocal data;
-  AdjacencyServiceLocal adjacency(runmeta.meta);
-  Executor executor(plan_id, runmeta.meta, data, adjacency, kernel_registry_);
+  auto erase_plan = [&]() {
+    hpx::lcos::broadcast<::kangaroo_erase_plan_action>(localities, plan_id).get();
+  };
 
-  executor.run(plan).get();
-  hpx::lcos::broadcast<::kangaroo_erase_plan_action>(localities, plan_id).get();
+  try {
+    DataServiceLocal data;
+    AdjacencyServiceLocal adjacency(runmeta.meta);
+    Executor executor(plan_id, runmeta.meta, data, adjacency, kernel_registry_);
+    executor.run(plan).get();
+  } catch (...) {
+    try {
+      erase_plan();
+    } catch (...) {
+    }
+    throw;
+  }
+
+  erase_plan();
 }
 
 void Runtime::preload_dataset(const RunMetaHandle& runmeta,
