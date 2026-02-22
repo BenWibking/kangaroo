@@ -53,7 +53,6 @@ Metadata MUST include enough information for:
 Plotfile backend MUST expose:
 - Particle type list.
 - Particle field list per type.
-- Whole-field particle reads.
 - Chunk-count and chunk-wise field reads.
 
 ## 5. Memory Backend Behavior

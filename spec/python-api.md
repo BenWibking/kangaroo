@@ -158,7 +158,7 @@ Validation:
 - `num_levels()`
 - `num_fabs(level)`
 - `read_fab(level, fab, comp_start, comp_count, return_ndarray=False)`
-- Particle APIs: type list, field list, whole-field read, chunked read (where supported)
+- Particle APIs: type list, field list, chunk count, and chunked field read
 
 Array conversion behavior:
 - `return_ndarray=True` converts payload bytes to NumPy array using reported dtype and shape.
