@@ -49,7 +49,7 @@ class Dataset:
             if os.path.isfile(path) and path.endswith((".phdf", ".h5", ".hdf5")):
                 return "parthenon", path
             return "amrex", path
-        if uri == "memory://local":
+        if uri.startswith("memory://"):
             return "memory", uri
         return "unknown", uri
 

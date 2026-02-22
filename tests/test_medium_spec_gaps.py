@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from analysis import histogram_edges_1d, histogram_edges_2d
+from analysis.dataset import Dataset
 from analysis.dashboard import DashboardApp, DashboardConfig
 from analysis.ops import histogram_edges_1d as histogram_edges_1d_ops
 from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
@@ -73,3 +74,16 @@ def test_dashboard_raises_explicit_error_for_malformed_plan_payload(tmp_path: Pa
     with pytest.raises(RuntimeError, match="malformed plan payload"):
         app._ensure_plan_loaded()
 
+
+def test_dataset_classifies_any_memory_uri_as_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class _FakeHandle:
+        def __init__(self, uri: str, step: int, level: int) -> None:
+            self.uri = uri
+            self.step = step
+            self.level = level
+
+    monkeypatch.setattr("analysis.dataset._core.DatasetHandle", _FakeHandle)
+    ds = Dataset(uri="memory://session-abc", runtime=None)
+    assert ds.kind == "memory"
