@@ -4182,7 +4182,7 @@ KernelRegistry& Runtime::kernels() {
 }
 
 void Runtime::set_event_log_path(const std::string& path) {
-  set_event_log_path(path);
+  ::kangaroo::set_event_log_path(path);
 }
 
 void set_event_log_path(const std::string& path) {
