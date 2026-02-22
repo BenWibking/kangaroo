@@ -53,6 +53,7 @@ Errors required for:
 Errors required for:
 - Reconfiguring runtime startup options after runtime backend startup.
 - Conflicting repeated startup option initialization.
+- Attempting Python-side output-buffer retrieval for a plan run that has not yet completed.
 
 ## 6. Dataset and URI Validation
 

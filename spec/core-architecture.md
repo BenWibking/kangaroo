@@ -188,6 +188,12 @@ For each `run_packed_plan` call, runtime MUST:
 4. Execute the stage DAG.
 5. Remove transient global plan context after completion.
 
+Output visibility during lifecycle:
+- Plan execution MUST have a well-defined completion point.
+- Until that completion point is reached, output buffers produced by that run MUST be treated as non-readable from Python-facing retrieval APIs.
+- The runtime MUST NOT expose partial or in-flight output buffer state to Python callers.
+- If output retrieval is attempted before completion, runtime MUST fail explicitly rather than returning provisional data.
+
 If execution fails:
 - Runtime MUST surface error to caller.
 - Error events SHOULD be emitted for affected tasks when event logging is enabled.

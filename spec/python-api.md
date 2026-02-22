@@ -39,6 +39,12 @@ Unknown attribute access MUST raise `AttributeError`.
 - `set_event_log_path(path)` updates runtime event sink path.
 - `kernels` property exposes registry/list API.
 
+Execution visibility rules:
+- `run(...)` MUST be a completion boundary for output visibility.
+- The Python runtime MUST NOT provide output-buffer access while a plan execution is in progress.
+- Calls to `get_task_chunk(...)` or `get_task_chunk_array(...)` that target outputs from an in-flight run MUST fail explicitly.
+- Output retrieval APIs MUST only expose data after successful completion of the corresponding plan execution.
+
 ### 2.3 `get_task_chunk_array` Semantics
 
 Required behavior:

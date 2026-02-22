@@ -27,6 +27,21 @@ In addition to functional correctness, MUST satisfy:
 - Native runtime support for GPU-offloaded kernel execution.
 - Data-parallel chunk execution across distributed-memory processes.
 - Streaming/out-of-core execution mode controlled by a memory usage cap.
+- Remote-client deployment model where Python API control may run on a physically separate machine and different network from the native runtime cluster.
+
+## 2.3 Remote Client / Cluster Deployment Model
+
+A performant implementation MUST support control-plane operation where:
+- The Python API process runs on a client machine that is physically separate from the compute cluster.
+- The client machine may be on a different network from the cluster runtime processes.
+- Connectivity may be provided through routed links or an SSH tunnel bridge.
+
+In this model:
+- Plan construction and orchestration requests originate from the Python client.
+- Task execution and data-plane kernel work occur on the native runtime in the compute environment.
+- Performance features in this profile (GPU offload, distributed chunk parallelism, memory-capped streaming) MUST remain available when connectivity is provided through the supported bridge path.
+
+The implementation SHOULD tolerate control-plane latency and intermittent link variability without violating functional semantics.
 
 ## 3. GPU Offload Requirements
 
@@ -212,4 +227,3 @@ To claim the performant profile, an implementation should provide:
 - Evidence of distributed chunk execution across processes.
 - Evidence of memory-capped streaming execution that preserves correctness.
 - Observability outputs that allow validating the above in practice.
-
