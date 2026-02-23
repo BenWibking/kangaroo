@@ -288,13 +288,18 @@ class Pipeline:
         self._particle_cache[key] = out
         return out
 
-    def _ensure_particle_executed(self) -> None:
+    def _ensure_particle_executed(self, *, progress_bar: bool = False) -> None:
         if self._particle_executed:
             return
         if not self._particle_stages:
             self._particle_executed = True
             return
-        self.runtime.run(Plan(stages=list(self._particle_stages)), runmeta=self._particle_runmeta(), dataset=self.dataset)
+        self.runtime.run(
+            Plan(stages=list(self._particle_stages)),
+            runmeta=self._particle_runmeta(),
+            dataset=self.dataset,
+            progress_bar=progress_bar,
+        )
         self._particle_executed = True
 
     def _particle_scalar_from_field(self, field: int, *, dtype: str) -> float | int:
@@ -1142,10 +1147,15 @@ class Pipeline:
     def plan(self) -> Plan:
         return Plan(stages=list(self._stages))
 
-    def run(self) -> None:
+    def run(self, *, progress_bar: bool = False) -> None:
         if self._stages:
-            self.runtime.run(self.plan(), runmeta=self.runmeta, dataset=self.dataset)
-        self._ensure_particle_executed()
+            self.runtime.run(
+                self.plan(),
+                runmeta=self.runmeta,
+                dataset=self.dataset,
+                progress_bar=progress_bar,
+            )
+        self._ensure_particle_executed(progress_bar=progress_bar)
 
 
 def pipeline(*, runtime: Any, runmeta: Any, dataset: Any) -> Pipeline:

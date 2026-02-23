@@ -24,8 +24,8 @@ class _FakeRuntime:
         self._rt = _FakeCoreRuntime()
         self.submitted = []
 
-    def run(self, plan, *, runmeta, dataset) -> None:
-        self.submitted.append((plan, runmeta, dataset))
+    def run(self, plan, *, runmeta, dataset, progress_bar: bool = False) -> None:
+        self.submitted.append((plan, runmeta, dataset, bool(progress_bar)))
 
 
 class _FakeDataset:
@@ -128,6 +128,20 @@ def test_pipeline_vorticity_fragment_and_run_submission() -> None:
 
     pipe.run()
     assert len(rt.submitted) == 1
+    assert rt.submitted[0][3] is False
+
+
+def test_pipeline_run_forwards_progress_bar_flag() -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_runmeta()
+    ds = _FakeDataset(rt)
+
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    pipe.field_expr("a + b", {"a": pipe.field("x"), "b": pipe.field("y")}, out="sum")
+    pipe.run(progress_bar=True)
+
+    assert len(rt.submitted) == 1
+    assert rt.submitted[0][3] is True
 
 
 def test_pipeline_imperative_chaining_adds_cross_fragment_edge() -> None:

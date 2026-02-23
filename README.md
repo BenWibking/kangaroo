@@ -128,7 +128,8 @@ out = pipe.uniform_slice(
     out="slice",
 )
 
-rt.run(pipe.plan(), runmeta=runmeta, dataset=ds)
+# Enable a shared tqdm task progress bar during execution.
+pipe.run(progress_bar=True)
 arr = rt.get_task_chunk_array(
     step=0,
     level=0,
@@ -139,6 +140,8 @@ arr = rt.get_task_chunk_array(
     dataset=ds,
 )
 ```
+
+Pass `progress_bar=True` to `pipeline.run(...)` to show task progress for any pipeline workflow (requires `tqdm` in the Python environment).
 
 To forward HPX flags from CLI scripts, use `argparse.parse_known_args()` and pass unknown args into `Runtime.from_parsed_args(...)` (as done by `scripts/plotfile_slice.py` and `scripts/plotfile_projection.py`).
 
