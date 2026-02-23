@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import sys
 import tempfile
 import threading
@@ -99,7 +100,13 @@ class Runtime:
         if self._run_in_progress:
             raise RuntimeError("runtime run is already in progress")
         self._bind_dataset_handle(dataset)
-        packed = msgpack.packb(plan_to_dict(plan), use_bin_type=True)
+        plan_ir = plan_to_dict(plan)
+        configured_plan_path = os.environ.get("KANGAROO_DASHBOARD_PLAN", "").strip()
+        if configured_plan_path:
+            plan_path = Path(configured_plan_path)
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
+            plan_path.write_text(json.dumps(plan_ir, indent=2), encoding="utf-8")
+        packed = msgpack.packb(plan_ir, use_bin_type=True)
         self._run_in_progress = True
         try:
             if progress_bar:
@@ -113,6 +120,29 @@ class Runtime:
         total_tasks = _count_plan_tasks(plan, runmeta=runmeta)
         stop_progress = threading.Event()
         progress_thread: threading.Thread | None = None
+        configured_event_log = os.environ.get("KANGAROO_EVENT_LOG", "").strip()
+        if configured_event_log:
+            event_log = Path(configured_event_log)
+            event_log.parent.mkdir(parents=True, exist_ok=True)
+            self.set_event_log_path(str(event_log))
+            progress_thread = threading.Thread(
+                target=_task_progress_monitor,
+                args=(event_log, total_tasks, stop_progress),
+                daemon=True,
+            )
+            progress_thread.start()
+            try:
+                self._rt.run_packed_plan(packed, runmeta._h, dataset._h)
+            finally:
+                stop_progress.set()
+                if progress_thread is not None:
+                    progress_thread.join(timeout=2.0)
+                try:
+                    self.set_event_log_path("")
+                except Exception:
+                    pass
+            return
+
         with tempfile.TemporaryDirectory(prefix="kangaroo-events-") as tmpdir:
             event_log = Path(tmpdir) / "events.jsonl"
             self.set_event_log_path(str(event_log))
