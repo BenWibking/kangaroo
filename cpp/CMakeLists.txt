@@ -16,6 +16,18 @@ endif()
 find_package(HPX REQUIRED)
 find_package(Python REQUIRED COMPONENTS Interpreter Development)
 find_package(nanobind CONFIG REQUIRED)
+find_package(protobuf CONFIG QUIET)
+if(protobuf_FOUND)
+  set(KANGAROO_PROTOBUF_FOUND TRUE)
+elseif(NOT protobuf_FOUND)
+  find_package(Protobuf CONFIG QUIET)
+  if(Protobuf_FOUND)
+    set(KANGAROO_PROTOBUF_FOUND TRUE)
+  else()
+    find_package(Protobuf REQUIRED)
+    set(KANGAROO_PROTOBUF_FOUND TRUE)
+  endif()
+endif()
 find_package(amrexpr CONFIG QUIET)
 find_package(msgpack-cxx CONFIG QUIET)
 if(NOT msgpack-cxx_FOUND)
@@ -61,11 +73,41 @@ endif()
 
 add_library(kangaroo_runtime STATIC ${KANGAROO_RUNTIME_SOURCES})
 
+set(KANGAROO_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
+set(KANGAROO_PROTO_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
+set(KANGAROO_PERFETTO_PROTO "${KANGAROO_PROTO_DIR}/perfetto_trace_minimal.proto")
+
+if(NOT COMMAND protobuf_generate)
+  message(FATAL_ERROR "protobuf_generate() CMake helper is unavailable; protobuf config package is incomplete.")
+endif()
+
+protobuf_generate(
+  TARGET kangaroo_runtime
+  LANGUAGE cpp
+  PROTOS "${KANGAROO_PERFETTO_PROTO}"
+  IMPORT_DIRS "${KANGAROO_PROTO_DIR}"
+  PROTOC_OUT_DIR "${KANGAROO_PROTO_GEN_DIR}"
+)
+
 target_include_directories(kangaroo_runtime PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${KANGAROO_PROTO_GEN_DIR}
 )
 
 target_link_libraries(kangaroo_runtime PUBLIC HPX::hpx)
+if(TARGET protobuf::libprotobuf)
+  target_link_libraries(kangaroo_runtime PUBLIC protobuf::libprotobuf)
+elseif(TARGET protobuf::protobuf)
+  target_link_libraries(kangaroo_runtime PUBLIC protobuf::protobuf)
+elseif(TARGET protobuf::libprotobuf-lite)
+  message(FATAL_ERROR "Found protobuf-lite only; full libprotobuf is required for Perfetto trace protos.")
+elseif(DEFINED Protobuf_LIBRARIES)
+  target_include_directories(kangaroo_runtime PUBLIC ${Protobuf_INCLUDE_DIRS})
+  target_link_libraries(kangaroo_runtime PUBLIC ${Protobuf_LIBRARIES})
+else()
+  message(FATAL_ERROR "Protobuf found but no usable CMake target/library was provided.")
+endif()
+target_compile_definitions(kangaroo_runtime PUBLIC KANGAROO_USE_PROTOBUF)
 if(TARGET amrexpr::amrexpr)
   target_link_libraries(kangaroo_runtime PUBLIC amrexpr::amrexpr)
 elseif(TARGET amrexpr)

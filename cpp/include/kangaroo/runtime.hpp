@@ -145,6 +145,7 @@ class Runtime {
                           int32_t block);
 
   void set_event_log_path(const std::string& path);
+  void set_perfetto_trace_path(const std::string& path);
 
  private:
   int32_t next_field_id_ = 1000;
@@ -175,6 +176,8 @@ struct TaskEvent {
 
 void set_event_log_path(const std::string& path);
 bool has_event_log();
+void set_perfetto_trace_path(const std::string& path);
+bool has_perfetto_trace();
 void log_task_event(const TaskEvent& event);
 
 void set_global_runmeta(const RunMeta& meta);

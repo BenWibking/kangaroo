@@ -167,6 +167,9 @@ class Runtime:
     def set_event_log_path(self, path: str) -> None:
         self._rt.set_event_log_path(path)
 
+    def set_perfetto_trace_path(self, path: str) -> None:
+        self._rt.set_perfetto_trace_path(path)
+
     def preload(self, *, runmeta, dataset, fields: list[int]) -> None:
         self._bind_dataset_handle(dataset)
         self._rt.preload_dataset(runmeta._h, dataset._h, list(fields))
@@ -412,3 +415,7 @@ def log_task_event(
 
 def set_event_log_path(path: str) -> None:
     _core.set_event_log_path(path)
+
+
+def set_perfetto_trace_path(path: str) -> None:
+    _core.set_perfetto_trace_path(path)
