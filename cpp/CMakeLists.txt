@@ -81,6 +81,8 @@ if(NOT COMMAND protobuf_generate)
   message(FATAL_ERROR "protobuf_generate() CMake helper is unavailable; protobuf config package is incomplete.")
 endif()
 
+file(MAKE_DIRECTORY "${KANGAROO_PROTO_GEN_DIR}")
+
 protobuf_generate(
   TARGET kangaroo_runtime
   LANGUAGE cpp
