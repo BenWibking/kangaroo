@@ -17,6 +17,7 @@ psutil = ">=7.2.2,<8"
 bokeh = ">=3.8.2,<4"
 hdf5 = ">=1.14,<1.15"
 mpich = ">=4.3.2,<5"
+tqdm = ">=4.67.3,<5"
 
 [dependencies.hpx]
 version = "==1.11.0"

@@ -4,11 +4,17 @@
 from __future__ import annotations
 
 import argparse
+import json
 import numpy as np
+import tempfile
+import threading
+import time
+from pathlib import Path
 
 from analysis import Runtime  # noqa: E402
 from analysis.dataset import open_dataset  # noqa: E402
 from analysis.pipeline import pipeline  # noqa: E402
+from analysis.runtime import plan_to_dict  # noqa: E402
 
 
 def _parse_bounds(bounds: str) -> tuple[float, float]:
@@ -19,6 +25,117 @@ def _parse_bounds(bounds: str) -> tuple[float, float]:
     if b0 == b1:
         raise ValueError("--axis-bounds must specify two distinct values")
     return b0, b1
+
+
+def _count_plan_tasks(plan_dict: dict) -> int:
+    total = 0
+    for stage in plan_dict.get("stages", []):
+        for tmpl in stage.get("templates", []):
+            domain = tmpl.get("domain") or {}
+            blocks = domain.get("blocks")
+            if isinstance(blocks, list) and blocks:
+                total += len(blocks)
+            else:
+                total += 1
+    return total
+
+
+def _fallback_task_id(event: dict) -> str:
+    return (
+        f"{event.get('stage','?')}:{event.get('template','?')}:"
+        f"{event.get('block','?')}:{event.get('start',0.0)}"
+    )
+
+
+def _task_progress_monitor(log_path: Path, total_tasks: int, stop_event: threading.Event) -> None:
+    try:
+        from tqdm.auto import tqdm
+    except Exception:  # noqa: BLE001
+        tqdm = None
+
+    seen_done: set[str] = set()
+    offset = 0
+    bar = None
+    if tqdm is not None:
+        bar = tqdm(total=total_tasks or None, desc="pipeline tasks", unit="task")
+
+    def _update_bar() -> None:
+        if bar is None:
+            return
+        delta = len(seen_done) - bar.n
+        if delta > 0:
+            bar.update(delta)
+
+    try:
+        while True:
+            progressed = False
+            try:
+                with log_path.open("r", encoding="utf-8") as handle:
+                    handle.seek(offset)
+                    while True:
+                        pos = handle.tell()
+                        line = handle.readline()
+                        if not line:
+                            offset = pos
+                            break
+                        offset = handle.tell()
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        if event.get("type") != "task":
+                            continue
+                        status = str(event.get("status", ""))
+                        if status not in {"end", "error"}:
+                            continue
+                        task_id = str(event.get("id") or _fallback_task_id(event))
+                        if task_id in seen_done:
+                            continue
+                        seen_done.add(task_id)
+                        progressed = True
+            except FileNotFoundError:
+                pass
+
+            if progressed:
+                _update_bar()
+            elif bar is not None:
+                bar.refresh()
+
+            if stop_event.is_set():
+                # Drain any final buffered events written just before/after run completion.
+                time.sleep(0.05)
+                try:
+                    with log_path.open("r", encoding="utf-8") as handle:
+                        handle.seek(offset)
+                        for line in handle:
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                event = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if not isinstance(event, dict) or event.get("type") != "task":
+                                continue
+                            status = str(event.get("status", ""))
+                            if status not in {"end", "error"}:
+                                continue
+                            task_id = str(event.get("id") or _fallback_task_id(event))
+                            seen_done.add(task_id)
+                except FileNotFoundError:
+                    pass
+                _update_bar()
+                break
+
+            time.sleep(0.1)
+    finally:
+        if bar is not None:
+            bar.close()
 
 
 def main() -> int:
@@ -88,7 +205,27 @@ def main() -> int:
         mass_max=mass_max,
         out="stellar_projection",
     )
-    rt.run(pipe.plan(), runmeta=runmeta, dataset=ds)
+    plan = pipe.plan()
+
+    # Stream task events to a temporary JSONL file and drive a tqdm-like progress bar
+    # from terminal task completion events while the runtime executes.
+    plan_task_total = _count_plan_tasks(plan_to_dict(plan))
+    stop_progress = threading.Event()
+    progress_thread = None
+    with tempfile.TemporaryDirectory(prefix="kangaroo-events-") as tmpdir:
+        event_log = Path(tmpdir) / "events.jsonl"
+        rt.set_event_log_path(str(event_log))
+        progress_thread = threading.Thread(
+            target=_task_progress_monitor,
+            args=(event_log, plan_task_total, stop_progress),
+            daemon=True,
+        )
+        progress_thread.start()
+        try:
+            rt.run(plan, runmeta=runmeta, dataset=ds)
+        finally:
+            stop_progress.set()
+            progress_thread.join(timeout=2.0)
 
     arr = rt.get_task_chunk_array(
         step=0,
