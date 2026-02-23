@@ -44,9 +44,9 @@ def main() -> int:
         default="StochasticStellarPop_particles",
         help="Particle species to deposit.",
     )
-    a = p.parse_args()
+    a, u = p.parse_known_args()
 
-    rt = Runtime.from_parsed_args(a, unknown_args=[])
+    rt = Runtime.from_parsed_args(a, unknown_args=u)
 
     base_level = 0
     ds = open_dataset(a.plotfile, level=base_level, runtime=rt)
