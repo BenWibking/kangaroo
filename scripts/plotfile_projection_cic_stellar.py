@@ -214,6 +214,7 @@ def main() -> int:
     progress_thread = None
     with tempfile.TemporaryDirectory(prefix="kangaroo-events-") as tmpdir:
         event_log = Path(tmpdir) / "events.jsonl"
+        print(f"event log: {event_log}", flush=True)
         rt.set_event_log_path(str(event_log))
         progress_thread = threading.Thread(
             target=_task_progress_monitor,
