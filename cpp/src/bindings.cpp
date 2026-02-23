@@ -264,12 +264,17 @@ NB_MODULE(_core, m) {
              return nb::bytes(reinterpret_cast<const char*>(view.data.data()), view.data.size());
            })
       .def("preload_dataset", &kangaroo::Runtime::preload_dataset)
-      .def("run_packed_plan", &kangaroo::Runtime::run_packed_plan)
+      .def("run_packed_plan",
+           &kangaroo::Runtime::run_packed_plan,
+           nb::call_guard<nb::gil_scoped_release>())
       .def("run_packed_plan",
            [](kangaroo::Runtime& self, nb::bytes packed, kangaroo::RunMetaHandle& runmeta,
               kangaroo::DatasetHandle& dataset) {
+             // Copy Python-owned bytes while the GIL is held, then release it for the
+             // long-running C++/HPX execution.
              auto* data = static_cast<const std::uint8_t*>(packed.data());
              std::vector<std::uint8_t> buffer(data, data + packed.size());
+             nb::gil_scoped_release release;
              self.run_packed_plan(buffer, runmeta, dataset);
            });
 
