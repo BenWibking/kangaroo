@@ -128,6 +128,7 @@ double now_seconds() {
 NB_MODULE(_core, m) {
   m.def("hpx_configuration_string", []() { return hpx::configuration_string(); });
   m.def("set_event_log_path", &kangaroo::set_event_log_path);
+  m.def("set_perfetto_trace_path", &kangaroo::set_perfetto_trace_path);
   m.def("set_global_dataset", &kangaroo::set_global_dataset);
   m.def("test_get_subbox",
         [](kangaroo::DatasetHandle& dataset,
@@ -257,6 +258,7 @@ NB_MODULE(_core, m) {
       .def("mark_field_persistent", &kangaroo::Runtime::mark_field_persistent)
       .def("kernels", &kangaroo::Runtime::kernels, nb::rv_policy::reference)
       .def("set_event_log_path", &kangaroo::Runtime::set_event_log_path)
+      .def("set_perfetto_trace_path", &kangaroo::Runtime::set_perfetto_trace_path)
       .def("get_task_chunk",
            [](kangaroo::Runtime& self, int32_t step, int16_t level, int32_t field,
               int32_t version, int32_t block) {

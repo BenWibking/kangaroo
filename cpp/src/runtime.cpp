@@ -2,6 +2,7 @@
 
 #include "kangaroo/plan_decode.hpp"
 #include "kangaroo/plotfile_reader.hpp"
+#include "perfetto_trace_minimal.pb.h"
 #include "amrexpr.hpp"
 
 #include <algorithm>
@@ -11,6 +12,7 @@
 #include <cstdlib>
 #include <condition_variable>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -22,8 +24,12 @@
 #include <thread>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
+#include <variant>
 #include <unordered_map>
 #include <msgpack.hpp>
+#include <unistd.h>
+#include <sys/resource.h>
 
 #include <hpx/include/actions.hpp>
 #include <hpx/collectives/broadcast_direct.hpp>
@@ -54,7 +60,12 @@ std::unordered_map<int32_t, PlanIR> g_plans;
 std::mutex g_event_log_mutex;
 std::string g_event_log_path;
 bool g_event_log_enabled = false;
+std::mutex g_perfetto_trace_mutex;
+std::string g_perfetto_trace_path;
+bool g_perfetto_trace_enabled = false;
 std::atomic<int32_t> g_active_plan_runs{0};
+std::atomic<int32_t> g_locality_hint{-1};
+std::atomic<int32_t> g_perfetto_metrics_active_runs{0};
 
 struct ActivePlanRunGuard {
   ActivePlanRunGuard() { g_active_plan_runs.fetch_add(1, std::memory_order_acq_rel); }
@@ -231,6 +242,626 @@ struct EventLogWorker {
 
 EventLogWorker g_event_log_worker;
 
+struct MetricEvent {
+  std::string name;
+  double value = 0.0;
+  double ts = 0.0;
+  int32_t locality = -1;
+};
+
+using PerfettoEvent = std::variant<TaskEvent, MetricEvent>;
+
+uint64_t hash_u64(std::string_view s) {
+  uint64_t h = 1469598103934665603ull;
+  for (unsigned char c : s) {
+    h ^= static_cast<uint64_t>(c);
+    h *= 1099511628211ull;
+  }
+  return h;
+}
+
+uint64_t mix_u64(uint64_t x) {
+  x ^= x >> 33;
+  x *= 0xff51afd7ed558ccdULL;
+  x ^= x >> 33;
+  x *= 0xc4ceb9fe1a85ec53ULL;
+  x ^= x >> 33;
+  return x;
+}
+
+uint64_t to_ns(double seconds) {
+  if (!std::isfinite(seconds)) {
+    return 0;
+  }
+  if (seconds <= 0.0) {
+    return 0;
+  }
+  const long double ns = static_cast<long double>(seconds) * 1.0e9L;
+  if (ns >= static_cast<long double>(std::numeric_limits<uint64_t>::max())) {
+    return std::numeric_limits<uint64_t>::max();
+  }
+  return static_cast<uint64_t>(ns);
+}
+
+void append_varint(std::string& out, uint64_t value) {
+  while (value >= 0x80) {
+    out.push_back(static_cast<char>((value & 0x7f) | 0x80));
+    value >>= 7;
+  }
+  out.push_back(static_cast<char>(value & 0x7f));
+}
+
+bool write_trace_packet_record(std::ofstream& out, const perfetto::protos::TracePacket& packet) {
+  std::string payload;
+  if (!packet.SerializeToString(&payload)) {
+    return false;
+  }
+  std::string framed;
+  framed.reserve(payload.size() + 16);
+  append_varint(framed, (1u << 3) | 2u);  // Trace.packet (field #1, length-delimited)
+  append_varint(framed, static_cast<uint64_t>(payload.size()));
+  framed += payload;
+  out.write(framed.data(), static_cast<std::streamsize>(framed.size()));
+  return static_cast<bool>(out);
+}
+
+std::string task_worker_name(const TaskEvent& event) {
+  if (!event.worker_label.empty()) {
+    return event.worker_label;
+  }
+  if (event.worker >= 0) {
+    return "worker-" + std::to_string(event.worker);
+  }
+  return "worker-0";
+}
+
+std::filesystem::path perfetto_locality_path(const std::string& base_path, int32_t locality) {
+  std::filesystem::path p(base_path);
+  const std::string suffix = ".loc" + [&] {
+    std::ostringstream os;
+    os << std::setw(3) << std::setfill('0') << std::max(0, locality);
+    return os.str();
+  }();
+  if (!p.has_extension()) {
+    p += suffix + ".pftrace";
+    return p;
+  }
+  std::filesystem::path out = p.parent_path();
+  out /= p.stem().string() + suffix + p.extension().string();
+  return out;
+}
+
+struct PerfettoTraceWorker {
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::deque<PerfettoEvent> queue;
+  std::thread thread;
+  bool running = false;
+  bool stop = false;
+  std::string base_path;
+  bool enabled = false;
+  uint64_t config_generation = 0;
+
+  void set_path(const std::string& next_path) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      base_path = next_path;
+      enabled = !base_path.empty();
+      config_generation++;
+    }
+    start_if_needed();
+    cv.notify_all();
+  }
+
+  void start_if_needed() {
+    bool should_start = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      should_start = enabled && !running;
+      if (should_start) {
+        running = true;
+      }
+    }
+    if (should_start) {
+      thread = std::thread([this]() { run(); });
+    }
+  }
+
+  void enqueue_task(TaskEvent event) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!enabled) {
+        return;
+      }
+      queue.push_back(PerfettoEvent{std::move(event)});
+    }
+    cv.notify_one();
+  }
+
+  void enqueue_metric(MetricEvent event) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!enabled) {
+        return;
+      }
+      queue.push_back(PerfettoEvent{std::move(event)});
+    }
+    cv.notify_one();
+  }
+
+  static uint32_t sequence_id_for_locality(int32_t locality) {
+    return static_cast<uint32_t>(std::max(0, locality) + 1);
+  }
+
+  static uint64_t process_track_uuid_for_locality(int32_t locality) {
+    return 0x1000000000000000ULL | static_cast<uint64_t>(static_cast<uint32_t>(std::max(0, locality)));
+  }
+
+  static uint64_t thread_track_uuid_for_event(const TaskEvent& event) {
+    uint64_t seed = 0x2000000000000000ULL;
+    seed ^= static_cast<uint64_t>(static_cast<uint32_t>(std::max(0, event.locality))) << 32;
+    uint64_t worker_bits = 0;
+    if (event.worker >= 0) {
+      worker_bits = static_cast<uint64_t>(static_cast<uint32_t>(event.worker));
+    } else {
+      worker_bits = hash_u64(task_worker_name(event)) & 0xffffffffULL;
+    }
+    return mix_u64(seed ^ worker_bits);
+  }
+
+  static uint64_t counter_track_uuid_for_metric(int32_t locality, const std::string& name) {
+    uint64_t seed = 0x3000000000000000ULL;
+    seed ^= static_cast<uint64_t>(static_cast<uint32_t>(std::max(0, locality))) << 32;
+    seed ^= hash_u64(name);
+    return mix_u64(seed);
+  }
+
+  void add_string_arg(perfetto::protos::TrackEvent* te, const std::string& key, const std::string& value) {
+    auto* ann = te->add_debug_annotations();
+    ann->set_name(key);
+    ann->set_string_value(value);
+  }
+
+  void add_int_arg(perfetto::protos::TrackEvent* te, const std::string& key, int64_t value) {
+    auto* ann = te->add_debug_annotations();
+    ann->set_name(key);
+    ann->set_int_value(value);
+  }
+
+  void emit_packet(std::ofstream& out,
+                   const perfetto::protos::TracePacket& packet,
+                   bool flush = false) {
+    if (!write_trace_packet_record(out, packet)) {
+      return;
+    }
+    if (flush) {
+      out.flush();
+    }
+  }
+
+  void emit_process_descriptor(std::ofstream& out,
+                               uint32_t seq_id,
+                               uint64_t process_track_uuid,
+                               int32_t locality,
+                               bool first_packet) {
+    perfetto::protos::TracePacket packet;
+    packet.set_trusted_packet_sequence_id(seq_id);
+    if (first_packet) {
+      packet.set_sequence_flags(perfetto::protos::TracePacket::SEQ_INCREMENTAL_STATE_CLEARED);
+      packet.set_first_packet_on_sequence(true);
+    }
+    auto* td = packet.mutable_track_descriptor();
+    td->set_uuid(process_track_uuid);
+    td->set_name("kangaroo locality " + std::to_string(std::max(0, locality)));
+    auto* pd = td->mutable_process();
+    pd->set_pid(std::max(1, static_cast<int>(::getpid())));
+    pd->set_process_name("kangaroo-locality-" + std::to_string(std::max(0, locality)));
+    emit_packet(out, packet, true);
+  }
+
+  void emit_thread_descriptor(std::ofstream& out,
+                              uint32_t seq_id,
+                              uint64_t process_track_uuid,
+                              uint64_t thread_track_uuid,
+                              const TaskEvent& event) {
+    perfetto::protos::TracePacket packet;
+    packet.set_trusted_packet_sequence_id(seq_id);
+    auto* td = packet.mutable_track_descriptor();
+    td->set_uuid(thread_track_uuid);
+    td->set_parent_uuid(process_track_uuid);
+    td->set_name(task_worker_name(event));
+    auto* th = td->mutable_thread();
+    const int32_t locality = std::max(0, event.locality);
+    const int32_t worker = std::max(0, event.worker);
+    th->set_pid(std::max(1, static_cast<int>(::getpid())));
+    th->set_tid(locality * 10000 + worker + 1);
+    th->set_thread_name(task_worker_name(event));
+    emit_packet(out, packet, false);
+  }
+
+  void emit_counter_descriptor(std::ofstream& out,
+                               uint32_t seq_id,
+                               uint64_t process_track_uuid,
+                               uint64_t counter_track_uuid,
+                               const std::string& counter_name) {
+    perfetto::protos::TracePacket packet;
+    packet.set_trusted_packet_sequence_id(seq_id);
+    auto* td = packet.mutable_track_descriptor();
+    td->set_uuid(counter_track_uuid);
+    td->set_parent_uuid(process_track_uuid);
+    td->set_name(counter_name);
+    td->mutable_counter();
+    emit_packet(out, packet, false);
+  }
+
+  void emit_task_event(std::ofstream& out,
+                       uint32_t seq_id,
+                       uint64_t track_uuid,
+                       const TaskEvent& event) {
+    perfetto::protos::TracePacket packet;
+    packet.set_trusted_packet_sequence_id(seq_id);
+    const bool is_start = event.status == "start";
+    uint64_t ts_ns = is_start ? to_ns(event.start > 0.0 ? event.start : event.ts)
+                              : to_ns(event.end > 0.0 ? event.end : event.ts);
+    packet.set_timestamp(ts_ns);
+    auto* te = packet.mutable_track_event();
+    te->set_track_uuid(track_uuid);
+    if (is_start) {
+      te->set_type(perfetto::protos::TrackEvent::TYPE_SLICE_BEGIN);
+      te->add_categories("kangaroo");
+      te->set_name(event.name);
+      add_string_arg(te, "id", event.id);
+      add_string_arg(te, "kernel", event.kernel);
+      add_string_arg(te, "plane", event.plane);
+      add_string_arg(te, "status", event.status);
+      add_string_arg(te, "worker", task_worker_name(event));
+      add_int_arg(te, "stage", event.stage);
+      add_int_arg(te, "template", event.template_index);
+      add_int_arg(te, "block", event.block);
+      add_int_arg(te, "step", event.step);
+      add_int_arg(te, "level", event.level);
+      add_int_arg(te, "locality", event.locality);
+      add_int_arg(te, "worker_index", event.worker);
+    } else {
+      te->set_type(perfetto::protos::TrackEvent::TYPE_SLICE_END);
+      if (event.status == "error") {
+        add_string_arg(te, "status", "error");
+      }
+    }
+    emit_packet(out, packet, true);
+  }
+
+  void emit_metric_event(std::ofstream& out,
+                         uint32_t seq_id,
+                         uint64_t counter_track_uuid,
+                         const MetricEvent& event) {
+    perfetto::protos::TracePacket packet;
+    packet.set_trusted_packet_sequence_id(seq_id);
+    packet.set_timestamp(to_ns(event.ts));
+    auto* te = packet.mutable_track_event();
+    te->set_type(perfetto::protos::TrackEvent::TYPE_COUNTER);
+    te->set_track_uuid(counter_track_uuid);
+    te->set_double_counter_value(event.value);
+    emit_packet(out, packet, true);
+  }
+
+  void run() {
+    std::ofstream out;
+    uint64_t active_generation = std::numeric_limits<uint64_t>::max();
+    std::string active_base_path;
+    bool descriptors_initialized = false;
+    int32_t active_locality = -1;
+    uint32_t seq_id = 1;
+    uint64_t process_track_uuid = 0;
+    std::unordered_map<uint64_t, bool> emitted_thread_tracks;
+    std::unordered_map<uint64_t, bool> emitted_counter_tracks;
+
+    auto reset_output = [&]() {
+      out.close();
+      descriptors_initialized = false;
+      active_locality = -1;
+      seq_id = 1;
+      process_track_uuid = 0;
+      emitted_thread_tracks.clear();
+      emitted_counter_tracks.clear();
+    };
+
+    for (;;) {
+      PerfettoEvent item;
+      uint64_t generation = 0;
+      std::string configured_base;
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait(lock, [&] {
+          return stop || !queue.empty() || config_generation != active_generation;
+        });
+        if (stop && queue.empty()) {
+          break;
+        }
+        generation = config_generation;
+        configured_base = base_path;
+        if (generation != active_generation) {
+          active_generation = generation;
+          active_base_path = configured_base;
+          reset_output();
+        }
+        if (queue.empty()) {
+          continue;
+        }
+        item = std::move(queue.front());
+        queue.pop_front();
+      }
+
+      if (active_base_path.empty()) {
+        continue;
+      }
+
+      const int32_t item_locality = std::visit(
+          [](const auto& ev) -> int32_t { return std::max(0, ev.locality); }, item);
+
+      if (active_locality < 0) {
+        active_locality = item_locality;
+        seq_id = sequence_id_for_locality(active_locality);
+        process_track_uuid = process_track_uuid_for_locality(active_locality);
+        std::filesystem::path loc_path = perfetto_locality_path(active_base_path, active_locality);
+        std::error_code ec;
+        if (loc_path.has_parent_path()) {
+          std::filesystem::create_directories(loc_path.parent_path(), ec);
+        }
+        out.open(loc_path, std::ios::binary | std::ios::trunc);
+        if (!out) {
+          continue;
+        }
+      }
+
+      if (!descriptors_initialized && out) {
+        emit_process_descriptor(out, seq_id, process_track_uuid, active_locality, true);
+        descriptors_initialized = true;
+      }
+
+      if (!out) {
+        continue;
+      }
+
+      if (std::holds_alternative<TaskEvent>(item)) {
+        const TaskEvent& event = std::get<TaskEvent>(item);
+        const uint64_t thread_track_uuid = thread_track_uuid_for_event(event);
+        if (emitted_thread_tracks.find(thread_track_uuid) == emitted_thread_tracks.end()) {
+          emit_thread_descriptor(out, seq_id, process_track_uuid, thread_track_uuid, event);
+          emitted_thread_tracks.emplace(thread_track_uuid, true);
+        }
+        emit_task_event(out, seq_id, thread_track_uuid, event);
+      } else {
+        const MetricEvent& event = std::get<MetricEvent>(item);
+        const uint64_t counter_track_uuid = counter_track_uuid_for_metric(active_locality, event.name);
+        if (emitted_counter_tracks.find(counter_track_uuid) == emitted_counter_tracks.end()) {
+          emit_counter_descriptor(out, seq_id, process_track_uuid, counter_track_uuid, event.name);
+          emitted_counter_tracks.emplace(counter_track_uuid, true);
+        }
+        emit_metric_event(out, seq_id, counter_track_uuid, event);
+      }
+    }
+    out.flush();
+  }
+
+  ~PerfettoTraceWorker() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      stop = true;
+    }
+    cv.notify_all();
+    if (thread.joinable()) {
+      thread.join();
+    }
+  }
+};
+
+PerfettoTraceWorker g_perfetto_trace_worker;
+
+void log_metric_event(const MetricEvent& event) {
+  if (!g_perfetto_trace_enabled || g_perfetto_trace_path.empty()) {
+    return;
+  }
+  g_perfetto_trace_worker.enqueue_metric(event);
+}
+
+struct ProcessIoCounters {
+  uint64_t read_bytes = 0;
+  uint64_t write_bytes = 0;
+  bool valid = false;
+};
+
+ProcessIoCounters read_process_io_counters() {
+  ProcessIoCounters out;
+#if defined(__linux__)
+  std::ifstream in("/proc/self/io");
+  if (!in) {
+    return out;
+  }
+  std::string key;
+  uint64_t value = 0;
+  while (in >> key >> value) {
+    if (key == "read_bytes:") {
+      out.read_bytes = value;
+    } else if (key == "write_bytes:") {
+      out.write_bytes = value;
+    }
+  }
+  out.valid = true;
+#endif
+  return out;
+}
+
+std::optional<uint64_t> current_rss_bytes() {
+#if defined(__linux__)
+  std::ifstream in("/proc/self/statm");
+  if (in) {
+    uint64_t size_pages = 0;
+    uint64_t resident_pages = 0;
+    if (in >> size_pages >> resident_pages) {
+      const long page_size = ::sysconf(_SC_PAGESIZE);
+      if (page_size > 0) {
+        return resident_pages * static_cast<uint64_t>(page_size);
+      }
+    }
+  }
+#endif
+  return std::nullopt;
+}
+
+double process_cpu_seconds() {
+  struct rusage usage {};
+  if (::getrusage(RUSAGE_SELF, &usage) != 0) {
+    return 0.0;
+  }
+  const double user_s =
+      static_cast<double>(usage.ru_utime.tv_sec) + static_cast<double>(usage.ru_utime.tv_usec) / 1.0e6;
+  const double sys_s =
+      static_cast<double>(usage.ru_stime.tv_sec) + static_cast<double>(usage.ru_stime.tv_usec) / 1.0e6;
+  return user_s + sys_s;
+}
+
+struct PerfettoMetricsSampler {
+  std::mutex mutex;
+  std::condition_variable cv;
+  std::thread thread;
+  bool running = false;
+  bool stop = false;
+  bool enabled = false;
+
+  void set_enabled(bool next_enabled) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      enabled = next_enabled;
+    }
+    start_if_needed();
+    cv.notify_all();
+  }
+
+  void start_if_needed() {
+    bool should_start = false;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      should_start = enabled && !running;
+      if (should_start) {
+        running = true;
+      }
+    }
+    if (should_start) {
+      thread = std::thread([this]() { run(); });
+    }
+  }
+
+  void emit_sample(double now_epoch_s,
+                   double dt_s,
+                   double cpu_now_s,
+                   double cpu_prev_s,
+                   const ProcessIoCounters& io_now,
+                   const ProcessIoCounters& io_prev) {
+    const int32_t locality = std::max(0, g_locality_hint.load(std::memory_order_acquire));
+
+    MetricEvent cpu_ev;
+    cpu_ev.name = "cpu_percent";
+    cpu_ev.ts = now_epoch_s;
+    cpu_ev.locality = locality;
+    if (dt_s > 1.0e-6) {
+      cpu_ev.value = std::max(0.0, std::min(1000.0, 100.0 * (cpu_now_s - cpu_prev_s) / dt_s));
+    } else {
+      cpu_ev.value = 0.0;
+    }
+    log_metric_event(cpu_ev);
+
+    if (auto rss_bytes = current_rss_bytes()) {
+      MetricEvent rss_ev;
+      rss_ev.name = "rss_current_bytes";
+      rss_ev.ts = now_epoch_s;
+      rss_ev.locality = locality;
+      rss_ev.value = static_cast<double>(*rss_bytes);
+      log_metric_event(rss_ev);
+    }
+
+#if defined(__linux__)
+    if (io_now.valid && io_prev.valid && dt_s > 1.0e-6) {
+      MetricEvent read_ev;
+      read_ev.name = "io_read_bytes_per_s";
+      read_ev.ts = now_epoch_s;
+      read_ev.locality = locality;
+      read_ev.value = static_cast<double>(io_now.read_bytes - io_prev.read_bytes) / dt_s;
+      log_metric_event(read_ev);
+
+      MetricEvent write_ev;
+      write_ev.name = "io_write_bytes_per_s";
+      write_ev.ts = now_epoch_s;
+      write_ev.locality = locality;
+      write_ev.value = static_cast<double>(io_now.write_bytes - io_prev.write_bytes) / dt_s;
+      log_metric_event(write_ev);
+    }
+#else
+    (void)io_now;
+    (void)io_prev;
+#endif
+  }
+
+  void run() {
+    bool sampling_active = false;
+    auto prev_wall = std::chrono::steady_clock::now();
+    double prev_cpu_s = 0.0;
+    ProcessIoCounters prev_io{};
+
+    for (;;) {
+      {
+        std::unique_lock<std::mutex> lock(mutex);
+        cv.wait_for(lock, std::chrono::milliseconds(500), [&] {
+          return stop || enabled;
+        });
+        if (stop) {
+          break;
+        }
+      }
+
+      const bool trace_enabled = g_perfetto_trace_enabled && !g_perfetto_trace_path.empty();
+      const bool plan_running = g_perfetto_metrics_active_runs.load(std::memory_order_acquire) > 0;
+      if (!(trace_enabled && plan_running)) {
+        sampling_active = false;
+        continue;
+      }
+
+      const auto now_wall = std::chrono::steady_clock::now();
+      const double now_epoch_s = std::chrono::duration<double>(
+          std::chrono::system_clock::now().time_since_epoch()).count();
+      const double cpu_now_s = process_cpu_seconds();
+      const ProcessIoCounters io_now = read_process_io_counters();
+
+      if (!sampling_active) {
+        sampling_active = true;
+        prev_wall = now_wall;
+        prev_cpu_s = cpu_now_s;
+        prev_io = io_now;
+        continue;
+      }
+
+      const double dt_s = std::chrono::duration<double>(now_wall - prev_wall).count();
+      emit_sample(now_epoch_s, dt_s, cpu_now_s, prev_cpu_s, io_now, prev_io);
+      prev_wall = now_wall;
+      prev_cpu_s = cpu_now_s;
+      prev_io = io_now;
+    }
+  }
+
+  ~PerfettoMetricsSampler() {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      stop = true;
+    }
+    cv.notify_all();
+    if (thread.joinable()) {
+      thread.join();
+    }
+  }
+};
+
+PerfettoMetricsSampler g_perfetto_metrics_sampler;
+
 std::string json_escape(const std::string& value) {
   std::string out;
   out.reserve(value.size());
@@ -263,6 +894,10 @@ const std::string& event_log_path() {
   return g_event_log_path;
 }
 
+const std::string& perfetto_trace_path() {
+  return g_perfetto_trace_path;
+}
+
 void init_event_log_from_env() {
   const char* env = std::getenv("KANGAROO_EVENT_LOG");
   if (env && *env != '\0') {
@@ -272,6 +907,18 @@ void init_event_log_from_env() {
       g_event_log_enabled = true;
     }
     g_event_log_worker.set_path(g_event_log_path);
+  }
+}
+
+void init_perfetto_trace_from_env() {
+  const char* env = std::getenv("KANGAROO_PERFETTO_TRACE");
+  if (env && *env != '\0') {
+    {
+      std::lock_guard<std::mutex> lock(g_perfetto_trace_mutex);
+      g_perfetto_trace_path = env;
+      g_perfetto_trace_enabled = true;
+    }
+    g_perfetto_trace_worker.set_path(g_perfetto_trace_path);
   }
 }
 
@@ -4054,6 +4701,22 @@ void set_event_log_action(const std::string& path) {
   set_event_log_path(path);
 }
 
+void set_perfetto_trace_action(const std::string& path) {
+  set_perfetto_trace_path(path);
+}
+
+void set_perfetto_metrics_sampling_active_action(bool active) {
+  g_locality_hint.store(static_cast<int32_t>(hpx::get_locality_id()), std::memory_order_release);
+  if (active) {
+    g_perfetto_metrics_active_runs.fetch_add(1, std::memory_order_acq_rel);
+  } else {
+    const int32_t prev = g_perfetto_metrics_active_runs.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev <= 0) {
+      g_perfetto_metrics_active_runs.store(0, std::memory_order_release);
+    }
+  }
+}
+
 void preload_action(const RunMeta& meta,
                     const DatasetHandle& dataset,
                     const std::vector<int32_t>& fields) {
@@ -4068,11 +4731,15 @@ HPX_PLAIN_ACTION(kangaroo::set_plan_action, kangaroo_set_plan_action)
 HPX_PLAIN_ACTION(kangaroo::erase_plan_action, kangaroo_erase_plan_action)
 HPX_PLAIN_ACTION(kangaroo::preload_action, kangaroo_preload_action)
 HPX_PLAIN_ACTION(kangaroo::set_event_log_action, kangaroo_set_event_log_action)
+HPX_PLAIN_ACTION(kangaroo::set_perfetto_trace_action, kangaroo_set_perfetto_trace_action)
+HPX_PLAIN_ACTION(kangaroo::set_perfetto_metrics_sampling_active_action,
+                 kangaroo_set_perfetto_metrics_sampling_active_action)
 
 namespace kangaroo {
 
 Runtime::Runtime() {
   init_event_log_from_env();
+  init_perfetto_trace_from_env();
   set_global_kernel_registry(&kernel_registry_);
   register_default_kernels(kernel_registry_);
 }
@@ -4080,6 +4747,7 @@ Runtime::Runtime() {
 Runtime::Runtime(const std::vector<std::string>& hpx_config,
                  const std::vector<std::string>& hpx_cmdline) {
   init_event_log_from_env();
+  init_perfetto_trace_from_env();
   if (g_hpx_started) {
     throw std::runtime_error("HPX already started; cannot change config/args");
   }
@@ -4139,6 +4807,10 @@ void Runtime::set_event_log_path(const std::string& path) {
   ::kangaroo::set_event_log_path(path);
 }
 
+void Runtime::set_perfetto_trace_path(const std::string& path) {
+  ::kangaroo::set_perfetto_trace_path(path);
+}
+
 void set_event_log_path(const std::string& path) {
   {
     std::lock_guard<std::mutex> lock(g_event_log_mutex);
@@ -4152,23 +4824,49 @@ bool has_event_log() {
   return g_event_log_enabled && !g_event_log_path.empty();
 }
 
+void set_perfetto_trace_path(const std::string& path) {
+  {
+    std::lock_guard<std::mutex> lock(g_perfetto_trace_mutex);
+    g_perfetto_trace_path = path;
+    g_perfetto_trace_enabled = !path.empty();
+  }
+  g_perfetto_trace_worker.set_path(g_perfetto_trace_path);
+  g_perfetto_metrics_sampler.set_enabled(!path.empty());
+}
+
+bool has_perfetto_trace() {
+  return g_perfetto_trace_enabled && !g_perfetto_trace_path.empty();
+}
+
 void log_task_event(const TaskEvent& event) {
-  if (!has_event_log()) {
+  const bool json_enabled = has_event_log();
+  const bool perfetto_enabled = has_perfetto_trace();
+  if (!json_enabled && !perfetto_enabled) {
     return;
   }
-  g_event_log_worker.enqueue(event);
+  if (json_enabled) {
+    g_event_log_worker.enqueue(event);
+  }
+  if (perfetto_enabled) {
+    g_perfetto_trace_worker.enqueue_task(event);
+  }
 }
 
 void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
                               const RunMetaHandle& runmeta,
                               const DatasetHandle& dataset) {
   ensure_hpx_started();
+  g_locality_hint.store(static_cast<int32_t>(hpx::get_locality_id()), std::memory_order_release);
   ActivePlanRunGuard active_run_guard;
   PlanIR plan = decode_plan_msgpack(std::span<const std::uint8_t>(packed.data(), packed.size()));
 
   auto localities = hpx::find_all_localities();
   if (has_event_log()) {
     hpx::lcos::broadcast<::kangaroo_set_event_log_action>(localities, event_log_path()).get();
+  }
+  if (has_perfetto_trace()) {
+    hpx::lcos::broadcast<::kangaroo_set_perfetto_trace_action>(localities, perfetto_trace_path()).get();
+    hpx::lcos::broadcast<::kangaroo_set_perfetto_metrics_sampling_active_action>(localities, true).get();
   }
   hpx::lcos::broadcast<::kangaroo_set_runmeta_action>(localities, runmeta.meta).get();
   hpx::lcos::broadcast<::kangaroo_set_dataset_action>(localities, dataset).get();
@@ -4177,6 +4875,11 @@ void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
 
   auto erase_plan = [&]() {
     hpx::lcos::broadcast<::kangaroo_erase_plan_action>(localities, plan_id).get();
+  };
+  auto stop_perfetto_sampling = [&]() {
+    if (has_perfetto_trace()) {
+      hpx::lcos::broadcast<::kangaroo_set_perfetto_metrics_sampling_active_action>(localities, false).get();
+    }
   };
 
   try {
@@ -4189,10 +4892,15 @@ void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
       erase_plan();
     } catch (...) {
     }
+    try {
+      stop_perfetto_sampling();
+    } catch (...) {
+    }
     throw;
   }
 
   erase_plan();
+  stop_perfetto_sampling();
 }
 
 void Runtime::preload_dataset(const RunMetaHandle& runmeta,
