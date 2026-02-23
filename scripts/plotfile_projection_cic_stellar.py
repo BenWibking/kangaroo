@@ -27,16 +27,27 @@ def _parse_bounds(bounds: str) -> tuple[float, float]:
     return b0, b1
 
 
-def _count_plan_tasks(plan_dict: dict) -> int:
+def _count_plan_tasks(plan_dict: dict, *, runmeta) -> int:
+    def _blocks_for_domain(domain: dict) -> int:
+        blocks = domain.get("blocks")
+        if blocks is None:
+            try:
+                step = int(domain.get("step", 0))
+                level = int(domain.get("level", 0))
+                levels = runmeta.steps[step].levels
+                return len(levels[level].boxes)
+            except Exception:  # noqa: BLE001
+                return 1
+        try:
+            return len(blocks)
+        except Exception:  # noqa: BLE001
+            return 1
+
     total = 0
     for stage in plan_dict.get("stages", []):
         for tmpl in stage.get("templates", []):
             domain = tmpl.get("domain") or {}
-            blocks = domain.get("blocks")
-            if isinstance(blocks, list) and blocks:
-                total += len(blocks)
-            else:
-                total += 1
+            total += _blocks_for_domain(domain)
     return total
 
 
@@ -57,7 +68,15 @@ def _task_progress_monitor(log_path: Path, total_tasks: int, stop_event: threadi
     offset = 0
     bar = None
     if tqdm is not None:
-        bar = tqdm(total=total_tasks or None, desc="pipeline tasks", unit="task")
+        bar = tqdm(
+            total=total_tasks or None,
+            desc="pipeline tasks",
+            unit="task",
+            mininterval=1.0,
+            miniters=1,
+            smoothing=0.0,
+        )
+        bar.refresh()
 
     def _update_bar() -> None:
         if bar is None:
@@ -108,7 +127,7 @@ def _task_progress_monitor(log_path: Path, total_tasks: int, stop_event: threadi
 
             if stop_event.is_set():
                 # Drain any final buffered events written just before/after run completion.
-                time.sleep(0.05)
+                time.sleep(0.1)
                 try:
                     with log_path.open("r", encoding="utf-8") as handle:
                         handle.seek(offset)
@@ -132,7 +151,7 @@ def _task_progress_monitor(log_path: Path, total_tasks: int, stop_event: threadi
                 _update_bar()
                 break
 
-            time.sleep(0.1)
+            time.sleep(1.0)
     finally:
         if bar is not None:
             bar.close()
@@ -209,7 +228,7 @@ def main() -> int:
 
     # Stream task events to a temporary JSONL file and drive a tqdm-like progress bar
     # from terminal task completion events while the runtime executes.
-    plan_task_total = _count_plan_tasks(plan_to_dict(plan))
+    plan_task_total = _count_plan_tasks(plan_to_dict(plan), runmeta=runmeta)
     stop_progress = threading.Event()
     progress_thread = None
     with tempfile.TemporaryDirectory(prefix="kangaroo-events-") as tmpdir:
