@@ -1,14 +1,11 @@
 from __future__ import annotations
 
-import json
 import math
-from pathlib import Path
 
 import pytest
 
 from analysis import histogram_edges_1d, histogram_edges_2d
 from analysis.dataset import Dataset
-from analysis.dashboard import DashboardApp, DashboardConfig
 from analysis.ops import histogram_edges_1d as histogram_edges_1d_ops
 from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
 
@@ -64,15 +61,6 @@ def test_runmeta_forwards_particle_species_to_core_handle(monkeypatch: pytest.Mo
     assert isinstance(payload, dict)
     assert payload["particle_species"] == {"dm": 3, "stars": 7}
     assert isinstance(payload["steps"], list)
-
-
-def test_dashboard_raises_explicit_error_for_malformed_plan_payload(tmp_path: Path) -> None:
-    bad_plan = tmp_path / "bad_plan.json"
-    bad_plan.write_text(json.dumps({"stages": "not-a-list"}), encoding="utf-8")
-
-    app = DashboardApp(DashboardConfig(plan_path=bad_plan))
-    with pytest.raises(RuntimeError, match="malformed plan payload"):
-        app._ensure_plan_loaded()
 
 
 def test_dataset_classifies_any_memory_uri_as_memory(

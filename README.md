@@ -194,20 +194,19 @@ Histogram accumulation is AMR-aware and uses global graph reductions across all 
 - `parthenon://...` (including `.phdf/.h5/.hdf5` files)
 - `memory://...` (for synthetic/in-memory testing)
 
-## Dashboard
+## Tracing (Perfetto UI)
 
-Run the local dashboard:
-
-```bash
-pixi run python scripts/kangaroo_dashboard.py
-```
-
-Run a workflow under the dashboard:
+Kangaroo can emit Perfetto traces for runtime execution. Set `KANGAROO_PERFETTO_TRACE`
+to a trace output path before running your workflow, then open the generated trace in
+Perfetto UI (`https://ui.perfetto.dev`).
 
 ```bash
-pixi run python scripts/kangaroo_dashboard.py \
-  --run scripts/plotfile_slice.py -- /path/to/plotfile --var density
+KANGAROO_PERFETTO_TRACE=run.pftrace pixi run python scripts/plotfile_slice.py \
+  /path/to/plotfile --var density
 ```
+
+In distributed runs, each locality writes its own trace file (for example
+`run.loc000.pftrace`, `run.loc001.pftrace`).
 
 ## Development Notes
 

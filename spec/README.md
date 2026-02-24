@@ -41,7 +41,7 @@ An implementation is conformant if all of the following hold:
 - Plan decoding, validation, and execution outcomes are equivalent.
 - Operator numerical behavior and masking semantics are equivalent.
 - Required error conditions produce explicit failures.
-- Script and dashboard behavior is compatible with documented inputs/outputs.
+- Script behavior is compatible with documented inputs/outputs.
 
 ## Conformance Priority
 
@@ -50,7 +50,7 @@ If two parts of this specification appear to conflict, precedence is:
 2. `spec/operators.md` (numerical and workflow semantics)
 3. `spec/python-api.md` (user-facing API contracts)
 4. `spec/core-architecture.md` and `spec/data-models.md`
-5. `spec/backends-and-io.md` and `spec/dashboard-and-cli.md`
+5. `spec/backends-and-io.md`
 6. `spec/glossary.md` (terminology guidance)
 
 ## Compatibility Target
@@ -65,7 +65,6 @@ The compatibility target is behavioral equivalence with the Kangaroo repository 
 - `spec/python-api.md`: Python-facing API contract (`Runtime`, `Dataset`, `Pipeline`, helpers).
 - `spec/operators.md`: required kernels and semantics for all major operators.
 - `spec/backends-and-io.md`: backend capability contract and reader behavior.
-- `spec/dashboard-and-cli.md`: dashboard lifecycle and script-level behavior contract.
 - `spec/validation-and-errors.md`: normative validation and failure requirements.
 - `spec/glossary.md`: definitions for uncommon or overloaded terms.
 - `spec/performance-requirements.md`: normative requirements for a performant implementation profile (GPU offload, distributed-memory execution, memory-capped streaming/out-of-core).

@@ -4,7 +4,7 @@
 - `analysis/`: Python API and DSL (plans, datasets, runtime wrappers, operators).
 - `cpp/`: C++20 runtime and nanobind extension modules (`_core`, `_plotfile`), with headers in `cpp/include/kangaroo/`.
 - `tests/`: `pytest` suite for Python API, operators, plotfile access, and smoke tests.
-- `scripts/`: runnable demos, dashboard entrypoints, and utility scripts (HPX detection, benchmarking).
+- `scripts/`: runnable demos and utility scripts (HPX detection, benchmarking).
 - Root docs: `README.md`, `PLAN.md`, and performance/tracking notes for design context.
 
 ## Build, Test, and Development Commands
@@ -13,7 +13,7 @@
 - `pixi run build`: compile C++ targets.
 - `pixi run install`: install extension modules and Python package into the Pixi environment.
 - `pixi run test`: run tests (`pytest -q`).
-- `python scripts/kangaroo_dashboard.py`: launch the local dashboard (use `pixi run python ...` if using Pixi env binaries).
+- `KANGAROO_PERFETTO_TRACE=run.pftrace pixi run python <script>`: emit a Perfetto trace and inspect it in Perfetto UI.
 
 ## Coding Style & Naming Conventions
 - Python: PEP 8 style, 4-space indentation, type hints used throughout (`analysis/runtime.py` is a good reference).
@@ -23,7 +23,7 @@
 
 ## Testing Guidelines
 - Framework: `pytest` (`pyproject.toml` sets `testpaths = ["tests"]`).
-- Add unit tests next to related coverage area (runtime, operators, dataset, dashboard DAG, etc.).
+- Add unit tests next to related coverage area (runtime, operators, dataset, etc.).
 - Prefer deterministic, small-input tests; include a smoke path for new end-to-end behavior when practical.
 - Run `pixi run test` before opening a PR.
 
@@ -34,4 +34,4 @@
   - concise problem/solution summary,
   - linked issue (if applicable),
   - exact validation commands run (for example `pixi run test`),
-  - screenshots only for dashboard/UI changes.
+  - screenshots only for UI changes.

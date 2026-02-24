@@ -157,7 +157,7 @@ This makes the plan portable across compatible runtime instances and decouples l
 
 Kangaroo includes a task-event stream designed for runtime introspection.
 
-The dashboard consumes:
+Observability tooling (including Perfetto traces) consumes:
 - task lifecycle events
 - runtime metric events
 - optional plan artifacts

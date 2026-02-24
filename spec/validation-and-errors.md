@@ -112,11 +112,10 @@ Errors required for:
 Errors required for:
 - Attempting mutable chunk writes on read-only backends.
 
-## 12. Dashboard/Workflow Validation
+## 12. Workflow Validation
 
 Errors required for:
-- Invalid thread-count argument for dashboard workflow launcher.
-- Invalid/malformed DAG-plan payloads that cannot be interpreted for node/edge construction.
+- Invalid workflow script configuration inputs.
 
 ## 13. Script Exit/Error Semantics
 
@@ -130,6 +129,5 @@ Conformance requires reproducing behavior validated by repository tests, includi
 - Coarse-fine correctness for gradient and vorticity workflows.
 - Correct AMR covered-cell masking in projections/histograms.
 - Proper plan topology and fragment chaining behavior.
-- Correct dashboard blockwise DAG edge mapping.
 - Accepted and rejected neighbor dependency configurations.
 - Correct cross-level subbox fetch behavior.
