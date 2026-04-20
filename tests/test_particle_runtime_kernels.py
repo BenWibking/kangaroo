@@ -8,26 +8,23 @@ from analysis.pipeline import pipeline
 from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
 
 
-def _single_block_runmeta() -> RunMeta:
+def _single_block_runmeta(step: int = 0) -> RunMeta:
+    levels = [
+        LevelMeta(
+            geom=LevelGeom(dx=(1.0, 1.0, 1.0), x0=(0.0, 0.0, 0.0), ref_ratio=1),
+            boxes=[BlockBox((0, 0, 0), (0, 0, 0))],
+        )
+    ]
     return RunMeta(
-        steps=[
-            StepMeta(
-                step=0,
-                levels=[
-                    LevelMeta(
-                        geom=LevelGeom(dx=(1.0, 1.0, 1.0), x0=(0.0, 0.0, 0.0), ref_ratio=1),
-                        boxes=[BlockBox((0, 0, 0), (0, 0, 0))],
-                    )
-                ],
-            )
-        ]
+        steps=[StepMeta(step=i, levels=levels) for i in range(step + 1)]
     )
 
 
 def test_particle_runtime_masks_filters_and_reductions_with_numpy_inputs() -> None:
+    step = 100
     rt = Runtime()
-    runmeta = _single_block_runmeta()
-    ds = open_dataset("memory://particle-kernels", runmeta=runmeta, step=0, level=0, runtime=rt)
+    runmeta = _single_block_runmeta(step=step)
+    ds = open_dataset("memory://particle-kernels", runmeta=runmeta, step=step, level=0, runtime=rt)
     pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
     pipe._particle_max_chunks = 2
 
