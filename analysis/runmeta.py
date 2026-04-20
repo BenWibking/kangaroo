@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from typing import Any, Dict, Iterable, Iterator, List
 
 from . import _core  # type: ignore
 
@@ -33,13 +33,51 @@ class StepMeta:
     levels: List[LevelMeta]
 
 
+class StepList:
+    def __init__(self, steps: Iterable[StepMeta] = ()) -> None:
+        self._items: list[StepMeta] = []
+        self._by_step: dict[int, StepMeta] = {}
+        for step in steps:
+            self.append(step)
+
+    def append(self, step: StepMeta) -> None:
+        step_id = int(step.step)
+        if step_id in self._by_step:
+            raise ValueError(f"duplicate RunMeta step {step_id}")
+        self._items.append(step)
+        self._by_step[step_id] = step
+
+    def at(self, step: int) -> StepMeta:
+        step_id = int(step)
+        try:
+            return self._by_step[step_id]
+        except KeyError as exc:
+            raise IndexError(f"RunMeta does not contain step {step_id}") from exc
+
+    def __getitem__(self, key: int | slice) -> StepMeta | list[StepMeta]:
+        if isinstance(key, slice):
+            return self._items[key]
+        return self.at(int(key))
+
+    def __iter__(self) -> Iterator[StepMeta]:
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __bool__(self) -> bool:
+        return bool(self._items)
+
+
 @dataclass
 class RunMeta:
-    steps: List[StepMeta]
+    steps: List[StepMeta] | StepList
     particle_species: Dict[str, int] = field(default_factory=dict)
     _h: Any = field(init=False)
 
     def __post_init__(self) -> None:
+        if not isinstance(self.steps, StepList):
+            self.steps = StepList(self.steps)
         steps_payload: List[Dict[str, Any]] = []
         for step in self.steps:
             levels_payload = []

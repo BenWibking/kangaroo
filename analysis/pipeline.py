@@ -109,6 +109,7 @@ class Pipeline:
         self._name_counters: dict[str, int] = {}
         self._particle_stages: list[Stage] = []
         self._particle_frontier: list[Stage] = []
+        self._particle_step = int(getattr(dataset, "step", 0))
         self._particle_max_chunks: int = 1
         self._particle_executed: bool = False
         self._particle_cache: dict[int, list[np.ndarray]] = {}
@@ -137,16 +138,15 @@ class Pipeline:
             return max(1, int(self.dataset.get_particle_chunk_count(particle_type)))
         return 1
 
+    def _particle_domain(self, *, blocks: list[int] | None = None) -> Domain:
+        return Domain(step=self._particle_step, level=0, blocks=blocks)
+
     def _particle_runmeta(self) -> RunMeta:
         n = max(1, int(self._particle_max_chunks))
         boxes = [BlockBox((i, 0, 0), (i, 0, 0)) for i in range(n)]
+        levels = [LevelMeta(geom=LevelGeom(dx=(1.0, 1.0, 1.0), x0=(0.0, 0.0, 0.0), ref_ratio=1), boxes=boxes)]
         return RunMeta(
-            steps=[
-                StepMeta(
-                    step=0,
-                    levels=[LevelMeta(geom=LevelGeom(dx=(1.0, 1.0, 1.0), x0=(0.0, 0.0, 0.0), ref_ratio=1), boxes=boxes)],
-                )
-            ],
+            steps=[StepMeta(step=self._particle_step, levels=levels)],
             particle_species=dict(getattr(self.runmeta, "particle_species", {})),
         )
 
@@ -206,7 +206,7 @@ class Pipeline:
             reduce_stage.map_blocks(
                 name=kernel,
                 kernel=kernel,
-                domain=Domain(step=0, level=0),
+                domain=self._particle_domain(),
                 inputs=[FieldRef(in_field)],
                 outputs=[FieldRef(out_field)],
                 output_bytes=[int(output_bytes)],
@@ -237,7 +237,7 @@ class Pipeline:
                 payload = np.ascontiguousarray(chunk, dtype=np.uint8).tobytes(order="C")
             else:
                 raise ValueError(f"unsupported particle import dtype '{dtype}'")
-            self.dataset._h.set_chunk_ref(0, 0, fid, 0, block, payload)
+            self.dataset._h.set_chunk_ref(self._particle_step, 0, fid, 0, block, payload)
         self._particle_max_chunks = max(self._particle_max_chunks, int(chunk_count))
         if dtype == "mask_u8":
             return ParticleMaskHandle(self, fid, int(chunk_count))
@@ -275,7 +275,7 @@ class Pipeline:
         out: list[np.ndarray] = []
         for block in range(chunk_count):
             raw = self.runtime.get_task_chunk(
-                step=0, level=0, field=field, version=0, block=block, dataset=self.dataset
+                step=self._particle_step, level=0, field=field, version=0, block=block, dataset=self.dataset
             )
             if dtype == "float64":
                 out.append(np.frombuffer(raw, dtype=np.float64).copy())
@@ -304,7 +304,9 @@ class Pipeline:
 
     def _particle_scalar_from_field(self, field: int, *, dtype: str) -> float | int:
         self._ensure_particle_executed()
-        raw = self.runtime.get_task_chunk(step=0, level=0, field=field, version=0, block=0, dataset=self.dataset)
+        raw = self.runtime.get_task_chunk(
+            step=self._particle_step, level=0, field=field, version=0, block=0, dataset=self.dataset
+        )
         if dtype == "float64":
             arr = np.frombuffer(raw, dtype=np.float64)
             return float(arr[0]) if arr.size else float("nan")
@@ -703,7 +705,7 @@ class Pipeline:
         stage.map_blocks(
             name="particle_load_field_chunk_f64",
             kernel="particle_load_field_chunk_f64",
-            domain=Domain(step=0, level=0, blocks=list(range(chunk_count))),
+            domain=self._particle_domain(blocks=list(range(chunk_count))),
             inputs=[],
             outputs=[FieldRef(out_fid)],
             output_bytes=[8],
@@ -722,7 +724,7 @@ class Pipeline:
         stage.map_blocks(
             name="particle_eq_mask",
             kernel="particle_eq_mask",
-            domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
+            domain=self._particle_domain(blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
             outputs=[FieldRef(out_fid)],
             output_bytes=[1],
@@ -741,7 +743,7 @@ class Pipeline:
         stage.map_blocks(
             name="particle_isin_mask",
             kernel="particle_isin_mask",
-            domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
+            domain=self._particle_domain(blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
             outputs=[FieldRef(out_fid)],
             output_bytes=[1],
@@ -758,7 +760,7 @@ class Pipeline:
         stage.map_blocks(
             name="particle_isfinite_mask",
             kernel="particle_isfinite_mask",
-            domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
+            domain=self._particle_domain(blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
             outputs=[FieldRef(out_fid)],
             output_bytes=[1],
@@ -777,7 +779,7 @@ class Pipeline:
         stage.map_blocks(
             name="particle_abs_lt_mask",
             kernel="particle_abs_lt_mask",
-            domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
+            domain=self._particle_domain(blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
             outputs=[FieldRef(out_fid)],
             output_bytes=[1],
@@ -796,7 +798,7 @@ class Pipeline:
         stage.map_blocks(
             name="particle_le_mask",
             kernel="particle_le_mask",
-            domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
+            domain=self._particle_domain(blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
             outputs=[FieldRef(out_fid)],
             output_bytes=[1],
@@ -815,7 +817,7 @@ class Pipeline:
         stage.map_blocks(
             name="particle_gt_mask",
             kernel="particle_gt_mask",
-            domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
+            domain=self._particle_domain(blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
             outputs=[FieldRef(out_fid)],
             output_bytes=[1],
@@ -838,7 +840,7 @@ class Pipeline:
             stage.map_blocks(
                 name="particle_and_mask",
                 kernel="particle_and_mask",
-                domain=Domain(step=0, level=0, blocks=list(range(out_h.chunk_count))),
+                domain=self._particle_domain(blocks=list(range(out_h.chunk_count))),
                 inputs=[FieldRef(out_h.field), FieldRef(rhs_h.field)],
                 outputs=[FieldRef(fid)],
                 output_bytes=[1],
@@ -861,7 +863,7 @@ class Pipeline:
         stage.map_blocks(
             name="particle_filter",
             kernel="particle_filter",
-            domain=Domain(step=0, level=0, blocks=list(range(arr_h.chunk_count))),
+            domain=self._particle_domain(blocks=list(range(arr_h.chunk_count))),
             inputs=[FieldRef(arr_h.field), FieldRef(mask_h.field)],
             outputs=[FieldRef(fid)],
             output_bytes=[8],
@@ -883,7 +885,7 @@ class Pipeline:
         stage.map_blocks(
             name="particle_subtract",
             kernel="particle_subtract",
-            domain=Domain(step=0, level=0, blocks=list(range(a_h.chunk_count))),
+            domain=self._particle_domain(blocks=list(range(a_h.chunk_count))),
             inputs=[FieldRef(a_h.field), FieldRef(b_h.field)],
             outputs=[FieldRef(fid)],
             output_bytes=[8],
@@ -917,7 +919,7 @@ class Pipeline:
         stage.map_blocks(
             name="particle_distance3",
             kernel="particle_distance3",
-            domain=Domain(step=0, level=0, blocks=list(range(chunk_count))),
+            domain=self._particle_domain(blocks=list(range(chunk_count))),
             inputs=[
                 FieldRef(ax_h.field),
                 FieldRef(ay_h.field),
@@ -941,7 +943,7 @@ class Pipeline:
         stage.map_blocks(
             name="particle_sum",
             kernel="particle_sum",
-            domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
+            domain=self._particle_domain(blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
             outputs=[FieldRef(fid)],
             output_bytes=[8],
@@ -965,7 +967,7 @@ class Pipeline:
         stage.map_blocks(
             name="particle_len_f64",
             kernel="particle_len_f64",
-            domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
+            domain=self._particle_domain(blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
             outputs=[FieldRef(fid)],
             output_bytes=[8],
@@ -989,7 +991,7 @@ class Pipeline:
         stage.map_blocks(
             name="particle_min",
             kernel="particle_min",
-            domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
+            domain=self._particle_domain(blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
             outputs=[FieldRef(fid)],
             output_bytes=[8],
@@ -1013,7 +1015,7 @@ class Pipeline:
         stage.map_blocks(
             name="particle_max",
             kernel="particle_max",
-            domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
+            domain=self._particle_domain(blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
             outputs=[FieldRef(fid)],
             output_bytes=[8],
@@ -1037,7 +1039,7 @@ class Pipeline:
         stage.map_blocks(
             name="particle_count",
             kernel="particle_count",
-            domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
+            domain=self._particle_domain(blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
             outputs=[FieldRef(fid)],
             output_bytes=[8],
@@ -1068,7 +1070,7 @@ class Pipeline:
         stage.map_blocks(
             name="particle_topk_modes",
             kernel="particle_topk_modes",
-            domain=Domain(step=0, level=0, blocks=[0]),
+            domain=self._particle_domain(blocks=[0]),
             inputs=[],
             outputs=[FieldRef(fid)],
             output_bytes=[int(k) * 2 * 8],
@@ -1081,7 +1083,9 @@ class Pipeline:
         )
         self._append_particle_stage(stage, chunk_count=1)
         self._ensure_particle_executed()
-        raw = self.runtime.get_task_chunk(step=0, level=0, field=fid, version=0, block=0, dataset=self.dataset)
+        raw = self.runtime.get_task_chunk(
+            step=self._particle_step, level=0, field=fid, version=0, block=0, dataset=self.dataset
+        )
         arr = np.frombuffer(raw, dtype=np.float64)
         if arr.size < 2 * int(k):
             return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
@@ -1119,7 +1123,7 @@ class Pipeline:
         stage.map_blocks(
             name="particle_histogram1d",
             kernel="particle_histogram1d",
-            domain=Domain(step=0, level=0, blocks=list(range(chunk_count))),
+            domain=self._particle_domain(blocks=list(range(chunk_count))),
             inputs=inputs,
             outputs=[FieldRef(fid)],
             output_bytes=[(edges.size - 1) * 8],

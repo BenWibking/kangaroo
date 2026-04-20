@@ -203,7 +203,7 @@ void DataServiceLocal::preload(const RunMeta& meta,
   if (meta.steps.empty()) {
     return;
   }
-  if (dataset.step < 0 || dataset.step >= static_cast<int32_t>(meta.steps.size())) {
+  if (!meta.steps.contains(dataset.step)) {
     return;
   }
   const auto& step_meta = meta.steps.at(dataset.step);
