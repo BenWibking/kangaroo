@@ -280,6 +280,13 @@ NB_MODULE(_core, m) {
              self.run_packed_plan(buffer, runmeta, dataset);
            });
 
+  nb::class_<kangaroo::KernelDesc>(m, "KernelDesc")
+      .def_rw("name", &kangaroo::KernelDesc::name)
+      .def_rw("n_inputs", &kangaroo::KernelDesc::n_inputs)
+      .def_rw("n_outputs", &kangaroo::KernelDesc::n_outputs)
+      .def_rw("needs_neighbors", &kangaroo::KernelDesc::needs_neighbors)
+      .def_rw("param_schema_json", &kangaroo::KernelDesc::param_schema_json);
+
   nb::class_<kangaroo::KernelRegistry>(m, "KernelRegistry")
       .def("list", &kangaroo::KernelRegistry::list_kernel_descs);
 

@@ -64,6 +64,10 @@ set(KANGAROO_RUNTIME_SOURCES
   src/kernel_registry.cpp
   src/plan_decode_msgpack.cpp
   src/runtime.cpp
+  src/kernels/register.cpp
+  src/kernels/plotfile_load.cpp
+  src/kernels/particle_misc.cpp
+  src/kernels/uniform_slice_misc.cpp
 )
 
 if(KANGAROO_USE_OPENPMD)
