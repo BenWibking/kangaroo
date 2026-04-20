@@ -1025,6 +1025,7 @@ class ParticleCICProjection:
                 dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
                 params = {
                     "particle_type": self.particle_type,
+                    "level_index": int(level_idx),
                     "axis": axis_idx,
                     "axis_bounds": [float(self.axis_bounds[0]), float(self.axis_bounds[1])],
                     "rect": list(self.rect),
@@ -1320,6 +1321,7 @@ class ParticleCICGrid:
                 dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
                 params = {
                     "particle_type": self.particle_type,
+                    "level_index": int(level_idx),
                     "axis": axis_idx,
                     "axis_bounds": [float(self.axis_bounds[0]), float(self.axis_bounds[1])],
                     "covered_boxes": covered_payload,

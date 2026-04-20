@@ -284,6 +284,7 @@ def test_pipeline_particle_cic_projection_lowering_wiring() -> None:
     assert len(acc) == 2
     assert red
     assert all(tmpl.params["particle_type"] == "StochasticStellarPop_particles" for tmpl in grid)
+    assert all(tmpl.params["level_index"] == 0 for tmpl in grid)
     assert all(tmpl.params["resolution"] == [16, 16] for tmpl in acc)
 
 

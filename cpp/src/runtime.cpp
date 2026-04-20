@@ -104,17 +104,45 @@ void append_particle_values_as_f64(const plotfile::ParticleArrayData& data, cons
   }
 }
 
-std::vector<double> read_particle_field_chunks_as_f64(const plotfile::PlotfileReader& reader,
-                                                      const std::string& particle_type,
-                                                      const std::string& field_name,
-                                                      const std::string& context) {
-  const int64_t nchunks = reader.particle_chunk_count(particle_type);
-  std::vector<double> out_vals;
-  for (int64_t chunk = 0; chunk < nchunks; ++chunk) {
-    const auto data = reader.read_particle_field_chunk(particle_type, field_name, chunk);
-    append_particle_values_as_f64(data, field_name, context, out_vals);
+std::unordered_map<double, int64_t> decode_particle_value_counts(std::span<const std::uint8_t> bytes) {
+  std::unordered_map<double, int64_t> counts;
+  if (bytes.size() < sizeof(uint64_t)) {
+    return counts;
   }
-  return out_vals;
+  uint64_t n = 0;
+  std::memcpy(&n, bytes.data(), sizeof(uint64_t));
+  const std::size_t expected =
+      sizeof(uint64_t) + static_cast<std::size_t>(n) * (sizeof(double) + sizeof(int64_t));
+  if (bytes.size() < expected) {
+    return counts;
+  }
+  counts.reserve(static_cast<std::size_t>(n));
+  const auto* ptr = bytes.data() + sizeof(uint64_t);
+  for (uint64_t i = 0; i < n; ++i) {
+    double value = 0.0;
+    int64_t count = 0;
+    std::memcpy(&value, ptr, sizeof(double));
+    ptr += sizeof(double);
+    std::memcpy(&count, ptr, sizeof(int64_t));
+    ptr += sizeof(int64_t);
+    counts[value] += count;
+  }
+  return counts;
+}
+
+void encode_particle_value_counts(const std::unordered_map<double, int64_t>& counts,
+                                  std::vector<std::uint8_t>& out) {
+  const uint64_t n = static_cast<uint64_t>(counts.size());
+  out.resize(sizeof(uint64_t) + static_cast<std::size_t>(n) * (sizeof(double) + sizeof(int64_t)));
+  auto* ptr = out.data();
+  std::memcpy(ptr, &n, sizeof(uint64_t));
+  ptr += sizeof(uint64_t);
+  for (const auto& [value, count] : counts) {
+    std::memcpy(ptr, &value, sizeof(double));
+    ptr += sizeof(double);
+    std::memcpy(ptr, &count, sizeof(int64_t));
+    ptr += sizeof(int64_t);
+  }
 }
 
 std::string json_escape(const std::string& value);
@@ -2811,6 +2839,7 @@ void register_default_kernels(KernelRegistry& registry) {
          std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
         struct Params {
           std::string particle_type;
+          int level_index = -1;
           int axis = 2;
           std::array<double, 2> axis_bounds{0.0, 0.0};
           double mass_max = std::numeric_limits<double>::quiet_NaN();
@@ -2831,6 +2860,10 @@ void register_default_kernels(KernelRegistry& registry) {
               const auto& v = root.via.map.ptr[i].val;
               if (key == "particle_type" && v.type == msgpack::type::STR) {
                 params.particle_type = v.as<std::string>();
+              } else if (key == "level_index" &&
+                         (v.type == msgpack::type::POSITIVE_INTEGER ||
+                          v.type == msgpack::type::NEGATIVE_INTEGER)) {
+                params.level_index = v.as<int>();
               } else if (key == "axis" &&
                          (v.type == msgpack::type::POSITIVE_INTEGER ||
                           v.type == msgpack::type::NEGATIVE_INTEGER)) {
@@ -2882,6 +2915,9 @@ void register_default_kernels(KernelRegistry& registry) {
         if (params.axis < 0 || params.axis > 2) {
           throw std::runtime_error("particle_cic_grid_accumulate: axis must be 0, 1, or 2");
         }
+        if (params.level_index < 0) {
+          throw std::runtime_error("particle_cic_grid_accumulate: missing level_index");
+        }
         if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
           throw std::runtime_error("particle_cic_grid_accumulate: block index out of range");
         }
@@ -2896,21 +2932,30 @@ void register_default_kernels(KernelRegistry& registry) {
               "particle_cic_grid_accumulate requires an AMReX plotfile-backed dataset");
         }
 
-        auto px = read_particle_field_chunks_as_f64(*reader, params.particle_type, "x",
-                                                    "particle_cic_grid_accumulate");
-        auto py = read_particle_field_chunks_as_f64(*reader, params.particle_type, "y",
-                                                    "particle_cic_grid_accumulate");
-        auto pz = read_particle_field_chunks_as_f64(*reader, params.particle_type, "z",
-                                                    "particle_cic_grid_accumulate");
-        auto pm = read_particle_field_chunks_as_f64(*reader, params.particle_type, "mass",
-                                                    "particle_cic_grid_accumulate");
+        auto px = reader->read_particle_field_grid(params.particle_type, "x", params.level_index,
+                                                   block);
+        auto py = reader->read_particle_field_grid(params.particle_type, "y", params.level_index,
+                                                   block);
+        auto pz = reader->read_particle_field_grid(params.particle_type, "z", params.level_index,
+                                                   block);
+        auto pm = reader->read_particle_field_grid(params.particle_type, "mass",
+                                                   params.level_index, block);
 
-        const std::size_t n =
-            std::min(std::min(px.size(), py.size()), std::min(pz.size(), pm.size()));
-        px.resize(n);
-        py.resize(n);
-        pz.resize(n);
-        pm.resize(n);
+        std::vector<double> px_vals;
+        std::vector<double> py_vals;
+        std::vector<double> pz_vals;
+        std::vector<double> pm_vals;
+        append_particle_values_as_f64(px, "x", "particle_cic_grid_accumulate", px_vals);
+        append_particle_values_as_f64(py, "y", "particle_cic_grid_accumulate", py_vals);
+        append_particle_values_as_f64(pz, "z", "particle_cic_grid_accumulate", pz_vals);
+        append_particle_values_as_f64(pm, "mass", "particle_cic_grid_accumulate", pm_vals);
+
+        const std::size_t n = std::min(std::min(px_vals.size(), py_vals.size()),
+                                       std::min(pz_vals.size(), pm_vals.size()));
+        px_vals.resize(n);
+        py_vals.resize(n);
+        pz_vals.resize(n);
+        pm_vals.resize(n);
 
         const int axis = params.axis;
         const int u_axis = (axis == 0) ? 1 : 0;
@@ -2963,7 +3008,7 @@ void register_default_kernels(KernelRegistry& registry) {
           return static_cast<std::size_t>((i * ny + j) * nz + k);
         };
 
-        const double* coord[3] = {px.data(), py.data(), pz.data()};
+        const double* coord[3] = {px_vals.data(), py_vals.data(), pz_vals.data()};
         const double du = dx[u_axis];
         const double dv = dx[v_axis];
         const double da = dx[axis];
@@ -3009,7 +3054,7 @@ void register_default_kernels(KernelRegistry& registry) {
           const double u = coord[u_axis][p];
           const double v = coord[v_axis][p];
           const double a = coord[axis][p];
-          const double m = pm[p];
+          const double m = pm_vals[p];
           if (!std::isfinite(u) || !std::isfinite(v) || !std::isfinite(a) || !std::isfinite(m)) {
             continue;
           }
@@ -3049,6 +3094,7 @@ void register_default_kernels(KernelRegistry& registry) {
          std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
         struct Params {
           std::string particle_type;
+          int level_index = -1;
           int axis = 2;
           std::array<double, 2> axis_bounds{0.0, 0.0};
           std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
@@ -3071,6 +3117,10 @@ void register_default_kernels(KernelRegistry& registry) {
               const auto& v = root.via.map.ptr[i].val;
               if (key == "particle_type" && v.type == msgpack::type::STR) {
                 params.particle_type = v.as<std::string>();
+              } else if (key == "level_index" &&
+                         (v.type == msgpack::type::POSITIVE_INTEGER ||
+                          v.type == msgpack::type::NEGATIVE_INTEGER)) {
+                params.level_index = v.as<int>();
               } else if (key == "axis" &&
                          (v.type == msgpack::type::POSITIVE_INTEGER ||
                           v.type == msgpack::type::NEGATIVE_INTEGER)) {
@@ -3141,6 +3191,9 @@ void register_default_kernels(KernelRegistry& registry) {
         if (params.axis < 0 || params.axis > 2) {
           throw std::runtime_error("particle_cic_projection_accumulate: axis must be 0, 1, or 2");
         }
+        if (params.level_index < 0) {
+          throw std::runtime_error("particle_cic_projection_accumulate: missing level_index");
+        }
         if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
           throw std::runtime_error("particle_cic_projection_accumulate: block index out of range");
         }
@@ -3155,21 +3208,30 @@ void register_default_kernels(KernelRegistry& registry) {
               "particle_cic_projection_accumulate requires an AMReX plotfile-backed dataset");
         }
 
-        auto px = read_particle_field_chunks_as_f64(*reader, params.particle_type, "x",
-                                                    "particle_cic_projection_accumulate");
-        auto py = read_particle_field_chunks_as_f64(*reader, params.particle_type, "y",
-                                                    "particle_cic_projection_accumulate");
-        auto pz = read_particle_field_chunks_as_f64(*reader, params.particle_type, "z",
-                                                    "particle_cic_projection_accumulate");
-        auto pm = read_particle_field_chunks_as_f64(*reader, params.particle_type, "mass",
-                                                    "particle_cic_projection_accumulate");
+        auto px = reader->read_particle_field_grid(params.particle_type, "x", params.level_index,
+                                                   block);
+        auto py = reader->read_particle_field_grid(params.particle_type, "y", params.level_index,
+                                                   block);
+        auto pz = reader->read_particle_field_grid(params.particle_type, "z", params.level_index,
+                                                   block);
+        auto pm = reader->read_particle_field_grid(params.particle_type, "mass",
+                                                   params.level_index, block);
 
-        const std::size_t n =
-            std::min(std::min(px.size(), py.size()), std::min(pz.size(), pm.size()));
-        px.resize(n);
-        py.resize(n);
-        pz.resize(n);
-        pm.resize(n);
+        std::vector<double> px_vals;
+        std::vector<double> py_vals;
+        std::vector<double> pz_vals;
+        std::vector<double> pm_vals;
+        append_particle_values_as_f64(px, "x", "particle_cic_projection_accumulate", px_vals);
+        append_particle_values_as_f64(py, "y", "particle_cic_projection_accumulate", py_vals);
+        append_particle_values_as_f64(pz, "z", "particle_cic_projection_accumulate", pz_vals);
+        append_particle_values_as_f64(pm, "mass", "particle_cic_projection_accumulate", pm_vals);
+
+        const std::size_t n = std::min(std::min(px_vals.size(), py_vals.size()),
+                                       std::min(pz_vals.size(), pm_vals.size()));
+        px_vals.resize(n);
+        py_vals.resize(n);
+        pz_vals.resize(n);
+        pm_vals.resize(n);
 
         const int axis = params.axis;
         const int u_axis = (axis == 0) ? 1 : 0;
@@ -3251,7 +3313,7 @@ void register_default_kernels(KernelRegistry& registry) {
           native_mass[native_index(iu_local, iv_local)] += wmass;
         };
 
-        const double* coord[3] = {px.data(), py.data(), pz.data()};
+        const double* coord[3] = {px_vals.data(), py_vals.data(), pz_vals.data()};
         const double du = dx[u_axis];
         const double dv = dx[v_axis];
         const double da = dx[axis];
@@ -3266,7 +3328,7 @@ void register_default_kernels(KernelRegistry& registry) {
           const double u = coord[u_axis][p];
           const double v = coord[v_axis][p];
           const double a = coord[axis][p];
-          const double m = pm[p];
+          const double m = pm_vals[p];
           if (!std::isfinite(u) || !std::isfinite(v) || !std::isfinite(a) || !std::isfinite(m)) {
             continue;
           }
@@ -3855,15 +3917,14 @@ void register_default_kernels(KernelRegistry& registry) {
         return hpx::make_ready_future();
       });
   registry.register_kernel(
-      KernelDesc{.name = "particle_topk_modes", .n_inputs = 0, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView>, const NeighborViews&,
+      KernelDesc{.name = "particle_topk_modes_map", .n_inputs = 0, .n_outputs = 1, .needs_neighbors = false},
+      [](const LevelMeta&, int32_t block, std::span<const HostView>, const NeighborViews&,
          std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }
         std::string particle_type;
         std::string field_name;
-        int64_t k = 0;
         if (!params_msgpack.empty()) {
           auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
                                         params_msgpack.size());
@@ -3879,39 +3940,86 @@ void register_default_kernels(KernelRegistry& registry) {
                 particle_type = root.via.map.ptr[i].val.as<std::string>();
               } else if (key == "field_name") {
                 field_name = root.via.map.ptr[i].val.as<std::string>();
-              } else if (key == "k") {
-                k = root.via.map.ptr[i].val.as<int64_t>();
               }
             }
           }
         }
-        if (particle_type.empty() || field_name.empty() || k <= 0) {
+        if (particle_type.empty() || field_name.empty()) {
           outputs[0].data.clear();
           return hpx::make_ready_future();
         }
 
         const auto& dataset = global_dataset();
         if (!dataset.backend) {
-          throw std::runtime_error("particle_topk_modes: missing dataset backend");
+          throw std::runtime_error("particle_topk_modes_map: missing dataset backend");
         }
         const auto* reader = dataset.backend->get_plotfile_reader();
         if (reader == nullptr) {
           throw std::runtime_error(
-              "particle_topk_modes requires an AMReX plotfile-backed dataset");
+              "particle_topk_modes_map requires an AMReX plotfile-backed dataset");
         }
         std::unordered_map<double, int64_t> counts;
-        const int64_t nchunks = reader->particle_chunk_count(particle_type);
-        for (int64_t chunk = 0; chunk < nchunks; ++chunk) {
-          const auto data = reader->read_particle_field_chunk(particle_type, field_name, chunk);
-          std::vector<double> values;
-          append_particle_values_as_f64(data, field_name, "particle_topk_modes", values);
-          for (double v : values) {
-            if (!std::isfinite(v)) {
-              continue;
-            }
-            counts[v] += 1;
+        const auto data = reader->read_particle_field_chunk(particle_type, field_name, block);
+        std::vector<double> values;
+        append_particle_values_as_f64(data, field_name, "particle_topk_modes_map", values);
+        for (double v : values) {
+          if (!std::isfinite(v)) {
+            continue;
+          }
+          counts[v] += 1;
+        }
+        encode_particle_value_counts(counts, outputs[0].data);
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_value_counts_reduce", .n_inputs = 1, .n_outputs = 1,
+                 .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+        if (outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        std::unordered_map<double, int64_t> merged;
+        for (const auto& in_view : inputs) {
+          auto counts = decode_particle_value_counts(in_view.data);
+          if (merged.empty()) {
+            merged = std::move(counts);
+            continue;
+          }
+          for (const auto& [value, count] : counts) {
+            merged[value] += count;
           }
         }
+        encode_particle_value_counts(merged, outputs[0].data);
+        return hpx::make_ready_future();
+      });
+  registry.register_kernel(
+      KernelDesc{.name = "particle_topk_modes_finalize", .n_inputs = 1, .n_outputs = 1,
+                 .needs_neighbors = false},
+      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
+         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        if (outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        int64_t k = 0;
+        if (!params_msgpack.empty()) {
+          auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()),
+                                        params_msgpack.size());
+          auto root = handle.get();
+          if (root.type == msgpack::type::MAP) {
+            for (uint32_t i = 0; i < root.via.map.size; ++i) {
+              const auto& k_msg = root.via.map.ptr[i].key;
+              if (k_msg.type == msgpack::type::STR && k_msg.as<std::string>() == "k") {
+                k = root.via.map.ptr[i].val.as<int64_t>();
+              }
+            }
+          }
+        }
+        if (inputs.empty() || k <= 0) {
+          outputs[0].data.clear();
+          return hpx::make_ready_future();
+        }
+        auto counts = decode_particle_value_counts(inputs[0].data);
         std::vector<std::pair<double, int64_t>> modes;
         modes.reserve(counts.size());
         for (const auto& it : counts) {

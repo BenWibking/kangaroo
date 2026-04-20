@@ -810,6 +810,29 @@ int64_t PlotfileReader::particle_chunk_count(const std::string& particle_type) c
   return chunks;
 }
 
+int64_t PlotfileReader::particle_chunk_index(const std::string& particle_type,
+                                             int level,
+                                             int grid_index) const {
+  const auto& species = get_particle_species(particle_type);
+  if (level < 0 || level > species.header.finest_level) {
+    throw std::runtime_error("particle level out of range");
+  }
+  if (level >= static_cast<int>(species.header.particle_counts.size())) {
+    throw std::runtime_error("particle header missing level metadata");
+  }
+  const auto& level_counts = species.header.particle_counts[static_cast<size_t>(level)];
+  if (grid_index < 0 || grid_index >= static_cast<int>(level_counts.size())) {
+    throw std::runtime_error("particle grid index out of range");
+  }
+
+  int64_t cursor = 0;
+  for (int l = 0; l < level; ++l) {
+    cursor += static_cast<int64_t>(
+        species.header.particle_counts[static_cast<size_t>(l)].size());
+  }
+  return cursor + static_cast<int64_t>(grid_index);
+}
+
 ParticleArrayData PlotfileReader::read_particle_field_chunk(const std::string& particle_type,
                                                             const std::string& field_name,
                                                             int64_t chunk_index) const {
@@ -898,6 +921,14 @@ ParticleArrayData PlotfileReader::read_particle_field_chunk(const std::string& p
     }
   }
   return out;
+}
+
+ParticleArrayData PlotfileReader::read_particle_field_grid(const std::string& particle_type,
+                                                           const std::string& field_name,
+                                                           int level,
+                                                           int grid_index) const {
+  const int64_t chunk_index = particle_chunk_index(particle_type, level, grid_index);
+  return read_particle_field_chunk(particle_type, field_name, chunk_index);
 }
 
 }  // namespace kangaroo::plotfile

@@ -131,9 +131,14 @@ public:
   std::vector<std::string> particle_types() const;
   std::vector<std::string> particle_fields(const std::string& particle_type) const;
   int64_t particle_chunk_count(const std::string& particle_type) const;
+  int64_t particle_chunk_index(const std::string& particle_type, int level, int grid_index) const;
   ParticleArrayData read_particle_field_chunk(const std::string& particle_type,
                                               const std::string& field_name,
                                               int64_t chunk_index) const;
+  ParticleArrayData read_particle_field_grid(const std::string& particle_type,
+                                             const std::string& field_name,
+                                             int level,
+                                             int grid_index) const;
 
 private:
   struct ParticleSpecies {

@@ -1063,23 +1063,43 @@ class Pipeline:
     ) -> tuple[np.ndarray, np.ndarray]:
         if k <= 0:
             return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
-        fid = self._alloc_runtime_field("particle_topk")
-        stage = Stage(name=self._unique_name("particle_topk"))
+        chunk_count = self._particle_chunk_count(particle_type)
+        counts_fid = self._alloc_runtime_field("particle_topk_counts")
+        stage = Stage(name=self._unique_name("particle_topk_map"))
         stage.map_blocks(
-            name="particle_topk_modes",
-            kernel="particle_topk_modes",
-            domain=Domain(step=0, level=0, blocks=[0]),
+            name="particle_topk_modes_map",
+            kernel="particle_topk_modes_map",
+            domain=Domain(step=0, level=0),
             inputs=[],
-            outputs=[FieldRef(fid)],
-            output_bytes=[int(k) * 2 * 8],
+            outputs=[FieldRef(counts_fid)],
+            output_bytes=[0],
             deps={"kind": "None"},
             params={
                 "particle_type": particle_type,
                 "field_name": field,
-                "k": int(k),
             },
         )
-        self._append_particle_stage(stage, chunk_count=1)
+        self._append_particle_stage(stage, chunk_count=chunk_count)
+        reduced = self._append_particle_reduce_tree(
+            input_field=counts_fid,
+            chunk_count=chunk_count,
+            kernel="particle_value_counts_reduce",
+            output_bytes=0,
+            params={},
+        )
+        fid = self._alloc_runtime_field("particle_topk")
+        finalize = Stage(name=self._unique_name("particle_topk_finalize"))
+        finalize.map_blocks(
+            name="particle_topk_modes_finalize",
+            kernel="particle_topk_modes_finalize",
+            domain=Domain(step=0, level=0, blocks=[0]),
+            inputs=[FieldRef(reduced)],
+            outputs=[FieldRef(fid)],
+            output_bytes=[int(k) * 2 * 8],
+            deps={"kind": "None"},
+            params={"k": int(k)},
+        )
+        self._append_particle_stage(finalize, chunk_count=1)
         self._ensure_particle_executed()
         raw = self.runtime.get_task_chunk(step=0, level=0, field=fid, version=0, block=0, dataset=self.dataset)
         arr = np.frombuffer(raw, dtype=np.float64)
