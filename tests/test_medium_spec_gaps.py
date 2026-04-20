@@ -63,6 +63,32 @@ def test_runmeta_forwards_particle_species_to_core_handle(monkeypatch: pytest.Mo
     assert isinstance(payload["steps"], list)
 
 
+def test_runmeta_step_meta_uses_sparse_step_numbers(monkeypatch: pytest.MonkeyPatch) -> None:
+    class _FakeRunMetaHandle:
+        def __init__(self, payload) -> None:
+            self.payload = payload
+
+    monkeypatch.setattr("analysis.runmeta._core.RunMetaHandle", _FakeRunMetaHandle)
+
+    rm = RunMeta(
+        steps=[
+            StepMeta(
+                step=50000,
+                levels=[
+                    LevelMeta(
+                        geom=LevelGeom(dx=(1.0, 1.0, 1.0), x0=(0.0, 0.0, 0.0), ref_ratio=1),
+                        boxes=[BlockBox((0, 0, 0), (1, 1, 1))],
+                    )
+                ],
+            )
+        ]
+    )
+
+    assert rm.steps[50000].step == 50000
+    with pytest.raises(IndexError, match="50001"):
+        _ = rm.steps[50001]
+
+
 def test_dataset_classifies_any_memory_uri_as_memory(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

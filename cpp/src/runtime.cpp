@@ -1249,10 +1249,10 @@ void register_legacy_kernels_impl(KernelRegistry& registry) {
         }
 
         const RunMeta& meta = global_runmeta();
-        if (params.input_step < 0 || static_cast<std::size_t>(params.input_step) >= meta.steps.size()) {
+        if (!meta.steps.contains(params.input_step)) {
           return hpx::make_ready_future();
         }
-        const auto& step_meta = meta.steps.at(static_cast<std::size_t>(params.input_step));
+        const auto& step_meta = meta.steps.at(params.input_step);
         if (params.input_level < 0 || static_cast<std::size_t>(params.input_level) >= step_meta.levels.size()) {
           return hpx::make_ready_future();
         }
@@ -1490,10 +1490,10 @@ void register_legacy_kernels_impl(KernelRegistry& registry) {
         self.bytes_per_value = bytes_per_value;
 
         const RunMeta& meta = global_runmeta();
-        if (params.input_step < 0 || static_cast<std::size_t>(params.input_step) >= meta.steps.size()) {
+        if (!meta.steps.contains(params.input_step)) {
           return hpx::make_ready_future();
         }
-        const auto& step_meta = meta.steps.at(static_cast<std::size_t>(params.input_step));
+        const auto& step_meta = meta.steps.at(params.input_step);
         const int16_t target_level = params.input_level;
         if (target_level < 0 || static_cast<std::size_t>(target_level) >= step_meta.levels.size()) {
           return hpx::make_ready_future();

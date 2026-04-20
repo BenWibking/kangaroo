@@ -146,7 +146,7 @@ class Pipeline:
         boxes = [BlockBox((i, 0, 0), (i, 0, 0)) for i in range(n)]
         levels = [LevelMeta(geom=LevelGeom(dx=(1.0, 1.0, 1.0), x0=(0.0, 0.0, 0.0), ref_ratio=1), boxes=boxes)]
         return RunMeta(
-            steps=[StepMeta(step=step, levels=levels) for step in range(self._particle_step + 1)],
+            steps=[StepMeta(step=self._particle_step, levels=levels)],
             particle_species=dict(getattr(self.runmeta, "particle_species", {})),
         )
 

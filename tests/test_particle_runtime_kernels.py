@@ -15,9 +15,7 @@ def _single_block_runmeta(step: int = 0) -> RunMeta:
             boxes=[BlockBox((0, 0, 0), (0, 0, 0))],
         )
     ]
-    return RunMeta(
-        steps=[StepMeta(step=i, levels=levels) for i in range(step + 1)]
-    )
+    return RunMeta(steps=[StepMeta(step=step, levels=levels)])
 
 
 def test_particle_runtime_masks_filters_and_reductions_with_numpy_inputs() -> None:
