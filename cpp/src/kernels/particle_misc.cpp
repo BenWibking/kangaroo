@@ -5,11 +5,24 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <exception>
 #include <limits>
+#include <optional>
 #include <vector>
 
 namespace kangaroo {
 namespace {
+
+std::optional<msgpack::object_handle> unpack_params(std::span<const std::uint8_t> params_msgpack) {
+  if (params_msgpack.empty()) {
+    return std::nullopt;
+  }
+  try {
+    return msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()), params_msgpack.size());
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
 
 const msgpack::object* find_param(const msgpack::object& root, const char* key) {
   if (root.type != msgpack::type::MAP) {
@@ -26,11 +39,11 @@ const msgpack::object* find_param(const msgpack::object& root, const char* key) 
 
 double unpack_scalar_param(std::span<const std::uint8_t> params_msgpack) {
   double scalar = 0.0;
-  if (params_msgpack.empty()) {
+  const auto handle = unpack_params(params_msgpack);
+  if (!handle) {
     return scalar;
   }
-  auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()), params_msgpack.size());
-  auto root = handle.get();
+  auto root = handle->get();
   if (const auto* value = find_param(root, "scalar")) {
     scalar = value->as<double>();
   }
@@ -39,11 +52,11 @@ double unpack_scalar_param(std::span<const std::uint8_t> params_msgpack) {
 
 std::vector<double> unpack_values_param(std::span<const std::uint8_t> params_msgpack) {
   std::vector<double> values;
-  if (params_msgpack.empty()) {
+  const auto handle = unpack_params(params_msgpack);
+  if (!handle) {
     return values;
   }
-  auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()), params_msgpack.size());
-  auto root = handle.get();
+  auto root = handle->get();
   const auto* value = find_param(root, "values");
   if (value == nullptr || value->type != msgpack::type::ARRAY) {
     return values;
@@ -52,16 +65,17 @@ std::vector<double> unpack_values_param(std::span<const std::uint8_t> params_msg
   for (uint32_t i = 0; i < value->via.array.size; ++i) {
     values.push_back(value->via.array.ptr[i].as<double>());
   }
+  std::sort(values.begin(), values.end());
   return values;
 }
 
 bool unpack_finite_only(std::span<const std::uint8_t> params_msgpack) {
   bool finite_only = true;
-  if (params_msgpack.empty()) {
+  const auto handle = unpack_params(params_msgpack);
+  if (!handle) {
     return finite_only;
   }
-  auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()), params_msgpack.size());
-  auto root = handle.get();
+  auto root = handle->get();
   if (const auto* value = find_param(root, "finite_only")) {
     finite_only = value->as<bool>();
   }
@@ -105,14 +119,7 @@ KANGAROO_KERNEL(particle_isin_mask) {
   const auto* in_d = reinterpret_cast<const double*>(in.data());
   auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
   for (std::size_t i = 0; i < n; ++i) {
-    bool found = false;
-    for (double value : values) {
-      if (in_d[i] == value) {
-        found = true;
-        break;
-      }
-    }
-    out[i] = found ? 1 : 0;
+    out[i] = std::binary_search(values.begin(), values.end(), in_d[i]) ? 1 : 0;
   }
   return hpx::make_ready_future();
 }

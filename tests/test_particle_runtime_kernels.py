@@ -35,10 +35,12 @@ def test_particle_runtime_masks_filters_and_reductions_with_numpy_inputs() -> No
         pipe.particle_isfinite(values),
     )
     equal_two = pipe.particle_equals(values, 2.0)
+    one_or_two = pipe.particle_isin(values, [2.0, 1.0])
     selected = pipe.particle_filter(values, positive_finite)
 
     assert pipe.particle_count(positive_finite) == 3
     assert pipe.particle_count(equal_two) == 2
+    assert pipe.particle_count(one_or_two) == 3
     assert pipe.particle_sum(selected) == 5.0
     assert pipe.particle_min(values, finite_only=True) == -3.0
     assert pipe.particle_max(values, finite_only=True) == 2.0

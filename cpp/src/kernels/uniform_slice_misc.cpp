@@ -3,18 +3,31 @@
 #include <msgpack.hpp>
 
 #include <algorithm>
+#include <exception>
 #include <limits>
+#include <optional>
 
 namespace kangaroo {
 namespace {
 
+std::optional<msgpack::object_handle> unpack_params(std::span<const std::uint8_t> params_msgpack) {
+  if (params_msgpack.empty()) {
+    return std::nullopt;
+  }
+  try {
+    return msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()), params_msgpack.size());
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
 int unpack_bytes_per_value(std::span<const std::uint8_t> params_msgpack, int default_value) {
   int bytes_per_value = default_value;
-  if (params_msgpack.empty()) {
+  const auto handle = unpack_params(params_msgpack);
+  if (!handle) {
     return bytes_per_value;
   }
-  auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()), params_msgpack.size());
-  auto root = handle.get();
+  auto root = handle->get();
   if (root.type != msgpack::type::MAP) {
     return bytes_per_value;
   }
@@ -32,11 +45,11 @@ int unpack_bytes_per_value(std::span<const std::uint8_t> params_msgpack, int def
 
 double unpack_pixel_area(std::span<const std::uint8_t> params_msgpack, double default_value) {
   double pixel_area = default_value;
-  if (params_msgpack.empty()) {
+  const auto handle = unpack_params(params_msgpack);
+  if (!handle) {
     return pixel_area;
   }
-  auto handle = msgpack::unpack(reinterpret_cast<const char*>(params_msgpack.data()), params_msgpack.size());
-  auto root = handle.get();
+  auto root = handle->get();
   if (root.type != msgpack::type::MAP) {
     return pixel_area;
   }
@@ -51,6 +64,21 @@ double unpack_pixel_area(std::span<const std::uint8_t> params_msgpack, double de
     }
   }
   return pixel_area;
+}
+
+void fill_nan(HostView& out, int bytes_per_value) {
+  if (out.data.empty()) {
+    return;
+  }
+  if (bytes_per_value == 8) {
+    const std::size_t n = out.data.size() / sizeof(double);
+    auto* out_d = reinterpret_cast<double*>(out.data.data());
+    std::fill(out_d, out_d + n, std::numeric_limits<double>::quiet_NaN());
+  } else if (bytes_per_value == 4) {
+    const std::size_t n = out.data.size() / sizeof(float);
+    auto* out_f = reinterpret_cast<float*>(out.data.data());
+    std::fill(out_f, out_f + n, std::numeric_limits<float>::quiet_NaN());
+  }
 }
 
 }  // namespace
@@ -110,22 +138,28 @@ KANGAROO_KERNEL(uniform_slice_finalize) {
   (void)nbr_inputs;
   const int bytes_per_value = unpack_bytes_per_value(params_msgpack, 4);
   const double pixel_area = unpack_pixel_area(params_msgpack, 1.0);
-  if (outputs.empty() || self_inputs.size() < 2 || pixel_area == 0.0) {
+  if (outputs.empty() || self_inputs.size() < 2) {
     return hpx::make_ready_future();
   }
 
   const auto& sum = self_inputs[0].data;
   const auto& area = self_inputs[1].data;
-  auto& out = outputs[0].data;
-  if (out.empty()) {
+  auto& out = outputs[0];
+  if (out.data.empty()) {
     return hpx::make_ready_future();
   }
+  fill_nan(out, bytes_per_value);
+  if (pixel_area == 0.0) {
+    return hpx::make_ready_future();
+  }
+
+  auto& out_data = out.data;
   const std::size_t n = std::min(sum.size(), area.size()) / sizeof(double);
   const auto* sum_d = reinterpret_cast<const double*>(sum.data());
   const auto* area_d = reinterpret_cast<const double*>(area.data());
 
   if (bytes_per_value == 8) {
-    auto* out_d = reinterpret_cast<double*>(out.data());
+    auto* out_d = reinterpret_cast<double*>(out_data.data());
     for (std::size_t i = 0; i < n; ++i) {
       if (area_d[i] == 0.0) {
         out_d[i] = std::numeric_limits<double>::quiet_NaN();
@@ -134,7 +168,7 @@ KANGAROO_KERNEL(uniform_slice_finalize) {
       }
     }
   } else if (bytes_per_value == 4) {
-    auto* out_f = reinterpret_cast<float*>(out.data());
+    auto* out_f = reinterpret_cast<float*>(out_data.data());
     for (std::size_t i = 0; i < n; ++i) {
       if (area_d[i] == 0.0) {
         out_f[i] = std::numeric_limits<float>::quiet_NaN();
