@@ -2339,16 +2339,34 @@ void register_default_kernels(KernelRegistry& registry) {
           return static_cast<std::size_t>((i * ny + j) * nz + k);
         };
 
-        auto covered = [&](int ix, int iy, int iz) -> bool {
+        std::vector<std::uint8_t> covered_mask;
+        if (!params.covered_boxes.empty()) {
+          const std::size_t block_cells = static_cast<std::size_t>(nx) *
+                                          static_cast<std::size_t>(ny) *
+                                          static_cast<std::size_t>(nz);
+          covered_mask.assign(block_cells, 0);
           for (const auto& b : params.covered_boxes) {
-            if (ix >= b.lo[0] && ix <= b.hi[0] &&
-                iy >= b.lo[1] && iy <= b.hi[1] &&
-                iz >= b.lo[2] && iz <= b.hi[2]) {
-              return true;
+            const int gx0 = std::max(box.lo.x, b.lo[0]);
+            const int gy0 = std::max(box.lo.y, b.lo[1]);
+            const int gz0 = std::max(box.lo.z, b.lo[2]);
+            const int gx1 = std::min(box.hi.x, b.hi[0]);
+            const int gy1 = std::min(box.hi.y, b.hi[1]);
+            const int gz1 = std::min(box.hi.z, b.hi[2]);
+            if (gx0 > gx1 || gy0 > gy1 || gz0 > gz1) {
+              continue;
+            }
+            for (int gx = gx0; gx <= gx1; ++gx) {
+              const int i = gx - box.lo.x;
+              for (int gy = gy0; gy <= gy1; ++gy) {
+                const int j = gy - box.lo.y;
+                for (int gz = gz0; gz <= gz1; ++gz) {
+                  const int k = gz - box.lo.z;
+                  covered_mask[in_index(i, j, k)] = 1;
+                }
+              }
             }
           }
-          return false;
-        };
+        }
 
         auto cell_edge = [&](int ax, int idx) -> double {
           return level.geom.x0[ax] + (idx - level.geom.index_origin[ax]) * level.geom.dx[ax];
@@ -2362,10 +2380,11 @@ void register_default_kernels(KernelRegistry& registry) {
           for (int j = 0; j < ny; ++j) {
             const int gy = box.lo.y + j;
             for (int k = 0; k < nz; ++k) {
-              const int gz = box.lo.z + k;
-              if (covered(gx, gy, gz)) {
+              const auto data_idx = in_index(i, j, k);
+              if (!covered_mask.empty() && covered_mask[data_idx] != 0) {
                 continue;
               }
+              const int gz = box.lo.z + k;
 
               const int a_global = axis == 0 ? gx : (axis == 1 ? gy : gz);
               const double a_cell_lo = cell_edge(axis, a_global);
@@ -2395,7 +2414,6 @@ void register_default_kernels(KernelRegistry& registry) {
               j1 = std::min(j1, out_ny - 1);
 
               double value = 0.0;
-              const auto data_idx = in_index(i, j, k);
               if (params.bytes_per_value == 4) {
                 if (data_idx * sizeof(float) < in.size()) {
                   value = reinterpret_cast<const float*>(in.data())[data_idx];
