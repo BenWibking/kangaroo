@@ -383,10 +383,38 @@ def _count_plan_tasks(plan: Plan, *, runmeta: Any) -> int:
         except Exception:
             return 1
 
+    def _graph_groups_for_template(tmpl: Any) -> int:
+        params = getattr(tmpl, "params", None)
+        if not isinstance(params, dict):
+            return 1
+        if str(params.get("graph_kind", "")) != "reduce":
+            return 1
+        try:
+            fan_in = max(1, int(params.get("fan_in", 1)))
+        except Exception:
+            fan_in = 1
+        try:
+            num_inputs = int(params.get("num_inputs", 0))
+        except Exception:
+            num_inputs = 0
+        if num_inputs <= 0:
+            input_blocks = params.get("input_blocks")
+            if input_blocks is not None:
+                try:
+                    num_inputs = len(input_blocks)
+                except Exception:
+                    num_inputs = 0
+        if num_inputs <= 0:
+            return 1
+        return max(1, (num_inputs + fan_in - 1) // fan_in)
+
     total = 0
     for stage in plan.topo_stages():
         for tmpl in stage.templates:
-            total += _blocks_for_domain(tmpl.domain)
+            if str(getattr(tmpl, "plane", getattr(stage, "plane", ""))) == "graph":
+                total += _graph_groups_for_template(tmpl)
+            else:
+                total += _blocks_for_domain(tmpl.domain)
     return total
 
 

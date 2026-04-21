@@ -8,7 +8,7 @@ import pytest
 
 from analysis.plan import Domain, FieldRef, Plan, Stage
 from analysis import runtime as runtime_mod
-from analysis.runtime import Runtime, plan_to_dict, run_console_main
+from analysis.runtime import Runtime, _count_plan_tasks, plan_to_dict, run_console_main
 
 
 class _FakeCoreRuntime:
@@ -30,6 +30,21 @@ class _FakeHandle:
 
 class _FakeRunMeta:
     _h = _FakeHandle()
+
+    class _Level:
+        def __init__(self, nboxes: int) -> None:
+            self.boxes = [object()] * nboxes
+
+    class _Step:
+        def __init__(self, nboxes: int) -> None:
+            self.levels = [
+                _FakeRunMeta._Level(nboxes),
+            ]
+
+    def __init__(self, nboxes: int = 1) -> None:
+        self.steps = [
+            _FakeRunMeta._Step(nboxes),
+        ]
 
 
 class _FakeDataset:
@@ -180,3 +195,33 @@ def test_run_console_main_waits_on_worker_locality() -> None:
     assert seen == []
     assert core.wait_called
     assert not core.release_called
+
+
+def test_count_plan_tasks_counts_graph_reduce_groups_not_level_blocks() -> None:
+    chunk_stage = Stage(name="deposit", plane="chunk")
+    chunk_stage.map_blocks(
+        name="deposit_particles",
+        kernel="deposit",
+        domain=Domain(step=0, level=0, blocks=[0, 1, 2, 3]),
+        inputs=[FieldRef(1)],
+        outputs=[FieldRef(2)],
+        output_bytes=[8],
+        deps={"kind": "None"},
+        params={},
+    )
+
+    graph_stage = Stage(name="reduce", plane="graph", after=[chunk_stage])
+    graph_stage.map_blocks(
+        name="reduce_particles",
+        kernel="reduce",
+        domain=Domain(step=0, level=0),
+        inputs=[FieldRef(2)],
+        outputs=[FieldRef(3)],
+        output_bytes=[8],
+        deps={"kind": "None"},
+        params={"graph_kind": "reduce", "fan_in": 2, "num_inputs": 4, "output_base": 0},
+    )
+
+    total = _count_plan_tasks(Plan(stages=[graph_stage]), runmeta=_FakeRunMeta(nboxes=976))
+
+    assert total == 6
