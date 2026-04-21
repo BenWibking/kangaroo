@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import numpy as np
 
-from analysis import Runtime  # noqa: E402
+from analysis import Runtime, run_console_main  # noqa: E402
 from analysis.dataset import open_dataset  # noqa: E402
 from analysis.pipeline import pipeline  # noqa: E402
 
@@ -48,90 +48,91 @@ def main() -> int:
 
     rt = Runtime.from_parsed_args(a, unknown_args=u)
 
-    base_level = 0
-    ds = open_dataset(a.plotfile, level=base_level, runtime=rt)
-    runmeta = ds.metadata_bundle().runmeta
+    def _run() -> int:
+        base_level = 0
+        ds = open_dataset(a.plotfile, level=base_level, runtime=rt)
+        runmeta = ds.metadata_bundle().runmeta
 
-    view = ds.plane_geometry(
-        axis=a.axis,
-        level=base_level,
-        zoom=a.zoom,
-        resolution=a.resolution,
-    )
-    rect = view["rect"]
-    res = view["resolution"]
-    labels = view["labels"]
-    plane = view["plane"]
-    axis_bounds = _parse_bounds(a.axis_bounds) if a.axis_bounds else view["axis_bounds"]
+        view = ds.plane_geometry(
+            axis=a.axis,
+            level=base_level,
+            zoom=a.zoom,
+            resolution=a.resolution,
+        )
+        rect = view["rect"]
+        res = view["resolution"]
+        labels = view["labels"]
+        plane = view["plane"]
+        axis_bounds = _parse_bounds(a.axis_bounds) if a.axis_bounds else view["axis_bounds"]
 
-    particle_types = ds.list_particle_types()
-    if a.particle_type not in particle_types:
-        available = ", ".join(particle_types) if particle_types else "<none>"
-        raise RuntimeError(
-            f"particle type '{a.particle_type}' not found in plotfile; available: {available}"
+        particle_types = ds.list_particle_types()
+        if a.particle_type not in particle_types:
+            available = ", ".join(particle_types) if particle_types else "<none>"
+            raise RuntimeError(
+                f"particle type '{a.particle_type}' not found in plotfile; available: {available}"
+            )
+
+        mass_max = None
+        if a.mass_max is not None:
+            if a.mass_max <= 0.0:
+                raise ValueError("--mass-max must be positive when specified")
+            msun_g = 1.98847e33
+            mass_max = a.mass_max * msun_g
+
+        pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+        out = pipe.particle_cic_projection(
+            particle_type=a.particle_type,
+            axis=a.axis,
+            axis_bounds=axis_bounds,
+            rect=rect,
+            resolution=res,
+            mass_max=mass_max,
+            out="stellar_projection",
+        )
+        pipe.run(progress_bar=True)
+
+        arr = rt.get_task_chunk_array(
+            step=0,
+            level=base_level,
+            field=out.field,
+            version=0,
+            block=0,
+            shape=res,
+            bytes_per_value=8,
+            dataset=ds,
         )
 
-    mass_max = None
-    if a.mass_max is not None:
-        if a.mass_max <= 0.0:
-            raise ValueError("--mass-max must be positive when specified")
+        nx, ny = res
+        pixel_area = abs((rect[2] - rect[0]) / nx) * abs((rect[3] - rect[1]) / ny)
+        arr = arr / pixel_area
+
         msun_g = 1.98847e33
-        mass_max = a.mass_max * msun_g
+        pc_cm = 3.0856775814913673e18
+        cgs_surface_density_to_msun_pc2 = (pc_cm**2) / msun_g
+        arr = arr * cgs_surface_density_to_msun_pc2
 
-    pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
-    out = pipe.particle_cic_projection(
-        particle_type=a.particle_type,
-        axis=a.axis,
-        axis_bounds=axis_bounds,
-        rect=rect,
-        resolution=res,
-        mass_max=mass_max,
-        out="stellar_projection",
-    )
-    pipe.run(progress_bar=True)
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import SymLogNorm
 
-    arr = rt.get_task_chunk_array(
-        step=0,
-        level=base_level,
-        field=out.field,
-        version=0,
-        block=0,
-        shape=res,
-        bytes_per_value=8,
-        dataset=ds,
-    )
+        fig, axp = plt.subplots(figsize=(6, 5))
+        kpc = 1.0e3 * pc_cm
+        extent = (rect[0] / kpc, rect[2] / kpc, rect[1] / kpc, rect[3] / kpc)
+        masked = np.ma.masked_invalid(arr)
+        vmax = np.nanmax(arr)
+        if not np.isfinite(vmax) or vmax <= 0.0:
+            vmax = 1.0
+        norm = SymLogNorm(linthresh=1.0e-2, vmin=0.0, vmax=vmax)
+        im = axp.imshow(masked, origin="lower", cmap="viridis", extent=extent, norm=norm)
+        axp.set_title(f"CIC stellar projection [{a.particle_type}] ({plane} plane)")
+        axp.set_xlabel(f"{labels[0]} [kpc]")
+        axp.set_ylabel(f"{labels[1]} [kpc]")
+        fig.colorbar(im, ax=axp, label=f"{a.particle_type} [Msun pc^-2] (symlog)")
+        fig.tight_layout()
+        fig.savefig(a.output, dpi=150) if a.output else plt.show()
 
-    nx, ny = res
-    pixel_area = abs((rect[2] - rect[0]) / nx) * abs((rect[3] - rect[1]) / ny)
-    arr = arr / pixel_area
+        return 0
 
-    msun_g = 1.98847e33
-    pc_cm = 3.0856775814913673e18
-    cgs_surface_density_to_msun_pc2 = (pc_cm**2) / msun_g
-    arr = arr * cgs_surface_density_to_msun_pc2
-
-    import matplotlib.pyplot as plt
-    from matplotlib.colors import SymLogNorm
-
-    fig, axp = plt.subplots(figsize=(6, 5))
-    kpc = 1.0e3 * pc_cm
-    extent = (rect[0] / kpc, rect[2] / kpc, rect[1] / kpc, rect[3] / kpc)
-    masked = np.ma.masked_invalid(arr)
-    vmax = np.nanmax(arr)
-    if not np.isfinite(vmax) or vmax <= 0.0:
-        vmax = 1.0
-    norm = SymLogNorm(linthresh=1.0e-2, vmin=0.0, vmax=vmax)
-    im = axp.imshow(masked, origin="lower", cmap="viridis", extent=extent, norm=norm)
-    axp.set_title(
-        f"CIC stellar projection [{a.particle_type}] ({plane} plane)"
-    )
-    axp.set_xlabel(f"{labels[0]} [kpc]")
-    axp.set_ylabel(f"{labels[1]} [kpc]")
-    fig.colorbar(im, ax=axp, label=f"{a.particle_type} [Msun pc^-2] (symlog)")
-    fig.tight_layout()
-    fig.savefig(a.output, dpi=150) if a.output else plt.show()
-
-    return 0
+    return int(run_console_main(rt, _run))
 
 
 if __name__ == "__main__":

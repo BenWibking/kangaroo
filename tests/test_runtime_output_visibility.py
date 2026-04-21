@@ -8,7 +8,7 @@ import pytest
 
 from analysis.plan import Domain, FieldRef, Plan, Stage
 from analysis import runtime as runtime_mod
-from analysis.runtime import Runtime, plan_to_dict
+from analysis.runtime import Runtime, plan_to_dict, run_console_main
 
 
 class _FakeCoreRuntime:
@@ -39,6 +39,25 @@ class _FakeDataset:
 class _ImmediateCoreRuntime:
     def run_packed_plan(self, packed, runmeta_h, dataset_h) -> None:
         return None
+
+
+class _FakeLocalityCoreRuntime:
+    def __init__(self, locality: int) -> None:
+        self._locality = locality
+        self.wait_called = False
+        self.release_called = False
+
+    def locality_id(self) -> int:
+        return self._locality
+
+    def num_localities(self) -> int:
+        return 2
+
+    def wait_for_console_release(self) -> None:
+        self.wait_called = True
+
+    def release_console_workers(self) -> None:
+        self.release_called = True
 
 
 def test_runtime_rejects_get_task_chunk_during_inflight_run() -> None:
@@ -135,3 +154,29 @@ def test_plan_to_dict_hoists_shared_covered_boxes() -> None:
     params = [tmpl["params"] for tmpl in plan_dict["stages"][0]["templates"]]
     assert all("covered_boxes" not in p for p in params)
     assert all(p["covered_boxes_ref"] == 0 for p in params)
+
+
+def test_run_console_main_executes_only_on_console_locality() -> None:
+    core = _FakeLocalityCoreRuntime(locality=0)
+    rt = Runtime(core_runtime=core)
+    seen: list[str] = []
+
+    result = run_console_main(rt, lambda: seen.append("ran") or 7)
+
+    assert result == 7
+    assert seen == ["ran"]
+    assert core.release_called
+    assert not core.wait_called
+
+
+def test_run_console_main_waits_on_worker_locality() -> None:
+    core = _FakeLocalityCoreRuntime(locality=1)
+    rt = Runtime(core_runtime=core)
+    seen: list[str] = []
+
+    result = run_console_main(rt, lambda: seen.append("ran") or 7)
+
+    assert result == 0
+    assert seen == []
+    assert core.wait_called
+    assert not core.release_called

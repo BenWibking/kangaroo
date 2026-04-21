@@ -5,6 +5,7 @@ __path__ = extend_path(__path__, __name__)
 __all__ = [
     "Runtime",
     "hpx_configuration_string",
+    "run_console_main",
     "Plan",
     "Stage",
     "TaskTemplate",
@@ -35,10 +36,14 @@ __all__ = [
 
 
 def __getattr__(name):
-    if name in {"Runtime", "hpx_configuration_string"}:
-        from .runtime import Runtime, hpx_configuration_string
+    if name in {"Runtime", "hpx_configuration_string", "run_console_main"}:
+        from .runtime import Runtime, hpx_configuration_string, run_console_main
 
-        return Runtime if name == "Runtime" else hpx_configuration_string
+        return {
+            "Runtime": Runtime,
+            "hpx_configuration_string": hpx_configuration_string,
+            "run_console_main": run_console_main,
+        }[name]
     if name in {"Plan", "Stage", "TaskTemplate", "Domain", "FieldRef"}:
         from .plan import Plan, Stage, TaskTemplate, Domain, FieldRef
 

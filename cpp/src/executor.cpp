@@ -666,10 +666,16 @@ hpx::future<void> run_block_task_remote(int32_t plan_id, int32_t stage_idx, int3
   const auto& plan = global_plan(plan_id);
   const auto& stage = plan.stages.at(stage_idx);
   const auto& tmpl = stage.templates.at(tmpl_idx);
-  DataServiceLocal data;
-  AdjacencyServiceLocal adjacency(global_runmeta());
-  return run_block_task_impl(tmpl, plan_id, stage_idx, tmpl_idx, block, global_runmeta(), data,
-                             adjacency, global_kernels());
+  const auto& meta = global_runmeta();
+  (void)global_dataset();
+  auto data = std::make_shared<DataServiceLocal>();
+  auto adjacency = std::make_shared<AdjacencyServiceLocal>(meta);
+  (void)global_kernels();
+  return run_block_task_impl(tmpl, plan_id, stage_idx, tmpl_idx, block, meta, *data,
+                             *adjacency, global_kernels())
+      .then([data = std::move(data), adjacency = std::move(adjacency)](auto&& done) mutable {
+        done.get();
+      });
 }
 
 hpx::future<void> run_graph_task_remote(int32_t plan_id, int32_t stage_idx, int32_t tmpl_idx,
@@ -677,9 +683,15 @@ hpx::future<void> run_graph_task_remote(int32_t plan_id, int32_t stage_idx, int3
   const auto& plan = global_plan(plan_id);
   const auto& stage = plan.stages.at(stage_idx);
   const auto& tmpl = stage.templates.at(tmpl_idx);
-  DataServiceLocal data;
-  return run_graph_task_impl(tmpl, plan_id, stage_idx, tmpl_idx, group_idx, global_runmeta(), data,
-                             global_kernels());
+  const auto& meta = global_runmeta();
+  (void)global_dataset();
+  auto data = std::make_shared<DataServiceLocal>();
+  (void)global_kernels();
+  return run_graph_task_impl(tmpl, plan_id, stage_idx, tmpl_idx, group_idx, meta, *data,
+                             global_kernels())
+      .then([data = std::move(data)](auto&& done) mutable {
+        done.get();
+      });
 }
 
 }  // namespace

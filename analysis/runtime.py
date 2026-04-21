@@ -46,6 +46,17 @@ def hpx_configuration_string() -> str:
     return _core.hpx_configuration_string()
 
 
+def run_console_main(runtime: "Runtime", fn: Any) -> Any:
+    locality = runtime.locality_id()
+    if locality != 0:
+        runtime.wait_for_console_release()
+        return 0
+    try:
+        return fn()
+    finally:
+        runtime.release_console_workers()
+
+
 def _log_phase_span(
     name: str,
     start: float,
@@ -211,6 +222,21 @@ class Runtime:
 
     def set_perfetto_trace_path(self, path: str) -> None:
         self._rt.set_perfetto_trace_path(path)
+
+    def locality_id(self) -> int:
+        return int(self._rt.locality_id())
+
+    def num_localities(self) -> int:
+        return int(self._rt.num_localities())
+
+    def is_console_locality(self) -> bool:
+        return self.locality_id() == 0
+
+    def wait_for_console_release(self) -> None:
+        self._rt.wait_for_console_release()
+
+    def release_console_workers(self) -> None:
+        self._rt.release_console_workers()
 
     def preload(self, *, runmeta, dataset, fields: list[int]) -> None:
         self._bind_dataset_handle(dataset)

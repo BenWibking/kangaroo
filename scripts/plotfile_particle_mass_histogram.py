@@ -10,7 +10,7 @@ import sys
 
 import numpy as np
 
-from analysis import Runtime  # noqa: E402
+from analysis import Runtime, run_console_main  # noqa: E402
 from analysis.dataset import open_dataset  # noqa: E402
 from analysis.pipeline import pipeline  # noqa: E402
 
@@ -84,29 +84,97 @@ def main() -> int:
     a, u = p.parse_known_args()
 
     rt = Runtime.from_parsed_args(a, unknown_args=u)
-    ds = open_dataset(a.plotfile, runtime=rt, step=0, level=0)
-    runmeta = ds.get_runmeta()
+    def _run() -> int:
+        ds = open_dataset(a.plotfile, runtime=rt, step=0, level=0)
+        runmeta = ds.get_runmeta()
 
-    particle_types = ds.list_particle_types()
-    if not particle_types:
-        raise RuntimeError("No particle species found in plotfile.")
-    particle_type = a.particle_type or particle_types[0]
-    if particle_type not in particle_types:
-        available = ", ".join(particle_types)
-        raise RuntimeError(
-            f"particle type '{particle_type}' not found in plotfile; available: {available}"
-        )
-    particle_fields = ds.list_particle_fields(particle_type)
-    if "mass" not in particle_fields:
-        available = ", ".join(particle_fields) if particle_fields else "<none>"
-        raise RuntimeError(
-            f"particle field 'mass' not found for '{particle_type}'; available: {available}"
-        )
+        particle_types = ds.list_particle_types()
+        if not particle_types:
+            raise RuntimeError("No particle species found in plotfile.")
+        particle_type = a.particle_type or particle_types[0]
+        if particle_type not in particle_types:
+            available = ", ".join(particle_types)
+            raise RuntimeError(
+                f"particle type '{particle_type}' not found in plotfile; available: {available}"
+            )
+        particle_fields = ds.list_particle_fields(particle_type)
+        if "mass" not in particle_fields:
+            available = ", ".join(particle_fields) if particle_fields else "<none>"
+            raise RuntimeError(
+                f"particle field 'mass' not found for '{particle_type}'; available: {available}"
+            )
 
-    topk_specified = any(arg == "--topk" or arg.startswith("--topk=") for arg in sys.argv[1:])
-    if topk_specified:
+        topk_specified = any(arg == "--topk" or arg.startswith("--topk=") for arg in sys.argv[1:])
+        if topk_specified:
+            if a.topk > 0:
+                pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+                mode_vals, mode_counts = pipe.particle_topk_modes(
+                    particle_type,
+                    "mass",
+                    k=a.topk,
+                )
+                msun_g = 1.98847e33
+                print("topk_mass_modes (value_msun,count):")
+                for v, c in zip(mode_vals, mode_counts):
+                    if not np.isfinite(v) or c <= 0:
+                        continue
+                    print(f"{v / msun_g:.8e},{int(c)}")
+            return 0
+
+        hist_range: tuple[float, float] | None = None
+        if a.hist_range:
+            r0, r1 = _parse_range(a.hist_range)
+            hist_range = (10.0**r0, 10.0**r1) if a.log_range else (r0, r1)
+        else:
+            range_pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+            mass_h = range_pipe.particle_field(particle_type, "mass")
+            rmin = range_pipe.particle_min(mass_h)
+            rmax = range_pipe.particle_max(mass_h)
+            if not np.isfinite(rmin) or not np.isfinite(rmax):
+                raise RuntimeError("Particle mass range contains non-finite values.")
+            if rmin == rmax:
+                raise RuntimeError("Particle mass range is degenerate; provide --range explicitly.")
+            hist_range = (min(rmin, rmax), max(rmin, rmax))
+        if hist_range[0] <= 0.0:
+            raise RuntimeError("Log-mass binning requires a strictly positive minimum mass.")
+
+        pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+        mass_h = pipe.particle_field(particle_type, "mass")
+        log_edges = np.linspace(
+            np.log10(hist_range[0]),
+            np.log10(hist_range[1]),
+            int(a.bins) + 1,
+        )
+        edges = np.power(10.0, log_edges)
+        edges[0] = min(edges[0], hist_range[0])
+        edges[-1] = max(edges[-1], hist_range[1])
+        edges[0] = np.nextafter(edges[0], 0.0)
+        edges[-1] = np.nextafter(edges[-1], np.inf)
+        counts, edges = pipe.particle_histogram1d(
+            mass_h,
+            bins=edges,
+            density=a.density,
+        )
+        if np.sum(counts) == 0.0:
+            verify_pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+            v_mass = verify_pipe.particle_field(particle_type, "mass")
+            in_range = verify_pipe.particle_count(
+                verify_pipe.particle_and(
+                    verify_pipe.particle_gt(v_mass, hist_range[0]),
+                    verify_pipe.particle_le(v_mass, hist_range[1]),
+                )
+            )
+            if in_range > 0:
+                print(
+                    "Warning: runtime histogram returned all zeros; "
+                    "falling back to a NumPy histogram for this run."
+                )
+                masses = v_mass.values
+                mask = np.isfinite(masses) & (masses >= hist_range[0]) & (masses <= hist_range[1])
+                masses = masses[mask]
+                counts, edges = np.histogram(masses, bins=edges, density=a.density)
+
         if a.topk > 0:
-            pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
             mode_vals, mode_counts = pipe.particle_topk_modes(
                 particle_type,
                 "mass",
@@ -118,126 +186,57 @@ def main() -> int:
                 if not np.isfinite(v) or c <= 0:
                     continue
                 print(f"{v / msun_g:.8e},{int(c)}")
+
+        log_range = (np.log10(hist_range[0]), np.log10(hist_range[1]))
+        print(
+            "particle_type="
+            f"{particle_type} bins={int(a.bins)} "
+            f"log_range=({log_range[0]:.6e}, {log_range[1]:.6e}) "
+            f"mass_range=({hist_range[0]:.6e}, {hist_range[1]:.6e})"
+        )
+        print("bin_lo,bin_hi,count")
+        for lo, hi, count in zip(edges[:-1], edges[1:], counts):
+            print(f"{lo:.8e},{hi:.8e},{count:.8e}")
+
+        if a.output:
+            out_path = Path(a.output)
+            if out_path.suffix == ".npz":
+                np.savez(out_path, edges=edges, counts=counts)
+            else:
+                _write_csv(out_path, edges, counts)
+
+        if np.sum(counts) == 0.0:
+            print(
+                "Warning: histogram counts are all zero; check --range/--log-range "
+                "and that particle masses fall within the selected range."
+            )
+
+        if not a.no_plot:
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(6, 4))
+            widths = np.diff(edges)
+            ax.bar(edges[:-1], counts, width=widths, align="edge", edgecolor="black")
+            msun_g = 1.98847e33
+            ax.set_xlabel("particle mass [Msun]")
+            ax.set_ylabel("count" if not a.density else "density")
+            ax.set_title(f"Particle mass histogram ({particle_type})")
+            if np.any(edges <= 0.0):
+                raise RuntimeError("Log-scaled histogram requires positive mass bin edges.")
+            ax.set_xscale("log")
+            if np.all(counts > 0.0):
+                ax.set_yscale("log")
+            else:
+                ax.set_yscale("symlog", linthresh=1.0)
+            ticks = ax.get_xticks()
+            if ticks.size:
+                ax.set_xticklabels([f"{t / msun_g:g}" for t in ticks])
+            fig.tight_layout()
+            fig.savefig(a.plot_output, dpi=150)
+
         return 0
 
-    hist_range: tuple[float, float] | None = None
-    if a.hist_range:
-        r0, r1 = _parse_range(a.hist_range)
-        if a.log_range:
-            hist_range = (10.0**r0, 10.0**r1)
-        else:
-            hist_range = (r0, r1)
-    else:
-        range_pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
-        mass_h = range_pipe.particle_field(particle_type, "mass")
-        rmin = range_pipe.particle_min(mass_h)
-        rmax = range_pipe.particle_max(mass_h)
-        if not np.isfinite(rmin) or not np.isfinite(rmax):
-            raise RuntimeError("Particle mass range contains non-finite values.")
-        if rmin == rmax:
-            raise RuntimeError("Particle mass range is degenerate; provide --range explicitly.")
-        hist_range = (min(rmin, rmax), max(rmin, rmax))
-    if hist_range[0] <= 0.0:
-        raise RuntimeError("Log-mass binning requires a strictly positive minimum mass.")
-
-    pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
-    mass_h = pipe.particle_field(particle_type, "mass")
-    log_edges = np.linspace(
-        np.log10(hist_range[0]),
-        np.log10(hist_range[1]),
-        int(a.bins) + 1,
-    )
-    edges = np.power(10.0, log_edges)
-    # Guard against floating-point rounding excluding min/max from the edge range.
-    edges[0] = min(edges[0], hist_range[0])
-    edges[-1] = max(edges[-1], hist_range[1])
-    edges[0] = np.nextafter(edges[0], 0.0)
-    edges[-1] = np.nextafter(edges[-1], np.inf)
-    counts, edges = pipe.particle_histogram1d(
-        mass_h,
-        bins=edges,
-        density=a.density,
-    )
-    if np.sum(counts) == 0.0:
-        verify_pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
-        v_mass = verify_pipe.particle_field(particle_type, "mass")
-        in_range = verify_pipe.particle_count(
-            verify_pipe.particle_and(
-                verify_pipe.particle_gt(v_mass, hist_range[0]),
-                verify_pipe.particle_le(v_mass, hist_range[1]),
-            )
-        )
-        if in_range > 0:
-            print(
-                "Warning: runtime histogram returned all zeros; "
-                "falling back to a NumPy histogram for this run."
-            )
-            masses = v_mass.values
-            mask = np.isfinite(masses) & (masses >= hist_range[0]) & (masses <= hist_range[1])
-            masses = masses[mask]
-            counts, edges = np.histogram(masses, bins=edges, density=a.density)
-
-    if a.topk > 0:
-        mode_vals, mode_counts = pipe.particle_topk_modes(
-            particle_type,
-            "mass",
-            k=a.topk,
-        )
-        msun_g = 1.98847e33
-        print("topk_mass_modes (value_msun,count):")
-        for v, c in zip(mode_vals, mode_counts):
-            if not np.isfinite(v) or c <= 0:
-                continue
-            print(f"{v / msun_g:.8e},{int(c)}")
-
-    log_range = (np.log10(hist_range[0]), np.log10(hist_range[1]))
-    print(
-        "particle_type="
-        f"{particle_type} bins={int(a.bins)} "
-        f"log_range=({log_range[0]:.6e}, {log_range[1]:.6e}) "
-        f"mass_range=({hist_range[0]:.6e}, {hist_range[1]:.6e})"
-    )
-    print("bin_lo,bin_hi,count")
-    for lo, hi, count in zip(edges[:-1], edges[1:], counts):
-        print(f"{lo:.8e},{hi:.8e},{count:.8e}")
-
-    if a.output:
-        out_path = Path(a.output)
-        if out_path.suffix == ".npz":
-            np.savez(out_path, edges=edges, counts=counts)
-        else:
-            _write_csv(out_path, edges, counts)
-
-    if np.sum(counts) == 0.0:
-        print(
-            "Warning: histogram counts are all zero; check --range/--log-range "
-            "and that particle masses fall within the selected range."
-        )
-
-    if not a.no_plot:
-        import matplotlib.pyplot as plt
-
-        fig, ax = plt.subplots(figsize=(6, 4))
-        widths = np.diff(edges)
-        ax.bar(edges[:-1], counts, width=widths, align="edge", edgecolor="black")
-        msun_g = 1.98847e33
-        ax.set_xlabel("particle mass [Msun]")
-        ax.set_ylabel("count" if not a.density else "density")
-        ax.set_title(f"Particle mass histogram ({particle_type})")
-        if np.any(edges <= 0.0):
-            raise RuntimeError("Log-scaled histogram requires positive mass bin edges.")
-        ax.set_xscale("log")
-        if np.all(counts > 0.0):
-            ax.set_yscale("log")
-        else:
-            ax.set_yscale("symlog", linthresh=1.0)
-        ticks = ax.get_xticks()
-        if ticks.size:
-            ax.set_xticklabels([f"{t / msun_g:g}" for t in ticks])
-        fig.tight_layout()
-        fig.savefig(a.plot_output, dpi=150)
-
-    return 0
+    return int(run_console_main(rt, _run))
 
 
 if __name__ == "__main__":

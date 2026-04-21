@@ -289,6 +289,12 @@ NB_MODULE(_core, m) {
       .def("kernels", &kangaroo::Runtime::kernels, nb::rv_policy::reference)
       .def("set_event_log_path", &kangaroo::Runtime::set_event_log_path)
       .def("set_perfetto_trace_path", &kangaroo::Runtime::set_perfetto_trace_path)
+      .def("locality_id", &kangaroo::Runtime::locality_id)
+      .def("num_localities", &kangaroo::Runtime::num_localities)
+      .def("wait_for_console_release",
+           &kangaroo::Runtime::wait_for_console_release,
+           nb::call_guard<nb::gil_scoped_release>())
+      .def("release_console_workers", &kangaroo::Runtime::release_console_workers)
       .def("get_task_chunk",
            [](kangaroo::Runtime& self, int32_t step, int16_t level, int32_t field,
               int32_t version, int32_t block) {

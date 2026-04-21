@@ -67,6 +67,9 @@ bool g_perfetto_trace_enabled = false;
 std::atomic<int32_t> g_active_plan_runs{0};
 std::atomic<int32_t> g_locality_hint{-1};
 std::atomic<int32_t> g_perfetto_metrics_active_runs{0};
+std::mutex g_console_release_mutex;
+std::condition_variable g_console_release_cv;
+bool g_console_release_requested = false;
 
 struct ActivePlanRunGuard {
   ActivePlanRunGuard() { g_active_plan_runs.fetch_add(1, std::memory_order_acq_rel); }
@@ -4975,6 +4978,14 @@ void preload_action(const RunMeta& meta,
   DataServiceLocal::preload(meta, dataset, fields);
 }
 
+void release_console_worker_action() {
+  {
+    std::lock_guard<std::mutex> lock(g_console_release_mutex);
+    g_console_release_requested = true;
+  }
+  g_console_release_cv.notify_all();
+}
+
 }  // namespace kangaroo
 
 HPX_PLAIN_ACTION(kangaroo::set_runmeta_action, kangaroo_set_runmeta_action)
@@ -4986,6 +4997,7 @@ HPX_PLAIN_ACTION(kangaroo::set_event_log_action, kangaroo_set_event_log_action)
 HPX_PLAIN_ACTION(kangaroo::set_perfetto_trace_action, kangaroo_set_perfetto_trace_action)
 HPX_PLAIN_ACTION(kangaroo::set_perfetto_metrics_sampling_active_action,
                  kangaroo_set_perfetto_metrics_sampling_active_action)
+HPX_PLAIN_ACTION(kangaroo::release_console_worker_action, kangaroo_release_console_worker_action)
 
 namespace kangaroo {
 
@@ -5260,6 +5272,40 @@ HostView Runtime::get_task_chunk(int32_t step,
   DataServiceLocal data;
   ChunkRef ref{step, level, field, version, block};
   return data.get_host(ref).get();
+}
+
+int32_t Runtime::locality_id() {
+  ensure_hpx_started();
+  return static_cast<int32_t>(hpx::get_locality_id());
+}
+
+int32_t Runtime::num_localities() {
+  ensure_hpx_started();
+  return static_cast<int32_t>(hpx::find_all_localities().size());
+}
+
+void Runtime::wait_for_console_release() {
+  ensure_hpx_started();
+  if (hpx::get_locality_id() == 0) {
+    return;
+  }
+  std::unique_lock<std::mutex> lock(g_console_release_mutex);
+  g_console_release_cv.wait(lock, []() { return g_console_release_requested; });
+}
+
+void Runtime::release_console_workers() {
+  ensure_hpx_started();
+  {
+    std::lock_guard<std::mutex> lock(g_console_release_mutex);
+    g_console_release_requested = true;
+  }
+  g_console_release_cv.notify_all();
+
+  auto localities = hpx::find_all_localities();
+  if (localities.size() <= 1) {
+    return;
+  }
+  hpx::lcos::broadcast<::kangaroo_release_console_worker_action>(localities).get();
 }
 
 }  // namespace kangaroo

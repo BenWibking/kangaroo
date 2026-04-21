@@ -144,6 +144,11 @@ class Runtime {
                           int32_t version,
                           int32_t block);
 
+  int32_t locality_id();
+  int32_t num_localities();
+  void wait_for_console_release();
+  void release_console_workers();
+
   void set_event_log_path(const std::string& path);
   void set_perfetto_trace_path(const std::string& path);
 
