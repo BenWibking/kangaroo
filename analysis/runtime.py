@@ -272,6 +272,9 @@ def plan_to_dict(plan: Plan) -> dict:
     stages = []
     topo = plan.topo_stages()
     stage_ids = {id(s): i for i, s in enumerate(topo)}
+    shared_covered_boxes: list[Any] = []
+    shared_covered_boxes_by_objid: dict[int, int] = {}
+    shared_covered_boxes_by_key: dict[str, int] = {}
 
     def domain_to_dict(domain) -> dict:
         return {
@@ -279,6 +282,24 @@ def plan_to_dict(plan: Plan) -> dict:
             "level": domain.level,
             "blocks": list(domain.blocks) if domain.blocks is not None else None,
         }
+
+    def params_to_dict(params: dict[str, Any]) -> dict[str, Any]:
+        if "covered_boxes" not in params:
+            return params
+        covered_boxes = params["covered_boxes"]
+        shared_idx = shared_covered_boxes_by_objid.get(id(covered_boxes))
+        if shared_idx is None:
+            key = json.dumps(covered_boxes, separators=(",", ":"))
+            shared_idx = shared_covered_boxes_by_key.get(key)
+            if shared_idx is None:
+                shared_idx = len(shared_covered_boxes)
+                shared_covered_boxes.append(covered_boxes)
+                shared_covered_boxes_by_key[key] = shared_idx
+            shared_covered_boxes_by_objid[id(covered_boxes)] = shared_idx
+        out = dict(params)
+        out.pop("covered_boxes", None)
+        out["covered_boxes_ref"] = shared_idx
+        return out
 
     for stage in topo:
         stages.append(
@@ -308,13 +329,16 @@ def plan_to_dict(plan: Plan) -> dict:
                         ],
                         "output_bytes": list(tmpl.output_bytes),
                         "deps": tmpl.deps,
-                        "params": tmpl.params,
+                        "params": params_to_dict(tmpl.params),
                     }
                     for tmpl in stage.templates
                 ],
             }
         )
-    return {"stages": stages}
+    plan_dict = {"stages": stages}
+    if shared_covered_boxes:
+        plan_dict["shared_covered_boxes"] = shared_covered_boxes
+    return plan_dict
 
 
 def _count_plan_tasks(plan: Plan, *, runmeta: Any) -> int:

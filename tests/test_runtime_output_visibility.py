@@ -6,9 +6,9 @@ import time
 
 import pytest
 
-from analysis.plan import Plan
+from analysis.plan import Domain, FieldRef, Plan, Stage
 from analysis import runtime as runtime_mod
-from analysis.runtime import Runtime
+from analysis.runtime import Runtime, plan_to_dict
 
 
 class _FakeCoreRuntime:
@@ -107,3 +107,31 @@ def test_runtime_writes_dashboard_plan_only_when_configured(
     rt.run(plan, runmeta=_FakeRunMeta(), dataset=_FakeDataset())
     assert plan_path.exists()
     assert json.loads(plan_path.read_text(encoding="utf-8")) == {"stages": []}
+
+
+def test_plan_to_dict_hoists_shared_covered_boxes() -> None:
+    shared_boxes = [[[0, 0, 0], [3, 3, 3]], [[4, 0, 0], [7, 3, 3]]]
+    stage = Stage(name="projection")
+    domain = Domain(step=0, level=0, blocks=[0])
+    for block in (0, 1):
+        stage.map_blocks(
+            name=f"uniform_projection_b{block}",
+            kernel="uniform_projection_accumulate",
+            domain=Domain(step=0, level=0, blocks=[block]),
+            inputs=[FieldRef(1, domain=domain)],
+            outputs=[FieldRef(2)],
+            output_bytes=[128],
+            deps={"kind": "None"},
+            params={
+                "axis": 2,
+                "resolution": [8, 8],
+                "covered_boxes": shared_boxes,
+            },
+        )
+
+    plan_dict = plan_to_dict(Plan(stages=[stage]))
+
+    assert plan_dict["shared_covered_boxes"] == [shared_boxes]
+    params = [tmpl["params"] for tmpl in plan_dict["stages"][0]["templates"]]
+    assert all("covered_boxes" not in p for p in params)
+    assert all(p["covered_boxes_ref"] == 0 for p in params)
