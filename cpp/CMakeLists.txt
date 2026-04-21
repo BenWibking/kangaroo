@@ -71,6 +71,7 @@ if(KANGAROO_USE_OPENPMD)
 endif()
 
 add_library(kangaroo_runtime STATIC ${KANGAROO_RUNTIME_SOURCES})
+set_target_properties(kangaroo_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set(KANGAROO_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
 set(KANGAROO_PROTO_GEN_DIR "${CMAKE_CURRENT_BINARY_DIR}/generated")
@@ -161,6 +162,7 @@ target_compile_definitions(_core PRIVATE KANGAROO_USE_NANOBIND)
 add_library(kangaroo_plotfile STATIC
   src/plotfile_reader.cpp
 )
+set_target_properties(kangaroo_plotfile PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 target_include_directories(kangaroo_plotfile PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}/include

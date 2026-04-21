@@ -13,19 +13,31 @@ find_from_prefix() {
   return 1
 }
 
+find_from_cmake_prefix_path() {
+  local prefix
+  IFS=':' read -r -a _prefixes <<< "${CMAKE_PREFIX_PATH:-}"
+  for prefix in "${_prefixes[@]}"; do
+    [[ -n "$prefix" ]] || continue
+    if find_from_prefix "$prefix"; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 if [[ -n "${HPX_DIR:-}" ]]; then
   echo "$HPX_DIR"
   exit 0
 fi
 
-if [[ -n "${CONDA_PREFIX:-}" ]]; then
-  if find_from_prefix "$CONDA_PREFIX"; then
+if [[ -n "${OLCF_HPX_ROOT:-}" ]]; then
+  if find_from_prefix "$OLCF_HPX_ROOT"; then
     exit 0
   fi
 fi
 
-if [[ -n "${VIRTUAL_ENV:-}" ]]; then
-  if find_from_prefix "$VIRTUAL_ENV"; then
+if [[ -n "${CMAKE_PREFIX_PATH:-}" ]]; then
+  if find_from_cmake_prefix_path; then
     exit 0
   fi
 fi
@@ -40,6 +52,18 @@ fi
 if command -v hpxcxx >/dev/null 2>&1; then
   prefix="$(dirname "$(dirname "$(command -v hpxcxx)")")"
   if find_from_prefix "$prefix"; then
+    exit 0
+  fi
+fi
+
+if [[ -n "${CONDA_PREFIX:-}" ]]; then
+  if find_from_prefix "$CONDA_PREFIX"; then
+    exit 0
+  fi
+fi
+
+if [[ -n "${VIRTUAL_ENV:-}" ]]; then
+  if find_from_prefix "$VIRTUAL_ENV"; then
     exit 0
   fi
 fi
