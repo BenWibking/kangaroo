@@ -229,6 +229,36 @@ NB_MODULE(_core, m) {
         nb::arg("end") = nb::none(),
         nb::arg("id") = nb::none(),
         nb::arg("worker_label") = nb::none());
+  m.def("log_phase_event",
+        [](const std::string& name,
+           const std::string& status,
+           nb::object start_obj,
+           nb::object end_obj,
+           nb::object category_obj,
+           nb::object worker_label_obj,
+           nb::object locality_obj) {
+          kangaroo::PhaseEvent event;
+          event.name = name;
+          event.category = category_obj.is_none() ? "kangaroo.phase" : nb::cast<std::string>(category_obj);
+          event.status = status;
+          event.locality = locality_obj.is_none() ? 0 : nb::cast<int32_t>(locality_obj);
+          event.worker = -1;
+          event.worker_label = worker_label_obj.is_none() ? "python" : nb::cast<std::string>(worker_label_obj);
+
+          double start = start_obj.is_none() ? now_seconds() : nb::cast<double>(start_obj);
+          double end = end_obj.is_none() ? start : nb::cast<double>(end_obj);
+          event.ts = end;
+          event.start = start;
+          event.end = end;
+          kangaroo::log_phase_event(event);
+        },
+        nb::arg("name"),
+        nb::arg("status"),
+        nb::arg("start") = nb::none(),
+        nb::arg("end") = nb::none(),
+        nb::arg("category") = nb::none(),
+        nb::arg("worker_label") = nb::none(),
+        nb::arg("locality") = nb::none());
 
   nb::class_<kangaroo::Runtime>(m, "Runtime")
       .def(nb::init<>())

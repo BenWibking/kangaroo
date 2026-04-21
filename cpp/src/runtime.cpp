@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <atomic>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <condition_variable>
@@ -150,7 +151,7 @@ std::string json_escape(const std::string& value);
 struct EventLogWorker {
   std::mutex mutex;
   std::condition_variable cv;
-  std::deque<TaskEvent> queue;
+  std::deque<std::variant<TaskEvent, PhaseEvent>> queue;
   std::thread thread;
   bool running = false;
   bool stop = false;
@@ -192,11 +193,22 @@ struct EventLogWorker {
     cv.notify_one();
   }
 
+  void enqueue(PhaseEvent event) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!enabled) {
+        return;
+      }
+      queue.push_back(std::variant<TaskEvent, PhaseEvent>{std::move(event)});
+    }
+    cv.notify_one();
+  }
+
   void run() {
     std::ofstream out;
     std::string active_path;
     for (;;) {
-      TaskEvent event;
+      std::variant<TaskEvent, PhaseEvent> item;
       {
         std::unique_lock<std::mutex> lock(mutex);
         cv.wait(lock, [&] {
@@ -215,7 +227,7 @@ struct EventLogWorker {
         if (queue.empty()) {
           continue;
         }
-        event = std::move(queue.front());
+        item = std::move(queue.front());
         queue.pop_front();
       }
       if (!out) {
@@ -224,34 +236,57 @@ struct EventLogWorker {
       auto write_string = [&](const char* key, const std::string& value) {
         out << '"' << key << "\":\"" << json_escape(value) << '"';
       };
-      out << '{';
-      out << "\"type\":\"task\",";
-      write_string("id", event.id);
-      out << ',';
-      write_string("name", event.name);
-      out << ',';
-      write_string("kernel", event.kernel);
-      out << ',';
-      write_string("plane", event.plane);
-      out << ',';
-      write_string("status", event.status);
-      out << ",\"stage\":" << event.stage;
-      out << ",\"template\":" << event.template_index;
-      out << ",\"block\":" << event.block;
-      out << ",\"step\":" << event.step;
-      out << ",\"level\":" << event.level;
-      out << ",\"locality\":" << event.locality;
-      if (!event.worker_label.empty()) {
-        out << ',';
-        write_string("worker", event.worker_label);
-      } else {
-        out << ",\"worker\":\"worker-" << event.worker << '"';
-      }
       out << std::fixed << std::setprecision(6);
-      out << ",\"ts\":" << event.ts;
-      out << ",\"start\":" << event.start;
-      out << ",\"end\":" << event.end;
-      out << "}\n";
+      if (std::holds_alternative<TaskEvent>(item)) {
+        const auto& event = std::get<TaskEvent>(item);
+        out << '{';
+        out << "\"type\":\"task\",";
+        write_string("id", event.id);
+        out << ',';
+        write_string("name", event.name);
+        out << ',';
+        write_string("kernel", event.kernel);
+        out << ',';
+        write_string("plane", event.plane);
+        out << ',';
+        write_string("status", event.status);
+        out << ",\"stage\":" << event.stage;
+        out << ",\"template\":" << event.template_index;
+        out << ",\"block\":" << event.block;
+        out << ",\"step\":" << event.step;
+        out << ",\"level\":" << event.level;
+        out << ",\"locality\":" << event.locality;
+        if (!event.worker_label.empty()) {
+          out << ',';
+          write_string("worker", event.worker_label);
+        } else {
+          out << ",\"worker\":\"worker-" << event.worker << '"';
+        }
+        out << ",\"ts\":" << event.ts;
+        out << ",\"start\":" << event.start;
+        out << ",\"end\":" << event.end;
+        out << "}\n";
+      } else {
+        const auto& event = std::get<PhaseEvent>(item);
+        out << '{';
+        out << "\"type\":\"phase\",";
+        write_string("name", event.name);
+        out << ',';
+        write_string("category", event.category);
+        out << ',';
+        write_string("status", event.status);
+        out << ",\"locality\":" << event.locality;
+        if (!event.worker_label.empty()) {
+          out << ',';
+          write_string("worker", event.worker_label);
+        } else {
+          out << ",\"worker\":\"worker-" << event.worker << '"';
+        }
+        out << ",\"ts\":" << event.ts;
+        out << ",\"start\":" << event.start;
+        out << ",\"end\":" << event.end;
+        out << "}\n";
+      }
       out.flush();
     }
   }
@@ -277,7 +312,7 @@ struct MetricEvent {
   int32_t locality = -1;
 };
 
-using PerfettoEvent = std::variant<TaskEvent, MetricEvent>;
+using PerfettoEvent = std::variant<TaskEvent, PhaseEvent, MetricEvent>;
 
 uint64_t hash_u64(std::string_view s) {
   uint64_t h = 1469598103934665603ull;
@@ -341,6 +376,16 @@ std::string task_worker_name(const TaskEvent& event) {
     return "worker-" + std::to_string(event.worker);
   }
   return "worker-0";
+}
+
+std::string phase_worker_name(const PhaseEvent& event) {
+  if (!event.worker_label.empty()) {
+    return event.worker_label;
+  }
+  if (event.worker >= 0) {
+    return "worker-" + std::to_string(event.worker);
+  }
+  return "runtime";
 }
 
 std::filesystem::path perfetto_locality_path(const std::string& base_path, int32_t locality) {
@@ -417,6 +462,17 @@ struct PerfettoTraceWorker {
     cv.notify_one();
   }
 
+  void enqueue_phase(PhaseEvent event) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!enabled) {
+        return;
+      }
+      queue.push_back(PerfettoEvent{std::move(event)});
+    }
+    cv.notify_one();
+  }
+
   static uint32_t sequence_id_for_locality(int32_t locality) {
     return static_cast<uint32_t>(std::max(0, locality) + 1);
   }
@@ -433,6 +489,18 @@ struct PerfettoTraceWorker {
       worker_bits = static_cast<uint64_t>(static_cast<uint32_t>(event.worker));
     } else {
       worker_bits = hash_u64(task_worker_name(event)) & 0xffffffffULL;
+    }
+    return mix_u64(seed ^ worker_bits);
+  }
+
+  static uint64_t thread_track_uuid_for_phase(const PhaseEvent& event) {
+    uint64_t seed = 0x2000000000000000ULL;
+    seed ^= static_cast<uint64_t>(static_cast<uint32_t>(std::max(0, event.locality))) << 32;
+    uint64_t worker_bits = 0;
+    if (event.worker >= 0) {
+      worker_bits = static_cast<uint64_t>(static_cast<uint32_t>(event.worker));
+    } else {
+      worker_bits = hash_u64(phase_worker_name(event)) & 0xffffffffULL;
     }
     return mix_u64(seed ^ worker_bits);
   }
@@ -507,6 +575,26 @@ struct PerfettoTraceWorker {
     emit_packet(out, packet, false);
   }
 
+  void emit_thread_descriptor(std::ofstream& out,
+                              uint32_t seq_id,
+                              uint64_t process_track_uuid,
+                              uint64_t thread_track_uuid,
+                              const PhaseEvent& event) {
+    perfetto::protos::TracePacket packet;
+    packet.set_trusted_packet_sequence_id(seq_id);
+    auto* td = packet.mutable_track_descriptor();
+    td->set_uuid(thread_track_uuid);
+    td->set_parent_uuid(process_track_uuid);
+    td->set_name(phase_worker_name(event));
+    auto* th = td->mutable_thread();
+    const int32_t locality = std::max(0, event.locality);
+    th->set_pid(std::max(1, static_cast<int>(::getpid())));
+    th->set_tid(locality * 10000 +
+                static_cast<int32_t>(hash_u64(phase_worker_name(event)) % 9000ULL) + 1);
+    th->set_thread_name(phase_worker_name(event));
+    emit_packet(out, packet, false);
+  }
+
   void emit_counter_descriptor(std::ofstream& out,
                                uint32_t seq_id,
                                uint64_t process_track_uuid,
@@ -570,6 +658,36 @@ struct PerfettoTraceWorker {
     te->set_type(perfetto::protos::TrackEvent::TYPE_COUNTER);
     te->set_track_uuid(counter_track_uuid);
     te->set_double_counter_value(event.value);
+    emit_packet(out, packet, true);
+  }
+
+  void emit_phase_event(std::ofstream& out,
+                        uint32_t seq_id,
+                        uint64_t track_uuid,
+                        const PhaseEvent& event) {
+    perfetto::protos::TracePacket packet;
+    packet.set_trusted_packet_sequence_id(seq_id);
+    const bool is_start = event.status == "start";
+    uint64_t ts_ns = is_start ? to_ns(event.start > 0.0 ? event.start : event.ts)
+                              : to_ns(event.end > 0.0 ? event.end : event.ts);
+    packet.set_timestamp(ts_ns);
+    auto* te = packet.mutable_track_event();
+    te->set_track_uuid(track_uuid);
+    if (is_start) {
+      te->set_type(perfetto::protos::TrackEvent::TYPE_SLICE_BEGIN);
+      te->add_categories(event.category.empty() ? "kangaroo.phase" : event.category);
+      te->set_name(event.name);
+      add_string_arg(te, "category", event.category);
+      add_string_arg(te, "status", event.status);
+      add_string_arg(te, "worker", phase_worker_name(event));
+      add_int_arg(te, "locality", event.locality);
+      add_int_arg(te, "worker_index", event.worker);
+    } else {
+      te->set_type(perfetto::protos::TrackEvent::TYPE_SLICE_END);
+      if (event.status == "error") {
+        add_string_arg(te, "status", "error");
+      }
+    }
     emit_packet(out, packet, true);
   }
 
@@ -659,6 +777,14 @@ struct PerfettoTraceWorker {
           emitted_thread_tracks.emplace(thread_track_uuid, true);
         }
         emit_task_event(out, seq_id, thread_track_uuid, event);
+      } else if (std::holds_alternative<PhaseEvent>(item)) {
+        const PhaseEvent& event = std::get<PhaseEvent>(item);
+        const uint64_t thread_track_uuid = thread_track_uuid_for_phase(event);
+        if (emitted_thread_tracks.find(thread_track_uuid) == emitted_thread_tracks.end()) {
+          emit_thread_descriptor(out, seq_id, process_track_uuid, thread_track_uuid, event);
+          emitted_thread_tracks.emplace(thread_track_uuid, true);
+        }
+        emit_phase_event(out, seq_id, thread_track_uuid, event);
       } else {
         const MetricEvent& event = std::get<MetricEvent>(item);
         const uint64_t counter_track_uuid = counter_track_uuid_for_metric(active_locality, event.name);
@@ -4960,33 +5086,112 @@ void log_task_event(const TaskEvent& event) {
   }
 }
 
+void log_phase_event(const PhaseEvent& event) {
+  const bool json_enabled = has_event_log();
+  const bool perfetto_enabled = has_perfetto_trace();
+  if (!json_enabled && !perfetto_enabled) {
+    return;
+  }
+  if (json_enabled) {
+    g_event_log_worker.enqueue(event);
+  }
+  if (perfetto_enabled) {
+    g_perfetto_trace_worker.enqueue_phase(event);
+  }
+}
+
 void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
                               const RunMetaHandle& runmeta,
                               const DatasetHandle& dataset) {
   ensure_hpx_started();
   g_locality_hint.store(static_cast<int32_t>(hpx::get_locality_id()), std::memory_order_release);
   ActivePlanRunGuard active_run_guard;
-  PlanIR plan = decode_plan_msgpack(std::span<const std::uint8_t>(packed.data(), packed.size()));
+
+  auto now_seconds = []() {
+    auto now = std::chrono::system_clock::now();
+    return std::chrono::duration<double>(now.time_since_epoch()).count();
+  };
+  auto emit_phase_span = [&](std::string_view name,
+                             std::string_view category,
+                             double start,
+                             double end,
+                             const std::string& worker_label = "runtime-main") {
+    const int32_t locality = std::max(0, g_locality_hint.load(std::memory_order_acquire));
+    PhaseEvent start_event;
+    start_event.name = std::string(name);
+    start_event.category = std::string(category);
+    start_event.status = "start";
+    start_event.locality = locality;
+    start_event.worker = -1;
+    start_event.worker_label = worker_label;
+    start_event.ts = start;
+    start_event.start = start;
+    start_event.end = start;
+    log_phase_event(start_event);
+
+    PhaseEvent end_event = start_event;
+    end_event.status = "end";
+    end_event.ts = end;
+    end_event.start = start;
+    end_event.end = end;
+    log_phase_event(end_event);
+  };
+  auto timed_phase = [&](std::string_view name, std::string_view category, auto&& fn) {
+    const double start = now_seconds();
+    decltype(auto) result = fn();
+    const double end = now_seconds();
+    emit_phase_span(name, category, start, end);
+    return result;
+  };
+
+  PlanIR plan = timed_phase("runtime_decode_plan_msgpack", "kangaroo.runtime.setup", [&]() {
+    return decode_plan_msgpack(std::span<const std::uint8_t>(packed.data(), packed.size()));
+  });
 
   auto localities = hpx::find_all_localities();
   if (has_event_log()) {
-    hpx::lcos::broadcast<::kangaroo_set_event_log_action>(localities, event_log_path()).get();
+    timed_phase("runtime_broadcast_event_log", "kangaroo.runtime.setup", [&]() {
+      hpx::lcos::broadcast<::kangaroo_set_event_log_action>(localities, event_log_path()).get();
+      return 0;
+    });
   }
   if (has_perfetto_trace()) {
-    hpx::lcos::broadcast<::kangaroo_set_perfetto_trace_action>(localities, perfetto_trace_path()).get();
-    hpx::lcos::broadcast<::kangaroo_set_perfetto_metrics_sampling_active_action>(localities, true).get();
+    timed_phase("runtime_broadcast_perfetto_trace", "kangaroo.runtime.setup", [&]() {
+      hpx::lcos::broadcast<::kangaroo_set_perfetto_trace_action>(localities, perfetto_trace_path()).get();
+      return 0;
+    });
+    timed_phase("runtime_enable_perfetto_metrics", "kangaroo.runtime.setup", [&]() {
+      hpx::lcos::broadcast<::kangaroo_set_perfetto_metrics_sampling_active_action>(localities, true).get();
+      return 0;
+    });
   }
-  hpx::lcos::broadcast<::kangaroo_set_runmeta_action>(localities, runmeta.meta).get();
-  hpx::lcos::broadcast<::kangaroo_set_dataset_action>(localities, dataset).get();
+  timed_phase("runtime_broadcast_runmeta", "kangaroo.runtime.setup", [&]() {
+    hpx::lcos::broadcast<::kangaroo_set_runmeta_action>(localities, runmeta.meta).get();
+    return 0;
+  });
+  timed_phase("runtime_broadcast_dataset", "kangaroo.runtime.setup", [&]() {
+    hpx::lcos::broadcast<::kangaroo_set_dataset_action>(localities, dataset).get();
+    return 0;
+  });
   int32_t plan_id = next_plan_id_++;
-  hpx::lcos::broadcast<::kangaroo_set_plan_action>(localities, plan_id, plan).get();
+  timed_phase("runtime_broadcast_plan", "kangaroo.runtime.setup", [&]() {
+    hpx::lcos::broadcast<::kangaroo_set_plan_action>(localities, plan_id, plan).get();
+    return 0;
+  });
 
   auto erase_plan = [&]() {
-    hpx::lcos::broadcast<::kangaroo_erase_plan_action>(localities, plan_id).get();
+    timed_phase("runtime_erase_plan", "kangaroo.runtime.cleanup", [&]() {
+      hpx::lcos::broadcast<::kangaroo_erase_plan_action>(localities, plan_id).get();
+      return 0;
+    });
   };
   auto stop_perfetto_sampling = [&]() {
     if (has_perfetto_trace()) {
-      hpx::lcos::broadcast<::kangaroo_set_perfetto_metrics_sampling_active_action>(localities, false).get();
+      timed_phase("runtime_disable_perfetto_metrics", "kangaroo.runtime.cleanup", [&]() {
+        hpx::lcos::broadcast<::kangaroo_set_perfetto_metrics_sampling_active_action>(localities, false)
+            .get();
+        return 0;
+      });
     }
   };
 
@@ -4994,7 +5199,10 @@ void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
     DataServiceLocal data;
     AdjacencyServiceLocal adjacency(runmeta.meta);
     Executor executor(plan_id, runmeta.meta, data, adjacency, kernel_registry_);
-    executor.run(plan).get();
+    timed_phase("runtime_execute_plan", "kangaroo.runtime.execute", [&]() {
+      executor.run(plan).get();
+      return 0;
+    });
   } catch (...) {
     try {
       erase_plan();

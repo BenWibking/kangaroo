@@ -46,6 +46,37 @@ def hpx_configuration_string() -> str:
     return _core.hpx_configuration_string()
 
 
+def _log_phase_span(
+    name: str,
+    start: float,
+    end: float,
+    *,
+    category: str = "kangaroo.python.setup",
+    worker_label: str = "python-main",
+    locality: int = 0,
+) -> None:
+    if not hasattr(_core, "log_phase_event"):
+        return
+    _core.log_phase_event(
+        name,
+        "start",
+        start,
+        start,
+        category,
+        worker_label,
+        locality,
+    )
+    _core.log_phase_event(
+        name,
+        "end",
+        start,
+        end,
+        category,
+        worker_label,
+        locality,
+    )
+
+
 class Runtime:
     def __init__(
         self,
@@ -100,13 +131,24 @@ class Runtime:
         if self._run_in_progress:
             raise RuntimeError("runtime run is already in progress")
         self._bind_dataset_handle(dataset)
+        prepare_start = time.time()
+        phase_start = prepare_start
         plan_ir = plan_to_dict(plan)
+        phase_end = time.time()
+        _log_phase_span("python_plan_to_dict", phase_start, phase_end)
         configured_plan_path = os.environ.get("KANGAROO_DASHBOARD_PLAN", "").strip()
         if configured_plan_path:
+            phase_start = time.time()
             plan_path = Path(configured_plan_path)
             plan_path.parent.mkdir(parents=True, exist_ok=True)
             plan_path.write_text(json.dumps(plan_ir, indent=2), encoding="utf-8")
+            phase_end = time.time()
+            _log_phase_span("python_write_dashboard_plan", phase_start, phase_end)
+        phase_start = time.time()
         packed = msgpack.packb(plan_ir, use_bin_type=True)
+        phase_end = time.time()
+        _log_phase_span("python_pack_plan_msgpack", phase_start, phase_end)
+        _log_phase_span("python_prepare_plan", prepare_start, phase_end)
         self._run_in_progress = True
         try:
             if progress_bar:
@@ -411,6 +453,21 @@ def log_task_event(
     worker_label: str | None = None,
 ) -> None:
     _core.log_task_event(name, status, start, end, event_id, worker_label)
+
+
+def log_phase_event(
+    name: str,
+    status: str,
+    *,
+    start: float | None = None,
+    end: float | None = None,
+    category: str | None = None,
+    worker_label: str | None = None,
+    locality: int | None = None,
+) -> None:
+    if not hasattr(_core, "log_phase_event"):
+        return
+    _core.log_phase_event(name, status, start, end, category, worker_label, locality)
 
 
 def set_event_log_path(path: str) -> None:
