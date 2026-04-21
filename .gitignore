@@ -1,3 +1,6 @@
+# Codex files
+.codex
+
 # Python-generated files
 __pycache__/
 *.py[oc]
