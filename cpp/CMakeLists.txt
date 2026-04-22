@@ -62,6 +62,7 @@ set(KANGAROO_RUNTIME_SOURCES
   src/data_service_local.cpp
   src/executor.cpp
   src/kernel_registry.cpp
+  src/param_decode.cpp
   src/plan_decode_msgpack.cpp
   src/runtime.cpp
 )
