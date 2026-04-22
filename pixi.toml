@@ -19,7 +19,7 @@ hdf5 = ">=1.14,<1.15"
 mpich = ">=4.3.2,<5"
 tqdm = ">=4.67.3,<5"
 
-[dependencies.hpx]
+[feature.pixi-hpx.dependencies.hpx]
 version = "==1.11.0"
 build = "system_*"
 
@@ -29,8 +29,13 @@ pytest = "*"
 scikit-build-core = ">=0.9.10"
 nanobind = ">=1.9"
 
+[environments]
+default = []
+pixi-hpx = ["pixi-hpx"]
+
 [tasks]
 configure = "bash -lc 'build_dir=${KANGAROO_BUILD_DIR:-.pixi/build}; cmake -S cpp -B \"$build_dir\" -DCMAKE_BUILD_TYPE=Release -DHPX_DIR=$(scripts/utils/detect_hpx.sh) -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -Dnanobind_DIR=$(python -m nanobind --cmake_dir) -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX -DPython_EXECUTABLE=$CONDA_PREFIX/bin/python'"
+configure-pixi-hpx = "bash -lc 'build_dir=${KANGAROO_BUILD_DIR:-.pixi/build}; cmake -S cpp -B \"$build_dir\" -DCMAKE_BUILD_TYPE=Release -DHPX_DIR=$CONDA_PREFIX/lib/cmake/HPX -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -Dnanobind_DIR=$(python -m nanobind --cmake_dir) -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX -DPython_EXECUTABLE=$CONDA_PREFIX/bin/python'"
 build = "bash -lc 'build_dir=${KANGAROO_BUILD_DIR:-.pixi/build}; cmake --build \"$build_dir\" --parallel'"
 install = "bash -lc 'build_dir=${KANGAROO_BUILD_DIR:-.pixi/build}; cmake --install \"$build_dir\" --prefix $CONDA_PREFIX'"
 test = "pytest -q"

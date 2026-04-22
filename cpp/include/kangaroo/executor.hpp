@@ -29,6 +29,7 @@ class Executor {
   DataService& data_;
   AdjacencyService& adj_;
   KernelRegistry& kernels_;
+  const PlanIR* current_plan_ = nullptr;
 };
 
 }  // namespace kangaroo

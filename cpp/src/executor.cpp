@@ -32,7 +32,7 @@ struct GraphReduceParams {
   std::vector<int32_t> input_blocks;
 };
 
-GraphReduceParams parse_graph_reduce_params(const std::vector<std::uint8_t>& params_msgpack) {
+GraphReduceParams parse_graph_reduce_params(std::span<const std::uint8_t> params_msgpack) {
   if (params_msgpack.empty()) {
     throw std::runtime_error("graph reduce params missing");
   }
@@ -105,6 +105,93 @@ GraphReduceParams parse_graph_reduce_params(const std::vector<std::uint8_t>& par
     throw std::runtime_error("graph reduce num_inputs must match input_blocks size");
   }
   return params;
+}
+
+struct ResolvedParams {
+  const std::vector<std::uint8_t>* base = nullptr;
+  std::vector<std::uint8_t> storage;
+
+  std::span<const std::uint8_t> bytes() const {
+    if (!storage.empty()) {
+      return std::span<const std::uint8_t>(storage.data(), storage.size());
+    }
+    if (base == nullptr || base->empty()) {
+      return {};
+    }
+    return std::span<const std::uint8_t>(base->data(), base->size());
+  }
+};
+
+ResolvedParams resolve_task_params(const PlanIR& plan, const TaskTemplateIR& tmpl) {
+  ResolvedParams resolved;
+  resolved.base = &tmpl.params_msgpack;
+  if (tmpl.covered_boxes_ref < 0) {
+    return resolved;
+  }
+  if (tmpl.covered_boxes_ref >= static_cast<int32_t>(plan.shared_covered_boxes_msgpack.size())) {
+    throw std::runtime_error("covered_boxes_ref out of range for plan");
+  }
+
+  auto handle = msgpack::unpack(reinterpret_cast<const char*>(tmpl.params_msgpack.data()),
+                                tmpl.params_msgpack.size());
+  const auto root = handle.get();
+  if (root.type != msgpack::type::MAP) {
+    throw std::runtime_error("task params must be a map");
+  }
+
+  const auto& shared_bytes =
+      plan.shared_covered_boxes_msgpack[static_cast<std::size_t>(tmpl.covered_boxes_ref)];
+  auto shared_handle =
+      msgpack::unpack(reinterpret_cast<const char*>(shared_bytes.data()), shared_bytes.size());
+  const auto shared_boxes = shared_handle.get();
+
+  uint32_t entry_count = 0;
+  bool has_covered_boxes = false;
+  for (uint32_t i = 0; i < root.via.map.size; ++i) {
+    const auto& k = root.via.map.ptr[i].key;
+    if (k.type == msgpack::type::STR) {
+      const auto key = k.as<std::string>();
+      if (key == "covered_boxes_ref") {
+        continue;
+      }
+      if (key == "covered_boxes") {
+        has_covered_boxes = true;
+      }
+    }
+    ++entry_count;
+  }
+  if (!has_covered_boxes) {
+    ++entry_count;
+  }
+
+  msgpack::sbuffer buffer;
+  msgpack::packer<msgpack::sbuffer> packer(buffer);
+  packer.pack_map(entry_count);
+  for (uint32_t i = 0; i < root.via.map.size; ++i) {
+    const auto& k = root.via.map.ptr[i].key;
+    const auto& v = root.via.map.ptr[i].val;
+    if (k.type == msgpack::type::STR) {
+      const auto key = k.as<std::string>();
+      if (key == "covered_boxes_ref") {
+        continue;
+      }
+      if (key == "covered_boxes") {
+        packer.pack(k);
+        packer.pack(shared_boxes);
+        has_covered_boxes = true;
+        continue;
+      }
+    }
+    packer.pack(k);
+    packer.pack(v);
+  }
+  if (!has_covered_boxes) {
+    packer.pack(std::string("covered_boxes"));
+    packer.pack(shared_boxes);
+  }
+
+  resolved.storage.assign(buffer.data(), buffer.data() + buffer.size());
+  return resolved;
 }
 
 double now_seconds() {
@@ -190,6 +277,7 @@ void end_span(TaskEvent event) {
 }
 
 hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
+                                      const PlanIR& plan,
                                       int32_t plan_id,
                                       int32_t stage_idx,
                                       int32_t tmpl_idx,
@@ -356,6 +444,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
       .then([&meta,
              &data,
              &kernels,
+             &plan,
              tmpl,
              block,
              halo_inputs = std::move(halo_inputs),
@@ -427,15 +516,17 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
 
         const auto& level = meta.steps.at(tmpl.domain.step).levels.at(tmpl.domain.level);
         auto& fn = kernels.get_by_name(tmpl.kernel);
+        auto resolved_params = resolve_task_params(plan, tmpl);
 
         TaskEvent kernel_event;
         if (log_enabled) {
           kernel_event = start_span(base_event, "kernel");
         }
-        return fn(level, block, inputs, nbrs, outputs, tmpl.params_msgpack)
+        return fn(level, block, inputs, nbrs, outputs, resolved_params.bytes())
             .then([&data,
                    tmpl,
                    block,
+                   resolved_params = std::move(resolved_params),
                    outputs = std::move(outputs),
                    log_enabled,
                    base_event,
@@ -485,6 +576,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
 }
 
 hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
+                                      const PlanIR& plan,
                                       int32_t plan_id,
                                       int32_t stage_idx,
                                       int32_t tmpl_idx,
@@ -505,7 +597,8 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
         std::runtime_error("graph templates must specify inputs and outputs"));
   }
 
-  const auto params = parse_graph_reduce_params(tmpl.params_msgpack);
+  auto resolved_params = resolve_task_params(plan, tmpl);
+  const auto params = parse_graph_reduce_params(resolved_params.bytes());
   const int32_t fan_in = params.fan_in;
   const int32_t num_inputs = params.num_inputs;
   const int32_t input_base = params.input_base;
@@ -571,6 +664,7 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
              &kernels,
              tmpl,
              out_block,
+             resolved_params = std::move(resolved_params),
              log_enabled,
              base_event,
              wait_inputs_event](auto&& all) mutable -> hpx::future<void> {
@@ -608,10 +702,11 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
         if (log_enabled) {
           kernel_event = start_span(base_event, "kernel");
         }
-        return fn(level, out_block, inputs, nbrs, outputs, tmpl.params_msgpack)
+        return fn(level, out_block, inputs, nbrs, outputs, resolved_params.bytes())
             .then([&data,
                    tmpl,
                    out_block,
+                   resolved_params = std::move(resolved_params),
                    outputs = std::move(outputs),
                    log_enabled,
                    base_event,
@@ -671,7 +766,7 @@ hpx::future<void> run_block_task_remote(int32_t plan_id, int32_t stage_idx, int3
   auto data = std::make_shared<DataServiceLocal>();
   auto adjacency = std::make_shared<AdjacencyServiceLocal>(meta);
   (void)global_kernels();
-  return run_block_task_impl(tmpl, plan_id, stage_idx, tmpl_idx, block, meta, *data,
+  return run_block_task_impl(tmpl, plan, plan_id, stage_idx, tmpl_idx, block, meta, *data,
                              *adjacency, global_kernels())
       .then([data = std::move(data), adjacency = std::move(adjacency)](auto&& done) mutable {
         done.get();
@@ -687,7 +782,7 @@ hpx::future<void> run_graph_task_remote(int32_t plan_id, int32_t stage_idx, int3
   (void)global_dataset();
   auto data = std::make_shared<DataServiceLocal>();
   (void)global_kernels();
-  return run_graph_task_impl(tmpl, plan_id, stage_idx, tmpl_idx, group_idx, meta, *data,
+  return run_graph_task_impl(tmpl, plan, plan_id, stage_idx, tmpl_idx, group_idx, meta, *data,
                              global_kernels())
       .then([data = std::move(data)](auto&& done) mutable {
         done.get();
@@ -708,6 +803,7 @@ Executor::Executor(int32_t plan_id, const RunMeta& meta, DataService& data, Adja
     : plan_id_(plan_id), meta_(meta), data_(data), adj_(adj), kernels_(kr) {}
 
 hpx::future<void> Executor::run(const PlanIR& plan) {
+  current_plan_ = &plan;
   const int32_t nstages = static_cast<int32_t>(plan.stages.size());
   std::vector<int32_t> indeg(nstages, 0);
   std::vector<std::vector<int32_t>> edges(nstages);
@@ -766,10 +862,16 @@ hpx::future<void> Executor::run(const PlanIR& plan) {
         }).share();
   }
 
-  return hpx::when_all(stage_futures).then([](auto&&) { return; });
+  return hpx::when_all(stage_futures).then([this](auto&&) {
+    current_plan_ = nullptr;
+    return;
+  });
 }
 
 hpx::future<void> Executor::run_stage(int32_t stage_idx, const StageIR& stage) {
+  if (current_plan_ == nullptr) {
+    throw std::runtime_error("executor run_stage requires active plan");
+  }
   std::vector<hpx::future<void>> futures;
   for (std::size_t tmpl_idx = 0; tmpl_idx < stage.templates.size(); ++tmpl_idx) {
     const auto& tmpl = stage.templates[tmpl_idx];
@@ -797,7 +899,7 @@ hpx::future<void> Executor::run_stage(int32_t stage_idx, const StageIR& stage) {
         return hpx::make_exceptional_future<void>(
             std::runtime_error("graph stage requires graph templates"));
       }
-      const auto params = parse_graph_reduce_params(tmpl.params_msgpack);
+      const auto params = parse_graph_reduce_params(resolve_task_params(*current_plan_, tmpl).bytes());
       const int32_t fan_in = params.fan_in;
       const int32_t num_inputs = params.num_inputs;
       const int32_t n_groups = (num_inputs + fan_in - 1) / fan_in;
@@ -832,7 +934,7 @@ hpx::future<void> Executor::run_block_task(const TaskTemplateIR& tmpl, int32_t s
     int here = hpx::get_locality_id();
     if (target == here) {
       return hpx::async([this, tmpl, stage_idx, tmpl_idx, block]() mutable {
-        run_block_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, block, meta_, data_, adj_,
+        run_block_task_impl(tmpl, *current_plan_, plan_id_, stage_idx, tmpl_idx, block, meta_, data_, adj_,
                             kernels_)
             .get();
       });
@@ -850,7 +952,8 @@ hpx::future<void> Executor::run_block_task(const TaskTemplateIR& tmpl, int32_t s
   int here = hpx::get_locality_id();
   if (target == here) {
     return hpx::async([this, tmpl, stage_idx, tmpl_idx, block]() mutable {
-      run_block_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, block, meta_, data_, adj_, kernels_)
+      run_block_task_impl(tmpl, *current_plan_, plan_id_, stage_idx, tmpl_idx, block, meta_, data_,
+                          adj_, kernels_)
           .get();
     });
   }
@@ -872,7 +975,7 @@ hpx::future<void> Executor::run_graph_task(const TaskTemplateIR& tmpl, int32_t s
         std::runtime_error("graph templates must specify outputs"));
   }
 
-  const auto params = parse_graph_reduce_params(tmpl.params_msgpack);
+  const auto params = parse_graph_reduce_params(resolve_task_params(*current_plan_, tmpl).bytes());
   const int32_t out_block = params.output_base + group_idx;
   const auto& out = tmpl.outputs.front();
   ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version, out_block};
@@ -881,7 +984,8 @@ hpx::future<void> Executor::run_graph_task(const TaskTemplateIR& tmpl, int32_t s
   int here = hpx::get_locality_id();
   if (target == here) {
     return hpx::async([this, tmpl, stage_idx, tmpl_idx, group_idx]() mutable {
-      run_graph_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, group_idx, meta_, data_, kernels_)
+      run_graph_task_impl(tmpl, *current_plan_, plan_id_, stage_idx, tmpl_idx, group_idx, meta_,
+                          data_, kernels_)
           .get();
     });
   }

@@ -58,10 +58,12 @@ struct TaskTemplateIR {
   std::vector<int32_t> output_bytes;
   DepRuleIR deps;
   std::vector<std::uint8_t> params_msgpack;
+  int32_t covered_boxes_ref = -1;
 
   template <typename Archive>
   void serialize(Archive& ar, unsigned) {
-    ar& name& plane& kernel& domain& inputs& outputs& output_bytes& deps& params_msgpack;
+    ar& name& plane& kernel& domain& inputs& outputs& output_bytes& deps& params_msgpack&
+        covered_boxes_ref;
   }
 };
 
@@ -79,10 +81,11 @@ struct StageIR {
 
 struct PlanIR {
   std::vector<StageIR> stages;
+  std::vector<std::vector<std::uint8_t>> shared_covered_boxes_msgpack;
 
   template <typename Archive>
   void serialize(Archive& ar, unsigned) {
-    ar& stages;
+    ar& stages& shared_covered_boxes_msgpack;
   }
 };
 

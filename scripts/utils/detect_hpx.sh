@@ -25,13 +25,44 @@ find_from_cmake_prefix_path() {
   return 1
 }
 
+find_from_spack_tree() {
+  local root="${1:-}"
+  local cand
+  [[ -n "$root" ]] || return 1
+  [[ -d "$root" ]] || return 1
+  for cand in \
+    "$root"/hpx-*/lib/cmake/HPX \
+    "$root"/hpx-*/lib64/cmake/HPX \
+    "$root"/*/hpx-*/lib/cmake/HPX \
+    "$root"/*/hpx-*/lib64/cmake/HPX
+  do
+    if [[ -d "$cand" ]]; then
+      echo "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
 if [[ -n "${HPX_DIR:-}" ]]; then
   echo "$HPX_DIR"
   exit 0
 fi
 
+if [[ -n "${SPACK_HPX_PREFIX:-}" ]]; then
+  if find_from_prefix "$SPACK_HPX_PREFIX"; then
+    exit 0
+  fi
+fi
+
 if [[ -n "${OLCF_HPX_ROOT:-}" ]]; then
   if find_from_prefix "$OLCF_HPX_ROOT"; then
+    exit 0
+  fi
+fi
+
+if [[ -d "$HOME/spack/opt/spack" ]]; then
+  if find_from_spack_tree "$HOME/spack/opt/spack"; then
     exit 0
   fi
 fi

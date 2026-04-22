@@ -329,6 +329,8 @@ void Runtime::run_packed_plan(bytes, runmeta_handle, dataset_handle);
 
 ## Phase 2 — Chunk Plane
 
+Follow-up note: after the runtime-side `covered_boxes` dedup lands, add typed parameter decode helpers in the executor/kernel path so kernels can consume shared metadata directly without reconstructing merged msgpack blobs.
+
 * Task template expansion
 * Neighbor adjacency via face hashing
 * Halo fetch
@@ -380,4 +382,3 @@ enum ExecPlane { Chunk, Graph, Mixed };
 
 > Implement a C++ + HPX distributed task runtime with Python DSL frontend, based on the following design:
 > [paste this summary]
-

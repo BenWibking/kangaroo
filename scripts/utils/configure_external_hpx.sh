@@ -10,13 +10,16 @@ if [[ ! -x "$PIXI_ENV/bin/python" ]]; then
   exit 1
 fi
 
+if [[ -z "${HPX_DIR:-}" && -n "${SPACK_HPX_PREFIX:-}" ]]; then
+  HPX_DIR="$(bash "$REPO_ROOT/scripts/utils/detect_hpx.sh")"
+fi
+
 if [[ -z "${HPX_DIR:-}" && -n "${OLCF_HPX_ROOT:-}" ]]; then
   HPX_DIR="$OLCF_HPX_ROOT/lib64/cmake/HPX"
 fi
 
 if [[ -z "${HPX_DIR:-}" ]]; then
-  echo "HPX_DIR is not set. Load an external HPX module and export HPX_DIR first." >&2
-  exit 1
+  HPX_DIR="$(bash "$REPO_ROOT/scripts/utils/detect_hpx.sh")"
 fi
 
 if [[ ! -d "$HPX_DIR" ]]; then

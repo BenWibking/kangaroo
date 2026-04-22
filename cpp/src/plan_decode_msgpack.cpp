@@ -160,16 +160,15 @@ std::vector<std::vector<std::uint8_t>> parse_shared_covered_boxes(const msgpack:
   return shared;
 }
 
-std::vector<std::uint8_t> repack_params(
+int32_t parse_covered_boxes_ref(
     const msgpack::object& obj,
     const std::vector<std::vector<std::uint8_t>>& shared_covered_boxes) {
   if (shared_covered_boxes.empty() || obj.type != msgpack::type::MAP) {
-    return repack_params(obj);
+    return -1;
   }
-
   const msgpack::object* covered_boxes_ref = nullptr;
   if (!try_get_map_value(obj, "covered_boxes_ref", &covered_boxes_ref)) {
-    return repack_params(obj);
+    return -1;
   }
 
   int64_t ref_idx = -1;
@@ -182,57 +181,7 @@ std::vector<std::uint8_t> repack_params(
   if (ref_idx < 0 || ref_idx >= static_cast<int64_t>(shared_covered_boxes.size())) {
     throw std::runtime_error("covered_boxes_ref out of range");
   }
-
-  auto shared_handle = msgpack::unpack(
-      reinterpret_cast<const char*>(shared_covered_boxes[static_cast<std::size_t>(ref_idx)].data()),
-      shared_covered_boxes[static_cast<std::size_t>(ref_idx)].size());
-  const auto shared_boxes = shared_handle.get();
-
-  bool inserted_covered_boxes = false;
-  uint32_t entry_count = 0;
-  for (uint32_t i = 0; i < obj.via.map.size; ++i) {
-    const auto& k = obj.via.map.ptr[i].key;
-    if (k.type == msgpack::type::STR) {
-      const auto key = k.as<std::string>();
-      if (key == "covered_boxes_ref") {
-        continue;
-      }
-      if (key == "covered_boxes") {
-        inserted_covered_boxes = true;
-      }
-    }
-    ++entry_count;
-  }
-  if (!inserted_covered_boxes) {
-    ++entry_count;
-  }
-
-  msgpack::sbuffer buffer;
-  msgpack::packer<msgpack::sbuffer> packer(buffer);
-  packer.pack_map(entry_count);
-  for (uint32_t i = 0; i < obj.via.map.size; ++i) {
-    const auto& k = obj.via.map.ptr[i].key;
-    const auto& v = obj.via.map.ptr[i].val;
-    if (k.type == msgpack::type::STR) {
-      const auto key = k.as<std::string>();
-      if (key == "covered_boxes_ref") {
-        continue;
-      }
-      if (key == "covered_boxes") {
-        packer.pack(k);
-        packer.pack(shared_boxes);
-        inserted_covered_boxes = true;
-        continue;
-      }
-    }
-    packer.pack(k);
-    packer.pack(v);
-  }
-  if (!inserted_covered_boxes) {
-    packer.pack(std::string("covered_boxes"));
-    packer.pack(shared_boxes);
-  }
-  return std::vector<std::uint8_t>(buffer.data(), buffer.data() + buffer.size());
+  return static_cast<int32_t>(ref_idx);
 }
 
 }  // namespace
@@ -249,6 +198,7 @@ PlanIR decode_plan_msgpack(std::span<const std::uint8_t> payload) {
 
   PlanIR plan;
   plan.stages.reserve(stages_obj.via.array.size);
+  plan.shared_covered_boxes_msgpack = shared_covered_boxes;
 
   for (uint32_t si = 0; si < stages_obj.via.array.size; ++si) {
     const auto& stage_obj = stages_obj.via.array.ptr[si];
@@ -294,7 +244,9 @@ PlanIR decode_plan_msgpack(std::span<const std::uint8_t> payload) {
         }
       }
       tmpl.deps = parse_deps(expect_map_value(tmpl_obj, "deps"));
-      tmpl.params_msgpack = repack_params(expect_map_value(tmpl_obj, "params"), shared_covered_boxes);
+      const auto& params_obj = expect_map_value(tmpl_obj, "params");
+      tmpl.params_msgpack = repack_params(params_obj);
+      tmpl.covered_boxes_ref = parse_covered_boxes_ref(params_obj, shared_covered_boxes);
 
       if (tmpl.deps.kind == "FaceNeighbors") {
         if (tmpl.inputs.empty()) {
