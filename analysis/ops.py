@@ -1161,6 +1161,7 @@ class ParticleCICProjection:
         stages: list = []
         producer_stage: dict[int, object] = {}
         out_sum_bytes = nx * ny * 8
+        previous_level_tail = None
 
         for level_idx in range(len(levels) - 1, -1, -1):
             level_meta = levels[level_idx]
@@ -1179,7 +1180,10 @@ class ParticleCICProjection:
 
             sum_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 
-            stage = ctx.stage("particle_cic_projection")
+            stage = ctx.stage(
+                "particle_cic_projection",
+                after=[previous_level_tail] if previous_level_tail is not None else None,
+            )
             for block in blocks:
                 dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
                 params = {
@@ -1253,6 +1257,7 @@ class ParticleCICProjection:
                 reduce_idx += 1
 
             sum_fields.append((input_sum, level_idx))
+            previous_level_tail = stages[-1]
 
         if not sum_fields:
             return ctx.fragment([])

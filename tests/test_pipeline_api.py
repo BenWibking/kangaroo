@@ -331,15 +331,13 @@ def test_pipeline_particle_cic_projection_lowering_wiring() -> None:
 
     plan = pipe.plan()
     templates = [tmpl for stage in plan.topo_stages() for tmpl in stage.templates]
-    grid = [tmpl for tmpl in templates if tmpl.kernel == "particle_cic_grid_accumulate"]
-    acc = [tmpl for tmpl in templates if tmpl.kernel == "uniform_projection_accumulate"]
+    acc = [tmpl for tmpl in templates if tmpl.kernel == "particle_cic_projection_accumulate"]
     red = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
-    assert len(grid) == 2
     assert len(acc) == 2
     assert red
-    assert all(tmpl.params["particle_type"] == "StochasticStellarPop_particles" for tmpl in grid)
-    assert all(tmpl.params["level_index"] == 0 for tmpl in grid)
     assert all(tmpl.params["resolution"] == [16, 16] for tmpl in acc)
+    assert all(tmpl.params["particle_type"] == "StochasticStellarPop_particles" for tmpl in acc)
+    assert all(tmpl.params["level_index"] == 0 for tmpl in acc)
 
 
 def test_pipeline_projection_reduce_carries_group_output_blocks() -> None:

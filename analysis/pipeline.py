@@ -9,7 +9,7 @@ from .ctx import LoweringContext
 from .ops import (
     Histogram1D,
     Histogram2D,
-    ParticleCICGrid,
+    ParticleCICProjection,
     UniformProjection,
     UniformSlice,
     VorticityMag,
@@ -614,30 +614,19 @@ class Pipeline:
         reduce_fan_in: int | None = None,
     ) -> FieldHandle:
         out_name = out or self._unique_name("particle_cic_projection")
-
-        grid_name = f"{out_name}_grid"
-        grid_fragment = ParticleCICGrid(
+        fragment = ParticleCICProjection(
             particle_type=particle_type,
             axis=axis,
             axis_bounds=axis_bounds,
             rect=rect,
-            mass_max=mass_max,
-            out_name=grid_name,
-        ).lower(self._ctx)
-        self._append_fragment(grid_fragment)
-        grid_field = self._sink_fields(grid_fragment)[-1]
-
-        return self.uniform_projection(
-            field=FieldHandle(self, grid_field, grid_name),
-            axis=axis,
-            axis_bounds=axis_bounds,
-            rect=rect,
             resolution=resolution,
-            out=out_name,
-            bytes_per_value=8,
+            mass_max=mass_max,
+            out_name=out_name,
             reduce_fan_in=reduce_fan_in,
-            amr_cell_average=True,
-        )
+        ).lower(self._ctx)
+        self._append_fragment(fragment)
+        out_field = self._sink_fields(fragment)[-1]
+        return FieldHandle(self, out_field, out_name)
 
     def histogram1d(
         self,
