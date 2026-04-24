@@ -104,7 +104,7 @@ class SharedByteBuffer {
       data_ = std::make_shared<container_type>();
       return;
     }
-    if (!data_.unique()) {
+    if (data_.use_count() != 1) {
       data_ = std::make_shared<container_type>(*data_);
     }
   }
