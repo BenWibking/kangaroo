@@ -225,6 +225,9 @@ class Runtime:
     def num_localities(self) -> int:
         return int(self._rt.num_localities())
 
+    def chunk_home_rank(self, *, step: int, level: int, block: int) -> int:
+        return int(self._rt.chunk_home_rank(int(step), int(level), int(block)))
+
     def is_console_locality(self) -> bool:
         return self.locality_id() == 0
 
@@ -420,6 +423,27 @@ def _fallback_task_id(event: dict) -> str:
     )
 
 
+def _event_log_paths(log_path: Path) -> list[Path]:
+    paths = [log_path]
+    suffix = log_path.suffix
+    if suffix:
+        pattern = f"{log_path.stem}.locality*{suffix}"
+    else:
+        pattern = f"{log_path.name}.locality*"
+    paths.extend(sorted(p for p in log_path.parent.glob(pattern) if p != log_path))
+    return paths
+
+
+def _is_main_task_completion(event: dict) -> bool:
+    if not isinstance(event, dict) or event.get("type") != "task":
+        return False
+    status = str(event.get("status", ""))
+    if status not in {"end", "error"}:
+        return False
+    task_id = str(event.get("id") or _fallback_task_id(event))
+    return task_id.count(":") == 3
+
+
 def _task_progress_monitor(log_path: Path, total_tasks: int, stop_event: threading.Event) -> None:
     try:
         from tqdm.auto import tqdm
@@ -427,7 +451,7 @@ def _task_progress_monitor(log_path: Path, total_tasks: int, stop_event: threadi
         tqdm = None
 
     seen_done: set[str] = set()
-    offset = 0
+    offsets: dict[Path, int] = {}
     bar = None
     if tqdm is not None:
         bar = tqdm(
@@ -450,35 +474,33 @@ def _task_progress_monitor(log_path: Path, total_tasks: int, stop_event: threadi
     try:
         while True:
             progressed = False
-            try:
-                with log_path.open("r", encoding="utf-8") as handle:
-                    handle.seek(offset)
-                    while True:
-                        pos = handle.tell()
-                        line = handle.readline()
-                        if not line:
-                            offset = pos
-                            break
-                        offset = handle.tell()
-                        line = line.strip()
-                        if not line:
-                            continue
-                        try:
-                            event = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
-                        if not isinstance(event, dict) or event.get("type") != "task":
-                            continue
-                        status = str(event.get("status", ""))
-                        if status not in {"end", "error"}:
-                            continue
-                        task_id = str(event.get("id") or _fallback_task_id(event))
-                        if task_id in seen_done:
-                            continue
-                        seen_done.add(task_id)
-                        progressed = True
-            except FileNotFoundError:
-                pass
+            for path in _event_log_paths(log_path):
+                try:
+                    with path.open("r", encoding="utf-8") as handle:
+                        handle.seek(offsets.get(path, 0))
+                        while True:
+                            pos = handle.tell()
+                            line = handle.readline()
+                            if not line:
+                                offsets[path] = pos
+                                break
+                            offsets[path] = handle.tell()
+                            line = line.strip()
+                            if not line:
+                                continue
+                            try:
+                                event = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if not _is_main_task_completion(event):
+                                continue
+                            task_id = str(event.get("id") or _fallback_task_id(event))
+                            if task_id in seen_done:
+                                continue
+                            seen_done.add(task_id)
+                            progressed = True
+                except FileNotFoundError:
+                    pass
 
             if progressed:
                 _update_bar()
@@ -487,26 +509,24 @@ def _task_progress_monitor(log_path: Path, total_tasks: int, stop_event: threadi
 
             if stop_event.is_set():
                 time.sleep(0.1)
-                try:
-                    with log_path.open("r", encoding="utf-8") as handle:
-                        handle.seek(offset)
-                        for line in handle:
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                event = json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
-                            if not isinstance(event, dict) or event.get("type") != "task":
-                                continue
-                            status = str(event.get("status", ""))
-                            if status not in {"end", "error"}:
-                                continue
-                            task_id = str(event.get("id") or _fallback_task_id(event))
-                            seen_done.add(task_id)
-                except FileNotFoundError:
-                    pass
+                for path in _event_log_paths(log_path):
+                    try:
+                        with path.open("r", encoding="utf-8") as handle:
+                            handle.seek(offsets.get(path, 0))
+                            for line in handle:
+                                line = line.strip()
+                                if not line:
+                                    continue
+                                try:
+                                    event = json.loads(line)
+                                except json.JSONDecodeError:
+                                    continue
+                                if not _is_main_task_completion(event):
+                                    continue
+                                task_id = str(event.get("id") or _fallback_task_id(event))
+                                seen_done.add(task_id)
+                    except FileNotFoundError:
+                        pass
                 _update_bar()
                 break
 

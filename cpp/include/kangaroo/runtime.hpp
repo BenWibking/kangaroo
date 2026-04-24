@@ -184,6 +184,7 @@ class Runtime {
 
   int32_t locality_id();
   int32_t num_localities();
+  int32_t chunk_home_rank(int32_t step, int16_t level, int32_t block);
   void wait_for_console_release();
   void release_console_workers();
 
@@ -232,12 +233,28 @@ struct PhaseEvent {
   double end = 0.0;
 };
 
+struct DataEvent {
+  std::string op;
+  std::string mode;
+  std::string status;
+  ChunkRef ref;
+  int32_t locality = -1;
+  int32_t target_locality = -1;
+  int32_t worker = -1;
+  std::string worker_label;
+  std::size_t bytes = 0;
+  double ts = 0.0;
+  double start = 0.0;
+  double end = 0.0;
+};
+
 void set_event_log_path(const std::string& path);
 bool has_event_log();
 void set_perfetto_trace_path(const std::string& path);
 bool has_perfetto_trace();
 void log_task_event(const TaskEvent& event);
 void log_phase_event(const PhaseEvent& event);
+void log_data_event(const DataEvent& event);
 
 void set_execution_context(int32_t run_id,
                            const RunMeta& meta,

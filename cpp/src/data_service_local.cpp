@@ -3,6 +3,7 @@
 #include "kangaroo/runtime.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <exception>
@@ -11,6 +12,7 @@
 
 #include <hpx/include/actions.hpp>
 #include <hpx/include/async.hpp>
+#include <hpx/runtime_local/get_worker_thread_num.hpp>
 
 HPX_PLAIN_ACTION(kangaroo::data_get_local_impl, kangaroo_data_get_local_action)
 HPX_PLAIN_ACTION(kangaroo::data_put_local_impl, kangaroo_data_put_local_action)
@@ -43,6 +45,37 @@ void log_dataflow_fetch(const char* op,
             << " bytes=" << bytes
             << " empty=" << (bytes == 0 ? 1 : 0)
             << std::endl;
+}
+
+double now_seconds() {
+  auto now = std::chrono::system_clock::now();
+  return std::chrono::duration<double>(now.time_since_epoch()).count();
+}
+
+void log_dataflow_event(const char* op,
+                        const char* status,
+                        const ChunkRef& ref,
+                        int here,
+                        int target,
+                        std::size_t bytes,
+                        double start) {
+  if (!has_event_log()) {
+    return;
+  }
+  const double end = now_seconds();
+  DataEvent event;
+  event.op = op;
+  event.mode = here == target ? "local" : "remote";
+  event.status = status;
+  event.ref = ref;
+  event.locality = here;
+  event.target_locality = target;
+  event.worker = static_cast<int32_t>(hpx::get_worker_thread_num());
+  event.bytes = bytes;
+  event.ts = end;
+  event.start = start;
+  event.end = end;
+  log_data_event(event);
 }
 
 SubboxView build_subbox_view(const HostView& chunk, const ChunkSubboxRef& ref) {
@@ -210,7 +243,13 @@ std::shared_ptr<ChunkStore> DataServiceLocal::resolve_chunk_store() const {
 }
 
 int DataServiceLocal::home_rank(const ChunkRef& ref) const {
-  std::size_t h = ChunkRefHash{}(ref);
+  std::size_t h = 0xcbf29ce484222325ull;
+  auto mix = [&](auto v) {
+    h ^= static_cast<std::size_t>(v) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+  };
+  mix(ref.step);
+  mix(ref.level);
+  mix(ref.block);
   auto localities = hpx::find_all_localities();
   return static_cast<int>(h % localities.size());
 }
@@ -353,26 +392,40 @@ void DataServiceLocal::put_local_impl(const ChunkRef& ref, HostView view) {
 hpx::future<HostView> DataServiceLocal::get_host(const ChunkRef& ref) {
   int target = home_rank(ref);
   int here = hpx::get_locality_id();
+  const double start = now_seconds();
   if (target == here) {
     auto local = get_local_impl(ref);
     if (local.is_ready()) {
       HostView view = local.get();
       log_dataflow_fetch("get_host_local", ref, here, target, view.data.size());
+      log_dataflow_event("get_host", "end", ref, here, target, view.data.size(), start);
       return hpx::make_ready_future(std::move(view));
     }
-    return local.then([ref, here, target](auto&& result) mutable {
-      HostView view = result.get();
-      log_dataflow_fetch("get_host_local", ref, here, target, view.data.size());
-      return view;
+    return local.then([ref, here, target, start](auto&& result) mutable {
+      try {
+        HostView view = result.get();
+        log_dataflow_fetch("get_host_local", ref, here, target, view.data.size());
+        log_dataflow_event("get_host", "end", ref, here, target, view.data.size(), start);
+        return view;
+      } catch (...) {
+        log_dataflow_event("get_host", "error", ref, here, target, 0, start);
+        throw;
+      }
     });
   }
   auto localities = hpx::find_all_localities();
   return hpx::unwrap(
              hpx::async<::kangaroo_data_get_local_action>(localities.at(target), run_id_, ref))
-      .then([ref, here, target](auto&& result) mutable {
-        HostView view = result.get();
-        log_dataflow_fetch("get_host_remote", ref, here, target, view.data.size());
-        return view;
+      .then([ref, here, target, start](auto&& result) mutable {
+        try {
+          HostView view = result.get();
+          log_dataflow_fetch("get_host_remote", ref, here, target, view.data.size());
+          log_dataflow_event("get_host", "end", ref, here, target, view.data.size(), start);
+          return view;
+        } catch (...) {
+          log_dataflow_event("get_host", "error", ref, here, target, 0, start);
+          throw;
+        }
       });
 }
 
@@ -386,16 +439,27 @@ hpx::future<SubboxView> DataServiceLocal::get_subbox(const ChunkSubboxRef& ref) 
 hpx::future<void> DataServiceLocal::put_host(const ChunkRef& ref, HostView view) {
   int target = home_rank(ref);
   int here = hpx::get_locality_id();
-  log_dataflow_fetch("put_host", ref, here, target, view.data.size());
+  const double start = now_seconds();
+  const std::size_t bytes = view.data.size();
+  log_dataflow_fetch("put_host", ref, here, target, bytes);
   if (target == here) {
     put_local_impl(ref, std::move(view));
+    log_dataflow_event("put_host", "end", ref, here, target, bytes, start);
     return hpx::make_ready_future();
   }
   auto localities = hpx::find_all_localities();
   return hpx::async<::kangaroo_data_put_local_action>(localities.at(target), run_id_, ref,
                                                       std::move(view))
-      .then(
-      [](auto&&) { return; });
+      .then([ref, here, target, bytes, start](auto&& result) mutable {
+        try {
+          result.get();
+          log_dataflow_event("put_host", "end", ref, here, target, bytes, start);
+          return;
+        } catch (...) {
+          log_dataflow_event("put_host", "error", ref, here, target, bytes, start);
+          throw;
+        }
+      });
 }
 
 void DataServiceLocal::preload(const RunMeta& meta,

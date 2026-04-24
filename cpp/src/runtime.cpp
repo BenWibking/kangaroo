@@ -189,22 +189,50 @@ void encode_particle_value_counts(const std::unordered_map<double, int64_t>& cou
 
 std::string json_escape(const std::string& value);
 
+std::string event_log_path_for_locality(const std::string& path) {
+  if (path.empty()) {
+    return path;
+  }
+  int32_t locality = 0;
+  try {
+    locality = static_cast<int32_t>(hpx::get_locality_id());
+  } catch (...) {
+    locality = 0;
+  }
+  if (locality <= 0) {
+    return path;
+  }
+
+  std::filesystem::path base(path);
+  const std::string stem = base.stem().string();
+  const std::string ext = base.extension().string();
+  std::string filename;
+  if (stem.empty()) {
+    filename = base.filename().string() + ".locality" + std::to_string(locality);
+  } else {
+    filename = stem + ".locality" + std::to_string(locality) + ext;
+  }
+  return (base.parent_path() / filename).string();
+}
+
 struct EventLogWorker {
   std::mutex mutex;
   std::condition_variable cv;
-  std::deque<std::variant<TaskEvent, PhaseEvent>> queue;
+  std::condition_variable idle_cv;
+  std::deque<std::variant<TaskEvent, PhaseEvent, DataEvent>> queue;
   std::thread thread;
   bool running = false;
   bool stop = false;
+  bool writing = false;
   std::string path;
   bool enabled = false;
 
   void set_path(const std::string& next_path) {
-    {
-      std::lock_guard<std::mutex> lock(mutex);
-      path = next_path;
-      enabled = !path.empty();
-    }
+    std::unique_lock<std::mutex> lock(mutex);
+    idle_cv.wait(lock, [&] { return queue.empty() && !writing; });
+    path = next_path;
+    enabled = !path.empty();
+    lock.unlock();
     start_if_needed();
     cv.notify_all();
   }
@@ -240,7 +268,18 @@ struct EventLogWorker {
       if (!enabled) {
         return;
       }
-      queue.push_back(std::variant<TaskEvent, PhaseEvent>{std::move(event)});
+      queue.push_back(std::variant<TaskEvent, PhaseEvent, DataEvent>{std::move(event)});
+    }
+    cv.notify_one();
+  }
+
+  void enqueue(DataEvent event) {
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (!enabled) {
+        return;
+      }
+      queue.push_back(std::variant<TaskEvent, PhaseEvent, DataEvent>{std::move(event)});
     }
     cv.notify_one();
   }
@@ -249,7 +288,7 @@ struct EventLogWorker {
     std::ofstream out;
     std::string active_path;
     for (;;) {
-      std::variant<TaskEvent, PhaseEvent> item;
+      std::variant<TaskEvent, PhaseEvent, DataEvent> item;
       {
         std::unique_lock<std::mutex> lock(mutex);
         cv.wait(lock, [&] {
@@ -270,8 +309,16 @@ struct EventLogWorker {
         }
         item = std::move(queue.front());
         queue.pop_front();
+        writing = true;
       }
       if (!out) {
+        {
+          std::lock_guard<std::mutex> lock(mutex);
+          writing = false;
+          if (queue.empty()) {
+            idle_cv.notify_all();
+          }
+        }
         continue;
       }
       auto write_string = [&](const char* key, const std::string& value) {
@@ -307,7 +354,7 @@ struct EventLogWorker {
         out << ",\"start\":" << event.start;
         out << ",\"end\":" << event.end;
         out << "}\n";
-      } else {
+      } else if (std::holds_alternative<PhaseEvent>(item)) {
         const auto& event = std::get<PhaseEvent>(item);
         out << '{';
         out << "\"type\":\"phase\",";
@@ -327,8 +374,43 @@ struct EventLogWorker {
         out << ",\"start\":" << event.start;
         out << ",\"end\":" << event.end;
         out << "}\n";
+      } else {
+        const auto& event = std::get<DataEvent>(item);
+        out << '{';
+        out << "\"type\":\"dataflow\",";
+        write_string("op", event.op);
+        out << ',';
+        write_string("mode", event.mode);
+        out << ',';
+        write_string("status", event.status);
+        out << ",\"step\":" << event.ref.step;
+        out << ",\"level\":" << event.ref.level;
+        out << ",\"field\":" << event.ref.field;
+        out << ",\"version\":" << event.ref.version;
+        out << ",\"block\":" << event.ref.block;
+        out << ",\"locality\":" << event.locality;
+        out << ",\"target_locality\":" << event.target_locality;
+        if (!event.worker_label.empty()) {
+          out << ',';
+          write_string("worker", event.worker_label);
+        } else {
+          out << ",\"worker\":\"worker-" << event.worker << '"';
+        }
+        out << ",\"bytes\":" << event.bytes;
+        out << ",\"elapsed\":" << (event.end - event.start);
+        out << ",\"ts\":" << event.ts;
+        out << ",\"start\":" << event.start;
+        out << ",\"end\":" << event.end;
+        out << "}\n";
       }
       out.flush();
+      {
+        std::lock_guard<std::mutex> lock(mutex);
+        writing = false;
+        if (queue.empty()) {
+          idle_cv.notify_all();
+        }
+      }
     }
   }
 
@@ -1101,7 +1183,7 @@ void init_event_log_from_env() {
       g_event_log_path = env;
       g_event_log_enabled = true;
     }
-    g_event_log_worker.set_path(g_event_log_path);
+    g_event_log_worker.set_path(event_log_path_for_locality(g_event_log_path));
   }
 }
 
@@ -4190,7 +4272,7 @@ void register_default_kernels(KernelRegistry& registry) {
             }
             counts[v] += 1;
           }
-          encode_particle_value_counts(counts, outputs[0].data);
+          encode_particle_value_counts(counts, outputs[0].data.mutable_vector());
           return hpx::make_ready_future();
         },
         make_kernel_params_preparer<Params>(decode_params));
@@ -4214,7 +4296,7 @@ void register_default_kernels(KernelRegistry& registry) {
             merged[value] += count;
           }
         }
-        encode_particle_value_counts(merged, outputs[0].data);
+        encode_particle_value_counts(merged, outputs[0].data.mutable_vector());
         return hpx::make_ready_future();
       });
   {
@@ -4886,6 +4968,10 @@ bool graph_template_contains_output_block(const TaskTemplateIR& tmpl, const Chun
     return false;
   }
   const auto& params = tmpl.graph_reduce.value();
+  if (!params.output_blocks.empty()) {
+    return std::find(params.output_blocks.begin(), params.output_blocks.end(), ref.block) !=
+           params.output_blocks.end();
+  }
   const int32_t fan_in = std::max(1, params.fan_in);
   const int32_t num_inputs = std::max(0, params.num_inputs);
   const int32_t n_groups = (num_inputs + fan_in - 1) / fan_in;
@@ -5174,7 +5260,7 @@ void set_event_log_path(const std::string& path) {
     g_event_log_path = path;
     g_event_log_enabled = !path.empty();
   }
-  g_event_log_worker.set_path(g_event_log_path);
+  g_event_log_worker.set_path(event_log_path_for_locality(g_event_log_path));
 }
 
 bool has_event_log() {
@@ -5221,6 +5307,13 @@ void log_phase_event(const PhaseEvent& event) {
   if (perfetto_enabled) {
     g_perfetto_trace_worker.enqueue_phase(event);
   }
+}
+
+void log_data_event(const DataEvent& event) {
+  if (!has_event_log()) {
+    return;
+  }
+  g_event_log_worker.enqueue(event);
 }
 
 void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
@@ -5425,6 +5518,12 @@ int32_t Runtime::locality_id() {
 int32_t Runtime::num_localities() {
   ensure_hpx_started();
   return static_cast<int32_t>(hpx::find_all_localities().size());
+}
+
+int32_t Runtime::chunk_home_rank(int32_t step, int16_t level, int32_t block) {
+  ensure_hpx_started();
+  DataServiceLocal data;
+  return static_cast<int32_t>(data.home_rank(ChunkRef{step, level, 0, 0, block}));
 }
 
 void Runtime::wait_for_console_release() {

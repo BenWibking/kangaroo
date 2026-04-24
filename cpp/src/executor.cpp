@@ -80,6 +80,30 @@ GraphReduceSpecIR parse_graph_reduce_params(const msgpack::object& root) {
       }
     }
   }
+  if (const auto* blocks = find_msgpack_map_value(root, "output_blocks");
+      blocks && blocks->type == msgpack::type::ARRAY) {
+    params.output_blocks.clear();
+    params.output_blocks.reserve(blocks->via.array.size);
+    for (uint32_t i = 0; i < blocks->via.array.size; ++i) {
+      const auto& entry = blocks->via.array.ptr[i];
+      if (entry.type == msgpack::type::POSITIVE_INTEGER ||
+          entry.type == msgpack::type::NEGATIVE_INTEGER) {
+        params.output_blocks.push_back(entry.as<int32_t>());
+      }
+    }
+  }
+  if (const auto* offsets = find_msgpack_map_value(root, "group_offsets");
+      offsets && offsets->type == msgpack::type::ARRAY) {
+    params.group_offsets.clear();
+    params.group_offsets.reserve(offsets->via.array.size);
+    for (uint32_t i = 0; i < offsets->via.array.size; ++i) {
+      const auto& entry = offsets->via.array.ptr[i];
+      if (entry.type == msgpack::type::POSITIVE_INTEGER ||
+          entry.type == msgpack::type::NEGATIVE_INTEGER) {
+        params.group_offsets.push_back(entry.as<int32_t>());
+      }
+    }
+  }
 
   if (params.fan_in <= 0) {
     params.fan_in = 1;
@@ -94,6 +118,25 @@ GraphReduceSpecIR parse_graph_reduce_params(const msgpack::object& root) {
   if (!params.input_blocks.empty() &&
       params.num_inputs != static_cast<int32_t>(params.input_blocks.size())) {
     throw std::runtime_error("graph reduce num_inputs must match input_blocks size");
+  }
+  int32_t n_groups = (params.num_inputs + params.fan_in - 1) / params.fan_in;
+  if (!params.group_offsets.empty()) {
+    if (params.group_offsets.size() < 2) {
+      throw std::runtime_error("graph reduce group_offsets must include start and end");
+    }
+    if (params.group_offsets.front() != 0 || params.group_offsets.back() != params.num_inputs) {
+      throw std::runtime_error("graph reduce group_offsets must span num_inputs");
+    }
+    for (std::size_t i = 1; i < params.group_offsets.size(); ++i) {
+      if (params.group_offsets[i] <= params.group_offsets[i - 1]) {
+        throw std::runtime_error("graph reduce group_offsets must be strictly increasing");
+      }
+    }
+    n_groups = static_cast<int32_t>(params.group_offsets.size() - 1);
+  }
+  if (!params.output_blocks.empty() &&
+      n_groups != static_cast<int32_t>(params.output_blocks.size())) {
+    throw std::runtime_error("graph reduce output_blocks size must match group count");
   }
   return params;
 }
@@ -110,6 +153,34 @@ const GraphReduceSpecIR& prepared_graph_reduce(const TaskTemplateIR& tmpl) {
     throw std::runtime_error("graph task template not prepared: missing graph reduce params");
   }
   return tmpl.graph_reduce.value();
+}
+
+int32_t graph_reduce_output_block(const GraphReduceSpecIR& params, int32_t group_idx) {
+  if (!params.output_blocks.empty()) {
+    return params.output_blocks.at(static_cast<std::size_t>(group_idx));
+  }
+  return params.output_base + group_idx;
+}
+
+int32_t graph_reduce_group_count(const GraphReduceSpecIR& params) {
+  if (!params.group_offsets.empty()) {
+    return static_cast<int32_t>(params.group_offsets.size() - 1);
+  }
+  return (params.num_inputs + params.fan_in - 1) / params.fan_in;
+}
+
+int32_t graph_reduce_group_start(const GraphReduceSpecIR& params, int32_t group_idx) {
+  if (!params.group_offsets.empty()) {
+    return params.group_offsets.at(static_cast<std::size_t>(group_idx));
+  }
+  return group_idx * params.fan_in;
+}
+
+int32_t graph_reduce_group_end(const GraphReduceSpecIR& params, int32_t group_idx) {
+  if (!params.group_offsets.empty()) {
+    return params.group_offsets.at(static_cast<std::size_t>(group_idx + 1));
+  }
+  return std::min(graph_reduce_group_start(params, group_idx) + params.fan_in, params.num_inputs);
 }
 
 double now_seconds() {
@@ -255,6 +326,33 @@ TaskEvent start_span(const TaskEvent& base, const std::string& suffix) {
   return event;
 }
 
+bool event_log_enqueue_timing_enabled() {
+  static const bool enabled = std::getenv("KANGAROO_TRACE_EVENT_LOG_OVERHEAD") != nullptr;
+  return enabled;
+}
+
+void log_task_event_with_enqueue_timing(const TaskEvent& event,
+                                        const TaskEvent& base,
+                                        const std::string& suffix) {
+  if (!event_log_enqueue_timing_enabled() || has_perfetto_trace()) {
+    log_task_event(event);
+    return;
+  }
+
+  const double start = now_seconds();
+  log_task_event(event);
+  const double end = now_seconds();
+
+  TaskEvent timing = base;
+  timing.id = base.id + ":" + suffix;
+  timing.name = base.name + "/" + suffix;
+  timing.status = "end";
+  timing.ts = end;
+  timing.start = start;
+  timing.end = end;
+  log_task_event(timing);
+}
+
 void end_span(TaskEvent event) {
   double ts = now_seconds();
   event.status = "end";
@@ -294,7 +392,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
     base_event.ts = start_ts;
     base_event.start = start_ts;
     base_event.end = start_ts;
-    log_task_event(base_event);
+    log_task_event_with_enqueue_timing(base_event, base_event, "emit_task_start");
   }
 
   std::vector<int32_t> halo_inputs;
@@ -320,12 +418,36 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
     }
   }
 
-  std::vector<hpx::future<HostView>> input_futures;
-  input_futures.reserve(tmpl.inputs.size());
+  TaskEvent get_inputs_event;
+  if (log_enabled) {
+    get_inputs_event = start_span(base_event, "get_inputs");
+  }
+
+  std::vector<ChunkRef> input_refs;
+  input_refs.reserve(tmpl.inputs.size());
+  TaskEvent resolve_inputs_event;
+  if (log_enabled) {
+    resolve_inputs_event = start_span(base_event, "resolve_inputs");
+  }
   for (const auto& input : tmpl.inputs) {
     const auto loc = resolve_input_location(tmpl, input, block);
-    ChunkRef cref{loc.step, loc.level, input.field, input.version, loc.block};
+    input_refs.push_back(ChunkRef{loc.step, loc.level, input.field, input.version, loc.block});
+  }
+  if (log_enabled) {
+    end_span(resolve_inputs_event);
+  }
+
+  std::vector<hpx::future<HostView>> input_futures;
+  input_futures.reserve(input_refs.size());
+  TaskEvent issue_inputs_event;
+  if (log_enabled) {
+    issue_inputs_event = start_span(base_event, "issue_get_inputs");
+  }
+  for (const auto& cref : input_refs) {
     input_futures.push_back(data.get_host(cref));
+  }
+  if (log_enabled) {
+    end_span(issue_inputs_event);
   }
 
   auto fetch_face = [&](Face face,
@@ -398,6 +520,10 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
   neighbor_futures.reserve(halo_inputs.size() * 6);
   neighbor_slots.reserve(halo_inputs.size() * 6);
 
+  TaskEvent issue_neighbors_event;
+  if (log_enabled) {
+    issue_neighbors_event = start_span(base_event, "issue_neighbor_inputs");
+  }
   for (std::size_t pos = 0; pos < halo_inputs.size(); ++pos) {
     const auto& nbr_field = tmpl.inputs.at(halo_inputs[pos]);
     int32_t step = tmpl.domain.step;
@@ -418,6 +544,13 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
     neighbor_slots.push_back({pos, Face::Zm});
     neighbor_futures.push_back(fetch_face(Face::Zp, nbr_field.field, nbr_field.version, step, level));
     neighbor_slots.push_back({pos, Face::Zp});
+  }
+  if (log_enabled) {
+    end_span(issue_neighbors_event);
+  }
+
+  if (log_enabled) {
+    end_span(get_inputs_event);
   }
 
   auto all_inputs = hpx::when_all(input_futures);
@@ -441,6 +574,10 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
              wait_inputs_event](auto&& all) mutable -> hpx::future<void> {
         if (log_enabled) {
           end_span(wait_inputs_event);
+        }
+        TaskEvent collect_inputs_event;
+        if (log_enabled) {
+          collect_inputs_event = start_span(base_event, "collect_inputs");
         }
         auto results = all.get();
         auto input_pack = hpx::get<0>(results).get();
@@ -485,7 +622,14 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
           const auto& slot = neighbor_slots.at(i);
           assign_face(nbrs.inputs.at(slot.input_pos), slot.face, std::move(views));
         }
+        if (log_enabled) {
+          end_span(collect_inputs_event);
+        }
 
+        TaskEvent alloc_outputs_event;
+        if (log_enabled) {
+          alloc_outputs_event = start_span(base_event, "alloc_outputs");
+        }
         std::vector<HostView> outputs;
         outputs.reserve(tmpl.outputs.size());
         if (!tmpl.output_bytes.empty() && tmpl.output_bytes.size() != tmpl.outputs.size()) {
@@ -499,6 +643,9 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
           const auto& out = tmpl.outputs[i];
           ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version, block};
           outputs.push_back(data.alloc_host(cref, bytes));
+        }
+        if (log_enabled) {
+          end_span(alloc_outputs_event);
         }
 
         auto inputs_ptr = std::make_shared<std::vector<HostView>>(std::move(inputs));
@@ -534,6 +681,10 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
               if (log_enabled) {
                 end_span(kernel_event);
               }
+              TaskEvent put_outputs_event;
+              if (log_enabled) {
+                put_outputs_event = start_span(base_event, "put_outputs");
+              }
               std::vector<hpx::future<void>> puts;
               puts.reserve(tmpl.outputs.size());
               for (std::size_t i = 0; i < tmpl.outputs.size(); ++i) {
@@ -541,6 +692,9 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
                 const auto& out = tmpl.outputs[i];
                 ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version, block};
                 puts.push_back(data.put_host(cref, std::move((*outputs_ptr)[i])));
+              }
+              if (log_enabled) {
+                end_span(put_outputs_event);
               }
               TaskEvent wait_outputs_event;
               if (log_enabled) {
@@ -566,11 +720,11 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
     try {
       done.get();
       event.status = "end";
-      log_task_event(event);
+      log_task_event_with_enqueue_timing(event, base_event, "emit_task_end");
       return;
     } catch (...) {
       event.status = "error";
-      log_task_event(event);
+      log_task_event_with_enqueue_timing(event, base_event, "emit_task_error");
       throw;
     }
   });
@@ -597,14 +751,11 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
   }
 
   const auto& params = prepared_graph_reduce(tmpl);
-  const int32_t fan_in = params.fan_in;
-  const int32_t num_inputs = params.num_inputs;
   const int32_t input_base = params.input_base;
-  const int32_t output_base = params.output_base;
   const bool debug_reduce = std::getenv("KANGAROO_DEBUG_REDUCE") != nullptr;
 
-  const int32_t start = group_idx * fan_in;
-  const int32_t end = std::min(start + fan_in, num_inputs);
+  const int32_t start = graph_reduce_group_start(params, group_idx);
+  const int32_t end = graph_reduce_group_end(params, group_idx);
   if (start >= end) {
     return hpx::make_ready_future();
   }
@@ -620,7 +771,7 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
     }
     std::cout << oss.str() << std::endl;
   }
-  const int32_t out_block = output_base + group_idx;
+  const int32_t out_block = graph_reduce_output_block(params, group_idx);
   if (debug_dataflow_enabled()) {
     std::ostringstream oss;
     oss << "[kangaroo][dataflow] op=graph_reduce_inputs"
@@ -649,11 +800,19 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
     base_event.ts = start_ts;
     base_event.start = start_ts;
     base_event.end = start_ts;
-    log_task_event(base_event);
+    log_task_event_with_enqueue_timing(base_event, base_event, "emit_task_start");
   }
 
-  std::vector<hpx::future<HostView>> input_futures;
-  input_futures.reserve(static_cast<std::size_t>((end - start) * tmpl.inputs.size()));
+  TaskEvent get_inputs_event;
+  if (log_enabled) {
+    get_inputs_event = start_span(base_event, "get_inputs");
+  }
+  std::vector<ChunkRef> input_refs;
+  input_refs.reserve(static_cast<std::size_t>((end - start) * tmpl.inputs.size()));
+  TaskEvent resolve_inputs_event;
+  if (log_enabled) {
+    resolve_inputs_event = start_span(base_event, "resolve_inputs");
+  }
   for (const auto& input : tmpl.inputs) {
     for (int32_t idx = start; idx < end; ++idx) {
       const int32_t block_id = params.input_blocks.empty()
@@ -665,9 +824,27 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
         step = input.domain->step;
         level = input.domain->level;
       }
-      ChunkRef cref{step, level, input.field, input.version, block_id};
-      input_futures.push_back(data.get_host(cref));
+      input_refs.push_back(ChunkRef{step, level, input.field, input.version, block_id});
     }
+  }
+  if (log_enabled) {
+    end_span(resolve_inputs_event);
+  }
+
+  std::vector<hpx::future<HostView>> input_futures;
+  input_futures.reserve(input_refs.size());
+  TaskEvent issue_inputs_event;
+  if (log_enabled) {
+    issue_inputs_event = start_span(base_event, "issue_get_inputs");
+  }
+  for (const auto& cref : input_refs) {
+    input_futures.push_back(data.get_host(cref));
+  }
+  if (log_enabled) {
+    end_span(issue_inputs_event);
+  }
+  if (log_enabled) {
+    end_span(get_inputs_event);
   }
 
   TaskEvent wait_inputs_event;
@@ -686,11 +863,18 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
         if (log_enabled) {
           end_span(wait_inputs_event);
         }
+        TaskEvent collect_inputs_event;
+        if (log_enabled) {
+          collect_inputs_event = start_span(base_event, "collect_inputs");
+        }
         auto input_pack = all.get();
         std::vector<HostView> inputs;
         inputs.reserve(input_pack.size());
         for (auto& f : input_pack) {
           inputs.push_back(f.get());
+        }
+        if (log_enabled) {
+          end_span(collect_inputs_event);
         }
         if (debug_dataflow_enabled()) {
           std::ostringstream oss;
@@ -713,6 +897,10 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
           throw std::runtime_error("output_bytes size must match outputs");
         }
 
+        TaskEvent alloc_outputs_event;
+        if (log_enabled) {
+          alloc_outputs_event = start_span(base_event, "alloc_outputs");
+        }
         std::vector<HostView> outputs;
         outputs.reserve(tmpl.outputs.size());
         for (std::size_t i = 0; i < tmpl.outputs.size(); ++i) {
@@ -723,6 +911,9 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
           const auto& out = tmpl.outputs[i];
           ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version, out_block};
           outputs.push_back(data.alloc_host(cref, bytes));
+        }
+        if (log_enabled) {
+          end_span(alloc_outputs_event);
         }
 
         NeighborViews nbrs;
@@ -759,6 +950,10 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
               if (log_enabled) {
                 end_span(kernel_event);
               }
+              TaskEvent put_outputs_event;
+              if (log_enabled) {
+                put_outputs_event = start_span(base_event, "put_outputs");
+              }
               std::vector<hpx::future<void>> puts;
               puts.reserve(tmpl.outputs.size());
               for (std::size_t i = 0; i < tmpl.outputs.size(); ++i) {
@@ -767,6 +962,9 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
                 ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version,
                               out_block};
                 puts.push_back(data.put_host(cref, std::move((*outputs_ptr)[i])));
+              }
+              if (log_enabled) {
+                end_span(put_outputs_event);
               }
               TaskEvent wait_outputs_event;
               if (log_enabled) {
@@ -792,11 +990,11 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
     try {
       done.get();
       event.status = "end";
-      log_task_event(event);
+      log_task_event_with_enqueue_timing(event, base_event, "emit_task_end");
       return;
     } catch (...) {
       event.status = "error";
-      log_task_event(event);
+      log_task_event_with_enqueue_timing(event, base_event, "emit_task_error");
       throw;
     }
   });
@@ -992,9 +1190,7 @@ hpx::future<void> Executor::run_stage(int32_t stage_idx, const StageIR& stage) {
             std::runtime_error("graph stage requires graph templates"));
       }
       const auto& params = prepared_graph_reduce(tmpl);
-      const int32_t fan_in = params.fan_in;
-      const int32_t num_inputs = params.num_inputs;
-      const int32_t n_groups = (num_inputs + fan_in - 1) / fan_in;
+      const int32_t n_groups = graph_reduce_group_count(params);
       for (int32_t group_idx = 0; group_idx < n_groups; ++group_idx) {
         futures.push_back(
             run_graph_task(tmpl, stage_idx, static_cast<int32_t>(tmpl_idx), group_idx));
@@ -1028,32 +1224,44 @@ hpx::future<void> Executor::run_block_task(const TaskTemplateIR& tmpl, int32_t s
     return hpx::make_exceptional_future<void>(
         std::runtime_error("templates must specify outputs"));
   }
-  if (tmpl.inputs.empty()) {
-    ChunkRef cref{tmpl.domain.step, tmpl.domain.level, tmpl.outputs.front().field,
-                  tmpl.outputs.front().version, block};
-    int target = data_.home_rank(cref);
-    int here = hpx::get_locality_id();
-    if (target == here) {
-      return run_block_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, block, meta_, data_, adj_);
-    }
-    auto localities = hpx::find_all_localities();
-    return hpx::async<::kangaroo_run_block_task_action>(localities.at(target), plan_id_, stage_idx,
-                                                        tmpl_idx, block);
+  const bool log_enabled = has_event_log();
+  TaskEvent dispatch_event;
+  if (log_enabled) {
+    dispatch_event = base_task_event(tmpl, plan_id_, stage_idx, tmpl_idx, block);
   }
-
-  const auto& first_input = tmpl.inputs.front();
-  const auto loc = resolve_input_location(tmpl, first_input, block);
-  ChunkRef cref{loc.step, loc.level, first_input.field, first_input.version, loc.block};
-
-  int target = data_.home_rank(cref);
+  TaskEvent resolve_target_event;
+  if (log_enabled) {
+    resolve_target_event = start_span(dispatch_event, "dispatch_resolve_target");
+  }
+  ChunkRef target_ref;
+  if (tmpl.inputs.empty()) {
+    target_ref = ChunkRef{tmpl.domain.step, tmpl.domain.level, tmpl.outputs.front().field,
+                          tmpl.outputs.front().version, block};
+  } else {
+    const auto& first_input = tmpl.inputs.front();
+    const auto loc = resolve_input_location(tmpl, first_input, block);
+    target_ref = ChunkRef{loc.step, loc.level, first_input.field, first_input.version, loc.block};
+  }
+  int target = data_.home_rank(target_ref);
+  if (log_enabled) {
+    end_span(resolve_target_event);
+  }
   int here = hpx::get_locality_id();
   if (target == here) {
     return run_block_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, block, meta_, data_, adj_);
   }
 
   auto localities = hpx::find_all_localities();
-  return hpx::async<::kangaroo_run_block_task_action>(localities.at(target), plan_id_, stage_idx,
-                                                      tmpl_idx, block);
+  TaskEvent launch_event;
+  if (log_enabled) {
+    launch_event = start_span(dispatch_event, "dispatch_remote_action");
+  }
+  auto fut = hpx::async<::kangaroo_run_block_task_action>(localities.at(target), plan_id_, stage_idx,
+                                                          tmpl_idx, block);
+  if (log_enabled) {
+    end_span(launch_event);
+  }
+  return fut;
 }
 
 hpx::future<void> Executor::run_graph_task(const TaskTemplateIR& tmpl, int32_t stage_idx,
@@ -1069,19 +1277,41 @@ hpx::future<void> Executor::run_graph_task(const TaskTemplateIR& tmpl, int32_t s
   }
 
   const auto& params = prepared_graph_reduce(tmpl);
-  const int32_t out_block = params.output_base + group_idx;
+  const int32_t out_block = graph_reduce_output_block(params, group_idx);
+  const bool log_enabled = has_event_log();
+  TaskEvent dispatch_event;
+  if (log_enabled) {
+    dispatch_event = base_task_event(tmpl, plan_id_, stage_idx, tmpl_idx, out_block);
+  }
+  TaskEvent resolve_target_event;
+  if (log_enabled) {
+    resolve_target_event = start_span(dispatch_event, "dispatch_resolve_target");
+  }
   const auto& out = tmpl.outputs.front();
   ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version, out_block};
 
   int target = data_.home_rank(cref);
+  if (log_enabled) {
+    end_span(resolve_target_event);
+  }
   int here = hpx::get_locality_id();
   if (target == here) {
-    return run_graph_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, group_idx, meta_, data_);
+    return hpx::unwrap(hpx::async([this, tmpl, stage_idx, tmpl_idx, group_idx]() mutable {
+      return run_graph_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, group_idx, meta_, data_);
+    }));
   }
 
   auto localities = hpx::find_all_localities();
-  return hpx::async<::kangaroo_run_graph_task_action>(localities.at(target), plan_id_, stage_idx,
-                                                      tmpl_idx, group_idx);
+  TaskEvent launch_event;
+  if (log_enabled) {
+    launch_event = start_span(dispatch_event, "dispatch_remote_action");
+  }
+  auto fut = hpx::async<::kangaroo_run_graph_task_action>(localities.at(target), plan_id_,
+                                                          stage_idx, tmpl_idx, group_idx);
+  if (log_enabled) {
+    end_span(launch_event);
+  }
+  return fut;
 }
 
 }  // namespace kangaroo

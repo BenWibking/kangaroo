@@ -468,6 +468,7 @@ NB_MODULE(_core, m) {
       .def("set_perfetto_trace_path", &kangaroo::Runtime::set_perfetto_trace_path)
       .def("locality_id", &kangaroo::Runtime::locality_id)
       .def("num_localities", &kangaroo::Runtime::num_localities)
+      .def("chunk_home_rank", &kangaroo::Runtime::chunk_home_rank)
       .def("wait_for_console_release",
            &kangaroo::Runtime::wait_for_console_release,
            nb::call_guard<nb::gil_scoped_release>())

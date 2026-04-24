@@ -7,6 +7,130 @@ from .ctx import LoweringContext
 from .plan import FieldRef
 
 
+def _default_reduce_fan_in(num_inputs: int) -> int:
+    return max(2, min(8, int(math.sqrt(max(1, num_inputs)))))
+
+
+def _contiguous_reduce_groups(input_blocks: Sequence[int], fan_in: int) -> list[list[int]]:
+    width = max(1, int(fan_in))
+    return [
+        [int(block) for block in input_blocks[i : i + width]]
+        for i in range(0, len(input_blocks), width)
+    ]
+
+
+def _fallback_home_rank(step: int, level: int, block: int, num_localities: int) -> int:
+    mask = (1 << 64) - 1
+    h = 0xCBF29CE484222325
+    for value in (step, level, block):
+        h ^= (
+            (int(value) & mask)
+            + 0x9E3779B97F4A7C15
+            + ((h << 6) & mask)
+            + (h >> 2)
+        )
+        h &= mask
+    return int(h % max(1, int(num_localities)))
+
+
+def _num_localities(ctx: LoweringContext) -> int:
+    fn = getattr(ctx.runtime, "num_localities", None)
+    if callable(fn):
+        try:
+            return max(1, int(fn()))
+        except Exception:
+            return 1
+    return 1
+
+
+def _chunk_home_rank(ctx: LoweringContext, *, step: int, level: int, block: int, num_localities: int) -> int:
+    fn = getattr(ctx.runtime, "chunk_home_rank", None)
+    if callable(fn):
+        try:
+            return int(fn(int(step), int(level), int(block))) % max(1, int(num_localities))
+        except TypeError:
+            return int(fn(step=int(step), level=int(level), block=int(block))) % max(1, int(num_localities))
+    return _fallback_home_rank(step, level, block, num_localities)
+
+
+FieldLocation = tuple[FieldRef, int, int]
+
+
+def _order_fields_by_home(
+    ctx: LoweringContext,
+    *,
+    step: int,
+    fields: Sequence[FieldLocation],
+) -> list[FieldLocation]:
+    ordered = list(fields)
+    num_localities = _num_localities(ctx)
+    if num_localities <= 1 or len(ordered) <= 2:
+        return ordered
+
+    buckets: list[list[FieldLocation]] = [[] for _ in range(num_localities)]
+    for item in ordered:
+        _, level, block = item
+        rank = _chunk_home_rank(
+            ctx,
+            step=step,
+            level=level,
+            block=block,
+            num_localities=num_localities,
+        )
+        buckets[rank].append(item)
+
+    grouped: list[FieldLocation] = []
+    leftovers: list[FieldLocation] = []
+    for bucket in buckets:
+        paired = len(bucket) - (len(bucket) % 2)
+        grouped.extend(bucket[:paired])
+        leftovers.extend(bucket[paired:])
+    grouped.extend(leftovers)
+    return grouped if len(grouped) == len(ordered) else ordered
+
+
+def _reduce_group_plan(
+    ctx: LoweringContext,
+    *,
+    step: int,
+    level: int,
+    input_blocks: Sequence[int],
+    fan_in: int,
+) -> tuple[list[int], list[int], list[int]]:
+    blocks = [int(block) for block in input_blocks]
+    if not blocks:
+        return [], [], [0]
+
+    groups = _contiguous_reduce_groups(blocks, fan_in)
+    num_localities = _num_localities(ctx)
+    if num_localities > 1 and len(blocks) > 1 and fan_in > 1:
+        buckets: list[list[int]] = [[] for _ in range(num_localities)]
+        for block in blocks:
+            rank = _chunk_home_rank(
+                ctx,
+                step=step,
+                level=level,
+                block=block,
+                num_localities=num_localities,
+            )
+            buckets[rank].append(block)
+        locality_groups = [
+            group
+            for bucket in buckets
+            for group in _contiguous_reduce_groups(bucket, fan_in)
+            if group
+        ]
+        if locality_groups and len(locality_groups) < len(blocks):
+            groups = locality_groups
+
+    ordered_blocks = [block for group in groups for block in group]
+    group_offsets = [0]
+    for group in groups:
+        group_offsets.append(group_offsets[-1] + len(group))
+    output_blocks = [0] if len(groups) == 1 else [group[0] for group in groups]
+    return ordered_blocks, output_blocks, group_offsets
+
+
 class VorticityMag:
     def __init__(
         self,
@@ -214,7 +338,7 @@ class UniformSlice:
 
     def _reduce_fan_in(self, num_inputs: int) -> int:
         if self.reduce_fan_in is None:
-            return max(2, int(math.sqrt(num_inputs)))
+            return _default_reduce_fan_in(num_inputs)
         return max(1, int(self.reduce_fan_in))
 
     def _coarsen_box(
@@ -367,9 +491,17 @@ class UniformSlice:
             fan_in = self._reduce_fan_in(num_inputs)
             input_sum = sum_field
             input_area = area_field
+            current_blocks = list(blocks)
             reduce_idx = 0
             while num_inputs > 1:
-                num_groups = (num_inputs + fan_in - 1) // fan_in
+                input_blocks, output_blocks, group_offsets = _reduce_group_plan(
+                    ctx,
+                    step=ds.step,
+                    level=level_idx,
+                    input_blocks=current_blocks,
+                    fan_in=fan_in,
+                )
+                num_groups = len(output_blocks)
                 out_sum = sum_field if num_groups == 1 else ctx.temp_field(
                     f"{self.out_name}_sum_reduce_{level_idx}_{reduce_idx}"
                 )
@@ -383,6 +515,9 @@ class UniformSlice:
                     "num_inputs": num_inputs,
                     "input_base": 0,
                     "output_base": 0,
+                    "input_blocks": list(input_blocks),
+                    "output_blocks": list(output_blocks),
+                    "group_offsets": list(group_offsets),
                     "bytes_per_value": 8,
                 }
                 area_params = {
@@ -391,11 +526,11 @@ class UniformSlice:
                     "num_inputs": num_inputs,
                     "input_base": 0,
                     "output_base": 0,
+                    "input_blocks": list(input_blocks),
+                    "output_blocks": list(output_blocks),
+                    "group_offsets": list(group_offsets),
                     "bytes_per_value": 8,
                 }
-                if reduce_idx == 0:
-                    sum_params["input_blocks"] = list(blocks)
-                    area_params["input_blocks"] = list(blocks)
                 reduce_stage.map_blocks(
                     name=f"uniform_slice_sum_reduce_s{reduce_idx}",
                     kernel="uniform_slice_reduce",
@@ -423,6 +558,7 @@ class UniformSlice:
                 producer_stage[out_area.field] = reduce_stage2
                 input_sum = out_sum
                 input_area = out_area
+                current_blocks = output_blocks
                 num_inputs = num_groups
                 reduce_idx += 1
 
@@ -583,7 +719,7 @@ class UniformProjection:
 
     def _reduce_fan_in(self, num_inputs: int) -> int:
         if self.reduce_fan_in is None:
-            return max(2, int(math.sqrt(num_inputs)))
+            return _default_reduce_fan_in(num_inputs)
         return max(1, int(self.reduce_fan_in))
 
     def _coarsen_box(
@@ -732,9 +868,17 @@ class UniformProjection:
             num_inputs = len(blocks)
             fan_in = self._reduce_fan_in(num_inputs)
             input_sum = sum_field
+            current_blocks = list(blocks)
             reduce_idx = 0
             while num_inputs > 1:
-                num_groups = (num_inputs + fan_in - 1) // fan_in
+                input_blocks, output_blocks, group_offsets = _reduce_group_plan(
+                    ctx,
+                    step=ds.step,
+                    level=level_idx,
+                    input_blocks=current_blocks,
+                    fan_in=fan_in,
+                )
+                num_groups = len(output_blocks)
                 out_sum = sum_field if num_groups == 1 else ctx.temp_field(
                     f"{self.out_name}_sum_reduce_{level_idx}_{reduce_idx}"
                 )
@@ -745,10 +889,11 @@ class UniformProjection:
                     "num_inputs": num_inputs,
                     "input_base": 0,
                     "output_base": 0,
+                    "input_blocks": list(input_blocks),
+                    "output_blocks": list(output_blocks),
+                    "group_offsets": list(group_offsets),
                     "bytes_per_value": 8,
                 }
-                if reduce_idx == 0:
-                    sum_params["input_blocks"] = list(blocks)
                 reduce_stage.map_blocks(
                     name=f"uniform_projection_sum_reduce_s{reduce_idx}",
                     kernel="uniform_slice_reduce",
@@ -762,6 +907,7 @@ class UniformProjection:
                 stages.append(reduce_stage)
                 producer_stage[out_sum.field] = reduce_stage
                 input_sum = out_sum
+                current_blocks = output_blocks
                 num_inputs = num_groups
                 reduce_idx += 1
 
@@ -770,21 +916,33 @@ class UniformProjection:
         if not sum_fields:
             return ctx.fragment([])
 
-        def reduce_pairwise(fields: list[tuple[FieldRef, int]]) -> tuple[FieldRef, int]:
-            if len(fields) == 1:
-                return fields[0]
-            current = fields
+        def reduce_pairwise(fields: list[tuple[FieldRef, int]]) -> FieldLocation:
+            current: list[FieldLocation] = [(field, level, 0) for field, level in fields]
+            if len(current) == 1:
+                return current[0]
             reduce_round = 0
             while len(current) > 1:
-                next_fields: list[tuple[FieldRef, int]] = []
+                current = _order_fields_by_home(ctx, step=ds.step, fields=current)
+                next_fields: list[FieldLocation] = []
                 for i in range(0, len(current), 2):
                     if i + 1 >= len(current):
                         next_fields.append(current[i])
                         continue
-                    left, left_level = current[i]
-                    right, right_level = current[i + 1]
-                    left_ref = FieldRef(left.field, version=left.version, domain=ctx.domain(step=ds.step, level=left_level))
-                    right_ref = FieldRef(right.field, version=right.version, domain=ctx.domain(step=ds.step, level=right_level))
+                    left, left_level, left_block = current[i]
+                    right, right_level, right_block = current[i + 1]
+                    if left_block != right_block:
+                        raise ValueError("cross-level projection reductions require matching blocks")
+                    out_level, out_block = left_level, left_block
+                    left_ref = FieldRef(
+                        left.field,
+                        version=left.version,
+                        domain=ctx.domain(step=ds.step, level=left_level, blocks=[left_block]),
+                    )
+                    right_ref = FieldRef(
+                        right.field,
+                        version=right.version,
+                        domain=ctx.domain(step=ds.step, level=right_level, blocks=[right_block]),
+                    )
                     out_field = ctx.temp_field(f"{self.out_name}_sum_add_{reduce_round}_{i}")
                     deps = [
                         s
@@ -798,7 +956,7 @@ class UniformProjection:
                     add_stage.map_blocks(
                         name=f"uniform_projection_add_{reduce_round}_{i}",
                         kernel="uniform_slice_add",
-                        domain=ctx.domain(step=ds.step, level=ds.level),
+                        domain=ctx.domain(step=ds.step, level=out_level, blocks=[out_block]),
                         inputs=[left_ref, right_ref],
                         outputs=[out_field],
                         output_bytes=[out_sum_bytes],
@@ -808,18 +966,19 @@ class UniformProjection:
                             "fan_in": 1,
                             "num_inputs": 1,
                             "input_base": 0,
-                            "output_base": 0,
+                            "output_base": out_block,
+                            "output_blocks": [out_block],
                             "bytes_per_value": 8,
                         },
                     )
                     stages.append(add_stage)
                     producer_stage[out_field.field] = add_stage
-                    next_fields.append((out_field, ds.level))
+                    next_fields.append((out_field, out_level, out_block))
                 current = next_fields
                 reduce_round += 1
             return current[0]
 
-        total_sum, total_sum_level = reduce_pairwise(sum_fields)
+        total_sum, total_sum_level, total_sum_block = reduce_pairwise(sum_fields)
         out_field = ctx.output_field(self.out_name)
         finalize_deps = [s for s in (producer_stage.get(total_sum.field),) if s is not None]
         finalize = ctx.stage("uniform_projection_output", plane="graph", after=finalize_deps)
@@ -831,7 +990,7 @@ class UniformProjection:
                 FieldRef(
                     total_sum.field,
                     version=total_sum.version,
-                    domain=ctx.domain(step=ds.step, level=total_sum_level),
+                    domain=ctx.domain(step=ds.step, level=total_sum_level, blocks=[total_sum_block]),
                 )
             ],
             outputs=[out_field],
@@ -914,7 +1073,7 @@ class ParticleCICProjection:
 
     def _reduce_fan_in(self, num_inputs: int) -> int:
         if self.reduce_fan_in is None:
-            return max(2, int(math.sqrt(num_inputs)))
+            return _default_reduce_fan_in(num_inputs)
         return max(1, int(self.reduce_fan_in))
 
     def _ref_ratio_between(self, levels, coarse: int, fine: int) -> int:
@@ -1050,9 +1209,17 @@ class ParticleCICProjection:
             num_inputs = len(blocks)
             fan_in = self._reduce_fan_in(num_inputs)
             input_sum = sum_field
+            current_blocks = list(blocks)
             reduce_idx = 0
             while num_inputs > 1:
-                num_groups = (num_inputs + fan_in - 1) // fan_in
+                input_blocks, output_blocks, group_offsets = _reduce_group_plan(
+                    ctx,
+                    step=ds.step,
+                    level=level_idx,
+                    input_blocks=current_blocks,
+                    fan_in=fan_in,
+                )
+                num_groups = len(output_blocks)
                 out_sum = sum_field if num_groups == 1 else ctx.temp_field(
                     f"{self.out_name}_sum_reduce_{level_idx}_{reduce_idx}"
                 )
@@ -1063,10 +1230,11 @@ class ParticleCICProjection:
                     "num_inputs": num_inputs,
                     "input_base": 0,
                     "output_base": 0,
+                    "input_blocks": list(input_blocks),
+                    "output_blocks": list(output_blocks),
+                    "group_offsets": list(group_offsets),
                     "bytes_per_value": 8,
                 }
-                if reduce_idx == 0:
-                    sum_params["input_blocks"] = list(blocks)
                 reduce_stage.map_blocks(
                     name=f"particle_cic_projection_sum_reduce_s{reduce_idx}",
                     kernel="uniform_slice_reduce",
@@ -1080,6 +1248,7 @@ class ParticleCICProjection:
                 stages.append(reduce_stage)
                 producer_stage[out_sum.field] = reduce_stage
                 input_sum = out_sum
+                current_blocks = output_blocks
                 num_inputs = num_groups
                 reduce_idx += 1
 
@@ -1088,21 +1257,33 @@ class ParticleCICProjection:
         if not sum_fields:
             return ctx.fragment([])
 
-        def reduce_pairwise(fields: list[tuple[FieldRef, int]]) -> tuple[FieldRef, int]:
-            if len(fields) == 1:
-                return fields[0]
-            current = fields
+        def reduce_pairwise(fields: list[tuple[FieldRef, int]]) -> FieldLocation:
+            current: list[FieldLocation] = [(field, level, 0) for field, level in fields]
+            if len(current) == 1:
+                return current[0]
             reduce_round = 0
             while len(current) > 1:
-                next_fields: list[tuple[FieldRef, int]] = []
+                current = _order_fields_by_home(ctx, step=ds.step, fields=current)
+                next_fields: list[FieldLocation] = []
                 for i in range(0, len(current), 2):
                     if i + 1 >= len(current):
                         next_fields.append(current[i])
                         continue
-                    left, left_level = current[i]
-                    right, right_level = current[i + 1]
-                    left_ref = FieldRef(left.field, version=left.version, domain=ctx.domain(step=ds.step, level=left_level))
-                    right_ref = FieldRef(right.field, version=right.version, domain=ctx.domain(step=ds.step, level=right_level))
+                    left, left_level, left_block = current[i]
+                    right, right_level, right_block = current[i + 1]
+                    if left_block != right_block:
+                        raise ValueError("cross-level CIC projection reductions require matching blocks")
+                    out_level, out_block = left_level, left_block
+                    left_ref = FieldRef(
+                        left.field,
+                        version=left.version,
+                        domain=ctx.domain(step=ds.step, level=left_level, blocks=[left_block]),
+                    )
+                    right_ref = FieldRef(
+                        right.field,
+                        version=right.version,
+                        domain=ctx.domain(step=ds.step, level=right_level, blocks=[right_block]),
+                    )
                     out_field = ctx.temp_field(f"{self.out_name}_sum_add_{reduce_round}_{i}")
                     deps = [
                         s
@@ -1116,7 +1297,7 @@ class ParticleCICProjection:
                     add_stage.map_blocks(
                         name=f"particle_cic_projection_add_{reduce_round}_{i}",
                         kernel="uniform_slice_add",
-                        domain=ctx.domain(step=ds.step, level=ds.level),
+                        domain=ctx.domain(step=ds.step, level=out_level, blocks=[out_block]),
                         inputs=[left_ref, right_ref],
                         outputs=[out_field],
                         output_bytes=[out_sum_bytes],
@@ -1126,18 +1307,19 @@ class ParticleCICProjection:
                             "fan_in": 1,
                             "num_inputs": 1,
                             "input_base": 0,
-                            "output_base": 0,
+                            "output_base": out_block,
+                            "output_blocks": [out_block],
                             "bytes_per_value": 8,
                         },
                     )
                     stages.append(add_stage)
                     producer_stage[out_field.field] = add_stage
-                    next_fields.append((out_field, ds.level))
+                    next_fields.append((out_field, out_level, out_block))
                 current = next_fields
                 reduce_round += 1
             return current[0]
 
-        total_sum, total_sum_level = reduce_pairwise(sum_fields)
+        total_sum, total_sum_level, total_sum_block = reduce_pairwise(sum_fields)
         out_field = ctx.output_field(self.out_name)
         finalize_deps = [s for s in (producer_stage.get(total_sum.field),) if s is not None]
         finalize = ctx.stage("particle_cic_projection_output", plane="graph", after=finalize_deps)
@@ -1149,7 +1331,7 @@ class ParticleCICProjection:
                 FieldRef(
                     total_sum.field,
                     version=total_sum.version,
-                    domain=ctx.domain(step=ds.step, level=total_sum_level),
+                    domain=ctx.domain(step=ds.step, level=total_sum_level, blocks=[total_sum_block]),
                 )
             ],
             outputs=[out_field],
@@ -1368,7 +1550,7 @@ class Histogram1D:
 
     def _reduce_fan_in(self, num_inputs: int) -> int:
         if self.reduce_fan_in is None:
-            return max(2, int(math.sqrt(num_inputs)))
+            return _default_reduce_fan_in(num_inputs)
         return max(1, int(self.reduce_fan_in))
 
     def _ref_ratio_between(self, levels, coarse: int, fine: int) -> int:
@@ -1455,9 +1637,17 @@ class Histogram1D:
             num_inputs = len(blocks)
             fan_in = self._reduce_fan_in(num_inputs)
             input_hist = hist_field
+            current_blocks = list(blocks)
             reduce_idx = 0
             while num_inputs > 1:
-                num_groups = (num_inputs + fan_in - 1) // fan_in
+                input_blocks, output_blocks, group_offsets = _reduce_group_plan(
+                    ctx,
+                    step=ds.step,
+                    level=level_idx,
+                    input_blocks=current_blocks,
+                    fan_in=fan_in,
+                )
+                num_groups = len(output_blocks)
                 out_hist = hist_field if num_groups == 1 else ctx.temp_field(
                     f"{self.out_name}_sum_reduce_{level_idx}_{reduce_idx}"
                 )
@@ -1468,10 +1658,11 @@ class Histogram1D:
                     "num_inputs": num_inputs,
                     "input_base": 0,
                     "output_base": 0,
+                    "input_blocks": list(input_blocks),
+                    "output_blocks": list(output_blocks),
+                    "group_offsets": list(group_offsets),
                     "bytes_per_value": 8,
                 }
-                if reduce_idx == 0:
-                    reduce_params["input_blocks"] = list(blocks)
                 reduce_stage.map_blocks(
                     name=f"histogram1d_reduce_s{reduce_idx}",
                     kernel="uniform_slice_reduce",
@@ -1485,6 +1676,7 @@ class Histogram1D:
                 stages.append(reduce_stage)
                 producer_stage[out_hist.field] = reduce_stage
                 input_hist = out_hist
+                current_blocks = output_blocks
                 num_inputs = num_groups
                 reduce_idx += 1
 
@@ -1609,7 +1801,7 @@ class Histogram2D:
 
     def _reduce_fan_in(self, num_inputs: int) -> int:
         if self.reduce_fan_in is None:
-            return max(2, int(math.sqrt(num_inputs)))
+            return _default_reduce_fan_in(num_inputs)
         return max(1, int(self.reduce_fan_in))
 
     def _ref_ratio_between(self, levels, coarse: int, fine: int) -> int:
@@ -1702,9 +1894,17 @@ class Histogram2D:
             num_inputs = len(blocks)
             fan_in = self._reduce_fan_in(num_inputs)
             input_hist = hist_field
+            current_blocks = list(blocks)
             reduce_idx = 0
             while num_inputs > 1:
-                num_groups = (num_inputs + fan_in - 1) // fan_in
+                input_blocks, output_blocks, group_offsets = _reduce_group_plan(
+                    ctx,
+                    step=ds.step,
+                    level=level_idx,
+                    input_blocks=current_blocks,
+                    fan_in=fan_in,
+                )
+                num_groups = len(output_blocks)
                 out_hist = hist_field if num_groups == 1 else ctx.temp_field(
                     f"{self.out_name}_sum_reduce_{level_idx}_{reduce_idx}"
                 )
@@ -1715,10 +1915,11 @@ class Histogram2D:
                     "num_inputs": num_inputs,
                     "input_base": 0,
                     "output_base": 0,
+                    "input_blocks": list(input_blocks),
+                    "output_blocks": list(output_blocks),
+                    "group_offsets": list(group_offsets),
                     "bytes_per_value": 8,
                 }
-                if reduce_idx == 0:
-                    reduce_params["input_blocks"] = list(blocks)
                 reduce_stage.map_blocks(
                     name=f"histogram2d_reduce_s{reduce_idx}",
                     kernel="uniform_slice_reduce",
@@ -1732,6 +1933,7 @@ class Histogram2D:
                 stages.append(reduce_stage)
                 producer_stage[out_hist.field] = reduce_stage
                 input_hist = out_hist
+                current_blocks = output_blocks
                 num_inputs = num_groups
                 reduce_idx += 1
 

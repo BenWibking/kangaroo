@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import struct
 
 
@@ -60,6 +61,43 @@ def test_put_host_before_get_returns_ready_value() -> None:
 
     assert out["ready_before_get"] is True
     assert out["data"] == payload
+
+
+def test_data_service_event_log_records_structured_dataflow(tmp_path) -> None:
+    from analysis import _core  # type: ignore
+
+    ds = _core.DatasetHandle("memory://local", 0, 0)
+    payload = b"dataflow-event"
+    log_path = tmp_path / "events.jsonl"
+
+    _core.set_event_log_path(str(log_path))
+    try:
+        _core.test_data_service_put_then_get(
+            dataset=ds,
+            step=0,
+            level=0,
+            field=12,
+            version=0,
+            block=0,
+            payload=payload,
+        )
+    finally:
+        _core.set_event_log_path("")
+
+    events = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    dataflow = [event for event in events if event["type"] == "dataflow"]
+
+    assert {event["op"] for event in dataflow} >= {"put_host", "get_host"}
+    for event in dataflow:
+        assert event["mode"] in {"local", "remote"}
+        assert event["status"] == "end"
+        assert event["target_locality"] >= 0
+        assert event["bytes"] == len(payload)
+        assert event["elapsed"] >= 0.0
 
 
 def test_multiple_get_host_consumers_wait_on_one_pending_chunk() -> None:

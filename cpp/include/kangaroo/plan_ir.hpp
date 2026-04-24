@@ -59,6 +59,8 @@ struct GraphReduceSpecIR {
   int32_t input_base = 0;
   int32_t output_base = 0;
   std::vector<int32_t> input_blocks;
+  std::vector<int32_t> output_blocks;
+  std::vector<int32_t> group_offsets;
 };
 
 struct CoveredBoxIR {

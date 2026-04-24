@@ -8,7 +8,14 @@ import pytest
 
 from analysis.plan import Domain, FieldRef, Plan, Stage
 from analysis import runtime as runtime_mod
-from analysis.runtime import Runtime, _count_plan_tasks, plan_to_dict, run_console_main
+from analysis.runtime import (
+    Runtime,
+    _count_plan_tasks,
+    _event_log_paths,
+    _is_main_task_completion,
+    plan_to_dict,
+    run_console_main,
+)
 
 
 class _FakeCoreRuntime:
@@ -225,3 +232,38 @@ def test_count_plan_tasks_counts_graph_reduce_groups_not_level_blocks() -> None:
     total = _count_plan_tasks(Plan(stages=[graph_stage]), runmeta=_FakeRunMeta(nboxes=976))
 
     assert total == 6
+
+
+def test_progress_monitor_discovers_locality_event_logs(tmp_path) -> None:
+    root = tmp_path / "events.jsonl"
+    loc1 = tmp_path / "events.locality1.jsonl"
+    loc2 = tmp_path / "events.locality2.jsonl"
+    other = tmp_path / "events.locality1.txt"
+    root.write_text("", encoding="utf-8")
+    loc2.write_text("", encoding="utf-8")
+    other.write_text("", encoding="utf-8")
+    loc1.write_text("", encoding="utf-8")
+
+    assert _event_log_paths(root) == [root, loc1, loc2]
+
+
+def test_progress_monitor_counts_only_main_task_completions() -> None:
+    main = {
+        "type": "task",
+        "status": "end",
+        "id": "1:2:3:4",
+    }
+    span = {
+        "type": "task",
+        "status": "end",
+        "id": "1:2:3:4:kernel",
+    }
+    phase = {
+        "type": "phase",
+        "status": "end",
+        "id": "1:2:3:4",
+    }
+
+    assert _is_main_task_completion(main)
+    assert not _is_main_task_completion(span)
+    assert not _is_main_task_completion(phase)

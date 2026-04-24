@@ -6,9 +6,10 @@ from analysis.pipeline import FieldHandle, Histogram1DHandle, Histogram2DHandle,
 
 
 class _FakeCoreRuntime:
-    def __init__(self) -> None:
+    def __init__(self, *, num_localities: int = 1) -> None:
         self._next_field = 1
         self.persistent: dict[int, str] = {}
+        self._num_localities = max(1, int(num_localities))
 
     def alloc_field_id(self, name: str) -> int:
         fid = self._next_field
@@ -18,14 +19,31 @@ class _FakeCoreRuntime:
     def mark_field_persistent(self, fid: int, name: str) -> None:
         self.persistent[fid] = name
 
+    def num_localities(self) -> int:
+        return self._num_localities
+
+    def chunk_home_rank(self, step: int, level: int, block: int) -> int:
+        return int(block) % self._num_localities
+
 
 class _FakeRuntime:
-    def __init__(self) -> None:
-        self._rt = _FakeCoreRuntime()
+    def __init__(self, *, num_localities: int = 1) -> None:
+        self._rt = _FakeCoreRuntime(num_localities=num_localities)
         self.submitted = []
 
     def run(self, plan, *, runmeta, dataset, progress_bar: bool = False) -> None:
         self.submitted.append((plan, runmeta, dataset, bool(progress_bar)))
+
+
+class _LevelHomeCoreRuntime(_FakeCoreRuntime):
+    def chunk_home_rank(self, step: int, level: int, block: int) -> int:
+        return int(level) % self._num_localities
+
+
+class _LevelHomeRuntime(_FakeRuntime):
+    def __init__(self, *, num_localities: int = 1) -> None:
+        self._rt = _LevelHomeCoreRuntime(num_localities=num_localities)
+        self.submitted = []
 
 
 class _FakeDataset:
@@ -101,6 +119,42 @@ def _single_level_two_block_runmeta() -> _RunMeta:
                             _Box((4, 0, 0), (7, 7, 7)),
                         ],
                     )
+                ],
+            )
+        ]
+    )
+
+
+def _single_level_many_block_runmeta(nblocks: int) -> _RunMeta:
+    return _RunMeta(
+        steps=[
+            _Step(
+                step=0,
+                levels=[
+                    _Level(
+                        geom=_Geom(dx=(1.0, 1.0, 1.0), x0=(0.0, 0.0, 0.0), index_origin=(0, 0, 0)),
+                        boxes=[
+                            _Box((i, 0, 0), (i, 0, 0))
+                            for i in range(nblocks)
+                        ],
+                    )
+                ],
+            )
+        ]
+    )
+
+
+def _multi_level_one_block_runmeta(nlevels: int) -> _RunMeta:
+    return _RunMeta(
+        steps=[
+            _Step(
+                step=0,
+                levels=[
+                    _Level(
+                        geom=_Geom(dx=(1.0, 1.0, 1.0), x0=(0.0, 0.0, 0.0), index_origin=(0, 0, 0)),
+                        boxes=[_Box((0, 0, 0), (0, 0, 0))],
+                    )
+                    for _ in range(nlevels)
                 ],
             )
         ]
@@ -286,6 +340,114 @@ def test_pipeline_particle_cic_projection_lowering_wiring() -> None:
     assert all(tmpl.params["particle_type"] == "StochasticStellarPop_particles" for tmpl in grid)
     assert all(tmpl.params["level_index"] == 0 for tmpl in grid)
     assert all(tmpl.params["resolution"] == [16, 16] for tmpl in acc)
+
+
+def test_pipeline_projection_reduce_carries_group_output_blocks() -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_many_block_runmeta(16)
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+
+    scalar = pipe.field("scalar")
+    pipe.uniform_projection(
+        scalar,
+        axis="z",
+        axis_bounds=(0.0, 1.0),
+        rect=(0.0, 0.0, 16.0, 1.0),
+        resolution=(4, 4),
+        out="proj",
+    )
+
+    plan = pipe.plan()
+    reductions = [
+        tmpl
+        for stage in plan.topo_stages()
+        for tmpl in stage.templates
+        if tmpl.kernel == "uniform_slice_reduce"
+        and tmpl.name.startswith("uniform_projection_sum_reduce")
+    ]
+
+    assert len(reductions) == 2
+    assert reductions[0].params["fan_in"] == 4
+    assert reductions[0].params["input_blocks"] == list(range(16))
+    assert reductions[0].params["output_blocks"] == [0, 4, 8, 12]
+    assert reductions[0].params["group_offsets"] == [0, 4, 8, 12, 16]
+    assert reductions[1].params["input_blocks"] == [0, 4, 8, 12]
+    assert reductions[1].params["output_blocks"] == [0]
+    assert reductions[1].params["group_offsets"] == [0, 4]
+
+
+def test_pipeline_projection_reduce_groups_by_locality() -> None:
+    rt = _FakeRuntime(num_localities=2)
+    runmeta = _single_level_many_block_runmeta(16)
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+
+    scalar = pipe.field("scalar")
+    pipe.uniform_projection(
+        scalar,
+        axis="z",
+        axis_bounds=(0.0, 1.0),
+        rect=(0.0, 0.0, 16.0, 1.0),
+        resolution=(4, 4),
+        out="proj",
+    )
+
+    plan = pipe.plan()
+    reductions = [
+        tmpl
+        for stage in plan.topo_stages()
+        for tmpl in stage.templates
+        if tmpl.kernel == "uniform_slice_reduce"
+        and tmpl.name.startswith("uniform_projection_sum_reduce")
+    ]
+
+    assert len(reductions) == 3
+    assert reductions[0].params["fan_in"] == 4
+    assert reductions[0].params["input_blocks"] == [
+        0, 2, 4, 6,
+        8, 10, 12, 14,
+        1, 3, 5, 7,
+        9, 11, 13, 15,
+    ]
+    assert reductions[0].params["output_blocks"] == [0, 8, 1, 9]
+    assert reductions[0].params["group_offsets"] == [0, 4, 8, 12, 16]
+    assert reductions[1].params["input_blocks"] == [0, 8, 1, 9]
+    assert reductions[1].params["output_blocks"] == [0, 1]
+    assert reductions[1].params["group_offsets"] == [0, 2, 4]
+    assert reductions[2].params["input_blocks"] == [0, 1]
+    assert reductions[2].params["output_blocks"] == [0]
+    assert reductions[2].params["group_offsets"] == [0, 2]
+
+
+def test_pipeline_projection_final_adds_group_levels_by_locality() -> None:
+    rt = _LevelHomeRuntime(num_localities=2)
+    runmeta = _multi_level_one_block_runmeta(4)
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+
+    scalar = pipe.field("scalar")
+    pipe.uniform_projection(
+        scalar,
+        axis="z",
+        axis_bounds=(0.0, 1.0),
+        rect=(0.0, 0.0, 1.0, 1.0),
+        resolution=(4, 4),
+        out="proj",
+    )
+
+    plan = pipe.plan()
+    adds = [
+        tmpl
+        for stage in plan.topo_stages()
+        for tmpl in stage.templates
+        if tmpl.kernel == "uniform_slice_add"
+        and tmpl.name.startswith("uniform_projection_add")
+    ]
+
+    assert [[ref.domain.level for ref in tmpl.inputs] for tmpl in adds[:2]] == [[2, 0], [3, 1]]
+    assert [tmpl.domain.level for tmpl in adds[:2]] == [2, 3]
+    assert [tmpl.params["output_blocks"] for tmpl in adds[:2]] == [[0], [0]]
 
 
 def test_pipeline_field_expr_lowering_wiring() -> None:

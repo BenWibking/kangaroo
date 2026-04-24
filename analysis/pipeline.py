@@ -13,6 +13,7 @@ from .ops import (
     UniformProjection,
     UniformSlice,
     VorticityMag,
+    _reduce_group_plan,
     histogram_edges_1d,
     histogram_edges_2d,
 )
@@ -174,7 +175,7 @@ class Pipeline:
         self._particle_cache.clear()
 
     def _particle_reduce_fan_in(self, num_inputs: int) -> int:
-        return max(2, int(np.sqrt(max(1, num_inputs))))
+        return max(2, min(8, int(np.sqrt(max(1, num_inputs)))))
 
     def _append_particle_reduce_tree(
         self,
@@ -188,9 +189,17 @@ class Pipeline:
         num_inputs = int(chunk_count)
         fan_in = self._particle_reduce_fan_in(num_inputs)
         in_field = int(input_field)
+        current_blocks = list(range(chunk_count))
         reduce_idx = 0
         while num_inputs > 1:
-            num_groups = (num_inputs + fan_in - 1) // fan_in
+            input_blocks, output_blocks, group_offsets = _reduce_group_plan(
+                self._ctx,
+                step=0,
+                level=0,
+                input_blocks=current_blocks,
+                fan_in=fan_in,
+            )
+            num_groups = len(output_blocks)
             out_field = in_field if num_groups == 1 else self._alloc_runtime_field("particle_reduce")
             reduce_stage = Stage(name=self._unique_name(f"{kernel}_reduce"), plane="graph")
             reduce_params = {
@@ -199,10 +208,11 @@ class Pipeline:
                 "num_inputs": num_inputs,
                 "input_base": 0,
                 "output_base": 0,
+                "input_blocks": list(input_blocks),
+                "output_blocks": list(output_blocks),
+                "group_offsets": list(group_offsets),
                 **params,
             }
-            if reduce_idx == 0:
-                reduce_params["input_blocks"] = list(range(chunk_count))
             reduce_stage.map_blocks(
                 name=kernel,
                 kernel=kernel,
@@ -215,6 +225,7 @@ class Pipeline:
             )
             self._append_particle_stage(reduce_stage, chunk_count=max(1, num_groups))
             in_field = out_field
+            current_blocks = output_blocks
             num_inputs = num_groups
             reduce_idx += 1
         return in_field

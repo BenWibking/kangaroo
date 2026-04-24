@@ -77,41 +77,53 @@ def _parse_base_id(event_id: str) -> Optional[Tuple[int, int, int, int]]:
         return None
 
 
+def _event_log_paths(path: Path) -> List[Path]:
+    paths = [path]
+    suffix = path.suffix
+    if suffix:
+        pattern = f"{path.stem}.locality*{suffix}"
+    else:
+        pattern = f"{path.name}.locality*"
+    paths.extend(sorted(p for p in path.parent.glob(pattern) if p != path))
+    return paths
+
+
 def _load_task_events(path: Path) -> List[RawTaskEvent]:
     out: List[RawTaskEvent] = []
-    with path.open("r", encoding="utf-8") as handle:
-        for lineno, line in enumerate(handle, 1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError as exc:
-                raise ValueError(f"{path}:{lineno}: invalid JSON: {exc}") from exc
-            if event.get("type") != "task":
-                continue
-            status = str(event.get("status", ""))
-            if status not in {"end", "error"}:
-                continue
-            try:
-                start = float(event.get("start", event.get("ts", 0.0)))
-                end = float(event.get("end", start))
-            except (TypeError, ValueError) as exc:
-                raise ValueError(f"{path}:{lineno}: non-numeric start/end") from exc
-            if end < start:
-                start, end = end, start
-            if end == start:
-                continue
-            out.append(
-                RawTaskEvent(
-                    event_id=str(event.get("id", "")),
-                    name=str(event.get("name", "")),
-                    start=start,
-                    end=end,
-                    locality=_safe_int(event.get("locality"), -1),
-                    worker=str(event.get("worker", "")),
+    for event_path in _event_log_paths(path):
+        with event_path.open("r", encoding="utf-8") as handle:
+            for lineno, line in enumerate(handle, 1):
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError as exc:
+                    raise ValueError(f"{event_path}:{lineno}: invalid JSON: {exc}") from exc
+                if event.get("type") != "task":
+                    continue
+                status = str(event.get("status", ""))
+                if status not in {"end", "error"}:
+                    continue
+                try:
+                    start = float(event.get("start", event.get("ts", 0.0)))
+                    end = float(event.get("end", start))
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"{event_path}:{lineno}: non-numeric start/end") from exc
+                if end < start:
+                    start, end = end, start
+                if end == start:
+                    continue
+                out.append(
+                    RawTaskEvent(
+                        event_id=str(event.get("id", "")),
+                        name=str(event.get("name", "")),
+                        start=start,
+                        end=end,
+                        locality=_safe_int(event.get("locality"), -1),
+                        worker=str(event.get("worker", "")),
+                    )
                 )
-            )
     if not out:
         raise ValueError(f"No completed task events found in {path}")
     return out
