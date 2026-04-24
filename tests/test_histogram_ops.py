@@ -218,14 +218,13 @@ def test_histogram1d_amr_covered_boxes_masking() -> None:
         levels,
     )
     ds0 = open_dataset("memory://local", runmeta=runmeta, step=step, level=0, runtime=rt)
-    ds1 = open_dataset("memory://local", runmeta=runmeta, step=step, level=1, runtime=rt)
     scalar = 23001
     ds0.register_field("scalar", scalar)
 
     coarse_vals = np.full((4, 4, 4), 0.5, dtype=np.float64)
     fine_vals = np.full((4, 8, 8), 0.5, dtype=np.float64)
     _set_block_double(ds0, step=step, level=0, field=scalar, block=0, values=coarse_vals)
-    _set_block_double(ds1, step=step, level=1, field=scalar, block=0, values=fine_vals)
+    _set_block_double(ds0, step=step, level=1, field=scalar, block=0, values=fine_vals)
 
     pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds0)
     scalar_h = pipe.field(scalar)

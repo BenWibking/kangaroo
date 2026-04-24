@@ -53,12 +53,9 @@ bool g_hpx_cfg_set = false;
 bool g_hpx_cmdline_set = false;
 std::vector<std::string> g_hpx_cfg;
 std::vector<std::string> g_hpx_cmdline;
-RunMeta g_runmeta;
-bool g_has_runmeta = false;
-DatasetHandle g_dataset;
-bool g_has_dataset = false;
 KernelRegistry* g_kernel_registry = nullptr;
-std::unordered_map<int32_t, PlanIR> g_plans;
+std::unordered_map<int32_t, std::shared_ptr<ExecutionContext>> g_execution_contexts;
+thread_local int32_t g_current_execution_context_id = 0;
 std::mutex g_event_log_mutex;
 std::string g_event_log_path;
 bool g_event_log_enabled = false;
@@ -69,13 +66,53 @@ std::atomic<int32_t> g_active_plan_runs{0};
 std::atomic<int32_t> g_locality_hint{-1};
 std::atomic<int32_t> g_perfetto_metrics_active_runs{0};
 std::mutex g_console_release_mutex;
-std::condition_variable g_console_release_cv;
+std::shared_ptr<hpx::promise<void>> g_console_release_promise;
+hpx::shared_future<void> g_console_release_future;
 bool g_console_release_requested = false;
+
+hpx::shared_future<void> ensure_console_release_future_locked() {
+  if (!g_console_release_promise || !g_console_release_future.valid()) {
+    auto promise = std::make_shared<hpx::promise<void>>();
+    g_console_release_future = promise->get_future().share();
+    g_console_release_promise = std::move(promise);
+  }
+  return g_console_release_future;
+}
 
 struct ActivePlanRunGuard {
   ActivePlanRunGuard() { g_active_plan_runs.fetch_add(1, std::memory_order_acq_rel); }
   ~ActivePlanRunGuard() { g_active_plan_runs.fetch_sub(1, std::memory_order_acq_rel); }
 };
+
+bool debug_projection_enabled() {
+  static const bool enabled = std::getenv("KANGAROO_DEBUG_PROJECTION") != nullptr;
+  return enabled;
+}
+
+void log_projection_kernel_summary(const char* kernel,
+                                   int32_t level_index,
+                                   int32_t block,
+                                   std::size_t covered_boxes_count,
+                                   std::size_t candidates,
+                                   std::size_t covered_skips,
+                                   std::size_t bounds_skips,
+                                   std::size_t deposited,
+                                   double out_sum) {
+  if (!debug_projection_enabled()) {
+    return;
+  }
+  std::cout << "[kangaroo][projection] kernel=" << kernel
+            << " locality=" << hpx::get_locality_id()
+            << " level=" << level_index
+            << " block=" << block
+            << " covered_boxes=" << covered_boxes_count
+            << " candidates=" << candidates
+            << " covered_skips=" << covered_skips
+            << " bounds_skips=" << bounds_skips
+            << " deposited=" << deposited
+            << " output_sum=" << out_sum
+            << std::endl;
+}
 
 void append_particle_values_as_f64(const plotfile::ParticleArrayData& data, const std::string& name,
                                    const std::string& context, std::vector<double>& out_vals) {
@@ -1352,52 +1389,131 @@ std::vector<SamplePatch> unpack_sample_patches(std::span<const std::uint8_t> pac
   return patches;
 }
 
+template <typename Params, typename DecodeFn>
+KernelRegistry::KernelParamsPrepareFn make_kernel_params_preparer(DecodeFn decode_fn) {
+  return [decode_fn = std::move(decode_fn)](
+             const KernelParamContext& context) -> KernelRegistry::PreparedParams {
+    if (context.params_msgpack.empty()) {
+      return {};
+    }
+    const auto& decoded = decode_params_cached<Params>(context.params_msgpack, decode_fn);
+    auto prepared = std::shared_ptr<const void>(
+        new Params(decoded),
+        [](const void* ptr) { delete static_cast<const Params*>(ptr); });
+    return KernelRegistry::PreparedParams{std::type_index(typeid(Params)), std::move(prepared)};
+  };
+}
+
+template <typename Params, typename DecodeFn>
+KernelRegistry::KernelParamsPrepareFn make_covered_box_params_preparer(DecodeFn decode_fn) {
+  return [decode_fn = std::move(decode_fn)](
+             const KernelParamContext& context) -> KernelRegistry::PreparedParams {
+    if (context.params_msgpack.empty() && !context.covered_boxes) {
+      return {};
+    }
+    Params decoded;
+    if (!context.params_msgpack.empty()) {
+      decoded = decode_params_cached<Params>(context.params_msgpack, decode_fn);
+    }
+    if (context.covered_boxes) {
+      decoded.covered_boxes = context.covered_boxes;
+    }
+    auto prepared = std::shared_ptr<const void>(
+        new Params(std::move(decoded)),
+        [](const void* ptr) { delete static_cast<const Params*>(ptr); });
+    return KernelRegistry::PreparedParams{std::type_index(typeid(Params)), std::move(prepared)};
+  };
+}
+
+std::shared_ptr<const CoveredBoxListIR> parse_covered_boxes_param(const msgpack::object& root) {
+  const auto* boxes = find_msgpack_map_value(root, "covered_boxes");
+  if (boxes == nullptr || boxes->type != msgpack::type::ARRAY) {
+    return {};
+  }
+
+  auto parsed = std::make_shared<CoveredBoxListIR>();
+  parsed->reserve(boxes->via.array.size);
+  for (uint32_t i = 0; i < boxes->via.array.size; ++i) {
+    const auto& entry = boxes->via.array.ptr[i];
+    if (entry.type != msgpack::type::ARRAY || entry.via.array.size != 2) {
+      continue;
+    }
+    const auto& lo = entry.via.array.ptr[0];
+    const auto& hi = entry.via.array.ptr[1];
+    if (lo.type != msgpack::type::ARRAY || hi.type != msgpack::type::ARRAY ||
+        lo.via.array.size != 3 || hi.via.array.size != 3) {
+      continue;
+    }
+    CoveredBoxIR box;
+    for (uint32_t d = 0; d < 3; ++d) {
+      box.lo[d] = lo.via.array.ptr[d].as<int32_t>();
+      box.hi[d] = hi.via.array.ptr[d].as<int32_t>();
+    }
+    parsed->push_back(box);
+  }
+  return parsed;
+}
+
+std::size_t covered_box_count(const std::shared_ptr<const CoveredBoxListIR>& boxes) {
+  return boxes ? boxes->size() : 0;
+}
+
+bool covered_box_contains(const CoveredBoxIR& box, int i, int j, int k) {
+  return i >= box.lo[0] && i <= box.hi[0] &&
+         j >= box.lo[1] && j <= box.hi[1] &&
+         k >= box.lo[2] && k <= box.hi[2];
+}
+
 void register_default_kernels(KernelRegistry& registry) {
   static const bool log_locality = []() {
     const char* env = std::getenv("KANGAROO_LOG_LOCALITY");
     return env != nullptr && *env != '\0' && *env != '0';
   }();
-  registry.register_kernel(
-      KernelDesc{.name = "amr_subbox_fetch_pack", .n_inputs = 0, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta& level, int32_t block, std::span<const HostView>, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+  {
+    struct Params {
+      int32_t input_field = -1;
+      int32_t input_version = 0;
+      int32_t input_step = 0;
+      int16_t input_level = 0;
+      int32_t bytes_per_value = 8;
+      int32_t halo_cells = 1;
+    };
+
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (root.type == msgpack::type::MAP) {
+        if (const auto* fld = find_msgpack_map_value(root, "input_field")) {
+          params.input_field = fld->as<int32_t>();
+        }
+        if (const auto* ver = find_msgpack_map_value(root, "input_version")) {
+          params.input_version = ver->as<int32_t>();
+        }
+        if (const auto* stp = find_msgpack_map_value(root, "input_step")) {
+          params.input_step = stp->as<int32_t>();
+        }
+        if (const auto* lev = find_msgpack_map_value(root, "input_level")) {
+          params.input_level = lev->as<int16_t>();
+        }
+        if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value")) {
+          params.bytes_per_value = bpv->as<int32_t>();
+        }
+        if (const auto* halo = find_msgpack_map_value(root, "halo_cells")) {
+          params.halo_cells = halo->as<int32_t>();
+        }
+      }
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "amr_subbox_fetch_pack", .n_inputs = 0, .n_outputs = 1, .needs_neighbors = false},
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView>,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
         if (outputs.empty() || block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
           return hpx::make_ready_future();
         }
 
-        struct Params {
-          int32_t input_field = -1;
-          int32_t input_version = 0;
-          int32_t input_step = 0;
-          int16_t input_level = 0;
-          int32_t bytes_per_value = 8;
-          int32_t halo_cells = 1;
-        };
-
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (root.type == msgpack::type::MAP) {
-            if (const auto* fld = find_msgpack_map_value(root, "input_field")) {
-              params.input_field = fld->as<int32_t>();
-            }
-            if (const auto* ver = find_msgpack_map_value(root, "input_version")) {
-              params.input_version = ver->as<int32_t>();
-            }
-            if (const auto* stp = find_msgpack_map_value(root, "input_step")) {
-              params.input_step = stp->as<int32_t>();
-            }
-            if (const auto* lev = find_msgpack_map_value(root, "input_level")) {
-              params.input_level = lev->as<int16_t>();
-            }
-            if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value")) {
-              params.bytes_per_value = bpv->as<int32_t>();
-            }
-            if (const auto* halo = find_msgpack_map_value(root, "halo_cells")) {
-              params.halo_cells = halo->as<int32_t>();
-            }
-          }
-          return params;
-        });
+        const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
         outputs[0].data.clear();
         if (params.input_field < 0) {
@@ -1407,7 +1523,7 @@ void register_default_kernels(KernelRegistry& registry) {
           return hpx::make_ready_future();
         }
 
-        const RunMeta& meta = global_runmeta();
+        const RunMeta& meta = current_runmeta();
         if (params.input_step < 0 || static_cast<std::size_t>(params.input_step) >= meta.steps.size()) {
           return hpx::make_ready_future();
         }
@@ -1435,7 +1551,65 @@ void register_default_kernels(KernelRegistry& registry) {
           int32_t bytes_per_value = 4;
           HostView data;
         };
-        std::vector<PackedPatch> packed_patches;
+        auto pack_patches = [](const std::vector<PackedPatch>& packed_patches) {
+          HostView packed;
+          msgpack::sbuffer sbuf;
+          msgpack::packer<msgpack::sbuffer> pk(&sbuf);
+          pk.pack_map(1);
+          pk.pack(std::string("patches"));
+          pk.pack_array(packed_patches.size());
+          for (const auto& p : packed_patches) {
+            pk.pack_map(9);
+            pk.pack(std::string("level"));
+            pk.pack_int16(p.level);
+            pk.pack(std::string("lo"));
+            pk.pack_array(3);
+            pk.pack_int32(p.box.lo[0]);
+            pk.pack_int32(p.box.lo[1]);
+            pk.pack_int32(p.box.lo[2]);
+            pk.pack(std::string("hi"));
+            pk.pack_array(3);
+            pk.pack_int32(p.box.hi[0]);
+            pk.pack_int32(p.box.hi[1]);
+            pk.pack_int32(p.box.hi[2]);
+            pk.pack(std::string("dx"));
+            pk.pack_array(3);
+            pk.pack_double(p.geom.dx[0]);
+            pk.pack_double(p.geom.dx[1]);
+            pk.pack_double(p.geom.dx[2]);
+            pk.pack(std::string("x0"));
+            pk.pack_array(3);
+            pk.pack_double(p.geom.x0[0]);
+            pk.pack_double(p.geom.x0[1]);
+            pk.pack_double(p.geom.x0[2]);
+            pk.pack(std::string("index_origin"));
+            pk.pack_array(3);
+            pk.pack_int32(p.geom.index_origin[0]);
+            pk.pack_int32(p.geom.index_origin[1]);
+            pk.pack_int32(p.geom.index_origin[2]);
+            pk.pack(std::string("is_periodic"));
+            pk.pack_array(3);
+            pk.pack(static_cast<bool>(p.geom.is_periodic[0]));
+            pk.pack(static_cast<bool>(p.geom.is_periodic[1]));
+            pk.pack(static_cast<bool>(p.geom.is_periodic[2]));
+            pk.pack(std::string("bytes_per_value"));
+            pk.pack_int32(p.bytes_per_value);
+            pk.pack(std::string("data"));
+            pk.pack_bin(p.data.data.size());
+            if (!p.data.data.empty()) {
+              pk.pack_bin_body(reinterpret_cast<const char*>(p.data.data.data()), p.data.data.size());
+            }
+          }
+          packed.data.assign(sbuf.data(), sbuf.data() + sbuf.size());
+          return packed;
+        };
+
+        struct PendingPatch {
+          int16_t level = 0;
+          LevelGeom geom;
+        };
+        std::vector<PendingPatch> pending_patches;
+        std::vector<hpx::future<SubboxView>> pending_subboxes;
 
         DataServiceLocal data_service;
         for (int16_t lev = 0; lev < static_cast<int16_t>(step_meta.levels.size()); ++lev) {
@@ -1473,127 +1647,99 @@ void register_default_kernels(KernelRegistry& registry) {
             ref.chunk_box.hi[2] = ob.hi.z;
             ref.request_box = request_box;
             ref.bytes_per_value = params.bytes_per_value;
-            auto sub = data_service.get_subbox(ref).get();
-            if (sub.box.hi[0] < sub.box.lo[0] || sub.box.hi[1] < sub.box.lo[1] ||
-                sub.box.hi[2] < sub.box.lo[2] || sub.data.data.empty()) {
-              continue;
-            }
-
-            PackedPatch pp;
-            pp.level = lev;
-            pp.box = sub.box;
-            pp.geom = lev_meta.geom;
-            pp.bytes_per_value = params.bytes_per_value;
-            pp.data = std::move(sub.data);
-            packed_patches.push_back(std::move(pp));
+            pending_patches.push_back(PendingPatch{.level = lev, .geom = lev_meta.geom});
+            pending_subboxes.push_back(data_service.get_subbox(ref));
           }
         }
 
-        msgpack::sbuffer sbuf;
-        msgpack::packer<msgpack::sbuffer> pk(&sbuf);
-        pk.pack_map(1);
-        pk.pack(std::string("patches"));
-        pk.pack_array(packed_patches.size());
-        for (const auto& p : packed_patches) {
-          pk.pack_map(9);
-          pk.pack(std::string("level"));
-          pk.pack_int16(p.level);
-          pk.pack(std::string("lo"));
-          pk.pack_array(3);
-          pk.pack_int32(p.box.lo[0]);
-          pk.pack_int32(p.box.lo[1]);
-          pk.pack_int32(p.box.lo[2]);
-          pk.pack(std::string("hi"));
-          pk.pack_array(3);
-          pk.pack_int32(p.box.hi[0]);
-          pk.pack_int32(p.box.hi[1]);
-          pk.pack_int32(p.box.hi[2]);
-          pk.pack(std::string("dx"));
-          pk.pack_array(3);
-          pk.pack_double(p.geom.dx[0]);
-          pk.pack_double(p.geom.dx[1]);
-          pk.pack_double(p.geom.dx[2]);
-          pk.pack(std::string("x0"));
-          pk.pack_array(3);
-          pk.pack_double(p.geom.x0[0]);
-          pk.pack_double(p.geom.x0[1]);
-          pk.pack_double(p.geom.x0[2]);
-          pk.pack(std::string("index_origin"));
-          pk.pack_array(3);
-          pk.pack_int32(p.geom.index_origin[0]);
-          pk.pack_int32(p.geom.index_origin[1]);
-          pk.pack_int32(p.geom.index_origin[2]);
-          pk.pack(std::string("is_periodic"));
-          pk.pack_array(3);
-          pk.pack(static_cast<bool>(p.geom.is_periodic[0]));
-          pk.pack(static_cast<bool>(p.geom.is_periodic[1]));
-          pk.pack(static_cast<bool>(p.geom.is_periodic[2]));
-          pk.pack(std::string("bytes_per_value"));
-          pk.pack_int32(p.bytes_per_value);
-          pk.pack(std::string("data"));
-          pk.pack_bin(p.data.data.size());
-          if (!p.data.data.empty()) {
-            pk.pack_bin_body(reinterpret_cast<const char*>(p.data.data.data()), p.data.data.size());
-          }
-        }
+        return hpx::when_all(std::move(pending_subboxes))
+            .then([pending_patches = std::move(pending_patches),
+                   pack_patches = std::move(pack_patches),
+                   outputs,
+                   bytes_per_value = params.bytes_per_value](auto&& all) mutable {
+              auto ready_subboxes = all.get();
+              std::vector<PackedPatch> packed_patches;
+              packed_patches.reserve(ready_subboxes.size());
+              for (std::size_t i = 0; i < ready_subboxes.size(); ++i) {
+                auto sub = ready_subboxes[i].get();
+                if (sub.box.hi[0] < sub.box.lo[0] || sub.box.hi[1] < sub.box.lo[1] ||
+                    sub.box.hi[2] < sub.box.lo[2] || sub.data.data.empty()) {
+                  continue;
+                }
 
-        outputs[0].data.assign(sbuf.data(), sbuf.data() + sbuf.size());
-        return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "gradU_stencil", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta& level, int32_t block, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+                PackedPatch pp;
+                pp.level = pending_patches[i].level;
+                pp.box = sub.box;
+                pp.geom = pending_patches[i].geom;
+                pp.bytes_per_value = bytes_per_value;
+                pp.data = std::move(sub.data);
+                packed_patches.push_back(std::move(pp));
+              }
+
+              outputs[0] = pack_patches(packed_patches);
+              return;
+            });
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
+      int32_t input_field = -1;
+      int32_t input_version = 0;
+      int32_t input_step = 0;
+      int16_t input_level = 0;
+      int32_t bytes_per_value = 0;
+      int32_t stencil_radius = 1;
+    };
+
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (root.type == msgpack::type::MAP) {
+        if (const auto* fld = find_msgpack_map_value(root, "input_field");
+            fld && (fld->type == msgpack::type::POSITIVE_INTEGER ||
+                    fld->type == msgpack::type::NEGATIVE_INTEGER)) {
+          params.input_field = fld->as<int32_t>();
+        }
+        if (const auto* ver = find_msgpack_map_value(root, "input_version");
+            ver && (ver->type == msgpack::type::POSITIVE_INTEGER ||
+                    ver->type == msgpack::type::NEGATIVE_INTEGER)) {
+          params.input_version = ver->as<int32_t>();
+        }
+        if (const auto* stp = find_msgpack_map_value(root, "input_step");
+            stp && (stp->type == msgpack::type::POSITIVE_INTEGER ||
+                    stp->type == msgpack::type::NEGATIVE_INTEGER)) {
+          params.input_step = stp->as<int32_t>();
+        }
+        if (const auto* lev = find_msgpack_map_value(root, "input_level");
+            lev && (lev->type == msgpack::type::POSITIVE_INTEGER ||
+                    lev->type == msgpack::type::NEGATIVE_INTEGER)) {
+          params.input_level = lev->as<int16_t>();
+        }
+        if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
+            bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                    bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+          params.bytes_per_value = bpv->as<int32_t>();
+        }
+        if (const auto* sr = find_msgpack_map_value(root, "stencil_radius");
+            sr && (sr->type == msgpack::type::POSITIVE_INTEGER ||
+                   sr->type == msgpack::type::NEGATIVE_INTEGER)) {
+          params.stencil_radius = sr->as<int32_t>();
+        }
+      }
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "gradU_stencil", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
         if (inputs.size() < 2 || outputs.empty() || block < 0 ||
             static_cast<std::size_t>(block) >= level.boxes.size()) {
           return hpx::make_ready_future();
         }
 
-        struct Params {
-          int32_t input_field = -1;
-          int32_t input_version = 0;
-          int32_t input_step = 0;
-          int16_t input_level = 0;
-          int32_t bytes_per_value = 0;
-          int32_t stencil_radius = 1;
-        };
-
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (root.type == msgpack::type::MAP) {
-            if (const auto* fld = find_msgpack_map_value(root, "input_field");
-                fld && (fld->type == msgpack::type::POSITIVE_INTEGER ||
-                        fld->type == msgpack::type::NEGATIVE_INTEGER)) {
-              params.input_field = fld->as<int32_t>();
-            }
-            if (const auto* ver = find_msgpack_map_value(root, "input_version");
-                ver && (ver->type == msgpack::type::POSITIVE_INTEGER ||
-                        ver->type == msgpack::type::NEGATIVE_INTEGER)) {
-              params.input_version = ver->as<int32_t>();
-            }
-            if (const auto* stp = find_msgpack_map_value(root, "input_step");
-                stp && (stp->type == msgpack::type::POSITIVE_INTEGER ||
-                        stp->type == msgpack::type::NEGATIVE_INTEGER)) {
-              params.input_step = stp->as<int32_t>();
-            }
-            if (const auto* lev = find_msgpack_map_value(root, "input_level");
-                lev && (lev->type == msgpack::type::POSITIVE_INTEGER ||
-                        lev->type == msgpack::type::NEGATIVE_INTEGER)) {
-              params.input_level = lev->as<int16_t>();
-            }
-            if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-                bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                        bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-              params.bytes_per_value = bpv->as<int32_t>();
-            }
-            if (const auto* sr = find_msgpack_map_value(root, "stencil_radius");
-                sr && (sr->type == msgpack::type::POSITIVE_INTEGER ||
-                       sr->type == msgpack::type::NEGATIVE_INTEGER)) {
-              params.stencil_radius = sr->as<int32_t>();
-            }
-          }
-          return params;
-        });
+        const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
         const auto& box = level.boxes.at(static_cast<std::size_t>(block));
         const int32_t nx = box.hi.x - box.lo.x + 1;
@@ -1638,7 +1784,7 @@ void register_default_kernels(KernelRegistry& registry) {
         self.view = inputs[0];
         self.bytes_per_value = bytes_per_value;
 
-        const RunMeta& meta = global_runmeta();
+        const RunMeta& meta = current_runmeta();
         if (params.input_step < 0 || static_cast<std::size_t>(params.input_step) >= meta.steps.size()) {
           return hpx::make_ready_future();
         }
@@ -1797,45 +1943,51 @@ void register_default_kernels(KernelRegistry& registry) {
           }
         }
         return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "plotfile_load", .n_inputs = 0, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta& level, int32_t block, std::span<const HostView>, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
+      std::string plotfile;
+      int level = 0;
+      int comp = 0;
+      int bytes_per_value = 4;
+    };
+
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* path = find_msgpack_map_value(root, "plotfile");
+          path && path->type == msgpack::type::STR) {
+        params.plotfile = path->as<std::string>();
+      }
+      if (const auto* lvl = find_msgpack_map_value(root, "level");
+          lvl && (lvl->type == msgpack::type::POSITIVE_INTEGER ||
+                  lvl->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.level = lvl->as<int>();
+      }
+      if (const auto* comp = find_msgpack_map_value(root, "comp");
+          comp && (comp->type == msgpack::type::POSITIVE_INTEGER ||
+                   comp->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.comp = comp->as<int>();
+      }
+      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
+          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.bytes_per_value = bpv->as<int>();
+      }
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "plotfile_load", .n_inputs = 0, .n_outputs = 1, .needs_neighbors = false},
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView>,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }
 
-        struct Params {
-          std::string plotfile;
-          int level = 0;
-          int comp = 0;
-          int bytes_per_value = 4;
-        };
-
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* path = find_msgpack_map_value(root, "plotfile");
-              path && path->type == msgpack::type::STR) {
-            params.plotfile = path->as<std::string>();
-          }
-          if (const auto* lvl = find_msgpack_map_value(root, "level");
-              lvl && (lvl->type == msgpack::type::POSITIVE_INTEGER ||
-                      lvl->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.level = lvl->as<int>();
-          }
-          if (const auto* comp = find_msgpack_map_value(root, "comp");
-              comp && (comp->type == msgpack::type::POSITIVE_INTEGER ||
-                       comp->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.comp = comp->as<int>();
-          }
-          if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-              bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                      bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.bytes_per_value = bpv->as<int>();
-          }
-          return params;
-        });
+        const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
         if (params.plotfile.empty()) {
           return hpx::make_ready_future();
@@ -1901,459 +2053,204 @@ void register_default_kernels(KernelRegistry& registry) {
         }
 
         return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "uniform_slice_cellavg_accumulate", .n_inputs = 1, .n_outputs = 2,
-                 .needs_neighbors = false},
-      [](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
-         const NeighborViews&, std::span<HostView> outputs,
-         std::span<const std::uint8_t> params_msgpack) {
-        struct Box3 {
-          std::array<int, 3> lo{0, 0, 0};
-          std::array<int, 3> hi{0, 0, 0};
-        };
-        struct Params {
-          int axis = 2;
-          double coord = 0.0;
-          int plane_index = 0;
-          bool has_plane_index = false;
-          std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
-          std::array<int, 2> resolution{1, 1};
-          int bytes_per_value = 4;
-          std::vector<Box3> covered_boxes;
-        };
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
+      int axis = 2;
+      double coord = 0.0;
+      int plane_index = 0;
+      bool has_plane_index = false;
+      std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
+      std::array<int, 2> resolution{1, 1};
+      int bytes_per_value = 4;
+      std::shared_ptr<const CoveredBoxListIR> covered_boxes;
+    };
 
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* axis = find_msgpack_map_value(root, "axis");
-              axis && (axis->type == msgpack::type::POSITIVE_INTEGER ||
-                       axis->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.axis = axis->as<int>();
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* axis = find_msgpack_map_value(root, "axis");
+          axis && (axis->type == msgpack::type::POSITIVE_INTEGER ||
+                   axis->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.axis = axis->as<int>();
+      }
+      if (const auto* coord = find_msgpack_map_value(root, "coord");
+          coord && (coord->type == msgpack::type::FLOAT ||
+                    coord->type == msgpack::type::POSITIVE_INTEGER ||
+                    coord->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.coord = coord->as<double>();
+      }
+      if (const auto* plane_idx = find_msgpack_map_value(root, "plane_index");
+          plane_idx && (plane_idx->type == msgpack::type::POSITIVE_INTEGER ||
+                        plane_idx->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.plane_index = plane_idx->as<int>();
+        params.has_plane_index = true;
+      }
+      if (const auto* rect = find_msgpack_map_value(root, "rect");
+          rect && rect->type == msgpack::type::ARRAY && rect->via.array.size == 4) {
+        for (uint32_t i = 0; i < 4; ++i) {
+          params.rect[i] = rect->via.array.ptr[i].as<double>();
+        }
+      }
+      if (const auto* res = find_msgpack_map_value(root, "resolution");
+          res && res->type == msgpack::type::ARRAY && res->via.array.size == 2) {
+        params.resolution[0] = res->via.array.ptr[0].as<int>();
+        params.resolution[1] = res->via.array.ptr[1].as<int>();
+      }
+      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
+          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.bytes_per_value = bpv->as<int>();
+      }
+      params.covered_boxes = parse_covered_boxes_param(root);
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "uniform_slice_cellavg_accumulate", .n_inputs = 1, .n_outputs = 2,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+          const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+
+          const auto out_nx = params.resolution[0];
+          const auto out_ny = params.resolution[1];
+          if (outputs.size() < 2 || inputs.empty() || out_nx <= 0 || out_ny <= 0) {
+            return hpx::make_ready_future();
           }
-          if (const auto* coord = find_msgpack_map_value(root, "coord");
-              coord && (coord->type == msgpack::type::FLOAT ||
-                        coord->type == msgpack::type::POSITIVE_INTEGER ||
-                        coord->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.coord = coord->as<double>();
+
+          const std::size_t bytes = static_cast<std::size_t>(out_nx) *
+                                    static_cast<std::size_t>(out_ny) * sizeof(double);
+          if (outputs[0].data.size() != bytes) {
+            outputs[0].data.assign(bytes, 0);
+          } else {
+            std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
           }
-          if (const auto* plane_idx = find_msgpack_map_value(root, "plane_index");
-              plane_idx && (plane_idx->type == msgpack::type::POSITIVE_INTEGER ||
-                            plane_idx->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.plane_index = plane_idx->as<int>();
-            params.has_plane_index = true;
+          if (outputs[1].data.size() != bytes) {
+            outputs[1].data.assign(bytes, 0);
+          } else {
+            std::fill(outputs[1].data.begin(), outputs[1].data.end(), 0);
           }
-          if (const auto* rect = find_msgpack_map_value(root, "rect");
-              rect && rect->type == msgpack::type::ARRAY && rect->via.array.size == 4) {
-            for (uint32_t i = 0; i < 4; ++i) {
-              params.rect[i] = rect->via.array.ptr[i].as<double>();
+
+          if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
+            return hpx::make_ready_future();
+          }
+
+          const auto& box = level.boxes.at(static_cast<std::size_t>(block));
+          const int nx = box.hi.x - box.lo.x + 1;
+          const int ny = box.hi.y - box.lo.y + 1;
+          const int nz = box.hi.z - box.lo.z + 1;
+          if (nx <= 0 || ny <= 0 || nz <= 0) {
+            return hpx::make_ready_future();
+          }
+
+          const int axis = params.axis;
+          int u_axis = 0;
+          int v_axis = 1;
+          if (axis == 0) {
+            u_axis = 1;
+            v_axis = 2;
+          } else if (axis == 1) {
+            u_axis = 0;
+            v_axis = 2;
+          } else {
+            u_axis = 0;
+            v_axis = 1;
+          }
+
+          auto cell_index = [&](int ax, double coord) -> int {
+            const double x0 = level.geom.x0[ax];
+            const double dx = level.geom.dx[ax];
+            const int origin = level.geom.index_origin[ax];
+            if (dx == 0.0) {
+              return origin;
             }
+            const double idx_f = (coord - x0) / dx;
+            return static_cast<int>(std::floor(idx_f)) + origin;
+          };
+
+          const int k_global =
+              params.has_plane_index ? params.plane_index : cell_index(axis, params.coord);
+          const int k_local = (axis == 0 ? k_global - box.lo.x
+                                         : (axis == 1 ? k_global - box.lo.y : k_global - box.lo.z));
+          if ((axis == 0 && (k_local < 0 || k_local >= nx)) ||
+              (axis == 1 && (k_local < 0 || k_local >= ny)) ||
+              (axis == 2 && (k_local < 0 || k_local >= nz))) {
+            return hpx::make_ready_future();
           }
-          if (const auto* res = find_msgpack_map_value(root, "resolution");
-              res && res->type == msgpack::type::ARRAY && res->via.array.size == 2) {
-            params.resolution[0] = res->via.array.ptr[0].as<int>();
-            params.resolution[1] = res->via.array.ptr[1].as<int>();
+
+          const double u0 = params.rect[0];
+          const double v0 = params.rect[1];
+          const double u1 = params.rect[2];
+          const double v1 = params.rect[3];
+          const double umin = std::min(u0, u1);
+          const double umax = std::max(u0, u1);
+          const double vmin = std::min(v0, v1);
+          const double vmax = std::max(v0, v1);
+          const double du = (out_nx > 0) ? (umax - umin) / static_cast<double>(out_nx) : 0.0;
+          const double dv = (out_ny > 0) ? (vmax - vmin) / static_cast<double>(out_ny) : 0.0;
+          if (du == 0.0 || dv == 0.0) {
+            return hpx::make_ready_future();
           }
-          if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-              bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                      bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.bytes_per_value = bpv->as<int>();
-          }
-          if (const auto* boxes = find_msgpack_map_value(root, "covered_boxes");
-              boxes && boxes->type == msgpack::type::ARRAY) {
-            params.covered_boxes.reserve(boxes->via.array.size);
-            for (uint32_t i = 0; i < boxes->via.array.size; ++i) {
-              const auto& entry = boxes->via.array.ptr[i];
-              if (entry.type != msgpack::type::ARRAY || entry.via.array.size != 2) {
+
+          auto in_index = [&](int i, int j, int k) -> std::size_t {
+            return static_cast<std::size_t>((i * ny + j) * nz + k);
+          };
+
+          auto covered = [&](int ix, int iy, int iz) -> bool {
+            if (!params.covered_boxes) {
+              return false;
+            }
+            for (const auto& b : *params.covered_boxes) {
+              if (covered_box_contains(b, ix, iy, iz)) {
+                return true;
+              }
+            }
+            return false;
+          };
+
+          const auto& in = inputs[0].data;
+          auto* out_sum = reinterpret_cast<double*>(outputs[0].data.data());
+          auto* out_area = reinterpret_cast<double*>(outputs[1].data.data());
+
+          auto cell_edge = [&](int ax, int idx) -> double {
+            return level.geom.x0[ax] + (idx - level.geom.index_origin[ax]) * level.geom.dx[ax];
+          };
+
+          for (int v_local = 0; v_local < (v_axis == 0 ? nx : (v_axis == 1 ? ny : nz)); ++v_local) {
+            const int v_global = (v_axis == 0 ? v_local + box.lo.x
+                                              : (v_axis == 1 ? v_local + box.lo.y
+                                                             : v_local + box.lo.z));
+            for (int u_local = 0; u_local < (u_axis == 0 ? nx : (u_axis == 1 ? ny : nz)); ++u_local) {
+              const int u_global = (u_axis == 0 ? u_local + box.lo.x
+                                                : (u_axis == 1 ? u_local + box.lo.y
+                                                               : u_local + box.lo.z));
+              int idx_global[3]{0, 0, 0};
+              idx_global[axis] = k_global;
+              idx_global[u_axis] = u_global;
+              idx_global[v_axis] = v_global;
+              if (covered(idx_global[0], idx_global[1], idx_global[2])) {
                 continue;
               }
-              const auto& lo = entry.via.array.ptr[0];
-              const auto& hi = entry.via.array.ptr[1];
-              if (lo.type != msgpack::type::ARRAY || hi.type != msgpack::type::ARRAY ||
-                  lo.via.array.size != 3 || hi.via.array.size != 3) {
-                continue;
-              }
-              Box3 box;
-              for (uint32_t d = 0; d < 3; ++d) {
-                box.lo[d] = lo.via.array.ptr[d].as<int>();
-                box.hi[d] = hi.via.array.ptr[d].as<int>();
-              }
-              params.covered_boxes.push_back(box);
-            }
-          }
-          return params;
-        });
 
-        const auto out_nx = params.resolution[0];
-        const auto out_ny = params.resolution[1];
-        if (outputs.size() < 2 || inputs.empty() || out_nx <= 0 || out_ny <= 0) {
-          return hpx::make_ready_future();
-        }
-
-        const std::size_t bytes = static_cast<std::size_t>(out_nx) *
-                                  static_cast<std::size_t>(out_ny) * sizeof(double);
-        if (outputs[0].data.size() != bytes) {
-          outputs[0].data.assign(bytes, 0);
-        } else {
-          std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
-        }
-        if (outputs[1].data.size() != bytes) {
-          outputs[1].data.assign(bytes, 0);
-        } else {
-          std::fill(outputs[1].data.begin(), outputs[1].data.end(), 0);
-        }
-
-        if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
-          return hpx::make_ready_future();
-        }
-
-        const auto& box = level.boxes.at(static_cast<std::size_t>(block));
-        const int nx = box.hi.x - box.lo.x + 1;
-        const int ny = box.hi.y - box.lo.y + 1;
-        const int nz = box.hi.z - box.lo.z + 1;
-        if (nx <= 0 || ny <= 0 || nz <= 0) {
-          return hpx::make_ready_future();
-        }
-
-        const int axis = params.axis;
-        int u_axis = 0;
-        int v_axis = 1;
-        if (axis == 0) {
-          u_axis = 1;
-          v_axis = 2;
-        } else if (axis == 1) {
-          u_axis = 0;
-          v_axis = 2;
-        } else {
-          u_axis = 0;
-          v_axis = 1;
-        }
-
-        auto cell_index = [&](int ax, double coord) -> int {
-          const double x0 = level.geom.x0[ax];
-          const double dx = level.geom.dx[ax];
-          const int origin = level.geom.index_origin[ax];
-          if (dx == 0.0) {
-            return origin;
-          }
-          const double idx_f = (coord - x0) / dx;
-          return static_cast<int>(std::floor(idx_f)) + origin;
-        };
-
-        const int k_global = params.has_plane_index ? params.plane_index : cell_index(axis, params.coord);
-        const int k_local = (axis == 0 ? k_global - box.lo.x
-                                       : (axis == 1 ? k_global - box.lo.y : k_global - box.lo.z));
-        if ((axis == 0 && (k_local < 0 || k_local >= nx)) ||
-            (axis == 1 && (k_local < 0 || k_local >= ny)) ||
-            (axis == 2 && (k_local < 0 || k_local >= nz))) {
-          return hpx::make_ready_future();
-        }
-
-        const double u0 = params.rect[0];
-        const double v0 = params.rect[1];
-        const double u1 = params.rect[2];
-        const double v1 = params.rect[3];
-        const double umin = std::min(u0, u1);
-        const double umax = std::max(u0, u1);
-        const double vmin = std::min(v0, v1);
-        const double vmax = std::max(v0, v1);
-        const double du = (out_nx > 0) ? (umax - umin) / static_cast<double>(out_nx) : 0.0;
-        const double dv = (out_ny > 0) ? (vmax - vmin) / static_cast<double>(out_ny) : 0.0;
-        if (du == 0.0 || dv == 0.0) {
-          return hpx::make_ready_future();
-        }
-
-        auto in_index = [&](int i, int j, int k) -> std::size_t {
-          return static_cast<std::size_t>((i * ny + j) * nz + k);
-        };
-
-        auto covered = [&](int ix, int iy, int iz) -> bool {
-          for (const auto& b : params.covered_boxes) {
-            if (ix >= b.lo[0] && ix <= b.hi[0] &&
-                iy >= b.lo[1] && iy <= b.hi[1] &&
-                iz >= b.lo[2] && iz <= b.hi[2]) {
-              return true;
-            }
-          }
-          return false;
-        };
-
-        const auto& in = inputs[0].data;
-        auto* out_sum = reinterpret_cast<double*>(outputs[0].data.data());
-        auto* out_area = reinterpret_cast<double*>(outputs[1].data.data());
-
-        auto cell_edge = [&](int ax, int idx) -> double {
-          return level.geom.x0[ax] + (idx - level.geom.index_origin[ax]) * level.geom.dx[ax];
-        };
-
-        for (int v_local = 0; v_local < (v_axis == 0 ? nx : (v_axis == 1 ? ny : nz)); ++v_local) {
-          const int v_global = (v_axis == 0 ? v_local + box.lo.x
-                                            : (v_axis == 1 ? v_local + box.lo.y
-                                                           : v_local + box.lo.z));
-          for (int u_local = 0; u_local < (u_axis == 0 ? nx : (u_axis == 1 ? ny : nz)); ++u_local) {
-            const int u_global = (u_axis == 0 ? u_local + box.lo.x
-                                              : (u_axis == 1 ? u_local + box.lo.y
-                                                             : u_local + box.lo.z));
-            int idx_global[3]{0, 0, 0};
-            idx_global[axis] = k_global;
-            idx_global[u_axis] = u_global;
-            idx_global[v_axis] = v_global;
-            if (covered(idx_global[0], idx_global[1], idx_global[2])) {
-              continue;
-            }
-
-            int idx_local[3]{0, 0, 0};
-            idx_local[axis] = k_local;
-            idx_local[u_axis] = u_local;
-            idx_local[v_axis] = v_local;
-            const auto data_idx = in_index(idx_local[0], idx_local[1], idx_local[2]);
-            double value = 0.0;
-            if (params.bytes_per_value == 4) {
-              if (data_idx * sizeof(float) < in.size()) {
-                value = reinterpret_cast<const float*>(in.data())[data_idx];
-              }
-            } else if (params.bytes_per_value == 8) {
-              if (data_idx * sizeof(double) < in.size()) {
-                value = reinterpret_cast<const double*>(in.data())[data_idx];
-              }
-            }
-
-            const double u_cell_lo = cell_edge(u_axis, u_global);
-            const double u_cell_hi = u_cell_lo + level.geom.dx[u_axis];
-            const double v_cell_lo = cell_edge(v_axis, v_global);
-            const double v_cell_hi = v_cell_lo + level.geom.dx[v_axis];
-
-            int i0 = static_cast<int>(std::floor((u_cell_lo - umin) / du));
-            int i1 = static_cast<int>(std::floor((u_cell_hi - umin) / du));
-            int j0 = static_cast<int>(std::floor((v_cell_lo - vmin) / dv));
-            int j1 = static_cast<int>(std::floor((v_cell_hi - vmin) / dv));
-            if (i1 < 0 || j1 < 0 || i0 >= out_nx || j0 >= out_ny) {
-              continue;
-            }
-            i0 = std::max(i0, 0);
-            j0 = std::max(j0, 0);
-            i1 = std::min(i1, out_nx - 1);
-            j1 = std::min(j1, out_ny - 1);
-
-            for (int j = j0; j <= j1; ++j) {
-              const double pv0 = vmin + static_cast<double>(j) * dv;
-              const double pv1 = pv0 + dv;
-              const double ov = std::max(0.0, std::min(v_cell_hi, pv1) - std::max(v_cell_lo, pv0));
-              if (ov <= 0.0) {
-                continue;
-              }
-              for (int i = i0; i <= i1; ++i) {
-                const double pu0 = umin + static_cast<double>(i) * du;
-                const double pu1 = pu0 + du;
-                const double ou = std::max(0.0, std::min(u_cell_hi, pu1) - std::max(u_cell_lo, pu0));
-                if (ou <= 0.0) {
-                  continue;
+              int idx_local[3]{0, 0, 0};
+              idx_local[axis] = k_local;
+              idx_local[u_axis] = u_local;
+              idx_local[v_axis] = v_local;
+              const auto data_idx = in_index(idx_local[0], idx_local[1], idx_local[2]);
+              double value = 0.0;
+              if (params.bytes_per_value == 4) {
+                if (data_idx * sizeof(float) < in.size()) {
+                  value = reinterpret_cast<const float*>(in.data())[data_idx];
                 }
-                const double area = ou * ov;
-                const std::size_t out_idx = static_cast<std::size_t>(j) * out_nx + i;
-                out_sum[out_idx] += value * area;
-                out_area[out_idx] += area;
-              }
-            }
-          }
-        }
-
-        return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "uniform_projection_accumulate", .n_inputs = 1, .n_outputs = 1,
-                 .needs_neighbors = false},
-      [](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
-         const NeighborViews&, std::span<HostView> outputs,
-         std::span<const std::uint8_t> params_msgpack) {
-        struct Box3 {
-          std::array<int, 3> lo{0, 0, 0};
-          std::array<int, 3> hi{0, 0, 0};
-        };
-        struct Params {
-          int axis = 2;
-          std::array<double, 2> axis_bounds{0.0, 1.0};
-          std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
-          std::array<int, 2> resolution{1, 1};
-          int bytes_per_value = 4;
-          std::vector<Box3> covered_boxes;
-        };
-
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* axis = find_msgpack_map_value(root, "axis");
-              axis && (axis->type == msgpack::type::POSITIVE_INTEGER ||
-                       axis->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.axis = axis->as<int>();
-          }
-          if (const auto* bounds = find_msgpack_map_value(root, "axis_bounds");
-              bounds && bounds->type == msgpack::type::ARRAY && bounds->via.array.size == 2) {
-            params.axis_bounds[0] = bounds->via.array.ptr[0].as<double>();
-            params.axis_bounds[1] = bounds->via.array.ptr[1].as<double>();
-          }
-          if (const auto* rect = find_msgpack_map_value(root, "rect");
-              rect && rect->type == msgpack::type::ARRAY && rect->via.array.size == 4) {
-            for (uint32_t i = 0; i < 4; ++i) {
-              params.rect[i] = rect->via.array.ptr[i].as<double>();
-            }
-          }
-          if (const auto* res = find_msgpack_map_value(root, "resolution");
-              res && res->type == msgpack::type::ARRAY && res->via.array.size == 2) {
-            params.resolution[0] = res->via.array.ptr[0].as<int>();
-            params.resolution[1] = res->via.array.ptr[1].as<int>();
-          }
-          if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-              bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                      bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.bytes_per_value = bpv->as<int>();
-          }
-          if (const auto* boxes = find_msgpack_map_value(root, "covered_boxes");
-              boxes && boxes->type == msgpack::type::ARRAY) {
-            params.covered_boxes.reserve(boxes->via.array.size);
-            for (uint32_t i = 0; i < boxes->via.array.size; ++i) {
-              const auto& entry = boxes->via.array.ptr[i];
-              if (entry.type != msgpack::type::ARRAY || entry.via.array.size != 2) {
-                continue;
-              }
-              const auto& lo = entry.via.array.ptr[0];
-              const auto& hi = entry.via.array.ptr[1];
-              if (lo.type != msgpack::type::ARRAY || hi.type != msgpack::type::ARRAY ||
-                  lo.via.array.size != 3 || hi.via.array.size != 3) {
-                continue;
-              }
-              Box3 box;
-              for (uint32_t d = 0; d < 3; ++d) {
-                box.lo[d] = lo.via.array.ptr[d].as<int>();
-                box.hi[d] = hi.via.array.ptr[d].as<int>();
-              }
-              params.covered_boxes.push_back(box);
-            }
-          }
-          return params;
-        });
-
-        const auto out_nx = params.resolution[0];
-        const auto out_ny = params.resolution[1];
-        if (outputs.empty() || inputs.empty() || out_nx <= 0 || out_ny <= 0) {
-          return hpx::make_ready_future();
-        }
-
-        const std::size_t bytes = static_cast<std::size_t>(out_nx) *
-                                  static_cast<std::size_t>(out_ny) * sizeof(double);
-        if (outputs[0].data.size() != bytes) {
-          outputs[0].data.assign(bytes, 0);
-        } else {
-          std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
-        }
-
-        if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
-          return hpx::make_ready_future();
-        }
-
-        const auto& box = level.boxes.at(static_cast<std::size_t>(block));
-        const int nx = box.hi.x - box.lo.x + 1;
-        const int ny = box.hi.y - box.lo.y + 1;
-        const int nz = box.hi.z - box.lo.z + 1;
-        if (nx <= 0 || ny <= 0 || nz <= 0) {
-          return hpx::make_ready_future();
-        }
-
-        const int axis = params.axis;
-        int u_axis = 0;
-        int v_axis = 1;
-        if (axis == 0) {
-          u_axis = 1;
-          v_axis = 2;
-        } else if (axis == 1) {
-          u_axis = 0;
-          v_axis = 2;
-        } else {
-          u_axis = 0;
-          v_axis = 1;
-        }
-
-        const double u0 = params.rect[0];
-        const double v0 = params.rect[1];
-        const double u1 = params.rect[2];
-        const double v1 = params.rect[3];
-        const double umin = std::min(u0, u1);
-        const double umax = std::max(u0, u1);
-        const double vmin = std::min(v0, v1);
-        const double vmax = std::max(v0, v1);
-        const double du = (out_nx > 0) ? (umax - umin) / static_cast<double>(out_nx) : 0.0;
-        const double dv = (out_ny > 0) ? (vmax - vmin) / static_cast<double>(out_ny) : 0.0;
-        if (du == 0.0 || dv == 0.0) {
-          return hpx::make_ready_future();
-        }
-
-        const double a0 = params.axis_bounds[0];
-        const double a1 = params.axis_bounds[1];
-        const double amin = std::min(a0, a1);
-        const double amax = std::max(a0, a1);
-        if (!(amax > amin)) {
-          return hpx::make_ready_future();
-        }
-
-        auto in_index = [&](int i, int j, int k) -> std::size_t {
-          return static_cast<std::size_t>((i * ny + j) * nz + k);
-        };
-
-        std::vector<std::uint8_t> covered_mask;
-        if (!params.covered_boxes.empty()) {
-          const std::size_t block_cells = static_cast<std::size_t>(nx) *
-                                          static_cast<std::size_t>(ny) *
-                                          static_cast<std::size_t>(nz);
-          covered_mask.assign(block_cells, 0);
-          for (const auto& b : params.covered_boxes) {
-            const int gx0 = std::max(box.lo.x, b.lo[0]);
-            const int gy0 = std::max(box.lo.y, b.lo[1]);
-            const int gz0 = std::max(box.lo.z, b.lo[2]);
-            const int gx1 = std::min(box.hi.x, b.hi[0]);
-            const int gy1 = std::min(box.hi.y, b.hi[1]);
-            const int gz1 = std::min(box.hi.z, b.hi[2]);
-            if (gx0 > gx1 || gy0 > gy1 || gz0 > gz1) {
-              continue;
-            }
-            for (int gx = gx0; gx <= gx1; ++gx) {
-              const int i = gx - box.lo.x;
-              for (int gy = gy0; gy <= gy1; ++gy) {
-                const int j = gy - box.lo.y;
-                for (int gz = gz0; gz <= gz1; ++gz) {
-                  const int k = gz - box.lo.z;
-                  covered_mask[in_index(i, j, k)] = 1;
+              } else if (params.bytes_per_value == 8) {
+                if (data_idx * sizeof(double) < in.size()) {
+                  value = reinterpret_cast<const double*>(in.data())[data_idx];
                 }
               }
-            }
-          }
-        }
 
-        auto cell_edge = [&](int ax, int idx) -> double {
-          return level.geom.x0[ax] + (idx - level.geom.index_origin[ax]) * level.geom.dx[ax];
-        };
-
-        const auto& in = inputs[0].data;
-        auto* out_sum = reinterpret_cast<double*>(outputs[0].data.data());
-
-        for (int i = 0; i < nx; ++i) {
-          const int gx = box.lo.x + i;
-          for (int j = 0; j < ny; ++j) {
-            const int gy = box.lo.y + j;
-            for (int k = 0; k < nz; ++k) {
-              const auto data_idx = in_index(i, j, k);
-              if (!covered_mask.empty() && covered_mask[data_idx] != 0) {
-                continue;
-              }
-              const int gz = box.lo.z + k;
-
-              const int a_global = axis == 0 ? gx : (axis == 1 ? gy : gz);
-              const double a_cell_lo = cell_edge(axis, a_global);
-              const double a_cell_hi = a_cell_lo + level.geom.dx[axis];
-              const double oa = std::max(0.0, std::min(a_cell_hi, amax) - std::max(a_cell_lo, amin));
-              if (oa <= 0.0) {
-                continue;
-              }
-
-              const int u_global = u_axis == 0 ? gx : (u_axis == 1 ? gy : gz);
-              const int v_global = v_axis == 0 ? gx : (v_axis == 1 ? gy : gz);
               const double u_cell_lo = cell_edge(u_axis, u_global);
               const double u_cell_hi = u_cell_lo + level.geom.dx[u_axis];
               const double v_cell_lo = cell_edge(v_axis, v_global);
@@ -2371,87 +2268,339 @@ void register_default_kernels(KernelRegistry& registry) {
               i1 = std::min(i1, out_nx - 1);
               j1 = std::min(j1, out_ny - 1);
 
-              double value = 0.0;
-              if (params.bytes_per_value == 4) {
-                if (data_idx * sizeof(float) < in.size()) {
-                  value = reinterpret_cast<const float*>(in.data())[data_idx];
-                }
-              } else if (params.bytes_per_value == 8) {
-                if (data_idx * sizeof(double) < in.size()) {
-                  value = reinterpret_cast<const double*>(in.data())[data_idx];
-                }
-              }
-
-              for (int jj = j0; jj <= j1; ++jj) {
-                const double pv0 = vmin + static_cast<double>(jj) * dv;
+              for (int j = j0; j <= j1; ++j) {
+                const double pv0 = vmin + static_cast<double>(j) * dv;
                 const double pv1 = pv0 + dv;
-                const double ov = std::max(0.0, std::min(v_cell_hi, pv1) - std::max(v_cell_lo, pv0));
+                const double ov =
+                    std::max(0.0, std::min(v_cell_hi, pv1) - std::max(v_cell_lo, pv0));
                 if (ov <= 0.0) {
                   continue;
                 }
-                for (int ii = i0; ii <= i1; ++ii) {
-                  const double pu0 = umin + static_cast<double>(ii) * du;
+                for (int i = i0; i <= i1; ++i) {
+                  const double pu0 = umin + static_cast<double>(i) * du;
                   const double pu1 = pu0 + du;
-                  const double ou = std::max(0.0, std::min(u_cell_hi, pu1) - std::max(u_cell_lo, pu0));
+                  const double ou =
+                      std::max(0.0, std::min(u_cell_hi, pu1) - std::max(u_cell_lo, pu0));
                   if (ou <= 0.0) {
                     continue;
                   }
-                  const double volume = ou * ov * oa;
-                  const std::size_t out_idx = static_cast<std::size_t>(jj) * out_nx + ii;
-                  out_sum[out_idx] += value * volume;
+                  const double area = ou * ov;
+                  const std::size_t out_idx = static_cast<std::size_t>(j) * out_nx + i;
+                  out_sum[out_idx] += value * area;
+                  out_area[out_idx] += area;
                 }
               }
             }
           }
+
+          return hpx::make_ready_future();
+        },
+        make_covered_box_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
+      int axis = 2;
+      std::array<double, 2> axis_bounds{0.0, 1.0};
+      std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
+      std::array<int, 2> resolution{1, 1};
+      int bytes_per_value = 4;
+      std::shared_ptr<const CoveredBoxListIR> covered_boxes;
+    };
+
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* axis = find_msgpack_map_value(root, "axis");
+          axis && (axis->type == msgpack::type::POSITIVE_INTEGER ||
+                   axis->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.axis = axis->as<int>();
+      }
+      if (const auto* bounds = find_msgpack_map_value(root, "axis_bounds");
+          bounds && bounds->type == msgpack::type::ARRAY && bounds->via.array.size == 2) {
+        params.axis_bounds[0] = bounds->via.array.ptr[0].as<double>();
+        params.axis_bounds[1] = bounds->via.array.ptr[1].as<double>();
+      }
+      if (const auto* rect = find_msgpack_map_value(root, "rect");
+          rect && rect->type == msgpack::type::ARRAY && rect->via.array.size == 4) {
+        for (uint32_t i = 0; i < 4; ++i) {
+          params.rect[i] = rect->via.array.ptr[i].as<double>();
         }
+      }
+      if (const auto* res = find_msgpack_map_value(root, "resolution");
+          res && res->type == msgpack::type::ARRAY && res->via.array.size == 2) {
+        params.resolution[0] = res->via.array.ptr[0].as<int>();
+        params.resolution[1] = res->via.array.ptr[1].as<int>();
+      }
+      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
+          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.bytes_per_value = bpv->as<int>();
+      }
+      params.covered_boxes = parse_covered_boxes_param(root);
+      return params;
+    };
 
-        return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "field_expr", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
-        struct Params {
-          std::string expression;
-          std::vector<std::string> variables;
-          std::vector<int> input_bytes_per_value;
-          int out_bytes_per_value = 8;
-        };
+    registry.register_kernel(
+        KernelDesc{.name = "uniform_projection_accumulate", .n_inputs = 1, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+          const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* expr = find_msgpack_map_value(root, "expression");
-              expr && expr->type == msgpack::type::STR) {
-            params.expression = expr->as<std::string>();
+          const auto out_nx = params.resolution[0];
+          const auto out_ny = params.resolution[1];
+          if (outputs.empty() || inputs.empty() || out_nx <= 0 || out_ny <= 0) {
+            return hpx::make_ready_future();
           }
-          if (const auto* vars = find_msgpack_map_value(root, "variables");
-              vars && vars->type == msgpack::type::ARRAY) {
-            params.variables.reserve(vars->via.array.size);
-            for (uint32_t i = 0; i < vars->via.array.size; ++i) {
-              const auto& v = vars->via.array.ptr[i];
-              if (v.type == msgpack::type::STR) {
-                params.variables.push_back(v.as<std::string>());
+
+          const std::size_t bytes = static_cast<std::size_t>(out_nx) *
+                                    static_cast<std::size_t>(out_ny) * sizeof(double);
+          if (outputs[0].data.size() != bytes) {
+            outputs[0].data.assign(bytes, 0);
+          } else {
+            std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
+          }
+
+          if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
+            return hpx::make_ready_future();
+          }
+
+          const auto& box = level.boxes.at(static_cast<std::size_t>(block));
+          const int nx = box.hi.x - box.lo.x + 1;
+          const int ny = box.hi.y - box.lo.y + 1;
+          const int nz = box.hi.z - box.lo.z + 1;
+          if (nx <= 0 || ny <= 0 || nz <= 0) {
+            return hpx::make_ready_future();
+          }
+
+          const int axis = params.axis;
+          int u_axis = 0;
+          int v_axis = 1;
+          if (axis == 0) {
+            u_axis = 1;
+            v_axis = 2;
+          } else if (axis == 1) {
+            u_axis = 0;
+            v_axis = 2;
+          } else {
+            u_axis = 0;
+            v_axis = 1;
+          }
+
+          const double u0 = params.rect[0];
+          const double v0 = params.rect[1];
+          const double u1 = params.rect[2];
+          const double v1 = params.rect[3];
+          const double umin = std::min(u0, u1);
+          const double umax = std::max(u0, u1);
+          const double vmin = std::min(v0, v1);
+          const double vmax = std::max(v0, v1);
+          const double du = (out_nx > 0) ? (umax - umin) / static_cast<double>(out_nx) : 0.0;
+          const double dv = (out_ny > 0) ? (vmax - vmin) / static_cast<double>(out_ny) : 0.0;
+          if (du == 0.0 || dv == 0.0) {
+            return hpx::make_ready_future();
+          }
+
+          const double a0 = params.axis_bounds[0];
+          const double a1 = params.axis_bounds[1];
+          const double amin = std::min(a0, a1);
+          const double amax = std::max(a0, a1);
+          if (!(amax > amin)) {
+            return hpx::make_ready_future();
+          }
+
+          auto in_index = [&](int i, int j, int k) -> std::size_t {
+            return static_cast<std::size_t>((i * ny + j) * nz + k);
+          };
+
+          std::vector<std::uint8_t> covered_mask;
+          if (params.covered_boxes && !params.covered_boxes->empty()) {
+            const std::size_t block_cells = static_cast<std::size_t>(nx) *
+                                            static_cast<std::size_t>(ny) *
+                                            static_cast<std::size_t>(nz);
+            covered_mask.assign(block_cells, 0);
+            for (const auto& b : *params.covered_boxes) {
+              const int gx0 = std::max(box.lo.x, b.lo[0]);
+              const int gy0 = std::max(box.lo.y, b.lo[1]);
+              const int gz0 = std::max(box.lo.z, b.lo[2]);
+              const int gx1 = std::min(box.hi.x, b.hi[0]);
+              const int gy1 = std::min(box.hi.y, b.hi[1]);
+              const int gz1 = std::min(box.hi.z, b.hi[2]);
+              if (gx0 > gx1 || gy0 > gy1 || gz0 > gz1) {
+                continue;
+              }
+              for (int gx = gx0; gx <= gx1; ++gx) {
+                const int i = gx - box.lo.x;
+                for (int gy = gy0; gy <= gy1; ++gy) {
+                  const int j = gy - box.lo.y;
+                  for (int gz = gz0; gz <= gz1; ++gz) {
+                    const int k = gz - box.lo.z;
+                    covered_mask[in_index(i, j, k)] = 1;
+                  }
+                }
               }
             }
           }
-          if (const auto* in_bpv = find_msgpack_map_value(root, "input_bytes_per_value");
-              in_bpv && in_bpv->type == msgpack::type::ARRAY) {
-            params.input_bytes_per_value.reserve(in_bpv->via.array.size);
-            for (uint32_t i = 0; i < in_bpv->via.array.size; ++i) {
-              const auto& v = in_bpv->via.array.ptr[i];
-              if (v.type == msgpack::type::POSITIVE_INTEGER ||
-                  v.type == msgpack::type::NEGATIVE_INTEGER) {
-                params.input_bytes_per_value.push_back(v.as<int>());
+
+          auto cell_edge = [&](int ax, int idx) -> double {
+            return level.geom.x0[ax] + (idx - level.geom.index_origin[ax]) * level.geom.dx[ax];
+          };
+
+          const auto& in = inputs[0].data;
+          auto* out_sum = reinterpret_cast<double*>(outputs[0].data.data());
+          std::size_t candidate_cells = 0;
+          std::size_t covered_skips = 0;
+          std::size_t bounds_skips = 0;
+          std::size_t deposited_cells = 0;
+
+          for (int i = 0; i < nx; ++i) {
+            const int gx = box.lo.x + i;
+            for (int j = 0; j < ny; ++j) {
+              const int gy = box.lo.y + j;
+              for (int k = 0; k < nz; ++k) {
+                ++candidate_cells;
+                const auto data_idx = in_index(i, j, k);
+                if (!covered_mask.empty() && covered_mask[data_idx] != 0) {
+                  ++covered_skips;
+                  continue;
+                }
+                const int gz = box.lo.z + k;
+
+                const int a_global = axis == 0 ? gx : (axis == 1 ? gy : gz);
+                const double a_cell_lo = cell_edge(axis, a_global);
+                const double a_cell_hi = a_cell_lo + level.geom.dx[axis];
+                const double oa =
+                    std::max(0.0, std::min(a_cell_hi, amax) - std::max(a_cell_lo, amin));
+                if (oa <= 0.0) {
+                  ++bounds_skips;
+                  continue;
+                }
+
+                const int u_global = u_axis == 0 ? gx : (u_axis == 1 ? gy : gz);
+                const int v_global = v_axis == 0 ? gx : (v_axis == 1 ? gy : gz);
+                const double u_cell_lo = cell_edge(u_axis, u_global);
+                const double u_cell_hi = u_cell_lo + level.geom.dx[u_axis];
+                const double v_cell_lo = cell_edge(v_axis, v_global);
+                const double v_cell_hi = v_cell_lo + level.geom.dx[v_axis];
+
+                int i0 = static_cast<int>(std::floor((u_cell_lo - umin) / du));
+                int i1 = static_cast<int>(std::floor((u_cell_hi - umin) / du));
+                int j0 = static_cast<int>(std::floor((v_cell_lo - vmin) / dv));
+                int j1 = static_cast<int>(std::floor((v_cell_hi - vmin) / dv));
+                if (i1 < 0 || j1 < 0 || i0 >= out_nx || j0 >= out_ny) {
+                  ++bounds_skips;
+                  continue;
+                }
+                i0 = std::max(i0, 0);
+                j0 = std::max(j0, 0);
+                i1 = std::min(i1, out_nx - 1);
+                j1 = std::min(j1, out_ny - 1);
+
+                double value = 0.0;
+                if (params.bytes_per_value == 4) {
+                  if (data_idx * sizeof(float) < in.size()) {
+                    value = reinterpret_cast<const float*>(in.data())[data_idx];
+                  }
+                } else if (params.bytes_per_value == 8) {
+                  if (data_idx * sizeof(double) < in.size()) {
+                    value = reinterpret_cast<const double*>(in.data())[data_idx];
+                  }
+                }
+
+                for (int jj = j0; jj <= j1; ++jj) {
+                  const double pv0 = vmin + static_cast<double>(jj) * dv;
+                  const double pv1 = pv0 + dv;
+                  const double ov =
+                      std::max(0.0, std::min(v_cell_hi, pv1) - std::max(v_cell_lo, pv0));
+                  if (ov <= 0.0) {
+                    continue;
+                  }
+                  for (int ii = i0; ii <= i1; ++ii) {
+                    const double pu0 = umin + static_cast<double>(ii) * du;
+                    const double pu1 = pu0 + du;
+                    const double ou =
+                        std::max(0.0, std::min(u_cell_hi, pu1) - std::max(u_cell_lo, pu0));
+                    if (ou <= 0.0) {
+                      continue;
+                    }
+                    const double volume = ou * ov * oa;
+                    const std::size_t out_idx = static_cast<std::size_t>(jj) * out_nx + ii;
+                    out_sum[out_idx] += value * volume;
+                    ++deposited_cells;
+                  }
+                }
               }
             }
           }
-          if (const auto* out_bpv = find_msgpack_map_value(root, "out_bytes_per_value");
-              out_bpv && (out_bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                          out_bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.out_bytes_per_value = out_bpv->as<int>();
+
+          double total_sum = 0.0;
+          for (std::size_t idx = 0;
+               idx < static_cast<std::size_t>(out_nx) * static_cast<std::size_t>(out_ny); ++idx) {
+            total_sum += out_sum[idx];
           }
-          return params;
-        });
+          log_projection_kernel_summary("uniform_projection_accumulate",
+                                        -1,
+                                        block,
+                                        covered_box_count(params.covered_boxes),
+                                        candidate_cells,
+                                        covered_skips,
+                                        bounds_skips,
+                                        deposited_cells,
+                                        total_sum);
+
+          return hpx::make_ready_future();
+        },
+        make_covered_box_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
+      std::string expression;
+      std::vector<std::string> variables;
+      std::vector<int> input_bytes_per_value;
+      int out_bytes_per_value = 8;
+    };
+
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* expr = find_msgpack_map_value(root, "expression");
+          expr && expr->type == msgpack::type::STR) {
+        params.expression = expr->as<std::string>();
+      }
+      if (const auto* vars = find_msgpack_map_value(root, "variables");
+          vars && vars->type == msgpack::type::ARRAY) {
+        params.variables.reserve(vars->via.array.size);
+        for (uint32_t i = 0; i < vars->via.array.size; ++i) {
+          const auto& v = vars->via.array.ptr[i];
+          if (v.type == msgpack::type::STR) {
+            params.variables.push_back(v.as<std::string>());
+          }
+        }
+      }
+      if (const auto* in_bpv = find_msgpack_map_value(root, "input_bytes_per_value");
+          in_bpv && in_bpv->type == msgpack::type::ARRAY) {
+        params.input_bytes_per_value.reserve(in_bpv->via.array.size);
+        for (uint32_t i = 0; i < in_bpv->via.array.size; ++i) {
+          const auto& v = in_bpv->via.array.ptr[i];
+          if (v.type == msgpack::type::POSITIVE_INTEGER ||
+              v.type == msgpack::type::NEGATIVE_INTEGER) {
+            params.input_bytes_per_value.push_back(v.as<int>());
+          }
+        }
+      }
+      if (const auto* out_bpv = find_msgpack_map_value(root, "out_bytes_per_value");
+          out_bpv && (out_bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                      out_bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.out_bytes_per_value = out_bpv->as<int>();
+      }
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "field_expr", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+        const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
         if (outputs.empty()) {
           return hpx::make_ready_future();
@@ -2554,7 +2703,9 @@ void register_default_kernels(KernelRegistry& registry) {
 
 #undef KANGAROO_FIELD_EXPR_CASE
         return hpx::make_ready_future();
-      });
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+  }
   registry.register_kernel(
       KernelDesc{.name = "vorticity_mag", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
       [](const LevelMeta& level, int32_t block, std::span<const HostView> inputs, const NeighborViews&,
@@ -2615,951 +2766,1057 @@ void register_default_kernels(KernelRegistry& registry) {
         }
         return hpx::make_ready_future();
       });
-  registry.register_kernel(
-      KernelDesc{.name = "uniform_slice", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
-         const NeighborViews&, std::span<HostView> outputs,
-         std::span<const std::uint8_t> params_msgpack) {
-        if (log_locality) {
-          std::cout << "[kangaroo] uniform_slice block=" << block
-                    << " locality=" << hpx::get_locality_id() << std::endl;
-        }
-        struct Params {
-          int axis = 2;
-          double coord = 0.0;
-          std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
-          std::array<int, 2> resolution{1, 1};
-          int bytes_per_value = 4;
-        };
+  {
+    struct Params {
+      int axis = 2;
+      double coord = 0.0;
+      std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
+      std::array<int, 2> resolution{1, 1};
+      int bytes_per_value = 4;
+    };
 
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* axis = find_msgpack_map_value(root, "axis");
-              axis && (axis->type == msgpack::type::POSITIVE_INTEGER ||
-                       axis->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.axis = axis->as<int>();
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* axis = find_msgpack_map_value(root, "axis");
+          axis && (axis->type == msgpack::type::POSITIVE_INTEGER ||
+                   axis->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.axis = axis->as<int>();
+      }
+      if (const auto* coord = find_msgpack_map_value(root, "coord");
+          coord && (coord->type == msgpack::type::FLOAT ||
+                    coord->type == msgpack::type::POSITIVE_INTEGER ||
+                    coord->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.coord = coord->as<double>();
+      }
+      if (const auto* rect = find_msgpack_map_value(root, "rect");
+          rect && rect->type == msgpack::type::ARRAY && rect->via.array.size == 4) {
+        for (uint32_t i = 0; i < 4; ++i) {
+          params.rect[i] = rect->via.array.ptr[i].as<double>();
+        }
+      }
+      if (const auto* res = find_msgpack_map_value(root, "resolution");
+          res && res->type == msgpack::type::ARRAY && res->via.array.size == 2) {
+        params.resolution[0] = res->via.array.ptr[0].as<int>();
+        params.resolution[1] = res->via.array.ptr[1].as<int>();
+      }
+      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
+          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.bytes_per_value = bpv->as<int>();
+      }
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "uniform_slice", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+          if (log_locality) {
+            std::cout << "[kangaroo] uniform_slice block=" << block
+                      << " locality=" << hpx::get_locality_id() << std::endl;
           }
-          if (const auto* coord = find_msgpack_map_value(root, "coord");
-              coord && (coord->type == msgpack::type::FLOAT ||
-                        coord->type == msgpack::type::POSITIVE_INTEGER ||
-                        coord->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.coord = coord->as<double>();
+          const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+
+          const auto out_nx = params.resolution[0];
+          const auto out_ny = params.resolution[1];
+          std::size_t bytes = 0;
+          if (out_nx > 0 && out_ny > 0 && params.bytes_per_value > 0) {
+            bytes = static_cast<std::size_t>(out_nx) * static_cast<std::size_t>(out_ny) *
+                    static_cast<std::size_t>(params.bytes_per_value);
           }
-          if (const auto* rect = find_msgpack_map_value(root, "rect");
-              rect && rect->type == msgpack::type::ARRAY && rect->via.array.size == 4) {
-            for (uint32_t i = 0; i < 4; ++i) {
-              params.rect[i] = rect->via.array.ptr[i].as<double>();
+
+          if (outputs.empty() || inputs.empty() || bytes == 0) {
+            return hpx::make_ready_future();
+          }
+
+          if (outputs[0].data.size() != bytes) {
+            outputs[0].data.assign(bytes, 0);
+          } else {
+            std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
+          }
+
+          if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
+            return hpx::make_ready_future();
+          }
+
+          const auto& box = level.boxes.at(static_cast<std::size_t>(block));
+          const int nx = box.hi.x - box.lo.x + 1;
+          const int ny = box.hi.y - box.lo.y + 1;
+          const int nz = box.hi.z - box.lo.z + 1;
+          if (nx <= 0 || ny <= 0 || nz <= 0) {
+            return hpx::make_ready_future();
+          }
+
+          const int axis = params.axis;
+          int u_axis = 0;
+          int v_axis = 1;
+          if (axis == 0) {
+            u_axis = 1;
+            v_axis = 2;
+          } else if (axis == 1) {
+            u_axis = 0;
+            v_axis = 2;
+          } else {
+            u_axis = 0;
+            v_axis = 1;
+          }
+
+          auto cell_index = [&](int ax, double coord) -> int {
+            const double x0 = level.geom.x0[ax];
+            const double dx = level.geom.dx[ax];
+            const int origin = level.geom.index_origin[ax];
+            if (dx == 0.0) {
+              return origin;
             }
+            const double idx_f = (coord - x0) / dx;
+            return static_cast<int>(std::floor(idx_f)) + origin;
+          };
+
+          const int k_global = cell_index(axis, params.coord);
+          const int k_local = (axis == 0 ? k_global - box.lo.x
+                                         : (axis == 1 ? k_global - box.lo.y : k_global - box.lo.z));
+          if ((axis == 0 && (k_local < 0 || k_local >= nx)) ||
+              (axis == 1 && (k_local < 0 || k_local >= ny)) ||
+              (axis == 2 && (k_local < 0 || k_local >= nz))) {
+            return hpx::make_ready_future();
           }
-          if (const auto* res = find_msgpack_map_value(root, "resolution");
-              res && res->type == msgpack::type::ARRAY && res->via.array.size == 2) {
-            params.resolution[0] = res->via.array.ptr[0].as<int>();
-            params.resolution[1] = res->via.array.ptr[1].as<int>();
-          }
-          if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-              bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                      bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.bytes_per_value = bpv->as<int>();
-          }
-          return params;
-        });
 
-        const auto out_nx = params.resolution[0];
-        const auto out_ny = params.resolution[1];
-        std::size_t bytes = 0;
-        if (out_nx > 0 && out_ny > 0 && params.bytes_per_value > 0) {
-          bytes = static_cast<std::size_t>(out_nx) * static_cast<std::size_t>(out_ny) *
-                  static_cast<std::size_t>(params.bytes_per_value);
-        }
+          const double u0 = params.rect[0];
+          const double v0 = params.rect[1];
+          const double u1 = params.rect[2];
+          const double v1 = params.rect[3];
+          const double du = (out_nx > 0) ? (u1 - u0) / static_cast<double>(out_nx) : 0.0;
+          const double dv = (out_ny > 0) ? (v1 - v0) / static_cast<double>(out_ny) : 0.0;
 
-        if (outputs.empty() || inputs.empty() || bytes == 0) {
-          return hpx::make_ready_future();
-        }
+          auto in_index = [&](int i, int j, int k) -> std::size_t {
+            return static_cast<std::size_t>((i * ny + j) * nz + k);
+          };
 
-        if (outputs[0].data.size() != bytes) {
-          outputs[0].data.assign(bytes, 0);
-        } else {
-          std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
-        }
-
-        if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
-          return hpx::make_ready_future();
-        }
-
-        const auto& box = level.boxes.at(static_cast<std::size_t>(block));
-        const int nx = box.hi.x - box.lo.x + 1;
-        const int ny = box.hi.y - box.lo.y + 1;
-        const int nz = box.hi.z - box.lo.z + 1;
-        if (nx <= 0 || ny <= 0 || nz <= 0) {
-          return hpx::make_ready_future();
-        }
-
-        const int axis = params.axis;
-        int u_axis = 0;
-        int v_axis = 1;
-        if (axis == 0) {
-          u_axis = 1;
-          v_axis = 2;
-        } else if (axis == 1) {
-          u_axis = 0;
-          v_axis = 2;
-        } else {
-          u_axis = 0;
-          v_axis = 1;
-        }
-
-        auto cell_index = [&](int ax, double coord) -> int {
-          const double x0 = level.geom.x0[ax];
-          const double dx = level.geom.dx[ax];
-          const int origin = level.geom.index_origin[ax];
-          if (dx == 0.0) {
-            return origin;
-          }
-          const double idx_f = (coord - x0) / dx;
-          return static_cast<int>(std::floor(idx_f)) + origin;
-        };
-
-        const int k_global = cell_index(axis, params.coord);
-        const int k_local = (axis == 0 ? k_global - box.lo.x
-                                       : (axis == 1 ? k_global - box.lo.y : k_global - box.lo.z));
-        if ((axis == 0 && (k_local < 0 || k_local >= nx)) ||
-            (axis == 1 && (k_local < 0 || k_local >= ny)) ||
-            (axis == 2 && (k_local < 0 || k_local >= nz))) {
-          return hpx::make_ready_future();
-        }
-
-        const double u0 = params.rect[0];
-        const double v0 = params.rect[1];
-        const double u1 = params.rect[2];
-        const double v1 = params.rect[3];
-        const double du = (out_nx > 0) ? (u1 - u0) / static_cast<double>(out_nx) : 0.0;
-        const double dv = (out_ny > 0) ? (v1 - v0) / static_cast<double>(out_ny) : 0.0;
-
-        auto in_index = [&](int i, int j, int k) -> std::size_t {
-          return static_cast<std::size_t>((i * ny + j) * nz + k);
-        };
-
-        const auto& in = inputs[0].data;
-        if (params.bytes_per_value == 4) {
-          const auto* in_f = reinterpret_cast<const float*>(in.data());
-          auto* out_f = reinterpret_cast<float*>(outputs[0].data.data());
-          for (int j = 0; j < out_ny; ++j) {
-            const double v = v0 + (static_cast<double>(j) + 0.5) * dv;
-            const int v_global = cell_index(v_axis, v);
-            const int v_local = v_axis == 0 ? v_global - box.lo.x
-                                            : (v_axis == 1 ? v_global - box.lo.y
-                                                           : v_global - box.lo.z);
-            for (int i = 0; i < out_nx; ++i) {
-              const double u = u0 + (static_cast<double>(i) + 0.5) * du;
-              const int u_global = cell_index(u_axis, u);
-              const int u_local = u_axis == 0 ? u_global - box.lo.x
-                                              : (u_axis == 1 ? u_global - box.lo.y
-                                                             : u_global - box.lo.z);
-              float value = 0.0f;
-              if (u_local >= 0 && v_local >= 0) {
-                if ((u_axis == 0 && u_local < nx) || (u_axis == 1 && u_local < ny) ||
-                    (u_axis == 2 && u_local < nz)) {
-                  if ((v_axis == 0 && v_local < nx) || (v_axis == 1 && v_local < ny) ||
-                      (v_axis == 2 && v_local < nz)) {
-                    int ii = 0;
-                    int jj = 0;
-                    int kk = 0;
-                    if (axis == 0) {
-                      ii = k_local;
-                      jj = u_axis == 1 ? u_local : v_local;
-                      kk = u_axis == 2 ? u_local : v_local;
-                    } else if (axis == 1) {
-                      ii = u_axis == 0 ? u_local : v_local;
-                      jj = k_local;
-                      kk = u_axis == 2 ? u_local : v_local;
-                    } else {
-                      ii = u_axis == 0 ? u_local : v_local;
-                      jj = u_axis == 1 ? u_local : v_local;
-                      kk = k_local;
-                    }
-                    const auto idx = in_index(ii, jj, kk);
-                    if (idx * sizeof(float) < in.size()) {
-                      value = in_f[idx];
+          const auto& in = inputs[0].data;
+          if (params.bytes_per_value == 4) {
+            const auto* in_f = reinterpret_cast<const float*>(in.data());
+            auto* out_f = reinterpret_cast<float*>(outputs[0].data.data());
+            for (int j = 0; j < out_ny; ++j) {
+              const double v = v0 + (static_cast<double>(j) + 0.5) * dv;
+              const int v_global = cell_index(v_axis, v);
+              const int v_local = v_axis == 0 ? v_global - box.lo.x
+                                              : (v_axis == 1 ? v_global - box.lo.y
+                                                             : v_global - box.lo.z);
+              for (int i = 0; i < out_nx; ++i) {
+                const double u = u0 + (static_cast<double>(i) + 0.5) * du;
+                const int u_global = cell_index(u_axis, u);
+                const int u_local = u_axis == 0 ? u_global - box.lo.x
+                                                : (u_axis == 1 ? u_global - box.lo.y
+                                                               : u_global - box.lo.z);
+                float value = 0.0f;
+                if (u_local >= 0 && v_local >= 0) {
+                  if ((u_axis == 0 && u_local < nx) || (u_axis == 1 && u_local < ny) ||
+                      (u_axis == 2 && u_local < nz)) {
+                    if ((v_axis == 0 && v_local < nx) || (v_axis == 1 && v_local < ny) ||
+                        (v_axis == 2 && v_local < nz)) {
+                      int ii = 0;
+                      int jj = 0;
+                      int kk = 0;
+                      if (axis == 0) {
+                        ii = k_local;
+                        jj = u_axis == 1 ? u_local : v_local;
+                        kk = u_axis == 2 ? u_local : v_local;
+                      } else if (axis == 1) {
+                        ii = u_axis == 0 ? u_local : v_local;
+                        jj = k_local;
+                        kk = u_axis == 2 ? u_local : v_local;
+                      } else {
+                        ii = u_axis == 0 ? u_local : v_local;
+                        jj = u_axis == 1 ? u_local : v_local;
+                        kk = k_local;
+                      }
+                      const auto idx = in_index(ii, jj, kk);
+                      if (idx * sizeof(float) < in.size()) {
+                        value = in_f[idx];
+                      }
                     }
                   }
                 }
+                out_f[static_cast<std::size_t>(j) * out_nx + i] = value;
               }
-              out_f[static_cast<std::size_t>(j) * out_nx + i] = value;
             }
-          }
-        } else if (params.bytes_per_value == 8) {
-          const auto* in_d = reinterpret_cast<const double*>(in.data());
-          auto* out_d = reinterpret_cast<double*>(outputs[0].data.data());
-          for (int j = 0; j < out_ny; ++j) {
-            const double v = v0 + (static_cast<double>(j) + 0.5) * dv;
-            const int v_global = cell_index(v_axis, v);
-            const int v_local = v_axis == 0 ? v_global - box.lo.x
-                                            : (v_axis == 1 ? v_global - box.lo.y
-                                                           : v_global - box.lo.z);
-            for (int i = 0; i < out_nx; ++i) {
-              const double u = u0 + (static_cast<double>(i) + 0.5) * du;
-              const int u_global = cell_index(u_axis, u);
-              const int u_local = u_axis == 0 ? u_global - box.lo.x
-                                              : (u_axis == 1 ? u_global - box.lo.y
-                                                             : u_global - box.lo.z);
-              double value = 0.0;
-              if (u_local >= 0 && v_local >= 0) {
-                if ((u_axis == 0 && u_local < nx) || (u_axis == 1 && u_local < ny) ||
-                    (u_axis == 2 && u_local < nz)) {
-                  if ((v_axis == 0 && v_local < nx) || (v_axis == 1 && v_local < ny) ||
-                      (v_axis == 2 && v_local < nz)) {
-                    int ii = 0;
-                    int jj = 0;
-                    int kk = 0;
-                    if (axis == 0) {
-                      ii = k_local;
-                      jj = u_axis == 1 ? u_local : v_local;
-                      kk = u_axis == 2 ? u_local : v_local;
-                    } else if (axis == 1) {
-                      ii = u_axis == 0 ? u_local : v_local;
-                      jj = k_local;
-                      kk = u_axis == 2 ? u_local : v_local;
-                    } else {
-                      ii = u_axis == 0 ? u_local : v_local;
-                      jj = u_axis == 1 ? u_local : v_local;
-                      kk = k_local;
-                    }
-                    const auto idx = in_index(ii, jj, kk);
-                    if (idx * sizeof(double) < in.size()) {
-                      value = in_d[idx];
+          } else if (params.bytes_per_value == 8) {
+            const auto* in_d = reinterpret_cast<const double*>(in.data());
+            auto* out_d = reinterpret_cast<double*>(outputs[0].data.data());
+            for (int j = 0; j < out_ny; ++j) {
+              const double v = v0 + (static_cast<double>(j) + 0.5) * dv;
+              const int v_global = cell_index(v_axis, v);
+              const int v_local = v_axis == 0 ? v_global - box.lo.x
+                                              : (v_axis == 1 ? v_global - box.lo.y
+                                                             : v_global - box.lo.z);
+              for (int i = 0; i < out_nx; ++i) {
+                const double u = u0 + (static_cast<double>(i) + 0.5) * du;
+                const int u_global = cell_index(u_axis, u);
+                const int u_local = u_axis == 0 ? u_global - box.lo.x
+                                                : (u_axis == 1 ? u_global - box.lo.y
+                                                               : u_global - box.lo.z);
+                double value = 0.0;
+                if (u_local >= 0 && v_local >= 0) {
+                  if ((u_axis == 0 && u_local < nx) || (u_axis == 1 && u_local < ny) ||
+                      (u_axis == 2 && u_local < nz)) {
+                    if ((v_axis == 0 && v_local < nx) || (v_axis == 1 && v_local < ny) ||
+                        (v_axis == 2 && v_local < nz)) {
+                      int ii = 0;
+                      int jj = 0;
+                      int kk = 0;
+                      if (axis == 0) {
+                        ii = k_local;
+                        jj = u_axis == 1 ? u_local : v_local;
+                        kk = u_axis == 2 ? u_local : v_local;
+                      } else if (axis == 1) {
+                        ii = u_axis == 0 ? u_local : v_local;
+                        jj = k_local;
+                        kk = u_axis == 2 ? u_local : v_local;
+                      } else {
+                        ii = u_axis == 0 ? u_local : v_local;
+                        jj = u_axis == 1 ? u_local : v_local;
+                        kk = k_local;
+                      }
+                      const auto idx = in_index(ii, jj, kk);
+                      if (idx * sizeof(double) < in.size()) {
+                        value = in_d[idx];
+                      }
                     }
                   }
                 }
-              }
-              out_d[static_cast<std::size_t>(j) * out_nx + i] = value;
-            }
-          }
-        }
-        return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "particle_load_field_chunk_f64", .n_inputs = 0, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t block, std::span<const HostView>, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
-        if (outputs.empty()) {
-          return hpx::make_ready_future();
-        }
-        struct Params {
-          std::string particle_type;
-          std::string field_name;
-        };
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* particle_type = find_msgpack_map_value(root, "particle_type");
-              particle_type && particle_type->type == msgpack::type::STR) {
-            params.particle_type = particle_type->as<std::string>();
-          }
-          if (const auto* field_name = find_msgpack_map_value(root, "field_name");
-              field_name && field_name->type == msgpack::type::STR) {
-            params.field_name = field_name->as<std::string>();
-          }
-          return params;
-        });
-        if (params.particle_type.empty() || params.field_name.empty()) {
-          throw std::runtime_error("particle_load_field_chunk_f64 requires particle_type and field_name");
-        }
-
-        const auto& dataset = global_dataset();
-        if (!dataset.backend) {
-          throw std::runtime_error("particle_load_field_chunk_f64: missing dataset backend");
-        }
-        const auto* reader = dataset.backend->get_plotfile_reader();
-        if (reader == nullptr) {
-          throw std::runtime_error(
-              "particle_load_field_chunk_f64 requires an AMReX plotfile-backed dataset");
-        }
-        auto data = reader->read_particle_field_chunk(params.particle_type, params.field_name, block);
-        const std::size_t n = static_cast<std::size_t>(std::max<int64_t>(0, data.count));
-        outputs[0].data.resize(n * sizeof(double));
-        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
-
-        if (data.dtype == "float64") {
-          if (data.bytes.size() < n * sizeof(double)) {
-            throw std::runtime_error("particle_load_field_chunk_f64: short float64 payload");
-          }
-          std::memcpy(out, data.bytes.data(), n * sizeof(double));
-        } else if (data.dtype == "float32") {
-          if (data.bytes.size() < n * sizeof(float)) {
-            throw std::runtime_error("particle_load_field_chunk_f64: short float32 payload");
-          }
-          const auto* in = reinterpret_cast<const float*>(data.bytes.data());
-          for (std::size_t i = 0; i < n; ++i) {
-            out[i] = static_cast<double>(in[i]);
-          }
-        } else if (data.dtype == "int64") {
-          if (data.bytes.size() < n * sizeof(int64_t)) {
-            throw std::runtime_error("particle_load_field_chunk_f64: short int64 payload");
-          }
-          const auto* in = reinterpret_cast<const int64_t*>(data.bytes.data());
-          for (std::size_t i = 0; i < n; ++i) {
-            out[i] = static_cast<double>(in[i]);
-          }
-        } else {
-          throw std::runtime_error("particle_load_field_chunk_f64: unsupported particle dtype '" +
-                                   data.dtype + "'");
-        }
-        return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "particle_cic_grid_accumulate", .n_inputs = 0, .n_outputs = 1,
-                 .needs_neighbors = false},
-      [](const LevelMeta& level, int32_t block, std::span<const HostView>, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
-        struct Params {
-          std::string particle_type;
-          int level_index = -1;
-          int axis = 2;
-          std::array<double, 2> axis_bounds{0.0, 0.0};
-          double mass_max = std::numeric_limits<double>::quiet_NaN();
-          std::vector<std::array<std::array<int, 3>, 2>> covered_boxes;
-        };
-
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* particle_type = find_msgpack_map_value(root, "particle_type");
-              particle_type && particle_type->type == msgpack::type::STR) {
-            params.particle_type = particle_type->as<std::string>();
-          }
-          if (const auto* level_index = find_msgpack_map_value(root, "level_index");
-              level_index && (level_index->type == msgpack::type::POSITIVE_INTEGER ||
-                              level_index->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.level_index = level_index->as<int>();
-          }
-          if (const auto* axis = find_msgpack_map_value(root, "axis");
-              axis && (axis->type == msgpack::type::POSITIVE_INTEGER ||
-                       axis->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.axis = axis->as<int>();
-          }
-          if (const auto* axis_bounds = find_msgpack_map_value(root, "axis_bounds");
-              axis_bounds && axis_bounds->type == msgpack::type::ARRAY &&
-              axis_bounds->via.array.size == 2) {
-            params.axis_bounds[0] = axis_bounds->via.array.ptr[0].as<double>();
-            params.axis_bounds[1] = axis_bounds->via.array.ptr[1].as<double>();
-          }
-          if (const auto* mass_max = find_msgpack_map_value(root, "mass_max");
-              mass_max && (mass_max->type == msgpack::type::POSITIVE_INTEGER ||
-                           mass_max->type == msgpack::type::NEGATIVE_INTEGER ||
-                           mass_max->type == msgpack::type::FLOAT)) {
-            params.mass_max = mass_max->as<double>();
-          }
-          if (const auto* boxes = find_msgpack_map_value(root, "covered_boxes");
-              boxes && boxes->type == msgpack::type::ARRAY) {
-            params.covered_boxes.reserve(boxes->via.array.size);
-            for (uint32_t bi = 0; bi < boxes->via.array.size; ++bi) {
-              const auto& box_val = boxes->via.array.ptr[bi];
-              if (box_val.type != msgpack::type::ARRAY || box_val.via.array.size != 2) {
-                continue;
-              }
-              std::array<std::array<int, 3>, 2> box{};
-              bool ok = true;
-              for (uint32_t side = 0; side < 2 && ok; ++side) {
-                const auto& side_val = box_val.via.array.ptr[side];
-                if (side_val.type != msgpack::type::ARRAY || side_val.via.array.size != 3) {
-                  ok = false;
-                  break;
-                }
-                for (uint32_t d = 0; d < 3; ++d) {
-                  box[side][d] = side_val.via.array.ptr[d].as<int>();
-                }
-              }
-              if (ok) {
-                params.covered_boxes.push_back(box);
+                out_d[static_cast<std::size_t>(j) * out_nx + i] = value;
               }
             }
           }
-          return params;
-        });
-
-        if (outputs.empty()) {
           return hpx::make_ready_future();
-        }
-        if (params.particle_type.empty()) {
-          throw std::runtime_error("particle_cic_grid_accumulate: missing particle_type");
-        }
-        if (params.axis < 0 || params.axis > 2) {
-          throw std::runtime_error("particle_cic_grid_accumulate: axis must be 0, 1, or 2");
-        }
-        if (params.level_index < 0) {
-          throw std::runtime_error("particle_cic_grid_accumulate: missing level_index");
-        }
-        if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
-          throw std::runtime_error("particle_cic_grid_accumulate: block index out of range");
-        }
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
+      std::string particle_type;
+      std::string field_name;
+    };
 
-        const auto& dataset = global_dataset();
-        if (!dataset.backend) {
-          throw std::runtime_error("particle_cic_grid_accumulate: missing dataset backend");
-        }
-        const auto* reader = dataset.backend->get_plotfile_reader();
-        if (reader == nullptr) {
-          throw std::runtime_error(
-              "particle_cic_grid_accumulate requires an AMReX plotfile-backed dataset");
-        }
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* particle_type = find_msgpack_map_value(root, "particle_type");
+          particle_type && particle_type->type == msgpack::type::STR) {
+        params.particle_type = particle_type->as<std::string>();
+      }
+      if (const auto* field_name = find_msgpack_map_value(root, "field_name");
+          field_name && field_name->type == msgpack::type::STR) {
+        params.field_name = field_name->as<std::string>();
+      }
+      return params;
+    };
 
-        auto px = reader->read_particle_field_grid(params.particle_type, "x", params.level_index,
-                                                   block);
-        auto py = reader->read_particle_field_grid(params.particle_type, "y", params.level_index,
-                                                   block);
-        auto pz = reader->read_particle_field_grid(params.particle_type, "z", params.level_index,
-                                                   block);
-        auto pm = reader->read_particle_field_grid(params.particle_type, "mass",
-                                                   params.level_index, block);
-
-        std::vector<double> px_vals;
-        std::vector<double> py_vals;
-        std::vector<double> pz_vals;
-        std::vector<double> pm_vals;
-        append_particle_values_as_f64(px, "x", "particle_cic_grid_accumulate", px_vals);
-        append_particle_values_as_f64(py, "y", "particle_cic_grid_accumulate", py_vals);
-        append_particle_values_as_f64(pz, "z", "particle_cic_grid_accumulate", pz_vals);
-        append_particle_values_as_f64(pm, "mass", "particle_cic_grid_accumulate", pm_vals);
-
-        const std::size_t n = std::min(std::min(px_vals.size(), py_vals.size()),
-                                       std::min(pz_vals.size(), pm_vals.size()));
-        px_vals.resize(n);
-        py_vals.resize(n);
-        pz_vals.resize(n);
-        pm_vals.resize(n);
-
-        const int axis = params.axis;
-        const int u_axis = (axis == 0) ? 1 : 0;
-        const int v_axis = (axis == 2) ? 1 : 2;
-
-        const auto& box = level.boxes[static_cast<std::size_t>(block)];
-        const int box_lo[3] = {box.lo.x, box.lo.y, box.lo.z};
-        const int box_hi[3] = {box.hi.x, box.hi.y, box.hi.z};
-        const int nx = box_hi[0] - box_lo[0] + 1;
-        const int ny = box_hi[1] - box_lo[1] + 1;
-        const int nz = box_hi[2] - box_lo[2] + 1;
-        if (nx <= 0 || ny <= 0 || nz <= 0) {
-          return hpx::make_ready_future();
-        }
-
-        const double x0[3] = {level.geom.x0[0], level.geom.x0[1], level.geom.x0[2]};
-        const double dx[3] = {level.geom.dx[0], level.geom.dx[1], level.geom.dx[2]};
-        const int origin[3] = {level.geom.index_origin[0], level.geom.index_origin[1],
-                               level.geom.index_origin[2]};
-        if (dx[0] == 0.0 || dx[1] == 0.0 || dx[2] == 0.0) {
-          return hpx::make_ready_future();
-        }
-
-        const std::size_t out_elems =
-            static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) *
-            static_cast<std::size_t>(nz);
-        outputs[0].data.resize(out_elems * sizeof(double));
-        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
-        std::fill(out, out + out_elems, 0.0);
-
-        const double cell_volume = dx[0] * dx[1] * dx[2];
-        if (!(cell_volume > 0.0)) {
-          return hpx::make_ready_future();
-        }
-
-        const double a_lo = std::min(params.axis_bounds[0], params.axis_bounds[1]);
-        const double a_hi = std::max(params.axis_bounds[0], params.axis_bounds[1]);
-
-        auto covered = [&](int i, int j, int k) -> bool {
-          for (const auto& b : params.covered_boxes) {
-            if (i >= b[0][0] && i <= b[1][0] && j >= b[0][1] && j <= b[1][1] && k >= b[0][2] &&
-                k <= b[1][2]) {
-              return true;
-            }
+    registry.register_kernel(
+        KernelDesc{.name = "particle_load_field_chunk_f64", .n_inputs = 0, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta&, int32_t block, std::span<const HostView>,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+          if (outputs.empty()) {
+            return hpx::make_ready_future();
           }
-          return false;
-        };
+          const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+          if (params.particle_type.empty() || params.field_name.empty()) {
+            throw std::runtime_error(
+                "particle_load_field_chunk_f64 requires particle_type and field_name");
+          }
 
-        auto out_index = [ny, nz](int i, int j, int k) -> std::size_t {
-          return static_cast<std::size_t>((i * ny + j) * nz + k);
-        };
+          const auto& dataset = current_dataset();
+          if (!dataset.backend) {
+            throw std::runtime_error("particle_load_field_chunk_f64: missing dataset backend");
+          }
+          const auto* reader = dataset.backend->get_plotfile_reader();
+          if (reader == nullptr) {
+            throw std::runtime_error(
+                "particle_load_field_chunk_f64 requires an AMReX plotfile-backed dataset");
+          }
+          auto data =
+              reader->read_particle_field_chunk(params.particle_type, params.field_name, block);
+          const std::size_t n = static_cast<std::size_t>(std::max<int64_t>(0, data.count));
+          outputs[0].data.resize(n * sizeof(double));
+          auto* out = reinterpret_cast<double*>(outputs[0].data.data());
 
-        const double* coord[3] = {px_vals.data(), py_vals.data(), pz_vals.data()};
-        const double du = dx[u_axis];
-        const double dv = dx[v_axis];
-        const double da = dx[axis];
-
-        const double u_center0 = x0[u_axis] + (0.5 - static_cast<double>(origin[u_axis])) * du;
-        const double v_center0 = x0[v_axis] + (0.5 - static_cast<double>(origin[v_axis])) * dv;
-        const double a_cell_lo = x0[axis] + (static_cast<double>(box_lo[axis] - origin[axis])) * da;
-        const double a_cell_hi =
-            x0[axis] + (static_cast<double>(box_hi[axis] + 1 - origin[axis])) * da;
-
-        auto add_density = [&](int iu, int iv, int ia, double wmass) {
-          int ii = 0;
-          int jj = 0;
-          int kk = 0;
-          if (axis == 0) {
-            ii = ia;
-            jj = iu;
-            kk = iv;
-          } else if (axis == 1) {
-            ii = iu;
-            jj = ia;
-            kk = iv;
+          if (data.dtype == "float64") {
+            if (data.bytes.size() < n * sizeof(double)) {
+              throw std::runtime_error("particle_load_field_chunk_f64: short float64 payload");
+            }
+            std::memcpy(out, data.bytes.data(), n * sizeof(double));
+          } else if (data.dtype == "float32") {
+            if (data.bytes.size() < n * sizeof(float)) {
+              throw std::runtime_error("particle_load_field_chunk_f64: short float32 payload");
+            }
+            const auto* in = reinterpret_cast<const float*>(data.bytes.data());
+            for (std::size_t i = 0; i < n; ++i) {
+              out[i] = static_cast<double>(in[i]);
+            }
+          } else if (data.dtype == "int64") {
+            if (data.bytes.size() < n * sizeof(int64_t)) {
+              throw std::runtime_error("particle_load_field_chunk_f64: short int64 payload");
+            }
+            const auto* in = reinterpret_cast<const int64_t*>(data.bytes.data());
+            for (std::size_t i = 0; i < n; ++i) {
+              out[i] = static_cast<double>(in[i]);
+            }
           } else {
-            ii = iu;
-            jj = iv;
-            kk = ia;
+            throw std::runtime_error("particle_load_field_chunk_f64: unsupported particle dtype '" +
+                                     data.dtype + "'");
           }
-          if (ii < box_lo[0] || ii > box_hi[0] || jj < box_lo[1] || jj > box_hi[1] || kk < box_lo[2] ||
-              kk > box_hi[2] || covered(ii, jj, kk)) {
-            return;
-          }
-          const int i_local = ii - box_lo[0];
-          const int j_local = jj - box_lo[1];
-          const int k_local = kk - box_lo[2];
-          if (i_local < 0 || i_local >= nx || j_local < 0 || j_local >= ny || k_local < 0 ||
-              k_local >= nz) {
-            return;
-          }
-          out[out_index(i_local, j_local, k_local)] += wmass / cell_volume;
-        };
+          return hpx::make_ready_future();
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
+      std::string particle_type;
+      int level_index = -1;
+      int axis = 2;
+      std::array<double, 2> axis_bounds{0.0, 0.0};
+      double mass_max = std::numeric_limits<double>::quiet_NaN();
+      std::shared_ptr<const CoveredBoxListIR> covered_boxes;
+    };
 
-        for (std::size_t p = 0; p < n; ++p) {
-          const double u = coord[u_axis][p];
-          const double v = coord[v_axis][p];
-          const double a = coord[axis][p];
-          const double m = pm_vals[p];
-          if (!std::isfinite(u) || !std::isfinite(v) || !std::isfinite(a) || !std::isfinite(m)) {
-            continue;
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* particle_type = find_msgpack_map_value(root, "particle_type");
+          particle_type && particle_type->type == msgpack::type::STR) {
+        params.particle_type = particle_type->as<std::string>();
+      }
+      if (const auto* level_index = find_msgpack_map_value(root, "level_index");
+          level_index && (level_index->type == msgpack::type::POSITIVE_INTEGER ||
+                          level_index->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.level_index = level_index->as<int>();
+      }
+      if (const auto* axis = find_msgpack_map_value(root, "axis");
+          axis && (axis->type == msgpack::type::POSITIVE_INTEGER ||
+                   axis->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.axis = axis->as<int>();
+      }
+      if (const auto* axis_bounds = find_msgpack_map_value(root, "axis_bounds");
+          axis_bounds && axis_bounds->type == msgpack::type::ARRAY &&
+          axis_bounds->via.array.size == 2) {
+        params.axis_bounds[0] = axis_bounds->via.array.ptr[0].as<double>();
+        params.axis_bounds[1] = axis_bounds->via.array.ptr[1].as<double>();
+      }
+      if (const auto* mass_max = find_msgpack_map_value(root, "mass_max");
+          mass_max && (mass_max->type == msgpack::type::POSITIVE_INTEGER ||
+                       mass_max->type == msgpack::type::NEGATIVE_INTEGER ||
+                       mass_max->type == msgpack::type::FLOAT)) {
+        params.mass_max = mass_max->as<double>();
+      }
+      params.covered_boxes = parse_covered_boxes_param(root);
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "particle_cic_grid_accumulate", .n_inputs = 0, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView>,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+          const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+
+          if (outputs.empty()) {
+            return hpx::make_ready_future();
           }
-          if (m <= 0.0) {
-            continue;
+          if (params.particle_type.empty()) {
+            throw std::runtime_error("particle_cic_grid_accumulate: missing particle_type");
           }
-          if (std::isfinite(params.mass_max) && m > params.mass_max) {
-            continue;
+          if (params.axis < 0 || params.axis > 2) {
+            throw std::runtime_error("particle_cic_grid_accumulate: axis must be 0, 1, or 2");
           }
-          if (a < a_lo || a > a_hi) {
-            continue;
+          if (params.level_index < 0) {
+            throw std::runtime_error("particle_cic_grid_accumulate: missing level_index");
           }
-          if (a < a_cell_lo || a >= a_cell_hi) {
-            continue;
+          if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
+            throw std::runtime_error("particle_cic_grid_accumulate: block index out of range");
           }
 
-          const double su = (u - u_center0) / du;
-          const double sv = (v - v_center0) / dv;
-          const int iu0 = static_cast<int>(std::floor(su));
-          const int iv0 = static_cast<int>(std::floor(sv));
-          const double tu = su - static_cast<double>(iu0);
-          const double tv = sv - static_cast<double>(iv0);
-          const int ia = static_cast<int>(std::floor((a - x0[axis]) / da)) + origin[axis];
+          const auto& dataset = current_dataset();
+          if (!dataset.backend) {
+            throw std::runtime_error("particle_cic_grid_accumulate: missing dataset backend");
+          }
+          const auto* reader = dataset.backend->get_plotfile_reader();
+          if (reader == nullptr) {
+            throw std::runtime_error(
+                "particle_cic_grid_accumulate requires an AMReX plotfile-backed dataset");
+          }
 
-          add_density(iu0, iv0, ia, m * (1.0 - tu) * (1.0 - tv));
-          add_density(iu0 + 1, iv0, ia, m * tu * (1.0 - tv));
-          add_density(iu0, iv0 + 1, ia, m * (1.0 - tu) * tv);
-          add_density(iu0 + 1, iv0 + 1, ia, m * tu * tv);
-        }
+          auto px =
+              reader->read_particle_field_grid(params.particle_type, "x", params.level_index, block);
+          auto py =
+              reader->read_particle_field_grid(params.particle_type, "y", params.level_index, block);
+          auto pz =
+              reader->read_particle_field_grid(params.particle_type, "z", params.level_index, block);
+          auto pm = reader->read_particle_field_grid(params.particle_type, "mass",
+                                                     params.level_index, block);
 
-        return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "particle_cic_projection_accumulate", .n_inputs = 0, .n_outputs = 1,
-                 .needs_neighbors = false},
-      [](const LevelMeta& level, int32_t block, std::span<const HostView>, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
-        struct Params {
-          std::string particle_type;
-          int level_index = -1;
-          int axis = 2;
-          std::array<double, 2> axis_bounds{0.0, 0.0};
-          std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
-          std::array<int, 2> resolution{1, 1};
-          double mass_max = std::numeric_limits<double>::quiet_NaN();
-          std::vector<std::array<std::array<int, 3>, 2>> covered_boxes;
-        };
+          std::vector<double> px_vals;
+          std::vector<double> py_vals;
+          std::vector<double> pz_vals;
+          std::vector<double> pm_vals;
+          append_particle_values_as_f64(px, "x", "particle_cic_grid_accumulate", px_vals);
+          append_particle_values_as_f64(py, "y", "particle_cic_grid_accumulate", py_vals);
+          append_particle_values_as_f64(pz, "z", "particle_cic_grid_accumulate", pz_vals);
+          append_particle_values_as_f64(pm, "mass", "particle_cic_grid_accumulate", pm_vals);
 
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* particle_type = find_msgpack_map_value(root, "particle_type");
-              particle_type && particle_type->type == msgpack::type::STR) {
-            params.particle_type = particle_type->as<std::string>();
+          const std::size_t n = std::min(std::min(px_vals.size(), py_vals.size()),
+                                         std::min(pz_vals.size(), pm_vals.size()));
+          px_vals.resize(n);
+          py_vals.resize(n);
+          pz_vals.resize(n);
+          pm_vals.resize(n);
+
+          const int axis = params.axis;
+          const int u_axis = (axis == 0) ? 1 : 0;
+          const int v_axis = (axis == 2) ? 1 : 2;
+
+          const auto& box = level.boxes[static_cast<std::size_t>(block)];
+          const int box_lo[3] = {box.lo.x, box.lo.y, box.lo.z};
+          const int box_hi[3] = {box.hi.x, box.hi.y, box.hi.z};
+          const int nx = box_hi[0] - box_lo[0] + 1;
+          const int ny = box_hi[1] - box_lo[1] + 1;
+          const int nz = box_hi[2] - box_lo[2] + 1;
+          if (nx <= 0 || ny <= 0 || nz <= 0) {
+            return hpx::make_ready_future();
           }
-          if (const auto* level_index = find_msgpack_map_value(root, "level_index");
-              level_index && (level_index->type == msgpack::type::POSITIVE_INTEGER ||
-                              level_index->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.level_index = level_index->as<int>();
+
+          const double x0[3] = {level.geom.x0[0], level.geom.x0[1], level.geom.x0[2]};
+          const double dx[3] = {level.geom.dx[0], level.geom.dx[1], level.geom.dx[2]};
+          const int origin[3] = {level.geom.index_origin[0], level.geom.index_origin[1],
+                                 level.geom.index_origin[2]};
+          if (dx[0] == 0.0 || dx[1] == 0.0 || dx[2] == 0.0) {
+            return hpx::make_ready_future();
           }
-          if (const auto* axis = find_msgpack_map_value(root, "axis");
-              axis && (axis->type == msgpack::type::POSITIVE_INTEGER ||
-                       axis->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.axis = axis->as<int>();
+
+          const std::size_t out_elems = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) *
+                                        static_cast<std::size_t>(nz);
+          outputs[0].data.resize(out_elems * sizeof(double));
+          auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+          std::fill(out, out + out_elems, 0.0);
+
+          const double cell_volume = dx[0] * dx[1] * dx[2];
+          if (!(cell_volume > 0.0)) {
+            return hpx::make_ready_future();
           }
-          if (const auto* axis_bounds = find_msgpack_map_value(root, "axis_bounds");
-              axis_bounds && axis_bounds->type == msgpack::type::ARRAY &&
-              axis_bounds->via.array.size == 2) {
-            params.axis_bounds[0] = axis_bounds->via.array.ptr[0].as<double>();
-            params.axis_bounds[1] = axis_bounds->via.array.ptr[1].as<double>();
-          }
-          if (const auto* rect = find_msgpack_map_value(root, "rect");
-              rect && rect->type == msgpack::type::ARRAY && rect->via.array.size == 4) {
-            for (uint32_t j = 0; j < 4; ++j) {
-              params.rect[j] = rect->via.array.ptr[j].as<double>();
+
+          const double a_lo = std::min(params.axis_bounds[0], params.axis_bounds[1]);
+          const double a_hi = std::max(params.axis_bounds[0], params.axis_bounds[1]);
+
+          auto covered = [&](int i, int j, int k) -> bool {
+            if (!params.covered_boxes) {
+              return false;
             }
+            for (const auto& b : *params.covered_boxes) {
+              if (covered_box_contains(b, i, j, k)) {
+                return true;
+              }
+            }
+            return false;
+          };
+
+          auto out_index = [ny, nz](int i, int j, int k) -> std::size_t {
+            return static_cast<std::size_t>((i * ny + j) * nz + k);
+          };
+
+          const double* coord[3] = {px_vals.data(), py_vals.data(), pz_vals.data()};
+          const double du = dx[u_axis];
+          const double dv = dx[v_axis];
+          const double da = dx[axis];
+
+          const double u_center0 =
+              x0[u_axis] + (0.5 - static_cast<double>(origin[u_axis])) * du;
+          const double v_center0 =
+              x0[v_axis] + (0.5 - static_cast<double>(origin[v_axis])) * dv;
+          const double a_cell_lo =
+              x0[axis] + (static_cast<double>(box_lo[axis] - origin[axis])) * da;
+          const double a_cell_hi =
+              x0[axis] + (static_cast<double>(box_hi[axis] + 1 - origin[axis])) * da;
+
+          auto add_density = [&](int iu, int iv, int ia, double wmass) {
+            int ii = 0;
+            int jj = 0;
+            int kk = 0;
+            if (axis == 0) {
+              ii = ia;
+              jj = iu;
+              kk = iv;
+            } else if (axis == 1) {
+              ii = iu;
+              jj = ia;
+              kk = iv;
+            } else {
+              ii = iu;
+              jj = iv;
+              kk = ia;
+            }
+            if (ii < box_lo[0] || ii > box_hi[0] || jj < box_lo[1] || jj > box_hi[1] ||
+                kk < box_lo[2] || kk > box_hi[2] || covered(ii, jj, kk)) {
+              return;
+            }
+            const int i_local = ii - box_lo[0];
+            const int j_local = jj - box_lo[1];
+            const int k_local = kk - box_lo[2];
+            if (i_local < 0 || i_local >= nx || j_local < 0 || j_local >= ny ||
+                k_local < 0 || k_local >= nz) {
+              return;
+            }
+            out[out_index(i_local, j_local, k_local)] += wmass / cell_volume;
+          };
+
+          for (std::size_t p = 0; p < n; ++p) {
+            const double u = coord[u_axis][p];
+            const double v = coord[v_axis][p];
+            const double a = coord[axis][p];
+            const double m = pm_vals[p];
+            if (!std::isfinite(u) || !std::isfinite(v) || !std::isfinite(a) || !std::isfinite(m)) {
+              continue;
+            }
+            if (m <= 0.0) {
+              continue;
+            }
+            if (std::isfinite(params.mass_max) && m > params.mass_max) {
+              continue;
+            }
+            if (a < a_lo || a > a_hi) {
+              continue;
+            }
+            if (a < a_cell_lo || a >= a_cell_hi) {
+              continue;
+            }
+
+            const double su = (u - u_center0) / du;
+            const double sv = (v - v_center0) / dv;
+            const int iu0 = static_cast<int>(std::floor(su));
+            const int iv0 = static_cast<int>(std::floor(sv));
+            const double tu = su - static_cast<double>(iu0);
+            const double tv = sv - static_cast<double>(iv0);
+            const int ia = static_cast<int>(std::floor((a - x0[axis]) / da)) + origin[axis];
+
+            add_density(iu0, iv0, ia, m * (1.0 - tu) * (1.0 - tv));
+            add_density(iu0 + 1, iv0, ia, m * tu * (1.0 - tv));
+            add_density(iu0, iv0 + 1, ia, m * (1.0 - tu) * tv);
+            add_density(iu0 + 1, iv0 + 1, ia, m * tu * tv);
           }
-          if (const auto* resolution = find_msgpack_map_value(root, "resolution");
-              resolution && resolution->type == msgpack::type::ARRAY &&
-              resolution->via.array.size == 2) {
-            params.resolution[0] = resolution->via.array.ptr[0].as<int>();
-            params.resolution[1] = resolution->via.array.ptr[1].as<int>();
+
+          return hpx::make_ready_future();
+        },
+        make_covered_box_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
+      std::string particle_type;
+      int level_index = -1;
+      int axis = 2;
+      std::array<double, 2> axis_bounds{0.0, 0.0};
+      std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
+      std::array<int, 2> resolution{1, 1};
+      double mass_max = std::numeric_limits<double>::quiet_NaN();
+      std::shared_ptr<const CoveredBoxListIR> covered_boxes;
+    };
+
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* particle_type = find_msgpack_map_value(root, "particle_type");
+          particle_type && particle_type->type == msgpack::type::STR) {
+        params.particle_type = particle_type->as<std::string>();
+      }
+      if (const auto* level_index = find_msgpack_map_value(root, "level_index");
+          level_index && (level_index->type == msgpack::type::POSITIVE_INTEGER ||
+                          level_index->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.level_index = level_index->as<int>();
+      }
+      if (const auto* axis = find_msgpack_map_value(root, "axis");
+          axis && (axis->type == msgpack::type::POSITIVE_INTEGER ||
+                   axis->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.axis = axis->as<int>();
+      }
+      if (const auto* axis_bounds = find_msgpack_map_value(root, "axis_bounds");
+          axis_bounds && axis_bounds->type == msgpack::type::ARRAY &&
+          axis_bounds->via.array.size == 2) {
+        params.axis_bounds[0] = axis_bounds->via.array.ptr[0].as<double>();
+        params.axis_bounds[1] = axis_bounds->via.array.ptr[1].as<double>();
+      }
+      if (const auto* rect = find_msgpack_map_value(root, "rect");
+          rect && rect->type == msgpack::type::ARRAY && rect->via.array.size == 4) {
+        for (uint32_t j = 0; j < 4; ++j) {
+          params.rect[j] = rect->via.array.ptr[j].as<double>();
+        }
+      }
+      if (const auto* resolution = find_msgpack_map_value(root, "resolution");
+          resolution && resolution->type == msgpack::type::ARRAY &&
+          resolution->via.array.size == 2) {
+        params.resolution[0] = resolution->via.array.ptr[0].as<int>();
+        params.resolution[1] = resolution->via.array.ptr[1].as<int>();
+      }
+      if (const auto* mass_max = find_msgpack_map_value(root, "mass_max");
+          mass_max && (mass_max->type == msgpack::type::POSITIVE_INTEGER ||
+                       mass_max->type == msgpack::type::NEGATIVE_INTEGER ||
+                       mass_max->type == msgpack::type::FLOAT)) {
+        params.mass_max = mass_max->as<double>();
+      }
+      params.covered_boxes = parse_covered_boxes_param(root);
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "particle_cic_projection_accumulate", .n_inputs = 0, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView>,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+          const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+
+          if (outputs.empty()) {
+            return hpx::make_ready_future();
           }
-          if (const auto* mass_max = find_msgpack_map_value(root, "mass_max");
-              mass_max && (mass_max->type == msgpack::type::POSITIVE_INTEGER ||
-                           mass_max->type == msgpack::type::NEGATIVE_INTEGER ||
-                           mass_max->type == msgpack::type::FLOAT)) {
-            params.mass_max = mass_max->as<double>();
+          const int out_nx = params.resolution[0];
+          const int out_ny = params.resolution[1];
+          if (out_nx <= 0 || out_ny <= 0) {
+            throw std::runtime_error("particle_cic_projection_accumulate: invalid resolution");
           }
-          if (const auto* boxes = find_msgpack_map_value(root, "covered_boxes");
-              boxes && boxes->type == msgpack::type::ARRAY) {
-            params.covered_boxes.reserve(boxes->via.array.size);
-            for (uint32_t bi = 0; bi < boxes->via.array.size; ++bi) {
-              const auto& box_val = boxes->via.array.ptr[bi];
-              if (box_val.type != msgpack::type::ARRAY || box_val.via.array.size != 2) {
+          outputs[0].data.resize(
+              static_cast<std::size_t>(out_nx) * static_cast<std::size_t>(out_ny) * sizeof(double));
+          auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+          std::fill(out, out + static_cast<std::size_t>(out_nx) * static_cast<std::size_t>(out_ny),
+                    0.0);
+
+          if (params.particle_type.empty()) {
+            throw std::runtime_error("particle_cic_projection_accumulate: missing particle_type");
+          }
+          if (params.axis < 0 || params.axis > 2) {
+            throw std::runtime_error(
+                "particle_cic_projection_accumulate: axis must be 0, 1, or 2");
+          }
+          if (params.level_index < 0) {
+            throw std::runtime_error("particle_cic_projection_accumulate: missing level_index");
+          }
+          if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
+            throw std::runtime_error(
+                "particle_cic_projection_accumulate: block index out of range");
+          }
+
+          const auto& dataset = current_dataset();
+          if (!dataset.backend) {
+            throw std::runtime_error("particle_cic_projection_accumulate: missing dataset backend");
+          }
+          const auto* reader = dataset.backend->get_plotfile_reader();
+          if (reader == nullptr) {
+            throw std::runtime_error(
+                "particle_cic_projection_accumulate requires an AMReX plotfile-backed dataset");
+          }
+
+          auto px =
+              reader->read_particle_field_grid(params.particle_type, "x", params.level_index, block);
+          auto py =
+              reader->read_particle_field_grid(params.particle_type, "y", params.level_index, block);
+          auto pz =
+              reader->read_particle_field_grid(params.particle_type, "z", params.level_index, block);
+          auto pm = reader->read_particle_field_grid(params.particle_type, "mass",
+                                                     params.level_index, block);
+
+          std::vector<double> px_vals;
+          std::vector<double> py_vals;
+          std::vector<double> pz_vals;
+          std::vector<double> pm_vals;
+          append_particle_values_as_f64(px, "x", "particle_cic_projection_accumulate", px_vals);
+          append_particle_values_as_f64(py, "y", "particle_cic_projection_accumulate", py_vals);
+          append_particle_values_as_f64(pz, "z", "particle_cic_projection_accumulate", pz_vals);
+          append_particle_values_as_f64(pm, "mass", "particle_cic_projection_accumulate", pm_vals);
+
+          const std::size_t n = std::min(std::min(px_vals.size(), py_vals.size()),
+                                         std::min(pz_vals.size(), pm_vals.size()));
+          px_vals.resize(n);
+          py_vals.resize(n);
+          pz_vals.resize(n);
+          pm_vals.resize(n);
+
+          const int axis = params.axis;
+          const int u_axis = (axis == 0) ? 1 : 0;
+          const int v_axis = (axis == 2) ? 1 : 2;
+
+          const auto& box = level.boxes[static_cast<std::size_t>(block)];
+          const int box_lo[3] = {box.lo.x, box.lo.y, box.lo.z};
+          const int box_hi[3] = {box.hi.x, box.hi.y, box.hi.z};
+
+          const double x0[3] = {level.geom.x0[0], level.geom.x0[1], level.geom.x0[2]};
+          const double dx[3] = {level.geom.dx[0], level.geom.dx[1], level.geom.dx[2]};
+          const int origin[3] = {level.geom.index_origin[0], level.geom.index_origin[1],
+                                 level.geom.index_origin[2]};
+          if (dx[0] == 0.0 || dx[1] == 0.0 || dx[2] == 0.0) {
+            return hpx::make_ready_future();
+          }
+
+          const int nu = box_hi[u_axis] - box_lo[u_axis] + 1;
+          const int nv = box_hi[v_axis] - box_lo[v_axis] + 1;
+          if (nu <= 0 || nv <= 0) {
+            return hpx::make_ready_future();
+          }
+
+          const double a_lo = std::min(params.axis_bounds[0], params.axis_bounds[1]);
+          const double a_hi = std::max(params.axis_bounds[0], params.axis_bounds[1]);
+          const double rect_u_lo = std::min(params.rect[0], params.rect[2]);
+          const double rect_u_hi = std::max(params.rect[0], params.rect[2]);
+          const double rect_v_lo = std::min(params.rect[1], params.rect[3]);
+          const double rect_v_hi = std::max(params.rect[1], params.rect[3]);
+          const double out_du = (rect_u_hi - rect_u_lo) / static_cast<double>(out_nx);
+          const double out_dv = (rect_v_hi - rect_v_lo) / static_cast<double>(out_ny);
+          if (out_du <= 0.0 || out_dv <= 0.0) {
+            return hpx::make_ready_future();
+          }
+          const double inv_out_du = 1.0 / out_du;
+          const double inv_out_dv = 1.0 / out_dv;
+
+          auto covered = [&](int i, int j, int k) -> bool {
+            if (!params.covered_boxes) {
+              return false;
+            }
+            for (const auto& b : *params.covered_boxes) {
+              if (covered_box_contains(b, i, j, k)) {
+                return true;
+              }
+            }
+            return false;
+          };
+
+          std::vector<double> native_mass(static_cast<std::size_t>(nu) * static_cast<std::size_t>(nv),
+                                          0.0);
+          auto native_index = [nu](int iu_local, int iv_local) -> std::size_t {
+            return static_cast<std::size_t>(iv_local) * static_cast<std::size_t>(nu) +
+                   static_cast<std::size_t>(iu_local);
+          };
+          std::size_t covered_skips = 0;
+          std::size_t bounds_skips = 0;
+          std::size_t deposited_cells = 0;
+          auto native_add = [&](int iu, int iv, int ia, double wmass) {
+            int ii = 0;
+            int jj = 0;
+            int kk = 0;
+            if (axis == 0) {
+              ii = ia;
+              jj = iu;
+              kk = iv;
+            } else if (axis == 1) {
+              ii = iu;
+              jj = ia;
+              kk = iv;
+            } else {
+              ii = iu;
+              jj = iv;
+              kk = ia;
+            }
+            if (ii < box_lo[0] || ii > box_hi[0] || jj < box_lo[1] || jj > box_hi[1] ||
+                kk < box_lo[2] || kk > box_hi[2]) {
+              ++bounds_skips;
+              return;
+            }
+            if (covered(ii, jj, kk)) {
+              ++covered_skips;
+              return;
+            }
+            const int iu_local = iu - box_lo[u_axis];
+            const int iv_local = iv - box_lo[v_axis];
+            if (iu_local < 0 || iu_local >= nu || iv_local < 0 || iv_local >= nv) {
+              ++bounds_skips;
+              return;
+            }
+            native_mass[native_index(iu_local, iv_local)] += wmass;
+            ++deposited_cells;
+          };
+
+          const double* coord[3] = {px_vals.data(), py_vals.data(), pz_vals.data()};
+          const double du = dx[u_axis];
+          const double dv = dx[v_axis];
+          const double da = dx[axis];
+
+          const double u_center0 =
+              x0[u_axis] + (0.5 - static_cast<double>(origin[u_axis])) * du;
+          const double v_center0 =
+              x0[v_axis] + (0.5 - static_cast<double>(origin[v_axis])) * dv;
+          const double a_cell_lo =
+              x0[axis] + (static_cast<double>(box_lo[axis] - origin[axis])) * da;
+          const double a_cell_hi =
+              x0[axis] + (static_cast<double>(box_hi[axis] + 1 - origin[axis])) * da;
+          std::size_t candidates = 0;
+
+          for (std::size_t p = 0; p < n; ++p) {
+            ++candidates;
+            const double u = coord[u_axis][p];
+            const double v = coord[v_axis][p];
+            const double a = coord[axis][p];
+            const double m = pm_vals[p];
+            if (!std::isfinite(u) || !std::isfinite(v) || !std::isfinite(a) || !std::isfinite(m)) {
+              ++bounds_skips;
+              continue;
+            }
+            if (m <= 0.0) {
+              ++bounds_skips;
+              continue;
+            }
+            if (std::isfinite(params.mass_max) && m > params.mass_max) {
+              ++bounds_skips;
+              continue;
+            }
+            if (a < a_lo || a > a_hi) {
+              ++bounds_skips;
+              continue;
+            }
+            if (a < a_cell_lo || a >= a_cell_hi) {
+              ++bounds_skips;
+              continue;
+            }
+
+            const double su = (u - u_center0) / du;
+            const double sv = (v - v_center0) / dv;
+            const int iu0 = static_cast<int>(std::floor(su));
+            const int iv0 = static_cast<int>(std::floor(sv));
+            const double tu = su - static_cast<double>(iu0);
+            const double tv = sv - static_cast<double>(iv0);
+            const int ia = static_cast<int>(std::floor((a - x0[axis]) / da)) + origin[axis];
+
+            native_add(iu0, iv0, ia, m * (1.0 - tu) * (1.0 - tv));
+            native_add(iu0 + 1, iv0, ia, m * tu * (1.0 - tv));
+            native_add(iu0, iv0 + 1, ia, m * (1.0 - tu) * tv);
+            native_add(iu0 + 1, iv0 + 1, ia, m * tu * tv);
+          }
+
+          const double cell_area = du * dv;
+          if (cell_area <= 0.0) {
+            return hpx::make_ready_future();
+          }
+
+          for (int iv_local = 0; iv_local < nv; ++iv_local) {
+            const int iv = box_lo[v_axis] + iv_local;
+            const double v_center =
+                x0[v_axis] + (static_cast<double>(iv - origin[v_axis]) + 0.5) * dv;
+            const double v_lo = v_center - 0.5 * dv;
+            const double v_hi = v_center + 0.5 * dv;
+            if (v_hi <= rect_v_lo || v_lo >= rect_v_hi) {
+              continue;
+            }
+
+            int iy_lo = static_cast<int>(std::floor((v_lo - rect_v_lo) * inv_out_dv));
+            int iy_hi = static_cast<int>(std::floor((v_hi - rect_v_lo) * inv_out_dv));
+            if (iy_hi < 0 || iy_lo >= out_ny) {
+              continue;
+            }
+            iy_lo = std::max(0, iy_lo);
+            iy_hi = std::min(out_ny - 1, iy_hi);
+
+            for (int iu_local = 0; iu_local < nu; ++iu_local) {
+              const double mass = native_mass[native_index(iu_local, iv_local)];
+              if (mass == 0.0) {
                 continue;
               }
-              std::array<std::array<int, 3>, 2> box{};
-              bool ok = true;
-              for (uint32_t side = 0; side < 2 && ok; ++side) {
-                const auto& side_val = box_val.via.array.ptr[side];
-                if (side_val.type != msgpack::type::ARRAY || side_val.via.array.size != 3) {
-                  ok = false;
-                  break;
-                }
-                for (uint32_t d = 0; d < 3; ++d) {
-                  box[side][d] = side_val.via.array.ptr[d].as<int>();
-                }
-              }
-              if (ok) {
-                params.covered_boxes.push_back(box);
-              }
-            }
-          }
-          return params;
-        });
-
-        if (outputs.empty()) {
-          return hpx::make_ready_future();
-        }
-        const int out_nx = params.resolution[0];
-        const int out_ny = params.resolution[1];
-        if (out_nx <= 0 || out_ny <= 0) {
-          throw std::runtime_error("particle_cic_projection_accumulate: invalid resolution");
-        }
-        outputs[0].data.resize(static_cast<std::size_t>(out_nx) * static_cast<std::size_t>(out_ny) *
-                               sizeof(double));
-        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
-        std::fill(out, out + static_cast<std::size_t>(out_nx) * static_cast<std::size_t>(out_ny), 0.0);
-
-        if (params.particle_type.empty()) {
-          throw std::runtime_error("particle_cic_projection_accumulate: missing particle_type");
-        }
-        if (params.axis < 0 || params.axis > 2) {
-          throw std::runtime_error("particle_cic_projection_accumulate: axis must be 0, 1, or 2");
-        }
-        if (params.level_index < 0) {
-          throw std::runtime_error("particle_cic_projection_accumulate: missing level_index");
-        }
-        if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
-          throw std::runtime_error("particle_cic_projection_accumulate: block index out of range");
-        }
-
-        const auto& dataset = global_dataset();
-        if (!dataset.backend) {
-          throw std::runtime_error("particle_cic_projection_accumulate: missing dataset backend");
-        }
-        const auto* reader = dataset.backend->get_plotfile_reader();
-        if (reader == nullptr) {
-          throw std::runtime_error(
-              "particle_cic_projection_accumulate requires an AMReX plotfile-backed dataset");
-        }
-
-        auto px = reader->read_particle_field_grid(params.particle_type, "x", params.level_index,
-                                                   block);
-        auto py = reader->read_particle_field_grid(params.particle_type, "y", params.level_index,
-                                                   block);
-        auto pz = reader->read_particle_field_grid(params.particle_type, "z", params.level_index,
-                                                   block);
-        auto pm = reader->read_particle_field_grid(params.particle_type, "mass",
-                                                   params.level_index, block);
-
-        std::vector<double> px_vals;
-        std::vector<double> py_vals;
-        std::vector<double> pz_vals;
-        std::vector<double> pm_vals;
-        append_particle_values_as_f64(px, "x", "particle_cic_projection_accumulate", px_vals);
-        append_particle_values_as_f64(py, "y", "particle_cic_projection_accumulate", py_vals);
-        append_particle_values_as_f64(pz, "z", "particle_cic_projection_accumulate", pz_vals);
-        append_particle_values_as_f64(pm, "mass", "particle_cic_projection_accumulate", pm_vals);
-
-        const std::size_t n = std::min(std::min(px_vals.size(), py_vals.size()),
-                                       std::min(pz_vals.size(), pm_vals.size()));
-        px_vals.resize(n);
-        py_vals.resize(n);
-        pz_vals.resize(n);
-        pm_vals.resize(n);
-
-        const int axis = params.axis;
-        const int u_axis = (axis == 0) ? 1 : 0;
-        const int v_axis = (axis == 2) ? 1 : 2;
-
-        const auto& box = level.boxes[static_cast<std::size_t>(block)];
-        const int box_lo[3] = {box.lo.x, box.lo.y, box.lo.z};
-        const int box_hi[3] = {box.hi.x, box.hi.y, box.hi.z};
-
-        const double x0[3] = {level.geom.x0[0], level.geom.x0[1], level.geom.x0[2]};
-        const double dx[3] = {level.geom.dx[0], level.geom.dx[1], level.geom.dx[2]};
-        const int origin[3] = {level.geom.index_origin[0], level.geom.index_origin[1],
-                               level.geom.index_origin[2]};
-        if (dx[0] == 0.0 || dx[1] == 0.0 || dx[2] == 0.0) {
-          return hpx::make_ready_future();
-        }
-
-        const int nu = box_hi[u_axis] - box_lo[u_axis] + 1;
-        const int nv = box_hi[v_axis] - box_lo[v_axis] + 1;
-        if (nu <= 0 || nv <= 0) {
-          return hpx::make_ready_future();
-        }
-
-        const double a_lo = std::min(params.axis_bounds[0], params.axis_bounds[1]);
-        const double a_hi = std::max(params.axis_bounds[0], params.axis_bounds[1]);
-        const double rect_u_lo = std::min(params.rect[0], params.rect[2]);
-        const double rect_u_hi = std::max(params.rect[0], params.rect[2]);
-        const double rect_v_lo = std::min(params.rect[1], params.rect[3]);
-        const double rect_v_hi = std::max(params.rect[1], params.rect[3]);
-        const double out_du = (rect_u_hi - rect_u_lo) / static_cast<double>(out_nx);
-        const double out_dv = (rect_v_hi - rect_v_lo) / static_cast<double>(out_ny);
-        if (out_du <= 0.0 || out_dv <= 0.0) {
-          return hpx::make_ready_future();
-        }
-        const double inv_out_du = 1.0 / out_du;
-        const double inv_out_dv = 1.0 / out_dv;
-
-        auto covered = [&](int i, int j, int k) -> bool {
-          for (const auto& b : params.covered_boxes) {
-            if (i >= b[0][0] && i <= b[1][0] && j >= b[0][1] && j <= b[1][1] && k >= b[0][2] &&
-                k <= b[1][2]) {
-              return true;
-            }
-          }
-          return false;
-        };
-
-        std::vector<double> native_mass(static_cast<std::size_t>(nu) * static_cast<std::size_t>(nv), 0.0);
-        auto native_index = [nu](int iu_local, int iv_local) -> std::size_t {
-          return static_cast<std::size_t>(iv_local) * static_cast<std::size_t>(nu) +
-                 static_cast<std::size_t>(iu_local);
-        };
-        auto native_add = [&](int iu, int iv, int ia, double wmass) {
-          int ii = 0;
-          int jj = 0;
-          int kk = 0;
-          if (axis == 0) {
-            ii = ia;
-            jj = iu;
-            kk = iv;
-          } else if (axis == 1) {
-            ii = iu;
-            jj = ia;
-            kk = iv;
-          } else {
-            ii = iu;
-            jj = iv;
-            kk = ia;
-          }
-          if (ii < box_lo[0] || ii > box_hi[0] || jj < box_lo[1] || jj > box_hi[1] || kk < box_lo[2] ||
-              kk > box_hi[2] || covered(ii, jj, kk)) {
-            return;
-          }
-          const int iu_local = iu - box_lo[u_axis];
-          const int iv_local = iv - box_lo[v_axis];
-          if (iu_local < 0 || iu_local >= nu || iv_local < 0 || iv_local >= nv) {
-            return;
-          }
-          native_mass[native_index(iu_local, iv_local)] += wmass;
-        };
-
-        const double* coord[3] = {px_vals.data(), py_vals.data(), pz_vals.data()};
-        const double du = dx[u_axis];
-        const double dv = dx[v_axis];
-        const double da = dx[axis];
-
-        const double u_center0 = x0[u_axis] + (0.5 - static_cast<double>(origin[u_axis])) * du;
-        const double v_center0 = x0[v_axis] + (0.5 - static_cast<double>(origin[v_axis])) * dv;
-        const double a_cell_lo = x0[axis] + (static_cast<double>(box_lo[axis] - origin[axis])) * da;
-        const double a_cell_hi =
-            x0[axis] + (static_cast<double>(box_hi[axis] + 1 - origin[axis])) * da;
-
-        for (std::size_t p = 0; p < n; ++p) {
-          const double u = coord[u_axis][p];
-          const double v = coord[v_axis][p];
-          const double a = coord[axis][p];
-          const double m = pm_vals[p];
-          if (!std::isfinite(u) || !std::isfinite(v) || !std::isfinite(a) || !std::isfinite(m)) {
-            continue;
-          }
-          if (m <= 0.0) {
-            continue;
-          }
-          if (std::isfinite(params.mass_max) && m > params.mass_max) {
-            continue;
-          }
-          if (a < a_lo || a > a_hi) {
-            continue;
-          }
-          if (a < a_cell_lo || a >= a_cell_hi) {
-            continue;
-          }
-
-          const double su = (u - u_center0) / du;
-          const double sv = (v - v_center0) / dv;
-          const int iu0 = static_cast<int>(std::floor(su));
-          const int iv0 = static_cast<int>(std::floor(sv));
-          const double tu = su - static_cast<double>(iu0);
-          const double tv = sv - static_cast<double>(iv0);
-          const int ia = static_cast<int>(std::floor((a - x0[axis]) / da)) + origin[axis];
-
-          native_add(iu0, iv0, ia, m * (1.0 - tu) * (1.0 - tv));
-          native_add(iu0 + 1, iv0, ia, m * tu * (1.0 - tv));
-          native_add(iu0, iv0 + 1, ia, m * (1.0 - tu) * tv);
-          native_add(iu0 + 1, iv0 + 1, ia, m * tu * tv);
-        }
-
-        const double cell_area = du * dv;
-        if (cell_area <= 0.0) {
-          return hpx::make_ready_future();
-        }
-
-        for (int iv_local = 0; iv_local < nv; ++iv_local) {
-          const int iv = box_lo[v_axis] + iv_local;
-          const double v_center =
-              x0[v_axis] + (static_cast<double>(iv - origin[v_axis]) + 0.5) * dv;
-          const double v_lo = v_center - 0.5 * dv;
-          const double v_hi = v_center + 0.5 * dv;
-          if (v_hi <= rect_v_lo || v_lo >= rect_v_hi) {
-            continue;
-          }
-
-          int iy_lo = static_cast<int>(std::floor((v_lo - rect_v_lo) * inv_out_dv));
-          int iy_hi = static_cast<int>(std::floor((v_hi - rect_v_lo) * inv_out_dv));
-          if (iy_hi < 0 || iy_lo >= out_ny) {
-            continue;
-          }
-          iy_lo = std::max(0, iy_lo);
-          iy_hi = std::min(out_ny - 1, iy_hi);
-
-          for (int iu_local = 0; iu_local < nu; ++iu_local) {
-            const double mass = native_mass[native_index(iu_local, iv_local)];
-            if (mass == 0.0) {
-              continue;
-            }
-            const int iu = box_lo[u_axis] + iu_local;
-            const double u_center =
-                x0[u_axis] + (static_cast<double>(iu - origin[u_axis]) + 0.5) * du;
-            const double u_lo = u_center - 0.5 * du;
-            const double u_hi = u_center + 0.5 * du;
-            if (u_hi <= rect_u_lo || u_lo >= rect_u_hi) {
-              continue;
-            }
-
-            int ix_lo = static_cast<int>(std::floor((u_lo - rect_u_lo) * inv_out_du));
-            int ix_hi = static_cast<int>(std::floor((u_hi - rect_u_lo) * inv_out_du));
-            if (ix_hi < 0 || ix_lo >= out_nx) {
-              continue;
-            }
-            ix_lo = std::max(0, ix_lo);
-            ix_hi = std::min(out_nx - 1, ix_hi);
-
-            for (int iy = iy_lo; iy <= iy_hi; ++iy) {
-              const double pv_lo = rect_v_lo + static_cast<double>(iy) * out_dv;
-              const double pv_hi = pv_lo + out_dv;
-              const double ov = std::max(0.0, std::min(v_hi, pv_hi) - std::max(v_lo, pv_lo));
-              if (ov <= 0.0) {
+              const int iu = box_lo[u_axis] + iu_local;
+              const double u_center =
+                  x0[u_axis] + (static_cast<double>(iu - origin[u_axis]) + 0.5) * du;
+              const double u_lo = u_center - 0.5 * du;
+              const double u_hi = u_center + 0.5 * du;
+              if (u_hi <= rect_u_lo || u_lo >= rect_u_hi) {
                 continue;
               }
-              const std::size_t row = static_cast<std::size_t>(iy) * static_cast<std::size_t>(out_nx);
-              for (int ix = ix_lo; ix <= ix_hi; ++ix) {
-                const double pu_lo = rect_u_lo + static_cast<double>(ix) * out_du;
-                const double pu_hi = pu_lo + out_du;
-                const double ou = std::max(0.0, std::min(u_hi, pu_hi) - std::max(u_lo, pu_lo));
-                if (ou <= 0.0) {
+
+              int ix_lo = static_cast<int>(std::floor((u_lo - rect_u_lo) * inv_out_du));
+              int ix_hi = static_cast<int>(std::floor((u_hi - rect_u_lo) * inv_out_du));
+              if (ix_hi < 0 || ix_lo >= out_nx) {
+                continue;
+              }
+              ix_lo = std::max(0, ix_lo);
+              ix_hi = std::min(out_nx - 1, ix_hi);
+
+              for (int iy = iy_lo; iy <= iy_hi; ++iy) {
+                const double pv_lo = rect_v_lo + static_cast<double>(iy) * out_dv;
+                const double pv_hi = pv_lo + out_dv;
+                const double ov = std::max(0.0, std::min(v_hi, pv_hi) - std::max(v_lo, pv_lo));
+                if (ov <= 0.0) {
                   continue;
                 }
-                const double w = (ou * ov) / cell_area;
-                out[row + static_cast<std::size_t>(ix)] += mass * w;
+                const std::size_t row = static_cast<std::size_t>(iy) *
+                                        static_cast<std::size_t>(out_nx);
+                for (int ix = ix_lo; ix <= ix_hi; ++ix) {
+                  const double pu_lo = rect_u_lo + static_cast<double>(ix) * out_du;
+                  const double pu_hi = pu_lo + out_du;
+                  const double ou = std::max(0.0, std::min(u_hi, pu_hi) - std::max(u_lo, pu_lo));
+                  if (ou <= 0.0) {
+                    continue;
+                  }
+                  const double w = (ou * ov) / cell_area;
+                  out[row + static_cast<std::size_t>(ix)] += mass * w;
+                }
               }
             }
           }
-        }
-        return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "particle_eq_mask", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
-        struct Params {
-          double scalar = 0.0;
-        };
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* scalar = find_msgpack_map_value(root, "scalar")) {
-            params.scalar = scalar->as<double>();
+          double total_sum = 0.0;
+          for (std::size_t idx = 0;
+               idx < static_cast<std::size_t>(out_nx) * static_cast<std::size_t>(out_ny); ++idx) {
+            total_sum += out[idx];
           }
-          return params;
-        });
-        if (inputs.empty() || outputs.empty()) {
+          log_projection_kernel_summary("particle_cic_projection_accumulate",
+                                        params.level_index,
+                                        block,
+                                        covered_box_count(params.covered_boxes),
+                                        candidates,
+                                        covered_skips,
+                                        bounds_skips,
+                                        deposited_cells,
+                                        total_sum);
           return hpx::make_ready_future();
-        }
-        const auto& in = inputs[0].data;
-        const std::size_t n = in.size() / sizeof(double);
-        outputs[0].data.resize(n);
-        const auto* in_d = reinterpret_cast<const double*>(in.data());
-        auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
-        for (std::size_t i = 0; i < n; ++i) {
-          out[i] = (in_d[i] == params.scalar) ? 1 : 0;
-        }
-        return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "particle_isin_mask", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
-        struct Params {
-          std::vector<double> values;
-        };
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* values = find_msgpack_map_value(root, "values");
-              values && values->type == msgpack::type::ARRAY) {
-            params.values.reserve(values->via.array.size);
-            for (uint32_t j = 0; j < values->via.array.size; ++j) {
-              params.values.push_back(values->via.array.ptr[j].as<double>());
-            }
+        },
+        make_covered_box_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
+      double scalar = 0.0;
+    };
+
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* scalar = find_msgpack_map_value(root, "scalar")) {
+        params.scalar = scalar->as<double>();
+      }
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "particle_eq_mask", .n_inputs = 1, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+          const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+          if (inputs.empty() || outputs.empty()) {
+            return hpx::make_ready_future();
           }
-          return params;
-        });
-        if (inputs.empty() || outputs.empty()) {
+          const auto& in = inputs[0].data;
+          const std::size_t n = in.size() / sizeof(double);
+          outputs[0].data.resize(n);
+          const auto* in_d = reinterpret_cast<const double*>(in.data());
+          auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+          for (std::size_t i = 0; i < n; ++i) {
+            out[i] = (in_d[i] == params.scalar) ? 1 : 0;
+          }
           return hpx::make_ready_future();
-        }
-        const auto& in = inputs[0].data;
-        const std::size_t n = in.size() / sizeof(double);
-        outputs[0].data.resize(n);
-        const auto* in_d = reinterpret_cast<const double*>(in.data());
-        auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
-        for (std::size_t i = 0; i < n; ++i) {
-          bool found = false;
-          for (double x : params.values) {
-            if (in_d[i] == x) {
-              found = true;
-              break;
-            }
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+
+    registry.register_kernel(
+        KernelDesc{.name = "particle_abs_lt_mask", .n_inputs = 1, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+          const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+          if (inputs.empty() || outputs.empty()) {
+            return hpx::make_ready_future();
           }
-          out[i] = found ? 1 : 0;
+          const auto& in = inputs[0].data;
+          const std::size_t n = in.size() / sizeof(double);
+          outputs[0].data.resize(n);
+          const auto* in_d = reinterpret_cast<const double*>(in.data());
+          auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+          for (std::size_t i = 0; i < n; ++i) {
+            out[i] = (std::abs(in_d[i]) < params.scalar) ? 1 : 0;
+          }
+          return hpx::make_ready_future();
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+
+    registry.register_kernel(
+        KernelDesc{.name = "particle_le_mask", .n_inputs = 1, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+          const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+          if (inputs.empty() || outputs.empty()) {
+            return hpx::make_ready_future();
+          }
+          const auto& in = inputs[0].data;
+          const std::size_t n = in.size() / sizeof(double);
+          outputs[0].data.resize(n);
+          const auto* in_d = reinterpret_cast<const double*>(in.data());
+          auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+          for (std::size_t i = 0; i < n; ++i) {
+            out[i] = (in_d[i] <= params.scalar) ? 1 : 0;
+          }
+          return hpx::make_ready_future();
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+
+    registry.register_kernel(
+        KernelDesc{.name = "particle_gt_mask", .n_inputs = 1, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+          const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+          if (inputs.empty() || outputs.empty()) {
+            return hpx::make_ready_future();
+          }
+          const auto& in = inputs[0].data;
+          const std::size_t n = in.size() / sizeof(double);
+          outputs[0].data.resize(n);
+          const auto* in_d = reinterpret_cast<const double*>(in.data());
+          auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+          for (std::size_t i = 0; i < n; ++i) {
+            out[i] = (in_d[i] > params.scalar) ? 1 : 0;
+          }
+          return hpx::make_ready_future();
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
+      std::vector<double> values;
+    };
+
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* values = find_msgpack_map_value(root, "values");
+          values && values->type == msgpack::type::ARRAY) {
+        params.values.reserve(values->via.array.size);
+        for (uint32_t j = 0; j < values->via.array.size; ++j) {
+          params.values.push_back(values->via.array.ptr[j].as<double>());
         }
-        return hpx::make_ready_future();
-      });
+      }
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "particle_isin_mask", .n_inputs = 1, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+          const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+          if (inputs.empty() || outputs.empty()) {
+            return hpx::make_ready_future();
+          }
+          const auto& in = inputs[0].data;
+          const std::size_t n = in.size() / sizeof(double);
+          outputs[0].data.resize(n);
+          const auto* in_d = reinterpret_cast<const double*>(in.data());
+          auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+          for (std::size_t i = 0; i < n; ++i) {
+            bool found = false;
+            for (double x : params.values) {
+              if (in_d[i] == x) {
+                found = true;
+                break;
+              }
+            }
+            out[i] = found ? 1 : 0;
+          }
+          return hpx::make_ready_future();
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+  }
   registry.register_kernel(
       KernelDesc{.name = "particle_isfinite_mask", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
       [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
@@ -3574,87 +3831,6 @@ void register_default_kernels(KernelRegistry& registry) {
         auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
         for (std::size_t i = 0; i < n; ++i) {
           out[i] = std::isfinite(in_d[i]) ? 1 : 0;
-        }
-        return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "particle_abs_lt_mask", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
-        struct Params {
-          double scalar = 0.0;
-        };
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* scalar = find_msgpack_map_value(root, "scalar")) {
-            params.scalar = scalar->as<double>();
-          }
-          return params;
-        });
-        if (inputs.empty() || outputs.empty()) {
-          return hpx::make_ready_future();
-        }
-        const auto& in = inputs[0].data;
-        const std::size_t n = in.size() / sizeof(double);
-        outputs[0].data.resize(n);
-        const auto* in_d = reinterpret_cast<const double*>(in.data());
-        auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
-        for (std::size_t i = 0; i < n; ++i) {
-          out[i] = (std::abs(in_d[i]) < params.scalar) ? 1 : 0;
-        }
-        return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "particle_le_mask", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
-        struct Params {
-          double scalar = 0.0;
-        };
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* scalar = find_msgpack_map_value(root, "scalar")) {
-            params.scalar = scalar->as<double>();
-          }
-          return params;
-        });
-        if (inputs.empty() || outputs.empty()) {
-          return hpx::make_ready_future();
-        }
-        const auto& in = inputs[0].data;
-        const std::size_t n = in.size() / sizeof(double);
-        outputs[0].data.resize(n);
-        const auto* in_d = reinterpret_cast<const double*>(in.data());
-        auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
-        for (std::size_t i = 0; i < n; ++i) {
-          out[i] = (in_d[i] <= params.scalar) ? 1 : 0;
-        }
-        return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "particle_gt_mask", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
-        struct Params {
-          double scalar = 0.0;
-        };
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* scalar = find_msgpack_map_value(root, "scalar")) {
-            params.scalar = scalar->as<double>();
-          }
-          return params;
-        });
-        if (inputs.empty() || outputs.empty()) {
-          return hpx::make_ready_future();
-        }
-        const auto& in = inputs[0].data;
-        const std::size_t n = in.size() / sizeof(double);
-        outputs[0].data.resize(n);
-        const auto* in_d = reinterpret_cast<const double*>(in.data());
-        auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
-        for (std::size_t i = 0; i < n; ++i) {
-          out[i] = (in_d[i] > params.scalar) ? 1 : 0;
         }
         return hpx::make_ready_future();
       });
@@ -3801,204 +3977,224 @@ void register_default_kernels(KernelRegistry& registry) {
         *reinterpret_cast<int64_t*>(outputs[0].data.data()) = n;
         return hpx::make_ready_future();
       });
-  registry.register_kernel(
-      KernelDesc{.name = "particle_min", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
-        struct Params {
-          bool finite_only = true;
-        };
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* finite_only = find_msgpack_map_value(root, "finite_only")) {
-            params.finite_only = finite_only->as<bool>();
+  {
+    struct Params {
+      bool finite_only = true;
+    };
+
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* finite_only = find_msgpack_map_value(root, "finite_only")) {
+        params.finite_only = finite_only->as<bool>();
+      }
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "particle_min", .n_inputs = 1, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+          const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+          if (inputs.empty() || outputs.empty()) {
+            return hpx::make_ready_future();
           }
-          return params;
-        });
-        if (inputs.empty() || outputs.empty()) {
-          return hpx::make_ready_future();
-        }
-        const auto& in = inputs[0].data;
-        const std::size_t n = in.size() / sizeof(double);
-        const auto* in_d = reinterpret_cast<const double*>(in.data());
-        double out_v = std::numeric_limits<double>::infinity();
-        bool any = false;
-        for (std::size_t i = 0; i < n; ++i) {
-          const double v = in_d[i];
-          if (params.finite_only && !std::isfinite(v)) {
-            continue;
-          }
-          if (!any || v < out_v) {
-            out_v = v;
-            any = true;
-          }
-        }
-        outputs[0].data.resize(sizeof(double));
-        *reinterpret_cast<double*>(outputs[0].data.data()) =
-            any ? out_v : std::numeric_limits<double>::infinity();
-        return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "particle_max", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
-        struct Params {
-          bool finite_only = true;
-        };
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* finite_only = find_msgpack_map_value(root, "finite_only")) {
-            params.finite_only = finite_only->as<bool>();
-          }
-          return params;
-        });
-        if (inputs.empty() || outputs.empty()) {
-          return hpx::make_ready_future();
-        }
-        const auto& in = inputs[0].data;
-        const std::size_t n = in.size() / sizeof(double);
-        const auto* in_d = reinterpret_cast<const double*>(in.data());
-        double out_v = -std::numeric_limits<double>::infinity();
-        bool any = false;
-        for (std::size_t i = 0; i < n; ++i) {
-          const double v = in_d[i];
-          if (params.finite_only && !std::isfinite(v)) {
-            continue;
-          }
-          if (!any || v > out_v) {
-            out_v = v;
-            any = true;
-          }
-        }
-        outputs[0].data.resize(sizeof(double));
-        *reinterpret_cast<double*>(outputs[0].data.data()) =
-            any ? out_v : -std::numeric_limits<double>::infinity();
-        return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "particle_histogram1d", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
-        struct Params {
-          std::vector<double> edges;
-          bool density = false;
-        };
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* edges = find_msgpack_map_value(root, "edges");
-              edges && edges->type == msgpack::type::ARRAY) {
-            params.edges.reserve(edges->via.array.size);
-            for (uint32_t j = 0; j < edges->via.array.size; ++j) {
-              params.edges.push_back(edges->via.array.ptr[j].as<double>());
-            }
-          }
-          if (const auto* density = find_msgpack_map_value(root, "density")) {
-            params.density = density->as<bool>();
-          }
-          return params;
-        });
-        if (inputs.empty() || outputs.empty() || params.edges.size() < 2) {
-          return hpx::make_ready_future();
-        }
-        const std::size_t bins = params.edges.size() - 1;
-        outputs[0].data.resize(bins * sizeof(double));
-        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
-        std::fill(out, out + bins, 0.0);
-        const auto& values = inputs[0].data;
-        const std::size_t n = values.size() / sizeof(double);
-        const auto* in_d = reinterpret_cast<const double*>(values.data());
-        const bool weighted = inputs.size() >= 2;
-        const auto* w_d = weighted ? reinterpret_cast<const double*>(inputs[1].data.data()) : nullptr;
-        const std::size_t nw = weighted ? (inputs[1].data.size() / sizeof(double)) : 0;
-        for (std::size_t i = 0; i < n; ++i) {
-          const double x = in_d[i];
-          if (!std::isfinite(x) || x < params.edges.front() || x > params.edges.back()) {
-            continue;
-          }
-          std::size_t idx = bins - 1;
-          if (x != params.edges.back()) {
-            auto it = std::upper_bound(params.edges.begin(), params.edges.end(), x);
-            idx = static_cast<std::size_t>(std::distance(params.edges.begin(), it) - 1);
-          }
-          if (idx >= bins) {
-            continue;
-          }
-          double w = 1.0;
-          if (weighted && i < nw) {
-            w = w_d[i];
-            if (!std::isfinite(w)) {
+          const auto& in = inputs[0].data;
+          const std::size_t n = in.size() / sizeof(double);
+          const auto* in_d = reinterpret_cast<const double*>(in.data());
+          double out_v = std::numeric_limits<double>::infinity();
+          bool any = false;
+          for (std::size_t i = 0; i < n; ++i) {
+            const double v = in_d[i];
+            if (params.finite_only && !std::isfinite(v)) {
               continue;
             }
+            if (!any || v < out_v) {
+              out_v = v;
+              any = true;
+            }
           }
-          out[idx] += w;
+          outputs[0].data.resize(sizeof(double));
+          *reinterpret_cast<double*>(outputs[0].data.data()) =
+              any ? out_v : std::numeric_limits<double>::infinity();
+          return hpx::make_ready_future();
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+
+    registry.register_kernel(
+        KernelDesc{.name = "particle_max", .n_inputs = 1, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+          const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+          if (inputs.empty() || outputs.empty()) {
+            return hpx::make_ready_future();
+          }
+          const auto& in = inputs[0].data;
+          const std::size_t n = in.size() / sizeof(double);
+          const auto* in_d = reinterpret_cast<const double*>(in.data());
+          double out_v = -std::numeric_limits<double>::infinity();
+          bool any = false;
+          for (std::size_t i = 0; i < n; ++i) {
+            const double v = in_d[i];
+            if (params.finite_only && !std::isfinite(v)) {
+              continue;
+            }
+            if (!any || v > out_v) {
+              out_v = v;
+              any = true;
+            }
+          }
+          outputs[0].data.resize(sizeof(double));
+          *reinterpret_cast<double*>(outputs[0].data.data()) =
+              any ? out_v : -std::numeric_limits<double>::infinity();
+          return hpx::make_ready_future();
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
+      std::vector<double> edges;
+      bool density = false;
+    };
+
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* edges = find_msgpack_map_value(root, "edges");
+          edges && edges->type == msgpack::type::ARRAY) {
+        params.edges.reserve(edges->via.array.size);
+        for (uint32_t j = 0; j < edges->via.array.size; ++j) {
+          params.edges.push_back(edges->via.array.ptr[j].as<double>());
         }
-        if (params.density) {
-          double total = 0.0;
-          for (std::size_t i = 0; i < bins; ++i) {
-            total += out[i];
+      }
+      if (const auto* density = find_msgpack_map_value(root, "density")) {
+        params.density = density->as<bool>();
+      }
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "particle_histogram1d", .n_inputs = 1, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+          const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+          if (inputs.empty() || outputs.empty() || params.edges.size() < 2) {
+            return hpx::make_ready_future();
           }
-          if (total > 0.0) {
+          const std::size_t bins = params.edges.size() - 1;
+          outputs[0].data.resize(bins * sizeof(double));
+          auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+          std::fill(out, out + bins, 0.0);
+          const auto& values = inputs[0].data;
+          const std::size_t n = values.size() / sizeof(double);
+          const auto* in_d = reinterpret_cast<const double*>(values.data());
+          const bool weighted = inputs.size() >= 2;
+          const auto* w_d =
+              weighted ? reinterpret_cast<const double*>(inputs[1].data.data()) : nullptr;
+          const std::size_t nw = weighted ? (inputs[1].data.size() / sizeof(double)) : 0;
+          for (std::size_t i = 0; i < n; ++i) {
+            const double x = in_d[i];
+            if (!std::isfinite(x) || x < params.edges.front() || x > params.edges.back()) {
+              continue;
+            }
+            std::size_t idx = bins - 1;
+            if (x != params.edges.back()) {
+              auto it = std::upper_bound(params.edges.begin(), params.edges.end(), x);
+              idx = static_cast<std::size_t>(std::distance(params.edges.begin(), it) - 1);
+            }
+            if (idx >= bins) {
+              continue;
+            }
+            double w = 1.0;
+            if (weighted && i < nw) {
+              w = w_d[i];
+              if (!std::isfinite(w)) {
+                continue;
+              }
+            }
+            out[idx] += w;
+          }
+          if (params.density) {
+            double total = 0.0;
             for (std::size_t i = 0; i < bins; ++i) {
-              const double width = params.edges[i + 1] - params.edges[i];
-              if (width > 0.0) {
-                out[i] /= (total * width);
+              total += out[i];
+            }
+            if (total > 0.0) {
+              for (std::size_t i = 0; i < bins; ++i) {
+                const double width = params.edges[i + 1] - params.edges[i];
+                if (width > 0.0) {
+                  out[i] /= (total * width);
+                }
               }
             }
           }
-        }
-        return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "particle_topk_modes_map", .n_inputs = 0, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t block, std::span<const HostView>, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
-        if (outputs.empty()) {
           return hpx::make_ready_future();
-        }
-        struct Params {
-          std::string particle_type;
-          std::string field_name;
-        };
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* particle_type = find_msgpack_map_value(root, "particle_type");
-              particle_type && particle_type->type == msgpack::type::STR) {
-            params.particle_type = particle_type->as<std::string>();
-          }
-          if (const auto* field_name = find_msgpack_map_value(root, "field_name");
-              field_name && field_name->type == msgpack::type::STR) {
-            params.field_name = field_name->as<std::string>();
-          }
-          return params;
-        });
-        if (params.particle_type.empty() || params.field_name.empty()) {
-          outputs[0].data.clear();
-          return hpx::make_ready_future();
-        }
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
+      std::string particle_type;
+      std::string field_name;
+    };
 
-        const auto& dataset = global_dataset();
-        if (!dataset.backend) {
-          throw std::runtime_error("particle_topk_modes_map: missing dataset backend");
-        }
-        const auto* reader = dataset.backend->get_plotfile_reader();
-        if (reader == nullptr) {
-          throw std::runtime_error(
-              "particle_topk_modes_map requires an AMReX plotfile-backed dataset");
-        }
-        std::unordered_map<double, int64_t> counts;
-        const auto data =
-            reader->read_particle_field_chunk(params.particle_type, params.field_name, block);
-        std::vector<double> values;
-        append_particle_values_as_f64(data, params.field_name, "particle_topk_modes_map", values);
-        for (double v : values) {
-          if (!std::isfinite(v)) {
-            continue;
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* particle_type = find_msgpack_map_value(root, "particle_type");
+          particle_type && particle_type->type == msgpack::type::STR) {
+        params.particle_type = particle_type->as<std::string>();
+      }
+      if (const auto* field_name = find_msgpack_map_value(root, "field_name");
+          field_name && field_name->type == msgpack::type::STR) {
+        params.field_name = field_name->as<std::string>();
+      }
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "particle_topk_modes_map", .n_inputs = 0, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta&, int32_t block, std::span<const HostView>,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+          if (outputs.empty()) {
+            return hpx::make_ready_future();
           }
-          counts[v] += 1;
-        }
-        encode_particle_value_counts(counts, outputs[0].data);
-        return hpx::make_ready_future();
-      });
+          const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+          if (params.particle_type.empty() || params.field_name.empty()) {
+            outputs[0].data.clear();
+            return hpx::make_ready_future();
+          }
+
+          const auto& dataset = current_dataset();
+          if (!dataset.backend) {
+            throw std::runtime_error("particle_topk_modes_map: missing dataset backend");
+          }
+          const auto* reader = dataset.backend->get_plotfile_reader();
+          if (reader == nullptr) {
+            throw std::runtime_error(
+                "particle_topk_modes_map requires an AMReX plotfile-backed dataset");
+          }
+          std::unordered_map<double, int64_t> counts;
+          const auto data =
+              reader->read_particle_field_chunk(params.particle_type, params.field_name, block);
+          std::vector<double> values;
+          append_particle_values_as_f64(data, params.field_name, "particle_topk_modes_map", values);
+          for (double v : values) {
+            if (!std::isfinite(v)) {
+              continue;
+            }
+            counts[v] += 1;
+          }
+          encode_particle_value_counts(counts, outputs[0].data);
+          return hpx::make_ready_future();
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+  }
   registry.register_kernel(
       KernelDesc{.name = "particle_value_counts_reduce", .n_inputs = 1, .n_outputs = 1,
                  .needs_neighbors = false},
@@ -4021,58 +4217,65 @@ void register_default_kernels(KernelRegistry& registry) {
         encode_particle_value_counts(merged, outputs[0].data);
         return hpx::make_ready_future();
       });
-  registry.register_kernel(
-      KernelDesc{.name = "particle_topk_modes_finalize", .n_inputs = 1, .n_outputs = 1,
-                 .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
-        if (outputs.empty()) {
-          return hpx::make_ready_future();
-        }
-        struct Params {
-          int64_t k = 0;
-        };
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* k = find_msgpack_map_value(root, "k");
-              k && (k->type == msgpack::type::POSITIVE_INTEGER ||
-                    k->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.k = k->as<int64_t>();
-          }
-          return params;
-        });
-        if (inputs.empty() || params.k <= 0) {
-          outputs[0].data.clear();
-          return hpx::make_ready_future();
-        }
-        auto counts = decode_particle_value_counts(inputs[0].data);
-        std::vector<std::pair<double, int64_t>> modes;
-        modes.reserve(counts.size());
-        for (const auto& it : counts) {
-          modes.emplace_back(it.first, it.second);
-        }
-        std::sort(modes.begin(), modes.end(),
-                  [](const auto& a, const auto& b) {
-                    if (a.second != b.second) {
-                      return a.second > b.second;
-                    }
-                    return a.first > b.first;
-                  });
+  {
+    struct Params {
+      int64_t k = 0;
+    };
 
-        const std::size_t out_len = static_cast<std::size_t>(params.k);
-        outputs[0].data.resize(out_len * 2 * sizeof(double));
-        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
-        for (std::size_t i = 0; i < out_len; ++i) {
-          if (i < modes.size()) {
-            out[i] = modes[i].first;
-            out[out_len + i] = static_cast<double>(modes[i].second);
-          } else {
-            out[i] = std::numeric_limits<double>::quiet_NaN();
-            out[out_len + i] = 0.0;
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* k = find_msgpack_map_value(root, "k");
+          k && (k->type == msgpack::type::POSITIVE_INTEGER ||
+                k->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.k = k->as<int64_t>();
+      }
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "particle_topk_modes_finalize", .n_inputs = 1, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+          if (outputs.empty()) {
+            return hpx::make_ready_future();
           }
-        }
-        return hpx::make_ready_future();
-      });
+          const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+          if (inputs.empty() || params.k <= 0) {
+            outputs[0].data.clear();
+            return hpx::make_ready_future();
+          }
+          auto counts = decode_particle_value_counts(inputs[0].data);
+          std::vector<std::pair<double, int64_t>> modes;
+          modes.reserve(counts.size());
+          for (const auto& it : counts) {
+            modes.emplace_back(it.first, it.second);
+          }
+          std::sort(modes.begin(), modes.end(),
+                    [](const auto& a, const auto& b) {
+                      if (a.second != b.second) {
+                        return a.second > b.second;
+                      }
+                      return a.first > b.first;
+                    });
+
+          const std::size_t out_len = static_cast<std::size_t>(params.k);
+          outputs[0].data.resize(out_len * 2 * sizeof(double));
+          auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+          for (std::size_t i = 0; i < out_len; ++i) {
+            if (i < modes.size()) {
+              out[i] = modes[i].first;
+              out[out_len + i] = static_cast<double>(modes[i].second);
+            } else {
+              out[i] = std::numeric_limits<double>::quiet_NaN();
+              out[out_len + i] = 0.0;
+            }
+          }
+          return hpx::make_ready_future();
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+  }
   registry.register_kernel(
       KernelDesc{.name = "particle_int64_sum_reduce", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
       [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
@@ -4148,64 +4351,42 @@ void register_default_kernels(KernelRegistry& registry) {
             any ? out_v : -std::numeric_limits<double>::infinity();
         return hpx::make_ready_future();
       });
-  registry.register_kernel(
-      KernelDesc{.name = "histogram1d_accumulate", .n_inputs = 1, .n_outputs = 1,
-                 .needs_neighbors = false},
-      [](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
-         const NeighborViews&, std::span<HostView> outputs,
-         std::span<const std::uint8_t> params_msgpack) {
-        struct Box3 {
-          std::array<int, 3> lo{0, 0, 0};
-          std::array<int, 3> hi{0, 0, 0};
-        };
-        struct Params {
-          std::array<double, 2> range{0.0, 1.0};
-          int bins = 1;
-          int bytes_per_value = 4;
-          std::vector<Box3> covered_boxes;
-        };
+  {
+    struct Params {
+      std::array<double, 2> range{0.0, 1.0};
+      int bins = 1;
+      int bytes_per_value = 4;
+      std::shared_ptr<const CoveredBoxListIR> covered_boxes;
+    };
 
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* range = find_msgpack_map_value(root, "range");
-              range && range->type == msgpack::type::ARRAY && range->via.array.size == 2) {
-            params.range[0] = range->via.array.ptr[0].as<double>();
-            params.range[1] = range->via.array.ptr[1].as<double>();
-          }
-          if (const auto* bins = find_msgpack_map_value(root, "bins");
-              bins && (bins->type == msgpack::type::POSITIVE_INTEGER ||
-                       bins->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.bins = bins->as<int>();
-          }
-          if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-              bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                      bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.bytes_per_value = bpv->as<int>();
-          }
-          if (const auto* boxes = find_msgpack_map_value(root, "covered_boxes");
-              boxes && boxes->type == msgpack::type::ARRAY) {
-            params.covered_boxes.reserve(boxes->via.array.size);
-            for (uint32_t i = 0; i < boxes->via.array.size; ++i) {
-              const auto& entry = boxes->via.array.ptr[i];
-              if (entry.type != msgpack::type::ARRAY || entry.via.array.size != 2) {
-                continue;
-              }
-              const auto& lo = entry.via.array.ptr[0];
-              const auto& hi = entry.via.array.ptr[1];
-              if (lo.type != msgpack::type::ARRAY || hi.type != msgpack::type::ARRAY ||
-                  lo.via.array.size != 3 || hi.via.array.size != 3) {
-                continue;
-              }
-              Box3 box_data;
-              for (uint32_t d = 0; d < 3; ++d) {
-                box_data.lo[d] = lo.via.array.ptr[d].as<int>();
-                box_data.hi[d] = hi.via.array.ptr[d].as<int>();
-              }
-              params.covered_boxes.push_back(box_data);
-            }
-          }
-          return params;
-        });
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* range = find_msgpack_map_value(root, "range");
+          range && range->type == msgpack::type::ARRAY && range->via.array.size == 2) {
+        params.range[0] = range->via.array.ptr[0].as<double>();
+        params.range[1] = range->via.array.ptr[1].as<double>();
+      }
+      if (const auto* bins = find_msgpack_map_value(root, "bins");
+          bins && (bins->type == msgpack::type::POSITIVE_INTEGER ||
+                   bins->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.bins = bins->as<int>();
+      }
+      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
+          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.bytes_per_value = bpv->as<int>();
+      }
+      params.covered_boxes = parse_covered_boxes_param(root);
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "histogram1d_accumulate", .n_inputs = 1, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+        const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
         if (outputs.empty() || inputs.empty() || params.bins <= 0) {
           return hpx::make_ready_future();
@@ -4235,10 +4416,11 @@ void register_default_kernels(KernelRegistry& registry) {
         }
 
         auto covered = [&](int ix, int iy, int iz) -> bool {
-          for (const auto& b : params.covered_boxes) {
-            if (ix >= b.lo[0] && ix <= b.hi[0] &&
-                iy >= b.lo[1] && iy <= b.hi[1] &&
-                iz >= b.lo[2] && iz <= b.hi[2]) {
+          if (!params.covered_boxes) {
+            return false;
+          }
+          for (const auto& b : *params.covered_boxes) {
+            if (covered_box_contains(b, ix, iy, iz)) {
               return true;
             }
           }
@@ -4300,79 +4482,58 @@ void register_default_kernels(KernelRegistry& registry) {
           }
         }
         return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "histogram2d_accumulate", .n_inputs = 2, .n_outputs = 1,
-                 .needs_neighbors = false},
-      [](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
-         const NeighborViews&, std::span<HostView> outputs,
-         std::span<const std::uint8_t> params_msgpack) {
-        struct Box3 {
-          std::array<int, 3> lo{0, 0, 0};
-          std::array<int, 3> hi{0, 0, 0};
-        };
-        struct Params {
-          std::array<double, 2> x_range{0.0, 1.0};
-          std::array<double, 2> y_range{0.0, 1.0};
-          std::array<int, 2> bins{1, 1};
-          int bytes_per_value = 4;
-          std::string weight_mode{"input"};
-          std::vector<Box3> covered_boxes;
-        };
+        },
+        make_covered_box_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
+      std::array<double, 2> x_range{0.0, 1.0};
+      std::array<double, 2> y_range{0.0, 1.0};
+      std::array<int, 2> bins{1, 1};
+      int bytes_per_value = 4;
+      std::string weight_mode{"input"};
+      std::shared_ptr<const CoveredBoxListIR> covered_boxes;
+    };
 
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (root.type == msgpack::type::MAP) {
-            if (const auto* x_range = find_msgpack_map_value(root, "x_range");
-                x_range && x_range->type == msgpack::type::ARRAY && x_range->via.array.size == 2) {
-              params.x_range[0] = x_range->via.array.ptr[0].as<double>();
-              params.x_range[1] = x_range->via.array.ptr[1].as<double>();
-            }
-            if (const auto* y_range = find_msgpack_map_value(root, "y_range");
-                y_range && y_range->type == msgpack::type::ARRAY && y_range->via.array.size == 2) {
-              params.y_range[0] = y_range->via.array.ptr[0].as<double>();
-              params.y_range[1] = y_range->via.array.ptr[1].as<double>();
-            }
-            if (const auto* bins = find_msgpack_map_value(root, "bins");
-                bins && bins->type == msgpack::type::ARRAY && bins->via.array.size == 2) {
-              params.bins[0] = bins->via.array.ptr[0].as<int>();
-              params.bins[1] = bins->via.array.ptr[1].as<int>();
-            }
-            if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-                bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                        bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-              params.bytes_per_value = bpv->as<int>();
-            }
-            if (const auto* mode = find_msgpack_map_value(root, "weight_mode");
-                mode && mode->type == msgpack::type::STR) {
-              params.weight_mode = mode->as<std::string>();
-            }
-            if (const auto* boxes = find_msgpack_map_value(root, "covered_boxes");
-                boxes && boxes->type == msgpack::type::ARRAY) {
-              params.covered_boxes.clear();
-              params.covered_boxes.reserve(boxes->via.array.size);
-              for (uint32_t i = 0; i < boxes->via.array.size; ++i) {
-                const auto& entry = boxes->via.array.ptr[i];
-                if (entry.type != msgpack::type::ARRAY || entry.via.array.size != 2) {
-                  continue;
-                }
-                const auto& lo = entry.via.array.ptr[0];
-                const auto& hi = entry.via.array.ptr[1];
-                if (lo.type != msgpack::type::ARRAY || hi.type != msgpack::type::ARRAY ||
-                    lo.via.array.size != 3 || hi.via.array.size != 3) {
-                  continue;
-                }
-                Box3 box_data;
-                for (uint32_t d = 0; d < 3; ++d) {
-                  box_data.lo[d] = lo.via.array.ptr[d].as<int>();
-                  box_data.hi[d] = hi.via.array.ptr[d].as<int>();
-                }
-                params.covered_boxes.push_back(box_data);
-              }
-            }
-          }
-          return params;
-        });
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (root.type == msgpack::type::MAP) {
+        if (const auto* x_range = find_msgpack_map_value(root, "x_range");
+            x_range && x_range->type == msgpack::type::ARRAY && x_range->via.array.size == 2) {
+          params.x_range[0] = x_range->via.array.ptr[0].as<double>();
+          params.x_range[1] = x_range->via.array.ptr[1].as<double>();
+        }
+        if (const auto* y_range = find_msgpack_map_value(root, "y_range");
+            y_range && y_range->type == msgpack::type::ARRAY && y_range->via.array.size == 2) {
+          params.y_range[0] = y_range->via.array.ptr[0].as<double>();
+          params.y_range[1] = y_range->via.array.ptr[1].as<double>();
+        }
+        if (const auto* bins = find_msgpack_map_value(root, "bins");
+            bins && bins->type == msgpack::type::ARRAY && bins->via.array.size == 2) {
+          params.bins[0] = bins->via.array.ptr[0].as<int>();
+          params.bins[1] = bins->via.array.ptr[1].as<int>();
+        }
+        if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
+            bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                    bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+          params.bytes_per_value = bpv->as<int>();
+        }
+        if (const auto* mode = find_msgpack_map_value(root, "weight_mode");
+            mode && mode->type == msgpack::type::STR) {
+          params.weight_mode = mode->as<std::string>();
+        }
+        params.covered_boxes = parse_covered_boxes_param(root);
+      }
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "histogram2d_accumulate", .n_inputs = 2, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+        const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
         const int nx_bins = params.bins[0];
         const int ny_bins = params.bins[1];
@@ -4408,10 +4569,11 @@ void register_default_kernels(KernelRegistry& registry) {
         }
 
         auto covered = [&](int ix, int iy, int iz) -> bool {
-          for (const auto& b : params.covered_boxes) {
-            if (ix >= b.lo[0] && ix <= b.hi[0] &&
-                iy >= b.lo[1] && iy <= b.hi[1] &&
-                iz >= b.lo[2] && iz <= b.hi[2]) {
+          if (!params.covered_boxes) {
+            return false;
+          }
+          for (const auto& b : *params.covered_boxes) {
+            if (covered_box_contains(b, ix, iy, iz)) {
               return true;
             }
           }
@@ -4480,23 +4642,28 @@ void register_default_kernels(KernelRegistry& registry) {
           }
         }
         return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "uniform_slice_add", .n_inputs = 2, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
-        struct Params {
-          int bytes_per_value = 8;
-        };
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-              bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                      bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.bytes_per_value = bpv->as<int>();
-          }
-          return params;
-        });
+        },
+        make_covered_box_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
+      int bytes_per_value = 8;
+    };
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
+          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.bytes_per_value = bpv->as<int>();
+      }
+      return params;
+    };
+    registry.register_kernel(
+        KernelDesc{.name = "uniform_slice_add", .n_inputs = 2, .n_outputs = 1, .needs_neighbors = false},
+        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+        const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
         if (outputs.empty() || inputs.size() < 2) {
           return hpx::make_ready_future();
@@ -4538,31 +4705,36 @@ void register_default_kernels(KernelRegistry& registry) {
           }
         }
         return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "uniform_slice_finalize", .n_inputs = 2, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
-        struct Params {
-          int bytes_per_value = 4;
-          double pixel_area = 1.0;
-        };
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
+      int bytes_per_value = 4;
+      double pixel_area = 1.0;
+    };
 
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-              bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                      bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.bytes_per_value = bpv->as<int>();
-          }
-          if (const auto* area = find_msgpack_map_value(root, "pixel_area");
-              area && (area->type == msgpack::type::FLOAT ||
-                       area->type == msgpack::type::POSITIVE_INTEGER ||
-                       area->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.pixel_area = area->as<double>();
-          }
-          return params;
-        });
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
+          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.bytes_per_value = bpv->as<int>();
+      }
+      if (const auto* area = find_msgpack_map_value(root, "pixel_area");
+          area && (area->type == msgpack::type::FLOAT ||
+                   area->type == msgpack::type::POSITIVE_INTEGER ||
+                   area->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.pixel_area = area->as<double>();
+      }
+      return params;
+    };
+    registry.register_kernel(
+        KernelDesc{.name = "uniform_slice_finalize", .n_inputs = 2, .n_outputs = 1, .needs_neighbors = false},
+        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+        const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
         if (outputs.empty() || inputs.size() < 2 || params.pixel_area == 0.0) {
           return hpx::make_ready_future();
@@ -4598,24 +4770,29 @@ void register_default_kernels(KernelRegistry& registry) {
           }
         }
         return hpx::make_ready_future();
-      });
-  registry.register_kernel(
-      KernelDesc{.name = "uniform_slice_reduce", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t> params_msgpack) {
-        struct Params {
-          int bytes_per_value = 4;
-        };
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
+      int bytes_per_value = 4;
+    };
 
-        const auto& params = decode_params_cached<Params>(params_msgpack, [](const msgpack::object& root) {
-          Params params;
-          if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-              bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                      bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-            params.bytes_per_value = bpv->as<int>();
-          }
-          return params;
-        });
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
+          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.bytes_per_value = bpv->as<int>();
+      }
+      return params;
+    };
+    registry.register_kernel(
+        KernelDesc{.name = "uniform_slice_reduce", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
+        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+        const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
         if (outputs.empty() || inputs.empty()) {
           return hpx::make_ready_future();
@@ -4659,19 +4836,91 @@ void register_default_kernels(KernelRegistry& registry) {
           }
         }
         return hpx::make_ready_future();
-      });
+        },
+        make_kernel_params_preparer<Params>(decode_params));
+  }
 }
 
-void set_runmeta_impl(const RunMeta& meta) {
-  std::lock_guard<std::mutex> lock(g_ctx_mutex);
-  g_runmeta = meta;
-  g_has_runmeta = true;
+std::shared_ptr<ExecutionContext> build_execution_context_impl(int32_t run_id,
+                                                               const RunMeta& meta,
+                                                               const DatasetHandle& dataset,
+                                                               const PlanIR& plan,
+                                                               std::shared_ptr<ChunkStore> chunk_store) {
+  PlanIR prepared = plan;
+  prepare_plan(prepared, global_kernels());
+
+  auto ctx = std::make_shared<ExecutionContext>();
+  ctx->run_id = run_id;
+  ctx->meta = meta;
+  ctx->dataset = dataset;
+  ctx->plan = std::move(prepared);
+  ctx->adjacency = std::make_shared<AdjacencyServiceLocal>(ctx->meta);
+  ctx->chunk_store = std::move(chunk_store);
+  if (ctx->chunk_store == nullptr) {
+    ctx->chunk_store = std::make_shared<ChunkStore>();
+  }
+  return ctx;
 }
 
-void set_dataset_impl(const DatasetHandle& dataset) {
-  std::lock_guard<std::mutex> lock(g_ctx_mutex);
-  g_dataset = dataset;
-  g_has_dataset = true;
+bool domain_contains_block(const DomainIR& domain, const RunMeta& meta, const ChunkRef& ref) {
+  if (domain.step != ref.step || domain.level != ref.level) {
+    return false;
+  }
+  if (domain.blocks.has_value()) {
+    const auto& blocks = domain.blocks.value();
+    return std::find(blocks.begin(), blocks.end(), ref.block) != blocks.end();
+  }
+  if (ref.step < 0 || static_cast<std::size_t>(ref.step) >= meta.steps.size()) {
+    return false;
+  }
+  const auto& step = meta.steps.at(static_cast<std::size_t>(ref.step));
+  if (ref.level < 0 || static_cast<std::size_t>(ref.level) >= step.levels.size()) {
+    return false;
+  }
+  const auto& level = step.levels.at(static_cast<std::size_t>(ref.level));
+  return ref.block >= 0 && static_cast<std::size_t>(ref.block) < level.boxes.size();
+}
+
+bool graph_template_contains_output_block(const TaskTemplateIR& tmpl, const ChunkRef& ref) {
+  if (!tmpl.graph_reduce.has_value()) {
+    return false;
+  }
+  const auto& params = tmpl.graph_reduce.value();
+  const int32_t fan_in = std::max(1, params.fan_in);
+  const int32_t num_inputs = std::max(0, params.num_inputs);
+  const int32_t n_groups = (num_inputs + fan_in - 1) / fan_in;
+  return ref.block >= params.output_base && ref.block < params.output_base + n_groups;
+}
+
+bool template_may_produce_chunk(const TaskTemplateIR& tmpl,
+                                const RunMeta& meta,
+                                const ChunkRef& ref) {
+  if (tmpl.domain.step != ref.step || tmpl.domain.level != ref.level) {
+    return false;
+  }
+  const bool block_matches =
+      tmpl.plane == ExecPlane::Graph ? graph_template_contains_output_block(tmpl, ref)
+                                     : domain_contains_block(tmpl.domain, meta, ref);
+  if (!block_matches) {
+    return false;
+  }
+  for (const auto& output : tmpl.outputs) {
+    if (output.field == ref.field && output.version == ref.version) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool context_may_produce_chunk(const ExecutionContext& ctx, const ChunkRef& ref) {
+  for (const auto& stage : ctx.plan.stages) {
+    for (const auto& tmpl : stage.templates) {
+      if (template_may_produce_chunk(tmpl, ctx.meta, ref)) {
+        return true;
+      }
+    }
+  }
+  return false;
 }
 
 void ensure_hpx_started() {
@@ -4708,31 +4957,6 @@ void ensure_hpx_started() {
 
 }  // namespace
 
-void set_global_runmeta(const RunMeta& meta) {
-  set_runmeta_impl(meta);
-}
-
-const RunMeta& global_runmeta() {
-  std::lock_guard<std::mutex> lock(g_ctx_mutex);
-  if (!g_has_runmeta) {
-    throw std::runtime_error("global RunMeta not initialized");
-  }
-  return g_runmeta;
-}
-
-void set_global_dataset(const DatasetHandle& dataset) {
-  set_dataset_impl(dataset);
-  DataServiceLocal::set_dataset(&g_dataset);
-}
-
-const DatasetHandle& global_dataset() {
-  std::lock_guard<std::mutex> lock(g_ctx_mutex);
-  if (!g_has_dataset) {
-    throw std::runtime_error("global DatasetHandle not initialized");
-  }
-  return g_dataset;
-}
-
 void set_global_kernel_registry(KernelRegistry* registry) {
   g_kernel_registry = registry;
 }
@@ -4744,40 +4968,77 @@ KernelRegistry& global_kernels() {
   return *g_kernel_registry;
 }
 
-void set_global_plan(int32_t plan_id, const PlanIR& plan) {
+void set_execution_context(int32_t run_id,
+                           const RunMeta& meta,
+                           const DatasetHandle& dataset,
+                           const PlanIR& plan) {
+  std::shared_ptr<ChunkStore> chunk_store;
+  {
+    std::lock_guard<std::mutex> lock(g_ctx_mutex);
+    auto it = g_execution_contexts.find(run_id);
+    if (it != g_execution_contexts.end()) {
+      chunk_store = it->second->chunk_store;
+    }
+  }
+  auto ctx = build_execution_context_impl(run_id, meta, dataset, plan, std::move(chunk_store));
   std::lock_guard<std::mutex> lock(g_ctx_mutex);
-  g_plans[plan_id] = plan;
+  g_execution_contexts[run_id] = std::move(ctx);
 }
 
-const PlanIR& global_plan(int32_t plan_id) {
+std::shared_ptr<ExecutionContext> execution_context_shared(int32_t run_id) {
   std::lock_guard<std::mutex> lock(g_ctx_mutex);
-  auto it = g_plans.find(plan_id);
-  if (it == g_plans.end()) {
-    throw std::runtime_error("global PlanIR not initialized for plan id");
+  auto it = g_execution_contexts.find(run_id);
+  if (it == g_execution_contexts.end()) {
+    throw std::runtime_error("execution context not initialized for run id");
   }
   return it->second;
 }
 
-void erase_global_plan(int32_t plan_id) {
+const ExecutionContext& execution_context(int32_t run_id) {
+  return *execution_context_shared(run_id);
+}
+
+bool execution_context_may_produce_chunk(int32_t run_id, const ChunkRef& ref) {
+  return context_may_produce_chunk(*execution_context_shared(run_id), ref);
+}
+
+void erase_execution_context(int32_t run_id) {
   std::lock_guard<std::mutex> lock(g_ctx_mutex);
-  g_plans.erase(plan_id);
+  g_execution_contexts.erase(run_id);
 }
 
-void set_runmeta_action(const RunMeta& meta) {
-  set_runmeta_impl(meta);
+ScopedExecutionContext::ScopedExecutionContext(int32_t run_id)
+    : previous_run_id_(g_current_execution_context_id) {
+  g_current_execution_context_id = run_id;
 }
 
-void set_dataset_action(const DatasetHandle& dataset) {
-  set_dataset_impl(dataset);
-  DataServiceLocal::set_dataset(&g_dataset);
+ScopedExecutionContext::~ScopedExecutionContext() {
+  g_current_execution_context_id = previous_run_id_;
 }
 
-void set_plan_action(int32_t plan_id, const PlanIR& plan) {
-  set_global_plan(plan_id, plan);
+const RunMeta& current_runmeta() {
+  if (g_current_execution_context_id != 0) {
+    return execution_context(g_current_execution_context_id).meta;
+  }
+  throw std::runtime_error("current RunMeta requires an active execution context");
 }
 
-void erase_plan_action(int32_t plan_id) {
-  erase_global_plan(plan_id);
+const DatasetHandle& current_dataset() {
+  if (g_current_execution_context_id != 0) {
+    return execution_context(g_current_execution_context_id).dataset;
+  }
+  throw std::runtime_error("current DatasetHandle requires an active execution context");
+}
+
+void set_execution_context_action(int32_t run_id,
+                                  const RunMeta& meta,
+                                  const DatasetHandle& dataset,
+                                  const PlanIR& plan) {
+  set_execution_context(run_id, meta, dataset, plan);
+}
+
+void erase_execution_context_action(int32_t run_id) {
+  erase_execution_context(run_id);
 }
 
 void set_event_log_action(const std::string& path) {
@@ -4800,26 +5061,30 @@ void set_perfetto_metrics_sampling_active_action(bool active) {
   }
 }
 
-void preload_action(const RunMeta& meta,
-                    const DatasetHandle& dataset,
+void preload_action(int32_t run_id,
                     const std::vector<int32_t>& fields) {
-  DataServiceLocal::preload(meta, dataset, fields);
+  auto ctx = execution_context_shared(run_id);
+  DataServiceLocal::preload(ctx->meta, ctx->dataset, ctx->chunk_store, fields);
 }
 
 void release_console_worker_action() {
+  std::shared_ptr<hpx::promise<void>> promise;
   {
     std::lock_guard<std::mutex> lock(g_console_release_mutex);
+    ensure_console_release_future_locked();
+    if (g_console_release_requested) {
+      return;
+    }
     g_console_release_requested = true;
+    promise = g_console_release_promise;
   }
-  g_console_release_cv.notify_all();
+  promise->set_value();
 }
 
 }  // namespace kangaroo
 
-HPX_PLAIN_ACTION(kangaroo::set_runmeta_action, kangaroo_set_runmeta_action)
-HPX_PLAIN_ACTION(kangaroo::set_dataset_action, kangaroo_set_dataset_action)
-HPX_PLAIN_ACTION(kangaroo::set_plan_action, kangaroo_set_plan_action)
-HPX_PLAIN_ACTION(kangaroo::erase_plan_action, kangaroo_erase_plan_action)
+HPX_PLAIN_ACTION(kangaroo::set_execution_context_action, kangaroo_set_execution_context_action)
+HPX_PLAIN_ACTION(kangaroo::erase_execution_context_action, kangaroo_erase_execution_context_action)
 HPX_PLAIN_ACTION(kangaroo::preload_action, kangaroo_preload_action)
 HPX_PLAIN_ACTION(kangaroo::set_event_log_action, kangaroo_set_event_log_action)
 HPX_PLAIN_ACTION(kangaroo::set_perfetto_trace_action, kangaroo_set_perfetto_trace_action)
@@ -5023,23 +5288,20 @@ void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
       return 0;
     });
   }
-  timed_phase("runtime_broadcast_runmeta", "kangaroo.runtime.setup", [&]() {
-    hpx::lcos::broadcast<::kangaroo_set_runmeta_action>(localities, runmeta.meta).get();
+  const bool reused_preload_context = preload_run_id_ != 0;
+  int32_t plan_id = reused_preload_context ? preload_run_id_ : next_plan_id_++;
+  preload_run_id_ = 0;
+  timed_phase("runtime_broadcast_execution_context", "kangaroo.runtime.setup", [&]() {
+    hpx::lcos::broadcast<::kangaroo_set_execution_context_action>(
+        localities, plan_id, runmeta.meta, dataset, plan)
+        .get();
     return 0;
   });
-  timed_phase("runtime_broadcast_dataset", "kangaroo.runtime.setup", [&]() {
-    hpx::lcos::broadcast<::kangaroo_set_dataset_action>(localities, dataset).get();
-    return 0;
-  });
-  int32_t plan_id = next_plan_id_++;
-  timed_phase("runtime_broadcast_plan", "kangaroo.runtime.setup", [&]() {
-    hpx::lcos::broadcast<::kangaroo_set_plan_action>(localities, plan_id, plan).get();
-    return 0;
-  });
+  auto ctx = execution_context_shared(plan_id);
 
-  auto erase_plan = [&]() {
-    timed_phase("runtime_erase_plan", "kangaroo.runtime.cleanup", [&]() {
-      hpx::lcos::broadcast<::kangaroo_erase_plan_action>(localities, plan_id).get();
+  auto erase_context = [&](int32_t run_id) {
+    timed_phase("runtime_erase_execution_context", "kangaroo.runtime.cleanup", [&]() {
+      hpx::lcos::broadcast<::kangaroo_erase_execution_context_action>(localities, run_id).get();
       return 0;
     });
   };
@@ -5054,16 +5316,15 @@ void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
   };
 
   try {
-    DataServiceLocal data;
-    AdjacencyServiceLocal adjacency(runmeta.meta);
-    Executor executor(plan_id, runmeta.meta, data, adjacency, kernel_registry_);
+    DataServiceLocal data(plan_id, &dataset);
+    Executor executor(plan_id, ctx->meta, data, *ctx->adjacency);
     timed_phase("runtime_execute_plan", "kangaroo.runtime.execute", [&]() {
-      executor.run(plan).get();
+      executor.run(ctx->plan).get();
       return 0;
     });
   } catch (...) {
     try {
-      erase_plan();
+      erase_context(plan_id);
     } catch (...) {
     }
     try {
@@ -5073,7 +5334,11 @@ void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
     throw;
   }
 
-  erase_plan();
+  retained_output_run_id_ = plan_id;
+  if (std::find(retained_output_run_ids_.begin(), retained_output_run_ids_.end(), plan_id) ==
+      retained_output_run_ids_.end()) {
+    retained_output_run_ids_.push_back(plan_id);
+  }
   stop_perfetto_sampling();
 }
 
@@ -5082,24 +5347,74 @@ void Runtime::preload_dataset(const RunMetaHandle& runmeta,
                               const std::vector<int32_t>& fields) {
   ensure_hpx_started();
   auto localities = hpx::find_all_localities();
-  hpx::lcos::broadcast<::kangaroo_set_runmeta_action>(localities, runmeta.meta).get();
-  hpx::lcos::broadcast<::kangaroo_set_dataset_action>(localities, dataset).get();
-  hpx::lcos::broadcast<::kangaroo_preload_action>(localities, runmeta.meta, dataset, fields).get();
+  auto erase_context = [&](int32_t run_id) {
+    hpx::lcos::broadcast<::kangaroo_erase_execution_context_action>(localities, run_id).get();
+  };
+  if (preload_run_id_ != 0) {
+    const int32_t old_preload_run_id = preload_run_id_;
+    erase_context(preload_run_id_);
+    retained_output_run_ids_.erase(
+        std::remove(retained_output_run_ids_.begin(), retained_output_run_ids_.end(),
+                    old_preload_run_id),
+        retained_output_run_ids_.end());
+    preload_run_id_ = 0;
+  }
+  preload_run_id_ = next_plan_id_++;
+  hpx::lcos::broadcast<::kangaroo_set_execution_context_action>(
+      localities, preload_run_id_, runmeta.meta, dataset, PlanIR{})
+      .get();
+  hpx::lcos::broadcast<::kangaroo_preload_action>(localities, preload_run_id_, fields).get();
 }
 
 HostView Runtime::get_task_chunk(int32_t step,
                                  int16_t level,
                                  int32_t field,
                                  int32_t version,
-                                 int32_t block) {
+                                 int32_t block,
+                                 const DatasetHandle* dataset) {
   ensure_hpx_started();
   if (g_active_plan_runs.load(std::memory_order_acquire) > 0) {
     throw std::runtime_error(
         "output retrieval is not allowed while a plan run is in progress");
   }
-  DataServiceLocal data;
+  if (retained_output_run_id_ == 0 && preload_run_id_ == 0 && dataset == nullptr) {
+    throw std::runtime_error("no retained execution context or dataset available for get_task_chunk");
+  }
   ChunkRef ref{step, level, field, version, block};
-  return data.get_host(ref).get();
+
+  std::vector<int32_t> candidate_run_ids;
+  candidate_run_ids.reserve(retained_output_run_ids_.size() + 2);
+  if (retained_output_run_id_ != 0) {
+    candidate_run_ids.push_back(retained_output_run_id_);
+  }
+  for (auto it = retained_output_run_ids_.rbegin(); it != retained_output_run_ids_.rend(); ++it) {
+    if (*it != retained_output_run_id_) {
+      candidate_run_ids.push_back(*it);
+    }
+  }
+  if (preload_run_id_ != 0) {
+    candidate_run_ids.push_back(preload_run_id_);
+  }
+
+  for (int32_t run_id : candidate_run_ids) {
+    std::shared_ptr<ExecutionContext> ctx;
+    try {
+      ctx = execution_context_shared(run_id);
+    } catch (...) {
+      continue;
+    }
+    if (context_may_produce_chunk(*ctx, ref) || ctx->dataset.has_chunk(ref)) {
+      DataServiceLocal data(run_id, dataset);
+      return data.get_host(ref).get();
+    }
+  }
+
+  if (dataset != nullptr && dataset->has_chunk(ref)) {
+    DataServiceLocal data(0, dataset);
+    return data.get_host(ref).get();
+  }
+
+  throw std::runtime_error("chunk is not available from retained outputs or dataset");
 }
 
 int32_t Runtime::locality_id() {
@@ -5117,17 +5432,31 @@ void Runtime::wait_for_console_release() {
   if (hpx::get_locality_id() == 0) {
     return;
   }
-  std::unique_lock<std::mutex> lock(g_console_release_mutex);
-  g_console_release_cv.wait(lock, []() { return g_console_release_requested; });
+  hpx::shared_future<void> release_future;
+  {
+    std::lock_guard<std::mutex> lock(g_console_release_mutex);
+    release_future = ensure_console_release_future_locked();
+    if (g_console_release_requested) {
+      return;
+    }
+  }
+  release_future.wait();
 }
 
 void Runtime::release_console_workers() {
   ensure_hpx_started();
+  std::shared_ptr<hpx::promise<void>> promise;
   {
     std::lock_guard<std::mutex> lock(g_console_release_mutex);
-    g_console_release_requested = true;
+    ensure_console_release_future_locked();
+    if (!g_console_release_requested) {
+      g_console_release_requested = true;
+      promise = g_console_release_promise;
+    }
   }
-  g_console_release_cv.notify_all();
+  if (promise) {
+    promise->set_value();
+  }
 
   auto localities = hpx::find_all_localities();
   if (localities.size() <= 1) {

@@ -10,10 +10,11 @@
 
 namespace kangaroo {
 
+void prepare_plan(PlanIR& plan, KernelRegistry& kernels);
+
 class Executor {
  public:
-  Executor(int32_t plan_id, const RunMeta& meta, DataService& data, AdjacencyService& adj,
-           KernelRegistry& kr);
+  Executor(int32_t plan_id, const RunMeta& meta, DataService& data, AdjacencyService& adj);
 
   hpx::future<void> run(const PlanIR& plan);
 
@@ -28,7 +29,6 @@ class Executor {
   const RunMeta& meta_;
   DataService& data_;
   AdjacencyService& adj_;
-  KernelRegistry& kernels_;
   const PlanIR* current_plan_ = nullptr;
 };
 

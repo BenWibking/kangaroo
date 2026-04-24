@@ -7,7 +7,13 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
+#include <iostream>
+#include <limits>
+#include <memory>
 #include <queue>
+#include <sstream>
 #include <stdexcept>
 #include <unordered_set>
 
@@ -23,15 +29,12 @@ namespace kangaroo {
 
 namespace {
 
-struct GraphReduceParams {
-  int32_t fan_in = 1;
-  int32_t num_inputs = 0;
-  int32_t input_base = 0;
-  int32_t output_base = 0;
-  std::vector<int32_t> input_blocks;
-};
+bool debug_dataflow_enabled() {
+  static const bool enabled = std::getenv("KANGAROO_DEBUG_DATAFLOW") != nullptr;
+  return enabled;
+}
 
-GraphReduceParams parse_graph_reduce_params(const msgpack::object& root) {
+GraphReduceSpecIR parse_graph_reduce_params(const msgpack::object& root) {
   if (root.type == msgpack::type::NIL) {
     throw std::runtime_error("graph reduce params missing");
   }
@@ -44,7 +47,7 @@ GraphReduceParams parse_graph_reduce_params(const msgpack::object& root) {
     throw std::runtime_error("graph template requires graph_kind=\"reduce\"");
   }
 
-  GraphReduceParams params;
+  GraphReduceSpecIR params;
   if (const auto* fan_in = find_msgpack_map_value(root, "fan_in"); fan_in &&
                                                 (fan_in->type == msgpack::type::POSITIVE_INTEGER ||
                                                  fan_in->type == msgpack::type::NEGATIVE_INTEGER)) {
@@ -95,9 +98,92 @@ GraphReduceParams parse_graph_reduce_params(const msgpack::object& root) {
   return params;
 }
 
+const KernelFn& prepared_kernel(const TaskTemplateIR& tmpl) {
+  if (!tmpl.kernel_fn) {
+    throw std::runtime_error("task template not prepared: missing kernel");
+  }
+  return *tmpl.kernel_fn;
+}
+
+const GraphReduceSpecIR& prepared_graph_reduce(const TaskTemplateIR& tmpl) {
+  if (!tmpl.graph_reduce.has_value()) {
+    throw std::runtime_error("graph task template not prepared: missing graph reduce params");
+  }
+  return tmpl.graph_reduce.value();
+}
+
 double now_seconds() {
   auto now = std::chrono::system_clock::now();
   return std::chrono::duration<double>(now.time_since_epoch()).count();
+}
+
+struct ViewSummary {
+  std::size_t bytes = 0;
+  bool interpreted_as_f64 = false;
+  double sum = 0.0;
+  double min = std::numeric_limits<double>::infinity();
+  double max = -std::numeric_limits<double>::infinity();
+  std::size_t nonzero = 0;
+};
+
+ViewSummary summarize_view_f64(const HostView& view) {
+  ViewSummary summary;
+  summary.bytes = view.data.size();
+  if (view.data.empty() || (view.data.size() % sizeof(double)) != 0) {
+    return summary;
+  }
+  summary.interpreted_as_f64 = true;
+  const std::size_t n = view.data.size() / sizeof(double);
+  const auto* ptr = reinterpret_cast<const double*>(view.data.data());
+  for (std::size_t i = 0; i < n; ++i) {
+    const double value = ptr[i];
+    summary.sum += value;
+    if (std::isfinite(value)) {
+      summary.min = std::min(summary.min, value);
+      summary.max = std::max(summary.max, value);
+    }
+    if (value != 0.0) {
+      ++summary.nonzero;
+    }
+  }
+  if (!std::isfinite(summary.min)) {
+    summary.min = std::numeric_limits<double>::quiet_NaN();
+  }
+  if (!std::isfinite(summary.max)) {
+    summary.max = std::numeric_limits<double>::quiet_NaN();
+  }
+  return summary;
+}
+
+void log_projection_output_summary(const TaskTemplateIR& tmpl,
+                                   int32_t block,
+                                   std::size_t output_idx,
+                                   const HostView& view) {
+  if (!debug_dataflow_enabled()) {
+    return;
+  }
+  if (tmpl.name.find("projection") == std::string::npos &&
+      tmpl.kernel.find("projection") == std::string::npos &&
+      tmpl.kernel != "uniform_slice_reduce" &&
+      tmpl.kernel != "uniform_slice_add") {
+    return;
+  }
+  const auto summary = summarize_view_f64(view);
+  std::cout << "[kangaroo][output] name=" << tmpl.name
+            << " kernel=" << tmpl.kernel
+            << " locality=" << hpx::get_locality_id()
+            << " step=" << tmpl.domain.step
+            << " level=" << tmpl.domain.level
+            << " block=" << block
+            << " output_idx=" << output_idx
+            << " bytes=" << summary.bytes;
+  if (summary.interpreted_as_f64) {
+    std::cout << " sum=" << summary.sum
+              << " min=" << summary.min
+              << " max=" << summary.max
+              << " nonzero=" << summary.nonzero;
+  }
+  std::cout << std::endl;
 }
 
 struct InputLocation {
@@ -184,8 +270,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
                                       int32_t block,
                                       const RunMeta& meta,
                                       DataService& data,
-                                      AdjacencyService& adj,
-                                      KernelRegistry& kernels) {
+                                      AdjacencyService& adj) {
   if (tmpl.plane != ExecPlane::Chunk) {
     return hpx::make_exceptional_future<void>(
         std::runtime_error("only chunk plane is implemented"));
@@ -290,6 +375,9 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
       ChunkRef cref{step, level, field, ver, nbr};
       futs.push_back(data.get_host(cref));
     }
+    if (futs.empty()) {
+      return hpx::make_ready_future(std::vector<HostView>{});
+    }
     return hpx::when_all(futs).then([](auto&& all) {
       std::vector<HostView> out;
       out.reserve(all.get().size());
@@ -343,7 +431,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
   auto fut = hpx::when_all(std::move(all_inputs), std::move(all_neighbors))
       .then([&meta,
              &data,
-             &kernels,
+             plan_id,
              tmpl,
              block,
              halo_inputs = std::move(halo_inputs),
@@ -413,23 +501,33 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
           outputs.push_back(data.alloc_host(cref, bytes));
         }
 
+        auto inputs_ptr = std::make_shared<std::vector<HostView>>(std::move(inputs));
+        auto nbrs_ptr = std::make_shared<NeighborViews>(std::move(nbrs));
+        auto outputs_ptr = std::make_shared<std::vector<HostView>>(std::move(outputs));
+        auto params_ptr = std::make_shared<std::vector<std::uint8_t>>(tmpl.params_msgpack);
+
         const auto& level = meta.steps.at(tmpl.domain.step).levels.at(tmpl.domain.level);
-        auto& fn = kernels.get_by_name(tmpl.kernel);
+        auto& fn = prepared_kernel(tmpl);
 
         TaskEvent kernel_event;
         if (log_enabled) {
           kernel_event = start_span(base_event, "kernel");
         }
+        ScopedExecutionContext active_context(plan_id);
+        ScopedPreparedParams active_params(tmpl.prepared_params_type, tmpl.prepared_params);
         return fn(level,
                   block,
-                  inputs,
-                  nbrs,
-                  outputs,
-                  std::span<const std::uint8_t>(tmpl.params_msgpack.data(), tmpl.params_msgpack.size()))
+                  *inputs_ptr,
+                  *nbrs_ptr,
+                  *outputs_ptr,
+                  std::span<const std::uint8_t>(params_ptr->data(), params_ptr->size()))
             .then([&data,
                    tmpl,
                    block,
-                   outputs = std::move(outputs),
+                   inputs_ptr = std::move(inputs_ptr),
+                   nbrs_ptr = std::move(nbrs_ptr),
+                   outputs_ptr = std::move(outputs_ptr),
+                   params_ptr = std::move(params_ptr),
                    log_enabled,
                    base_event,
                    kernel_event](auto&&) mutable {
@@ -439,9 +537,10 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
               std::vector<hpx::future<void>> puts;
               puts.reserve(tmpl.outputs.size());
               for (std::size_t i = 0; i < tmpl.outputs.size(); ++i) {
+                log_projection_output_summary(tmpl, block, i, (*outputs_ptr)[i]);
                 const auto& out = tmpl.outputs[i];
                 ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version, block};
-                puts.push_back(data.put_host(cref, std::move(outputs[i])));
+                puts.push_back(data.put_host(cref, std::move((*outputs_ptr)[i])));
               }
               TaskEvent wait_outputs_event;
               if (log_enabled) {
@@ -483,8 +582,7 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
                                       int32_t tmpl_idx,
                                       int32_t group_idx,
                                       const RunMeta& meta,
-                                      DataService& data,
-                                      KernelRegistry& kernels) {
+                                      DataService& data) {
   if (tmpl.plane != ExecPlane::Graph) {
     return hpx::make_exceptional_future<void>(
         std::runtime_error("graph tasks require graph plane"));
@@ -498,9 +596,7 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
         std::runtime_error("graph templates must specify inputs and outputs"));
   }
 
-  const auto& params = decode_params_cached<GraphReduceParams>(
-      std::span<const std::uint8_t>(tmpl.params_msgpack.data(), tmpl.params_msgpack.size()),
-      parse_graph_reduce_params);
+  const auto& params = prepared_graph_reduce(tmpl);
   const int32_t fan_in = params.fan_in;
   const int32_t num_inputs = params.num_inputs;
   const int32_t input_base = params.input_base;
@@ -524,8 +620,26 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
     }
     std::cout << oss.str() << std::endl;
   }
-
   const int32_t out_block = output_base + group_idx;
+  if (debug_dataflow_enabled()) {
+    std::ostringstream oss;
+    oss << "[kangaroo][dataflow] op=graph_reduce_inputs"
+        << " locality=" << hpx::get_locality_id()
+        << " name=" << tmpl.name
+        << " kernel=" << tmpl.kernel
+        << " group=" << group_idx
+        << " out_block=" << out_block
+        << " blocks=";
+    for (int32_t idx = start; idx < end; ++idx) {
+      if (idx > start) {
+        oss << ",";
+      }
+      oss << (params.input_blocks.empty()
+                  ? (input_base + idx)
+                  : params.input_blocks.at(static_cast<std::size_t>(idx)));
+    }
+    std::cout << oss.str() << std::endl;
+  }
   const bool log_enabled = has_event_log();
   TaskEvent base_event;
   if (log_enabled) {
@@ -563,7 +677,7 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
   auto fut = hpx::when_all(std::move(input_futures))
       .then([&meta,
              &data,
-             &kernels,
+             plan_id,
              tmpl,
              out_block,
              log_enabled,
@@ -577,6 +691,22 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
         inputs.reserve(input_pack.size());
         for (auto& f : input_pack) {
           inputs.push_back(f.get());
+        }
+        if (debug_dataflow_enabled()) {
+          std::ostringstream oss;
+          oss << "[kangaroo][dataflow] op=graph_reduce_ready"
+              << " locality=" << hpx::get_locality_id()
+              << " name=" << tmpl.name
+              << " kernel=" << tmpl.kernel
+              << " out_block=" << out_block
+              << " input_bytes=";
+          for (std::size_t i = 0; i < inputs.size(); ++i) {
+            if (i > 0) {
+              oss << ",";
+            }
+            oss << inputs[i].data.size();
+          }
+          std::cout << oss.str() << std::endl;
         }
 
         if (!tmpl.output_bytes.empty() && tmpl.output_bytes.size() != tmpl.outputs.size()) {
@@ -595,24 +725,34 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
           outputs.push_back(data.alloc_host(cref, bytes));
         }
 
-        const auto& level = meta.steps.at(tmpl.domain.step).levels.at(tmpl.domain.level);
-        auto& fn = kernels.get_by_name(tmpl.kernel);
-
         NeighborViews nbrs;
+        auto inputs_ptr = std::make_shared<std::vector<HostView>>(std::move(inputs));
+        auto nbrs_ptr = std::make_shared<NeighborViews>(std::move(nbrs));
+        auto outputs_ptr = std::make_shared<std::vector<HostView>>(std::move(outputs));
+        auto params_ptr = std::make_shared<std::vector<std::uint8_t>>(tmpl.params_msgpack);
+
+        const auto& level = meta.steps.at(tmpl.domain.step).levels.at(tmpl.domain.level);
+        auto& fn = prepared_kernel(tmpl);
+
         TaskEvent kernel_event;
         if (log_enabled) {
           kernel_event = start_span(base_event, "kernel");
         }
+        ScopedExecutionContext active_context(plan_id);
+        ScopedPreparedParams active_params(tmpl.prepared_params_type, tmpl.prepared_params);
         return fn(level,
                   out_block,
-                  inputs,
-                  nbrs,
-                  outputs,
-                  std::span<const std::uint8_t>(tmpl.params_msgpack.data(), tmpl.params_msgpack.size()))
+                  *inputs_ptr,
+                  *nbrs_ptr,
+                  *outputs_ptr,
+                  std::span<const std::uint8_t>(params_ptr->data(), params_ptr->size()))
             .then([&data,
                    tmpl,
                    out_block,
-                   outputs = std::move(outputs),
+                   inputs_ptr = std::move(inputs_ptr),
+                   nbrs_ptr = std::move(nbrs_ptr),
+                   outputs_ptr = std::move(outputs_ptr),
+                   params_ptr = std::move(params_ptr),
                    log_enabled,
                    base_event,
                    kernel_event](auto&&) mutable {
@@ -622,10 +762,11 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
               std::vector<hpx::future<void>> puts;
               puts.reserve(tmpl.outputs.size());
               for (std::size_t i = 0; i < tmpl.outputs.size(); ++i) {
+                log_projection_output_summary(tmpl, out_block, i, (*outputs_ptr)[i]);
                 const auto& out = tmpl.outputs[i];
                 ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version,
                               out_block};
-                puts.push_back(data.put_host(cref, std::move(outputs[i])));
+                puts.push_back(data.put_host(cref, std::move((*outputs_ptr)[i])));
               }
               TaskEvent wait_outputs_event;
               if (log_enabled) {
@@ -663,33 +804,25 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
 
 hpx::future<void> run_block_task_remote(int32_t plan_id, int32_t stage_idx, int32_t tmpl_idx,
                                         int32_t block) {
-  const auto& plan = global_plan(plan_id);
-  const auto& stage = plan.stages.at(stage_idx);
+  auto ctx = execution_context_shared(plan_id);
+  const auto& stage = ctx->plan.stages.at(stage_idx);
   const auto& tmpl = stage.templates.at(tmpl_idx);
-  const auto& meta = global_runmeta();
-  (void)global_dataset();
-  auto data = std::make_shared<DataServiceLocal>();
-  auto adjacency = std::make_shared<AdjacencyServiceLocal>(meta);
-  (void)global_kernels();
-  return run_block_task_impl(tmpl, plan_id, stage_idx, tmpl_idx, block, meta, *data, *adjacency,
-                             global_kernels())
-      .then([data = std::move(data), adjacency = std::move(adjacency)](auto&& done) mutable {
+  auto data = std::make_shared<DataServiceLocal>(plan_id);
+  return run_block_task_impl(tmpl, plan_id, stage_idx, tmpl_idx, block, ctx->meta, *data,
+                             *ctx->adjacency)
+      .then([ctx = std::move(ctx), data = std::move(data)](auto&& done) mutable {
         done.get();
       });
 }
 
 hpx::future<void> run_graph_task_remote(int32_t plan_id, int32_t stage_idx, int32_t tmpl_idx,
                                         int32_t group_idx) {
-  const auto& plan = global_plan(plan_id);
-  const auto& stage = plan.stages.at(stage_idx);
+  auto ctx = execution_context_shared(plan_id);
+  const auto& stage = ctx->plan.stages.at(stage_idx);
   const auto& tmpl = stage.templates.at(tmpl_idx);
-  const auto& meta = global_runmeta();
-  (void)global_dataset();
-  auto data = std::make_shared<DataServiceLocal>();
-  (void)global_kernels();
-  return run_graph_task_impl(tmpl, plan_id, stage_idx, tmpl_idx, group_idx, meta, *data,
-                             global_kernels())
-      .then([data = std::move(data)](auto&& done) mutable {
+  auto data = std::make_shared<DataServiceLocal>(plan_id);
+  return run_graph_task_impl(tmpl, plan_id, stage_idx, tmpl_idx, group_idx, ctx->meta, *data)
+      .then([ctx = std::move(ctx), data = std::move(data)](auto&& done) mutable {
         done.get();
       });
 }
@@ -703,9 +836,46 @@ HPX_PLAIN_ACTION(kangaroo::run_graph_task_remote, kangaroo_run_graph_task_action
 
 namespace kangaroo {
 
-Executor::Executor(int32_t plan_id, const RunMeta& meta, DataService& data, AdjacencyService& adj,
-                   KernelRegistry& kr)
-    : plan_id_(plan_id), meta_(meta), data_(data), adj_(adj), kernels_(kr) {}
+void prepare_plan(PlanIR& plan, KernelRegistry& kernels) {
+  std::vector<std::shared_ptr<const CoveredBoxListIR>> shared_covered_boxes;
+  shared_covered_boxes.reserve(plan.shared_covered_boxes.size());
+  for (const auto& boxes : plan.shared_covered_boxes) {
+    shared_covered_boxes.push_back(std::make_shared<CoveredBoxListIR>(boxes));
+  }
+
+  for (auto& stage : plan.stages) {
+    for (auto& tmpl : stage.templates) {
+      tmpl.kernel_fn = kernels.get_shared_by_name(tmpl.kernel);
+      std::shared_ptr<const CoveredBoxListIR> covered_boxes;
+      if (tmpl.covered_boxes_ref >= 0) {
+        const auto ref_idx = static_cast<std::size_t>(tmpl.covered_boxes_ref);
+        if (ref_idx >= shared_covered_boxes.size()) {
+          throw std::runtime_error("covered_boxes_ref out of range while preparing plan");
+        }
+        covered_boxes = shared_covered_boxes[ref_idx];
+      }
+      auto prepared_params = kernels.prepare_params_by_name(
+          tmpl.kernel,
+          KernelParamContext{
+              std::span<const std::uint8_t>(tmpl.params_msgpack.data(), tmpl.params_msgpack.size()),
+              std::move(covered_boxes),
+          });
+      tmpl.prepared_params = std::move(prepared_params.value);
+      tmpl.prepared_params_type = prepared_params.type;
+      if (tmpl.plane == ExecPlane::Graph) {
+        const auto& params = decode_params_cached<GraphReduceSpecIR>(
+            std::span<const std::uint8_t>(tmpl.params_msgpack.data(), tmpl.params_msgpack.size()),
+            parse_graph_reduce_params);
+        tmpl.graph_reduce = params;
+      } else {
+        tmpl.graph_reduce.reset();
+      }
+    }
+  }
+}
+
+Executor::Executor(int32_t plan_id, const RunMeta& meta, DataService& data, AdjacencyService& adj)
+    : plan_id_(plan_id), meta_(meta), data_(data), adj_(adj) {}
 
 hpx::future<void> Executor::run(const PlanIR& plan) {
   current_plan_ = &plan;
@@ -747,6 +917,10 @@ hpx::future<void> Executor::run(const PlanIR& plan) {
   if (static_cast<int32_t>(order.size()) != nstages) {
     throw std::runtime_error("stage dependency cycle detected");
   }
+  if (nstages == 0) {
+    current_plan_ = nullptr;
+    return hpx::make_ready_future();
+  }
 
   std::vector<hpx::shared_future<void>> stage_futures(nstages);
   for (int32_t stage_idx : order) {
@@ -762,12 +936,25 @@ hpx::future<void> Executor::run(const PlanIR& plan) {
       deps.push_back(stage_futures.at(dep));
     }
     stage_futures[stage_idx] =
-        hpx::when_all(deps).then([this, stage, stage_idx](auto&&) {
+        hpx::when_all(deps).then([this, stage, stage_idx](auto&& ready_deps) {
+          auto dep_results = ready_deps.get();
+          for (auto& dep : dep_results) {
+            dep.get();
+          }
           return run_stage(stage_idx, stage);
         }).share();
   }
 
-  return hpx::when_all(stage_futures).then([this](auto&&) {
+  return hpx::when_all(stage_futures).then([this](auto&& ready_stages) {
+    try {
+      auto stage_results = ready_stages.get();
+      for (auto& stage : stage_results) {
+        stage.get();
+      }
+    } catch (...) {
+      current_plan_ = nullptr;
+      throw;
+    }
     current_plan_ = nullptr;
     return;
   });
@@ -804,9 +991,7 @@ hpx::future<void> Executor::run_stage(int32_t stage_idx, const StageIR& stage) {
         return hpx::make_exceptional_future<void>(
             std::runtime_error("graph stage requires graph templates"));
       }
-      const auto& params = decode_params_cached<GraphReduceParams>(
-          std::span<const std::uint8_t>(tmpl.params_msgpack.data(), tmpl.params_msgpack.size()),
-          parse_graph_reduce_params);
+      const auto& params = prepared_graph_reduce(tmpl);
       const int32_t fan_in = params.fan_in;
       const int32_t num_inputs = params.num_inputs;
       const int32_t n_groups = (num_inputs + fan_in - 1) / fan_in;
@@ -820,7 +1005,16 @@ hpx::future<void> Executor::run_stage(int32_t stage_idx, const StageIR& stage) {
     }
   }
 
-  return hpx::when_all(futures).then([](auto&&) { return; });
+  if (futures.empty()) {
+    return hpx::make_ready_future();
+  }
+  return hpx::when_all(futures).then([](auto&& ready_tasks) {
+    auto task_results = ready_tasks.get();
+    for (auto& task : task_results) {
+      task.get();
+    }
+    return;
+  });
 }
 
 hpx::future<void> Executor::run_block_task(const TaskTemplateIR& tmpl, int32_t stage_idx,
@@ -840,10 +1034,7 @@ hpx::future<void> Executor::run_block_task(const TaskTemplateIR& tmpl, int32_t s
     int target = data_.home_rank(cref);
     int here = hpx::get_locality_id();
     if (target == here) {
-      return hpx::async([this, tmpl, stage_idx, tmpl_idx, block]() mutable {
-        run_block_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, block, meta_, data_, adj_, kernels_)
-            .get();
-      });
+      return run_block_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, block, meta_, data_, adj_);
     }
     auto localities = hpx::find_all_localities();
     return hpx::async<::kangaroo_run_block_task_action>(localities.at(target), plan_id_, stage_idx,
@@ -857,10 +1048,7 @@ hpx::future<void> Executor::run_block_task(const TaskTemplateIR& tmpl, int32_t s
   int target = data_.home_rank(cref);
   int here = hpx::get_locality_id();
   if (target == here) {
-    return hpx::async([this, tmpl, stage_idx, tmpl_idx, block]() mutable {
-      run_block_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, block, meta_, data_, adj_, kernels_)
-          .get();
-    });
+    return run_block_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, block, meta_, data_, adj_);
   }
 
   auto localities = hpx::find_all_localities();
@@ -880,9 +1068,7 @@ hpx::future<void> Executor::run_graph_task(const TaskTemplateIR& tmpl, int32_t s
         std::runtime_error("graph templates must specify outputs"));
   }
 
-  const auto& params = decode_params_cached<GraphReduceParams>(
-      std::span<const std::uint8_t>(tmpl.params_msgpack.data(), tmpl.params_msgpack.size()),
-      parse_graph_reduce_params);
+  const auto& params = prepared_graph_reduce(tmpl);
   const int32_t out_block = params.output_base + group_idx;
   const auto& out = tmpl.outputs.front();
   ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version, out_block};
@@ -890,10 +1076,7 @@ hpx::future<void> Executor::run_graph_task(const TaskTemplateIR& tmpl, int32_t s
   int target = data_.home_rank(cref);
   int here = hpx::get_locality_id();
   if (target == here) {
-    return hpx::async([this, tmpl, stage_idx, tmpl_idx, group_idx]() mutable {
-      run_graph_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, group_idx, meta_, data_, kernels_)
-          .get();
-    });
+    return run_graph_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, group_idx, meta_, data_);
   }
 
   auto localities = hpx::find_all_localities();

@@ -39,6 +39,9 @@ def _make_runtime_handles():
         ]
     )
     ds = open_dataset("memory://example", runmeta=runmeta, step=0, level=0, runtime=rt)
+    payload = bytes(8 * 8 * 8 * 8)
+    ds._h.set_chunk_ref(0, 0, 1, 0, 0, payload)
+    ds._h.set_chunk_ref(0, 0, 2, 0, 0, payload)
     return rt, runmeta, ds
 
 

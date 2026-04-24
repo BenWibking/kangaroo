@@ -2,8 +2,8 @@
 
 #include "kangaroo/runmeta.hpp"
 
+#include <array>
 #include <cstdint>
-#include <unordered_map>
 #include <vector>
 
 namespace kangaroo {
@@ -23,29 +23,18 @@ class AdjacencyService {
 
 class AdjacencyServiceLocal final : public AdjacencyService {
  public:
-  explicit AdjacencyServiceLocal(const RunMeta& meta);
+ explicit AdjacencyServiceLocal(const RunMeta& meta);
 
   NeighborSpan neighbors(int32_t step, int16_t level, int32_t block, Face face) override;
 
  private:
-  struct CacheKey {
-    int32_t step = 0;
-    int16_t level = 0;
-    int32_t block = 0;
-    Face face = Face::Xm;
-
-    bool operator==(const CacheKey& other) const;
-  };
-
-  struct CacheKeyHash {
-    std::size_t operator()(const CacheKey& key) const;
-  };
-
-  NeighborSpan compute_neighbors(int32_t step, int16_t level, int32_t block, Face face);
+  using FaceNeighbors = std::array<std::vector<int32_t>, 6>;
+  using LevelNeighbors = std::vector<FaceNeighbors>;
+  std::vector<LevelNeighbors> build_step_neighbors(const StepMeta& step_meta) const;
+  std::vector<int32_t> compute_neighbors(const LevelMeta& level_meta, int32_t block, Face face) const;
 
   const RunMeta& meta_;
-  std::unordered_map<CacheKey, std::vector<int32_t>, CacheKeyHash> cache_;
-  std::vector<int32_t> scratch_;
+  std::vector<std::vector<LevelNeighbors>> neighbors_;
 };
 
 }  // namespace kangaroo

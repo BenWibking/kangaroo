@@ -2,7 +2,9 @@
 
 #include <msgpack.hpp>
 
+#include <cstdlib>
 #include <cstdint>
+#include <iostream>
 #include <optional>
 #include <string>
 #include <vector>
@@ -10,6 +12,19 @@
 namespace kangaroo {
 
 namespace {
+
+bool debug_plan_params_enabled() {
+  static const bool enabled = std::getenv("KANGAROO_DEBUG_PLAN_PARAMS") != nullptr;
+  return enabled;
+}
+
+std::size_t hash_bytes(const std::vector<std::uint8_t>& bytes) {
+  std::size_t hash = bytes.size();
+  for (auto byte : bytes) {
+    hash ^= static_cast<std::size_t>(byte) + 0x9e3779b97f4a7c15ULL + (hash << 6U) + (hash >> 2U);
+  }
+  return hash;
+}
 
 const msgpack::object& expect_map_value(const msgpack::object& obj, const char* key) {
   if (obj.type != msgpack::type::MAP) {
@@ -144,7 +159,34 @@ std::vector<std::uint8_t> repack_params(const msgpack::object& obj) {
   return std::vector<std::uint8_t>(buffer.data(), buffer.data() + buffer.size());
 }
 
-std::vector<msgpack::object> parse_shared_covered_boxes(const msgpack::object& root) {
+CoveredBoxListIR parse_covered_box_list(const msgpack::object& obj) {
+  if (obj.type != msgpack::type::ARRAY) {
+    throw std::runtime_error("covered box list must be array");
+  }
+  CoveredBoxListIR boxes;
+  boxes.reserve(obj.via.array.size);
+  for (uint32_t i = 0; i < obj.via.array.size; ++i) {
+    const auto& entry = obj.via.array.ptr[i];
+    if (entry.type != msgpack::type::ARRAY || entry.via.array.size != 2) {
+      throw std::runtime_error("covered box entry must be [lo, hi]");
+    }
+    const auto& lo = entry.via.array.ptr[0];
+    const auto& hi = entry.via.array.ptr[1];
+    if (lo.type != msgpack::type::ARRAY || hi.type != msgpack::type::ARRAY ||
+        lo.via.array.size != 3 || hi.via.array.size != 3) {
+      throw std::runtime_error("covered box lo/hi must be length-3 arrays");
+    }
+    CoveredBoxIR box;
+    for (uint32_t d = 0; d < 3; ++d) {
+      box.lo[d] = lo.via.array.ptr[d].as<int32_t>();
+      box.hi[d] = hi.via.array.ptr[d].as<int32_t>();
+    }
+    boxes.push_back(box);
+  }
+  return boxes;
+}
+
+std::vector<CoveredBoxListIR> parse_shared_covered_boxes(const msgpack::object& root) {
   const msgpack::object* shared_obj = nullptr;
   if (!try_get_map_value(root, "shared_covered_boxes", &shared_obj)) {
     return {};
@@ -152,24 +194,22 @@ std::vector<msgpack::object> parse_shared_covered_boxes(const msgpack::object& r
   if (shared_obj->type != msgpack::type::ARRAY) {
     throw std::runtime_error("shared_covered_boxes must be array");
   }
-  std::vector<msgpack::object> shared;
+  std::vector<CoveredBoxListIR> shared;
   shared.reserve(shared_obj->via.array.size);
   for (uint32_t i = 0; i < shared_obj->via.array.size; ++i) {
-    shared.push_back(shared_obj->via.array.ptr[i]);
+    shared.push_back(parse_covered_box_list(shared_obj->via.array.ptr[i]));
   }
   return shared;
 }
 
-std::vector<std::uint8_t> resolve_params_msgpack(
-    const msgpack::object& obj,
-    const std::vector<msgpack::object>& shared_covered_boxes) {
-  if (obj.type != msgpack::type::MAP || shared_covered_boxes.empty()) {
-    return repack_params(obj);
+int32_t parse_covered_boxes_ref(const msgpack::object& obj, std::size_t shared_count) {
+  if (obj.type != msgpack::type::MAP) {
+    return -1;
   }
 
   const msgpack::object* covered_boxes_ref = nullptr;
   if (!try_get_map_value(obj, "covered_boxes_ref", &covered_boxes_ref)) {
-    return repack_params(obj);
+    return -1;
   }
 
   int64_t ref_idx = -1;
@@ -179,12 +219,23 @@ std::vector<std::uint8_t> resolve_params_msgpack(
   } else {
     throw std::runtime_error("covered_boxes_ref must be integer");
   }
-  if (ref_idx < 0 || ref_idx >= static_cast<int64_t>(shared_covered_boxes.size())) {
+  if (ref_idx < 0 || ref_idx >= static_cast<int64_t>(shared_count)) {
     throw std::runtime_error("covered_boxes_ref out of range");
+  }
+  return static_cast<int32_t>(ref_idx);
+}
+
+std::vector<std::uint8_t> repack_params_without_covered_ref(const msgpack::object& obj) {
+  if (obj.type != msgpack::type::MAP) {
+    return repack_params(obj);
+  }
+
+  const msgpack::object* covered_boxes_ref = nullptr;
+  if (!try_get_map_value(obj, "covered_boxes_ref", &covered_boxes_ref)) {
+    return repack_params(obj);
   }
 
   uint32_t entry_count = 0;
-  bool has_covered_boxes = false;
   for (uint32_t i = 0; i < obj.via.map.size; ++i) {
     const auto& key = obj.via.map.ptr[i].key;
     if (key.type == msgpack::type::STR) {
@@ -192,20 +243,13 @@ std::vector<std::uint8_t> resolve_params_msgpack(
       if (key_str == "covered_boxes_ref") {
         continue;
       }
-      if (key_str == "covered_boxes") {
-        has_covered_boxes = true;
-      }
     }
-    ++entry_count;
-  }
-  if (!has_covered_boxes) {
     ++entry_count;
   }
 
   msgpack::sbuffer buffer;
   msgpack::packer<msgpack::sbuffer> packer(buffer);
   packer.pack_map(entry_count);
-  const auto& shared_boxes = shared_covered_boxes[static_cast<std::size_t>(ref_idx)];
   for (uint32_t i = 0; i < obj.via.map.size; ++i) {
     const auto& key = obj.via.map.ptr[i].key;
     const auto& value = obj.via.map.ptr[i].val;
@@ -214,22 +258,21 @@ std::vector<std::uint8_t> resolve_params_msgpack(
       if (key_str == "covered_boxes_ref") {
         continue;
       }
-      if (key_str == "covered_boxes") {
-        packer.pack(key);
-        packer.pack(shared_boxes);
-        has_covered_boxes = true;
-        continue;
-      }
     }
     packer.pack(key);
     packer.pack(value);
   }
-  if (!has_covered_boxes) {
-    packer.pack(std::string("covered_boxes"));
-    packer.pack(shared_boxes);
-  }
 
   return std::vector<std::uint8_t>(buffer.data(), buffer.data() + buffer.size());
+}
+
+std::size_t inline_covered_box_count(const msgpack::object& obj) {
+  const msgpack::object* covered_boxes = nullptr;
+  if (!try_get_map_value(obj, "covered_boxes", &covered_boxes) ||
+      covered_boxes->type != msgpack::type::ARRAY) {
+    return 0;
+  }
+  return covered_boxes->via.array.size;
 }
 
 }  // namespace
@@ -237,7 +280,7 @@ std::vector<std::uint8_t> resolve_params_msgpack(
 PlanIR decode_plan_msgpack(std::span<const std::uint8_t> payload) {
   msgpack::object_handle handle = msgpack::unpack(reinterpret_cast<const char*>(payload.data()), payload.size());
   msgpack::object root = handle.get();
-  const auto shared_covered_boxes = parse_shared_covered_boxes(root);
+  const bool debug_plan_params = debug_plan_params_enabled();
 
   const auto& stages_obj = expect_map_value(root, "stages");
   if (stages_obj.type != msgpack::type::ARRAY) {
@@ -245,6 +288,7 @@ PlanIR decode_plan_msgpack(std::span<const std::uint8_t> payload) {
   }
 
   PlanIR plan;
+  plan.shared_covered_boxes = parse_shared_covered_boxes(root);
   plan.stages.reserve(stages_obj.via.array.size);
 
   for (uint32_t si = 0; si < stages_obj.via.array.size; ++si) {
@@ -292,7 +336,30 @@ PlanIR decode_plan_msgpack(std::span<const std::uint8_t> payload) {
       }
       tmpl.deps = parse_deps(expect_map_value(tmpl_obj, "deps"));
       const auto& params_obj = expect_map_value(tmpl_obj, "params");
-      tmpl.params_msgpack = resolve_params_msgpack(params_obj, shared_covered_boxes);
+      tmpl.covered_boxes_ref = parse_covered_boxes_ref(params_obj, plan.shared_covered_boxes.size());
+      tmpl.params_msgpack = repack_params_without_covered_ref(params_obj);
+      if (debug_plan_params) {
+        if (tmpl.covered_boxes_ref >= 0) {
+          const auto ref_idx = static_cast<std::size_t>(tmpl.covered_boxes_ref);
+          const std::size_t covered_boxes_count = plan.shared_covered_boxes[ref_idx].size();
+          std::cout << "[kangaroo][plan-params] stage=" << stage.name
+                    << " template=" << tmpl.name
+                    << " kernel=" << tmpl.kernel
+                    << " covered_boxes_ref=" << tmpl.covered_boxes_ref
+                    << " covered_boxes_count=" << covered_boxes_count
+                    << " params_hash=" << hash_bytes(tmpl.params_msgpack)
+                    << std::endl;
+        } else if (const auto covered_boxes_count = inline_covered_box_count(params_obj);
+                   covered_boxes_count > 0) {
+          std::cout << "[kangaroo][plan-params] stage=" << stage.name
+                    << " template=" << tmpl.name
+                    << " kernel=" << tmpl.kernel
+                    << " covered_boxes_ref=-1"
+                    << " covered_boxes_count=" << covered_boxes_count
+                    << " params_hash=" << hash_bytes(tmpl.params_msgpack)
+                    << std::endl;
+        }
+      }
 
       if (tmpl.deps.kind == "FaceNeighbors") {
         if (tmpl.inputs.empty()) {

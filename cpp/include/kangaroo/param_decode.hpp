@@ -13,11 +13,22 @@ const msgpack::object* find_msgpack_map_value(const msgpack::object& obj, const 
 
 const msgpack::object& cached_params_root(std::span<const std::uint8_t> params_msgpack);
 
+class ScopedPreparedParams {
+ public:
+  ScopedPreparedParams(std::type_index type, std::shared_ptr<const void> decoded);
+  ~ScopedPreparedParams();
+
+ private:
+  std::type_index previous_type_{typeid(void)};
+  std::shared_ptr<const void> previous_decoded_;
+};
+
 template <typename T, typename DecodeFn>
 const T& decode_params_cached(std::span<const std::uint8_t> params_msgpack, DecodeFn&& decode_fn);
 
 namespace detail {
 
+std::shared_ptr<const void> current_prepared_params(std::type_index type);
 std::shared_ptr<const void> find_cached_params_decode(std::span<const std::uint8_t> params_msgpack,
                                                       std::type_index type);
 
@@ -30,6 +41,9 @@ void store_cached_params_decode(std::span<const std::uint8_t> params_msgpack,
 template <typename T, typename DecodeFn>
 const T& decode_params_cached(std::span<const std::uint8_t> params_msgpack, DecodeFn&& decode_fn) {
   const auto type = std::type_index(typeid(T));
+  if (auto decoded = detail::current_prepared_params(type)) {
+    return *static_cast<const T*>(decoded.get());
+  }
   if (auto decoded = detail::find_cached_params_decode(params_msgpack, type)) {
     return *static_cast<const T*>(decoded.get());
   }

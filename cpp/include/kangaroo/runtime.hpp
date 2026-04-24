@@ -14,9 +14,13 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
+
+#include <hpx/include/lcos.hpp>
 
 namespace kangaroo {
 
@@ -119,6 +123,39 @@ struct DatasetHandle {
   HPX_SERIALIZATION_SPLIT_MEMBER()
 };
 
+struct ChunkSlot {
+  std::shared_ptr<hpx::promise<std::shared_ptr<HostView>>> promise;
+  hpx::shared_future<std::shared_ptr<HostView>> future;
+  std::shared_ptr<HostView> value;
+  bool ready = false;
+  bool dataset_load_started = false;
+};
+
+struct ChunkStore {
+  using MapT = std::unordered_map<ChunkRef, ChunkSlot, ChunkRefHash, ChunkRefEq>;
+
+  std::mutex mutex;
+  MapT data;
+};
+
+struct ExecutionContext {
+  int32_t run_id = 0;
+  RunMeta meta;
+  DatasetHandle dataset;
+  PlanIR plan;
+  std::shared_ptr<AdjacencyServiceLocal> adjacency;
+  std::shared_ptr<ChunkStore> chunk_store;
+};
+
+class ScopedExecutionContext {
+ public:
+  explicit ScopedExecutionContext(int32_t run_id);
+  ~ScopedExecutionContext();
+
+ private:
+  int32_t previous_run_id_ = 0;
+};
+
 class Runtime {
  public:
   Runtime();
@@ -142,7 +179,8 @@ class Runtime {
                           int16_t level,
                           int32_t field,
                           int32_t version,
-                          int32_t block);
+                          int32_t block,
+                          const DatasetHandle* dataset = nullptr);
 
   int32_t locality_id();
   int32_t num_localities();
@@ -155,6 +193,9 @@ class Runtime {
  private:
   int32_t next_field_id_ = 1000;
   int32_t next_plan_id_ = 1;
+  int32_t retained_output_run_id_ = 0;
+  std::vector<int32_t> retained_output_run_ids_;
+  int32_t preload_run_id_ = 0;
   std::unordered_map<int32_t, std::string> persistent_fields_;
 
   KernelRegistry kernel_registry_;
@@ -198,14 +239,18 @@ bool has_perfetto_trace();
 void log_task_event(const TaskEvent& event);
 void log_phase_event(const PhaseEvent& event);
 
-void set_global_runmeta(const RunMeta& meta);
-const RunMeta& global_runmeta();
-void set_global_dataset(const DatasetHandle& dataset);
-const DatasetHandle& global_dataset();
+void set_execution_context(int32_t run_id,
+                           const RunMeta& meta,
+                           const DatasetHandle& dataset,
+                           const PlanIR& plan);
+std::shared_ptr<ExecutionContext> execution_context_shared(int32_t run_id);
+const ExecutionContext& execution_context(int32_t run_id);
+bool execution_context_may_produce_chunk(int32_t run_id, const ChunkRef& ref);
+void erase_execution_context(int32_t run_id);
+const RunMeta& current_runmeta();
+const DatasetHandle& current_dataset();
+
 void set_global_kernel_registry(KernelRegistry* registry);
 KernelRegistry& global_kernels();
-void set_global_plan(int32_t plan_id, const PlanIR& plan);
-const PlanIR& global_plan(int32_t plan_id);
-void erase_global_plan(int32_t plan_id);
 
 }  // namespace kangaroo

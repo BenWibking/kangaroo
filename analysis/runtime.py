@@ -123,10 +123,7 @@ class Runtime:
 
     @staticmethod
     def _bind_dataset_handle(dataset: Any | None) -> None:
-        if dataset is None or not hasattr(dataset, "_h"):
-            return
-        if hasattr(_core, "set_global_dataset"):
-            _core.set_global_dataset(dataset._h)
+        return
 
     @property
     def kernels(self):
@@ -141,7 +138,6 @@ class Runtime:
     def run(self, plan: Plan, *, runmeta, dataset, progress_bar: bool = False) -> None:
         if self._run_in_progress:
             raise RuntimeError("runtime run is already in progress")
-        self._bind_dataset_handle(dataset)
         prepare_start = time.time()
         phase_start = prepare_start
         plan_ir = plan_to_dict(plan)
@@ -239,7 +235,6 @@ class Runtime:
         self._rt.release_console_workers()
 
     def preload(self, *, runmeta, dataset, fields: list[int]) -> None:
-        self._bind_dataset_handle(dataset)
         self._rt.preload_dataset(runmeta._h, dataset._h, list(fields))
 
     def get_task_chunk(
@@ -254,8 +249,8 @@ class Runtime:
     ) -> bytes:
         if self._run_in_progress:
             raise RuntimeError("output retrieval is not allowed while a plan run is in progress")
-        self._bind_dataset_handle(dataset)
-        return self._rt.get_task_chunk(step, level, field, version, block)
+        dataset_h = dataset._h if dataset is not None and hasattr(dataset, "_h") else None
+        return self._rt.get_task_chunk(step, level, field, version, block, dataset_h)
 
     def get_task_chunk_array(
         self,

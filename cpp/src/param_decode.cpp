@@ -59,6 +59,9 @@ std::shared_ptr<ParamCacheEntry> get_or_create_entry(std::span<const std::uint8_
   return entry;
 }
 
+thread_local std::type_index g_prepared_params_type = std::type_index(typeid(void));
+thread_local std::shared_ptr<const void> g_prepared_params;
+
 }  // namespace
 
 const msgpack::object* find_msgpack_map_value(const msgpack::object& obj, const char* key) {
@@ -93,6 +96,24 @@ const msgpack::object& cached_params_root(std::span<const std::uint8_t> params_m
     entry->root_ready = true;
   }
   return entry->root_handle.get();
+}
+
+ScopedPreparedParams::ScopedPreparedParams(std::type_index type, std::shared_ptr<const void> decoded)
+    : previous_type_(g_prepared_params_type), previous_decoded_(std::move(g_prepared_params)) {
+  g_prepared_params_type = type;
+  g_prepared_params = std::move(decoded);
+}
+
+ScopedPreparedParams::~ScopedPreparedParams() {
+  g_prepared_params_type = previous_type_;
+  g_prepared_params = std::move(previous_decoded_);
+}
+
+std::shared_ptr<const void> detail::current_prepared_params(std::type_index type) {
+  if (g_prepared_params && g_prepared_params_type == type) {
+    return g_prepared_params;
+  }
+  return {};
 }
 
 std::shared_ptr<const void> detail::find_cached_params_decode(

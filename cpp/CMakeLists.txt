@@ -64,7 +64,6 @@ set(KANGAROO_RUNTIME_SOURCES
   src/kernel_registry.cpp
   src/param_decode.cpp
   src/plan_decode_msgpack.cpp
-  src/runtime.cpp
 )
 
 if(KANGAROO_USE_OPENPMD)
@@ -198,7 +197,7 @@ target_compile_features(kangaroo_runtime PUBLIC cxx_std_20)
 
 target_compile_definitions(kangaroo_runtime PUBLIC KANGAROO_USE_MSGPACK)
 
-nanobind_add_module(_core src/bindings.cpp)
+nanobind_add_module(_core src/bindings.cpp src/runtime.cpp)
 target_link_libraries(_core PRIVATE kangaroo_runtime)
 target_compile_definitions(_core PRIVATE KANGAROO_USE_NANOBIND)
 if(KANGAROO_HPX_RPATH_DIRS)

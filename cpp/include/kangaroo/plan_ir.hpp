@@ -1,8 +1,13 @@
 #pragma once
 
+#include "kangaroo/kernel.hpp"
+
+#include <array>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
+#include <typeindex>
 #include <vector>
 
 #include <hpx/datastructures/serialization/optional.hpp>
@@ -48,6 +53,31 @@ struct DepRuleIR {
   }
 };
 
+struct GraphReduceSpecIR {
+  int32_t fan_in = 1;
+  int32_t num_inputs = 0;
+  int32_t input_base = 0;
+  int32_t output_base = 0;
+  std::vector<int32_t> input_blocks;
+};
+
+struct CoveredBoxIR {
+  std::array<int32_t, 3> lo{0, 0, 0};
+  std::array<int32_t, 3> hi{0, 0, 0};
+
+  template <typename Archive>
+  void serialize(Archive& ar, unsigned) {
+    for (auto& v : lo) {
+      ar& v;
+    }
+    for (auto& v : hi) {
+      ar& v;
+    }
+  }
+};
+
+using CoveredBoxListIR = std::vector<CoveredBoxIR>;
+
 struct TaskTemplateIR {
   std::string name;
   ExecPlane plane = ExecPlane::Chunk;
@@ -57,11 +87,17 @@ struct TaskTemplateIR {
   std::vector<FieldRefIR> outputs;
   std::vector<int32_t> output_bytes;
   DepRuleIR deps;
+  int32_t covered_boxes_ref = -1;
   std::vector<std::uint8_t> params_msgpack;
+  std::shared_ptr<const KernelFn> kernel_fn;           // locality-local prepared metadata
+  std::optional<GraphReduceSpecIR> graph_reduce;       // locality-local prepared metadata
+  std::shared_ptr<const void> prepared_params;         // locality-local prepared metadata
+  std::type_index prepared_params_type{typeid(void)};  // locality-local prepared metadata
 
   template <typename Archive>
   void serialize(Archive& ar, unsigned) {
-    ar& name& plane& kernel& domain& inputs& outputs& output_bytes& deps& params_msgpack;
+    ar& name& plane& kernel& domain& inputs& outputs& output_bytes& deps& covered_boxes_ref&
+        params_msgpack;
   }
 };
 
@@ -78,11 +114,12 @@ struct StageIR {
 };
 
 struct PlanIR {
+  std::vector<CoveredBoxListIR> shared_covered_boxes;
   std::vector<StageIR> stages;
 
   template <typename Archive>
   void serialize(Archive& ar, unsigned) {
-    ar& stages;
+    ar& shared_covered_boxes& stages;
   }
 };
 

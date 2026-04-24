@@ -123,13 +123,52 @@ double now_seconds() {
   return std::chrono::duration<double>(now.time_since_epoch()).count();
 }
 
+kangaroo::Runtime& binding_runtime() {
+  static kangaroo::Runtime runtime;
+  return runtime;
+}
+
+kangaroo::IndexBox3 parse_index_box(nb::tuple lo, nb::tuple hi) {
+  kangaroo::IndexBox3 b;
+  b.lo[0] = nb::cast<int32_t>(lo[0]);
+  b.lo[1] = nb::cast<int32_t>(lo[1]);
+  b.lo[2] = nb::cast<int32_t>(lo[2]);
+  b.hi[0] = nb::cast<int32_t>(hi[0]);
+  b.hi[1] = nb::cast<int32_t>(hi[1]);
+  b.hi[2] = nb::cast<int32_t>(hi[2]);
+  return b;
+}
+
+kangaroo::HostView host_view_from_bytes(nb::bytes payload) {
+  kangaroo::HostView view;
+  const auto* raw = reinterpret_cast<const std::uint8_t*>(payload.data());
+  view.data.assign(raw, raw + payload.size());
+  return view;
+}
+
+nb::bytes host_view_bytes(const kangaroo::HostView& view) {
+  return nb::bytes(reinterpret_cast<const char*>(view.data.data()), view.data.size());
+}
+
+nb::dict subbox_view_dict(const kangaroo::SubboxView& view) {
+  auto to_tuple = [](const int32_t v[3]) {
+    return nb::make_tuple(v[0], v[1], v[2]);
+  };
+  nb::dict d;
+  d["data"] = nb::bytes(reinterpret_cast<const char*>(view.data.data.data()),
+                        view.data.data.size());
+  d["bytes_per_value"] = view.bytes_per_value;
+  d["lo"] = to_tuple(view.box.lo);
+  d["hi"] = to_tuple(view.box.hi);
+  return d;
+}
+
 }  // namespace
 
 NB_MODULE(_core, m) {
   m.def("hpx_configuration_string", []() { return hpx::configuration_string(); });
   m.def("set_event_log_path", &kangaroo::set_event_log_path);
   m.def("set_perfetto_trace_path", &kangaroo::set_perfetto_trace_path);
-  m.def("set_global_dataset", &kangaroo::set_global_dataset);
   m.def("test_get_subbox",
         [](kangaroo::DatasetHandle& dataset,
            int32_t step,
@@ -142,37 +181,17 @@ NB_MODULE(_core, m) {
            nb::tuple request_lo,
            nb::tuple request_hi,
            int32_t bytes_per_value) -> nb::dict {
-          auto parse_box = [](nb::tuple lo, nb::tuple hi) {
-            kangaroo::IndexBox3 b;
-            b.lo[0] = nb::cast<int32_t>(lo[0]);
-            b.lo[1] = nb::cast<int32_t>(lo[1]);
-            b.lo[2] = nb::cast<int32_t>(lo[2]);
-            b.hi[0] = nb::cast<int32_t>(hi[0]);
-            b.hi[1] = nb::cast<int32_t>(hi[1]);
-            b.hi[2] = nb::cast<int32_t>(hi[2]);
-            return b;
-          };
-
-          kangaroo::set_global_dataset(dataset);
+          (void)binding_runtime().locality_id();
 
           kangaroo::ChunkSubboxRef ref;
           ref.chunk = kangaroo::ChunkRef{step, level, field, version, block};
-          ref.chunk_box = parse_box(chunk_lo, chunk_hi);
-          ref.request_box = parse_box(request_lo, request_hi);
+          ref.chunk_box = parse_index_box(chunk_lo, chunk_hi);
+          ref.request_box = parse_index_box(request_lo, request_hi);
           ref.bytes_per_value = bytes_per_value;
 
-          auto out = kangaroo::data_get_subbox_local_impl(ref);
-
-          auto to_tuple = [](const int32_t v[3]) {
-            return nb::make_tuple(v[0], v[1], v[2]);
-          };
-          nb::dict d;
-          d["data"] =
-              nb::bytes(reinterpret_cast<const char*>(out.data.data.data()), out.data.data.size());
-          d["bytes_per_value"] = out.bytes_per_value;
-          d["lo"] = to_tuple(out.box.lo);
-          d["hi"] = to_tuple(out.box.hi);
-          return d;
+          kangaroo::DataServiceLocal data_service(0, &dataset);
+          auto out = data_service.get_subbox(ref).get();
+          return subbox_view_dict(out);
         },
         nb::arg("dataset"),
         nb::arg("step"),
@@ -185,6 +204,164 @@ NB_MODULE(_core, m) {
         nb::arg("request_lo"),
         nb::arg("request_hi"),
         nb::arg("bytes_per_value"));
+  m.def("test_data_service_pending_then_put",
+        [](kangaroo::DatasetHandle& dataset,
+           int32_t step,
+           int16_t level,
+           int32_t field,
+           int32_t version,
+           int32_t block,
+           nb::bytes payload,
+           int64_t timeout_ms) -> nb::dict {
+          (void)binding_runtime().locality_id();
+
+          kangaroo::DataServiceLocal data_service(0, &dataset);
+          kangaroo::ChunkRef ref{step, level, field, version, block};
+
+          (void)timeout_ms;
+          auto host_future = data_service.get_host(ref);
+          const bool returned_before_put = true;
+          const bool future_ready_before_put = host_future.is_ready();
+
+          kangaroo::HostView payload_view = host_view_from_bytes(payload);
+          data_service.put_host(ref, std::move(payload_view)).get();
+          const bool ready_before_get = host_future.is_ready();
+          kangaroo::HostView out = host_future.get();
+
+          nb::dict d;
+          d["returned_before_put"] = returned_before_put;
+          d["future_ready_before_put"] = future_ready_before_put;
+          d["ready_before_get"] = ready_before_get;
+          d["data"] = host_view_bytes(out);
+          return d;
+        },
+        nb::arg("dataset"),
+        nb::arg("step"),
+        nb::arg("level"),
+        nb::arg("field"),
+        nb::arg("version"),
+        nb::arg("block"),
+        nb::arg("payload"),
+        nb::arg("timeout_ms") = 50);
+  m.def("test_data_service_put_then_get",
+        [](kangaroo::DatasetHandle& dataset,
+           int32_t step,
+           int16_t level,
+           int32_t field,
+           int32_t version,
+           int32_t block,
+           nb::bytes payload) -> nb::dict {
+          (void)binding_runtime().locality_id();
+
+          kangaroo::DataServiceLocal data_service(0, &dataset);
+          kangaroo::ChunkRef ref{step, level, field, version, block};
+          data_service.put_host(ref, host_view_from_bytes(payload)).get();
+
+          auto host_future = data_service.get_host(ref);
+          const bool ready_before_get = host_future.is_ready();
+          kangaroo::HostView out = host_future.get();
+
+          nb::dict d;
+          d["ready_before_get"] = ready_before_get;
+          d["data"] = host_view_bytes(out);
+          return d;
+        },
+        nb::arg("dataset"),
+        nb::arg("step"),
+        nb::arg("level"),
+        nb::arg("field"),
+        nb::arg("version"),
+        nb::arg("block"),
+        nb::arg("payload"));
+  m.def("test_data_service_many_pending_consumers_then_put",
+        [](kangaroo::DatasetHandle& dataset,
+           int32_t step,
+           int16_t level,
+           int32_t field,
+           int32_t version,
+           int32_t block,
+           nb::bytes payload,
+           int32_t consumers) -> nb::dict {
+          (void)binding_runtime().locality_id();
+
+          kangaroo::DataServiceLocal data_service(0, &dataset);
+          kangaroo::ChunkRef ref{step, level, field, version, block};
+          std::vector<hpx::future<kangaroo::HostView>> futures;
+          futures.reserve(static_cast<std::size_t>(consumers));
+          nb::list ready_before_put;
+          for (int32_t i = 0; i < consumers; ++i) {
+            futures.push_back(data_service.get_host(ref));
+            ready_before_put.append(futures.back().is_ready());
+          }
+
+          data_service.put_host(ref, host_view_from_bytes(payload)).get();
+
+          nb::list ready_after_put;
+          nb::list data;
+          for (auto& future : futures) {
+            ready_after_put.append(future.is_ready());
+            data.append(host_view_bytes(future.get()));
+          }
+
+          nb::dict d;
+          d["ready_before_put"] = ready_before_put;
+          d["ready_after_put"] = ready_after_put;
+          d["data"] = data;
+          return d;
+        },
+        nb::arg("dataset"),
+        nb::arg("step"),
+        nb::arg("level"),
+        nb::arg("field"),
+        nb::arg("version"),
+        nb::arg("block"),
+        nb::arg("payload"),
+        nb::arg("consumers"));
+  m.def("test_data_service_subbox_pending_then_put",
+        [](kangaroo::DatasetHandle& dataset,
+           int32_t step,
+           int16_t level,
+           int32_t field,
+           int32_t version,
+           int32_t block,
+           nb::tuple chunk_lo,
+           nb::tuple chunk_hi,
+           nb::tuple request_lo,
+           nb::tuple request_hi,
+           int32_t bytes_per_value,
+           nb::bytes payload) -> nb::dict {
+          (void)binding_runtime().locality_id();
+
+          kangaroo::ChunkSubboxRef subbox_ref;
+          subbox_ref.chunk = kangaroo::ChunkRef{step, level, field, version, block};
+          subbox_ref.chunk_box = parse_index_box(chunk_lo, chunk_hi);
+          subbox_ref.request_box = parse_index_box(request_lo, request_hi);
+          subbox_ref.bytes_per_value = bytes_per_value;
+
+          kangaroo::DataServiceLocal data_service(0, &dataset);
+          auto subbox_future = data_service.get_subbox(subbox_ref);
+          const bool future_ready_before_put = subbox_future.is_ready();
+          data_service.put_host(subbox_ref.chunk, host_view_from_bytes(payload)).get();
+          const bool ready_before_get = subbox_future.is_ready();
+          auto out = subbox_future.get();
+
+          nb::dict d = subbox_view_dict(out);
+          d["future_ready_before_put"] = future_ready_before_put;
+          d["ready_before_get"] = ready_before_get;
+          return d;
+        },
+        nb::arg("dataset"),
+        nb::arg("step"),
+        nb::arg("level"),
+        nb::arg("field"),
+        nb::arg("version"),
+        nb::arg("block"),
+        nb::arg("chunk_lo"),
+        nb::arg("chunk_hi"),
+        nb::arg("request_lo"),
+        nb::arg("request_hi"),
+        nb::arg("bytes_per_value"),
+        nb::arg("payload"));
   m.def("log_task_event",
         [](const std::string& name,
            const std::string& status,
@@ -297,10 +474,16 @@ NB_MODULE(_core, m) {
       .def("release_console_workers", &kangaroo::Runtime::release_console_workers)
       .def("get_task_chunk",
            [](kangaroo::Runtime& self, int32_t step, int16_t level, int32_t field,
-              int32_t version, int32_t block) {
-             auto view = self.get_task_chunk(step, level, field, version, block);
+              int32_t version, int32_t block, kangaroo::DatasetHandle* dataset) {
+             auto view = self.get_task_chunk(step, level, field, version, block, dataset);
              return nb::bytes(reinterpret_cast<const char*>(view.data.data()), view.data.size());
-           })
+           },
+           nb::arg("step"),
+           nb::arg("level"),
+           nb::arg("field"),
+           nb::arg("version") = 0,
+           nb::arg("block"),
+           nb::arg("dataset") = nb::none())
       .def("preload_dataset", &kangaroo::Runtime::preload_dataset)
       .def("run_packed_plan",
            &kangaroo::Runtime::run_packed_plan,
