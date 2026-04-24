@@ -143,7 +143,7 @@ struct ExecutionContext {
   RunMeta meta;
   DatasetHandle dataset;
   PlanIR plan;
-  std::shared_ptr<AdjacencyServiceLocal> adjacency;
+  std::shared_ptr<AdjacencyService> adjacency;
   std::shared_ptr<ChunkStore> chunk_store;
 };
 

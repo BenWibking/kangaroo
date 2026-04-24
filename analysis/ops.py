@@ -1184,29 +1184,28 @@ class ParticleCICProjection:
                 "particle_cic_projection",
                 after=[previous_level_tail] if previous_level_tail is not None else None,
             )
-            for block in blocks:
-                dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
-                params = {
-                    "particle_type": self.particle_type,
-                    "level_index": int(level_idx),
-                    "axis": axis_idx,
-                    "axis_bounds": [float(self.axis_bounds[0]), float(self.axis_bounds[1])],
-                    "rect": list(self.rect),
-                    "resolution": [nx, ny],
-                    "covered_boxes": covered_payload,
-                }
-                if self.mass_max is not None:
-                    params["mass_max"] = float(self.mass_max)
-                stage.map_blocks(
-                    name=f"particle_cic_projection_b{block}",
-                    kernel="particle_cic_projection_accumulate",
-                    domain=dom,
-                    inputs=[],
-                    outputs=[sum_field],
-                    output_bytes=[out_sum_bytes],
-                    deps={"kind": "None"},
-                    params=params,
-                )
+            dom = ctx.domain(step=ds.step, level=level_idx, blocks=blocks)
+            params = {
+                "particle_type": self.particle_type,
+                "level_index": int(level_idx),
+                "axis": axis_idx,
+                "axis_bounds": [float(self.axis_bounds[0]), float(self.axis_bounds[1])],
+                "rect": list(self.rect),
+                "resolution": [nx, ny],
+                "covered_boxes": covered_payload,
+            }
+            if self.mass_max is not None:
+                params["mass_max"] = float(self.mass_max)
+            stage.map_blocks(
+                name=f"particle_cic_projection_l{level_idx}",
+                kernel="particle_cic_projection_accumulate",
+                domain=dom,
+                inputs=[],
+                outputs=[sum_field],
+                output_bytes=[out_sum_bytes],
+                deps={"kind": "None"},
+                params=params,
+            )
             stages.append(stage)
             producer_stage[sum_field.field] = stage
 

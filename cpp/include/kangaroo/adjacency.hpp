@@ -21,6 +21,13 @@ class AdjacencyService {
   virtual NeighborSpan neighbors(int32_t step, int16_t level, int32_t block, Face face) = 0;
 };
 
+class EmptyAdjacencyService final : public AdjacencyService {
+ public:
+  NeighborSpan neighbors(int32_t, int16_t, int32_t, Face) override {
+    return NeighborSpan{};
+  }
+};
+
 class AdjacencyServiceLocal final : public AdjacencyService {
  public:
  explicit AdjacencyServiceLocal(const RunMeta& meta);

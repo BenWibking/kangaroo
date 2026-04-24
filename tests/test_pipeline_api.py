@@ -333,8 +333,9 @@ def test_pipeline_particle_cic_projection_lowering_wiring() -> None:
     templates = [tmpl for stage in plan.topo_stages() for tmpl in stage.templates]
     acc = [tmpl for tmpl in templates if tmpl.kernel == "particle_cic_projection_accumulate"]
     red = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
-    assert len(acc) == 2
+    assert len(acc) == 1
     assert red
+    assert acc[0].domain.blocks == [0, 1]
     assert all(tmpl.params["resolution"] == [16, 16] for tmpl in acc)
     assert all(tmpl.params["particle_type"] == "StochasticStellarPop_particles" for tmpl in acc)
     assert all(tmpl.params["level_index"] == 0 for tmpl in acc)

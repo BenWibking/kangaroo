@@ -4931,12 +4931,29 @@ std::shared_ptr<ExecutionContext> build_execution_context_impl(int32_t run_id,
   PlanIR prepared = plan;
   prepare_plan(prepared, global_kernels());
 
+  bool needs_adjacency = false;
+  for (const auto& stage : prepared.stages) {
+    for (const auto& tmpl : stage.templates) {
+      if (tmpl.deps.kind == "FaceNeighbors") {
+        needs_adjacency = true;
+        break;
+      }
+    }
+    if (needs_adjacency) {
+      break;
+    }
+  }
+
   auto ctx = std::make_shared<ExecutionContext>();
   ctx->run_id = run_id;
   ctx->meta = meta;
   ctx->dataset = dataset;
   ctx->plan = std::move(prepared);
-  ctx->adjacency = std::make_shared<AdjacencyServiceLocal>(ctx->meta);
+  if (needs_adjacency) {
+    ctx->adjacency = std::make_shared<AdjacencyServiceLocal>(ctx->meta);
+  } else {
+    ctx->adjacency = std::make_shared<EmptyAdjacencyService>();
+  }
   ctx->chunk_store = std::move(chunk_store);
   if (ctx->chunk_store == nullptr) {
     ctx->chunk_store = std::make_shared<ChunkStore>();
