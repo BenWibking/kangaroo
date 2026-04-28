@@ -7,6 +7,7 @@ import numpy as np
 
 from .ctx import LoweringContext
 from .ops import (
+    FluxSurfaceIntegral,
     Histogram1D,
     Histogram2D,
     ParticleCICProjection,
@@ -51,6 +52,25 @@ class Histogram2DHandle:
     @property
     def edges(self) -> tuple[list[float], list[float]]:
         return histogram_edges_2d(self.x_range, self.y_range, self.bins)
+
+
+@dataclass(frozen=True)
+class FluxSurfaceIntegralHandle:
+    fluxes: FieldHandle
+    components: tuple[str, str, str, str] = (
+        "mass_flux_sphere",
+        "hydro_energy_flux_sphere",
+        "mhd_energy_flux_sphere",
+        "passive_scalar_flux_sphere",
+    )
+
+    @property
+    def field(self) -> int:
+        return self.fluxes.field
+
+    @property
+    def name(self) -> str | None:
+        return self.fluxes.name
 
 
 @dataclass(frozen=True)
@@ -627,6 +647,41 @@ class Pipeline:
         self._append_fragment(fragment)
         out_field = self._sink_fields(fragment)[-1]
         return FieldHandle(self, out_field, out_name)
+
+    def flux_surface_integral(
+        self,
+        density: int | FieldHandle,
+        *,
+        momentum: tuple[int | FieldHandle, int | FieldHandle, int | FieldHandle],
+        energy: int | FieldHandle,
+        passive_scalar: int | FieldHandle,
+        magnetic_field: tuple[int | FieldHandle, int | FieldHandle, int | FieldHandle],
+        radius: float,
+        out: str | None = None,
+        gamma: float = 5.0 / 3.0,
+        bytes_per_value: int | None = None,
+        reduce_fan_in: int | None = None,
+    ) -> FluxSurfaceIntegralHandle:
+        if len(momentum) != 3:
+            raise ValueError("momentum must contain three fields")
+        if len(magnetic_field) != 3:
+            raise ValueError("magnetic_field must contain three cell-centered fields")
+        out_name = out or self._unique_name("flux_surface_integral")
+        fragment = FluxSurfaceIntegral(
+            density=self._as_field_id(density),
+            momentum=tuple(self._as_field_id(comp) for comp in momentum),
+            energy=self._as_field_id(energy),
+            passive_scalar=self._as_field_id(passive_scalar),
+            magnetic_field=tuple(self._as_field_id(comp) for comp in magnetic_field),
+            radius=radius,
+            out_name=out_name,
+            gamma=gamma,
+            bytes_per_value=bytes_per_value,
+            reduce_fan_in=reduce_fan_in,
+        ).lower(self._ctx)
+        self._append_fragment(fragment)
+        out_field = self._sink_fields(fragment)[-1]
+        return FluxSurfaceIntegralHandle(FieldHandle(self, out_field, out_name))
 
     def histogram1d(
         self,

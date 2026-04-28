@@ -1532,6 +1532,295 @@ class ParticleCICGrid:
         return ctx.fragment(stages)
 
 
+class FluxSurfaceIntegral:
+    def __init__(
+        self,
+        *,
+        density: int,
+        momentum: tuple[int, int, int],
+        energy: int,
+        passive_scalar: int,
+        magnetic_field: tuple[int, int, int],
+        radius: float,
+        out_name: str = "flux_surface_integral",
+        gamma: float = 5.0 / 3.0,
+        bytes_per_value: int | None = None,
+        reduce_fan_in: Optional[int] = None,
+    ) -> None:
+        self.density = int(density)
+        self.momentum = tuple(int(v) for v in momentum)
+        self.energy = int(energy)
+        self.passive_scalar = int(passive_scalar)
+        self.magnetic_field = tuple(int(v) for v in magnetic_field)
+        self.radius = float(radius)
+        self.out_name = out_name
+        self.gamma = float(gamma)
+        self.bytes_per_value = bytes_per_value
+        self.reduce_fan_in = reduce_fan_in
+
+    def _reduce_fan_in(self, num_inputs: int) -> int:
+        if self.reduce_fan_in is None:
+            return _default_reduce_fan_in(num_inputs)
+        return max(1, int(self.reduce_fan_in))
+
+    def _ref_ratio_between(self, levels, coarse: int, fine: int) -> int:
+        ratio = 1
+        for lev in range(coarse, fine):
+            ratio *= int(levels[lev].geom.ref_ratio)
+        return ratio
+
+    def _covered_boxes_for_level(
+        self,
+        ctx: LoweringContext,
+        *,
+        level: int,
+    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
+        ds = ctx.dataset
+        levels = ctx.runmeta.steps[ds.step].levels
+        coarse_origin = levels[level].geom.index_origin
+        covered: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
+        for fine in range(level + 1, len(levels)):
+            ratio = self._ref_ratio_between(levels, level, fine)
+            fine_origin = levels[fine].geom.index_origin
+            for box in levels[fine].boxes:
+                covered.append(
+                    _coarsen_box(
+                        box.lo,
+                        box.hi,
+                        ratio=ratio,
+                        fine_origin=fine_origin,
+                        coarse_origin=coarse_origin,
+                    )
+                )
+        return covered
+
+    def _block_intersects_sphere(self, level_meta, block) -> bool:
+        radius2 = self.radius * self.radius
+        geom = level_meta.geom
+        lo2 = 0.0
+        hi2 = 0.0
+        for axis in range(3):
+            x0, x1 = _bounds_1d(
+                block.lo[axis],
+                block.hi[axis],
+                geom.x0[axis],
+                geom.dx[axis],
+                geom.index_origin[axis],
+            )
+            if x1 < 0.0:
+                lo2 += x1 * x1
+            elif x0 > 0.0:
+                lo2 += x0 * x0
+            hi2 += max(abs(x0), abs(x1)) ** 2
+        return lo2 <= radius2 <= hi2
+
+    def lower(self, ctx: LoweringContext):
+        ds = ctx.dataset
+        if not math.isfinite(self.radius) or self.radius <= 0.0:
+            raise ValueError("radius must be finite and positive")
+        if not math.isfinite(self.gamma) or self.gamma <= 1.0:
+            raise ValueError("gamma must be finite and greater than 1")
+        if len(self.momentum) != 3:
+            raise ValueError("momentum must contain three fields")
+        if len(self.magnetic_field) != 3:
+            raise ValueError("magnetic_field must contain three cell-centered fields")
+
+        bpv = _resolve_bytes_per_value(
+            ctx,
+            field=self.density,
+            bytes_per_value=self.bytes_per_value,
+        )
+        input_fields = [
+            self.density,
+            *self.momentum,
+            self.energy,
+            self.passive_scalar,
+            *self.magnetic_field,
+        ]
+        levels = ctx.runmeta.steps[ds.step].levels
+        out_bytes = 4 * 8
+
+        flux_fields: list[tuple[FieldRef, int]] = []
+        stages: list = []
+        producer_stage: dict[int, object] = {}
+
+        for level_idx in range(len(levels) - 1, -1, -1):
+            level_meta = levels[level_idx]
+            blocks = [
+                block_idx
+                for block_idx, block in enumerate(level_meta.boxes)
+                if self._block_intersects_sphere(level_meta, block)
+            ]
+            if not blocks:
+                continue
+
+            covered_boxes = self._covered_boxes_for_level(ctx, level=level_idx)
+            covered_payload = [[list(c_lo), list(c_hi)] for c_lo, c_hi in covered_boxes]
+            flux_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
+
+            stage = ctx.stage("flux_surface_integral")
+            for block in blocks:
+                dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
+                stage.map_blocks(
+                    name=f"flux_surface_integral_b{block}",
+                    kernel="flux_surface_integral_accumulate",
+                    domain=dom,
+                    inputs=[FieldRef(fid) for fid in input_fields],
+                    outputs=[flux_field],
+                    output_bytes=[out_bytes],
+                    deps={"kind": "None"},
+                    params={
+                        "radius": self.radius,
+                        "gamma": self.gamma,
+                        "bytes_per_value": int(bpv),
+                        "covered_boxes": covered_payload,
+                    },
+                )
+            stages.append(stage)
+            producer_stage[flux_field.field] = stage
+
+            num_inputs = len(blocks)
+            fan_in = self._reduce_fan_in(num_inputs)
+            input_flux = flux_field
+            current_blocks = list(blocks)
+            reduce_idx = 0
+            while num_inputs > 1:
+                input_blocks, output_blocks, group_offsets = _reduce_group_plan(
+                    ctx,
+                    step=ds.step,
+                    level=level_idx,
+                    input_blocks=current_blocks,
+                    fan_in=fan_in,
+                )
+                num_groups = len(output_blocks)
+                out_flux = flux_field if num_groups == 1 else ctx.temp_field(
+                    f"{self.out_name}_sum_reduce_{level_idx}_{reduce_idx}"
+                )
+                reduce_stage = ctx.stage(
+                    "flux_surface_integral_reduce",
+                    plane="graph",
+                    after=[stages[-1]],
+                )
+                reduce_stage.map_blocks(
+                    name=f"flux_surface_integral_reduce_s{reduce_idx}",
+                    kernel="uniform_slice_reduce",
+                    domain=ctx.domain(step=ds.step, level=level_idx),
+                    inputs=[input_flux],
+                    outputs=[out_flux],
+                    output_bytes=[out_bytes],
+                    deps={"kind": "None"},
+                    params={
+                        "graph_kind": "reduce",
+                        "fan_in": fan_in,
+                        "num_inputs": num_inputs,
+                        "input_base": 0,
+                        "output_base": 0,
+                        "input_blocks": list(input_blocks),
+                        "output_blocks": list(output_blocks),
+                        "group_offsets": list(group_offsets),
+                        "bytes_per_value": 8,
+                    },
+                )
+                stages.append(reduce_stage)
+                producer_stage[out_flux.field] = reduce_stage
+                input_flux = out_flux
+                current_blocks = output_blocks
+                num_inputs = num_groups
+                reduce_idx += 1
+
+            flux_fields.append((input_flux, level_idx))
+
+        if not flux_fields:
+            return ctx.fragment([])
+
+        def reduce_pairwise(fields: list[tuple[FieldRef, int]]) -> tuple[FieldRef, int]:
+            if len(fields) == 1:
+                return fields[0]
+            current = fields
+            reduce_round = 0
+            while len(current) > 1:
+                next_fields: list[tuple[FieldRef, int]] = []
+                for i in range(0, len(current), 2):
+                    if i + 1 >= len(current):
+                        next_fields.append(current[i])
+                        continue
+                    left, left_level = current[i]
+                    right, right_level = current[i + 1]
+                    left_ref = FieldRef(
+                        left.field,
+                        version=left.version,
+                        domain=ctx.domain(step=ds.step, level=left_level),
+                    )
+                    right_ref = FieldRef(
+                        right.field,
+                        version=right.version,
+                        domain=ctx.domain(step=ds.step, level=right_level),
+                    )
+                    out_field = ctx.temp_field(f"{self.out_name}_sum_add_{reduce_round}_{i}")
+                    deps = [
+                        s
+                        for s in (
+                            producer_stage.get(left.field),
+                            producer_stage.get(right.field),
+                        )
+                        if s is not None
+                    ]
+                    add_stage = ctx.stage("flux_surface_integral_add", plane="graph", after=deps)
+                    add_stage.map_blocks(
+                        name=f"flux_surface_integral_add_{reduce_round}_{i}",
+                        kernel="uniform_slice_add",
+                        domain=ctx.domain(step=ds.step, level=ds.level),
+                        inputs=[left_ref, right_ref],
+                        outputs=[out_field],
+                        output_bytes=[out_bytes],
+                        deps={"kind": "None"},
+                        params={
+                            "graph_kind": "reduce",
+                            "fan_in": 1,
+                            "num_inputs": 1,
+                            "input_base": 0,
+                            "output_base": 0,
+                            "bytes_per_value": 8,
+                        },
+                    )
+                    stages.append(add_stage)
+                    producer_stage[out_field.field] = add_stage
+                    next_fields.append((out_field, ds.level))
+                current = next_fields
+                reduce_round += 1
+            return current[0]
+
+        total_flux, total_flux_level = reduce_pairwise(flux_fields)
+        out_field = ctx.output_field(self.out_name)
+        finalize_deps = [s for s in (producer_stage.get(total_flux.field),) if s is not None]
+        finalize = ctx.stage("flux_surface_integral_output", plane="graph", after=finalize_deps)
+        finalize.map_blocks(
+            name="flux_surface_integral_output",
+            kernel="uniform_slice_reduce",
+            domain=ctx.domain(step=ds.step, level=ds.level),
+            inputs=[
+                FieldRef(
+                    total_flux.field,
+                    version=total_flux.version,
+                    domain=ctx.domain(step=ds.step, level=total_flux_level),
+                )
+            ],
+            outputs=[out_field],
+            output_bytes=[out_bytes],
+            deps={"kind": "None"},
+            params={
+                "graph_kind": "reduce",
+                "fan_in": 1,
+                "num_inputs": 1,
+                "input_base": 0,
+                "output_base": 0,
+                "bytes_per_value": 8,
+            },
+        )
+        stages.append(finalize)
+        return ctx.fragment(stages)
+
+
 class Histogram1D:
     def __init__(
         self,

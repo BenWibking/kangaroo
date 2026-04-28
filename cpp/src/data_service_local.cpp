@@ -321,20 +321,18 @@ hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_local_shared
   }
 
   if (start_load) {
-    hpx::async([ref, dataset, chunk_store, ctx]() {
-      try {
-        if (dataset == nullptr) {
-          throw std::runtime_error("dataset not initialized");
-        }
-        auto view = dataset->get_chunk(ref);
-        if (!view.has_value()) {
-          throw std::runtime_error("dataset chunk disappeared during async load");
-        }
-        fulfill_dataset_load(chunk_store, ref, std::move(*view));
-      } catch (...) {
-        fail_dataset_load(chunk_store, ref, std::current_exception());
+    try {
+      if (dataset == nullptr) {
+        throw std::runtime_error("dataset not initialized");
       }
-    });
+      auto view = dataset->get_chunk(ref);
+      if (!view.has_value()) {
+        throw std::runtime_error("dataset chunk disappeared during load");
+      }
+      fulfill_dataset_load(chunk_store, ref, std::move(*view));
+    } catch (...) {
+      fail_dataset_load(chunk_store, ref, std::current_exception());
+    }
   }
 
   return future;

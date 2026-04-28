@@ -1,0 +1,376 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+import pytest
+
+from analysis import Runtime
+from analysis.dataset import open_dataset
+from analysis.pipeline import Pipeline
+from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
+
+
+class _FakeCoreRuntime:
+    def __init__(self) -> None:
+        self._next_field = 1000
+        self.persistent: dict[int, str] = {}
+
+    def alloc_field_id(self, name: str) -> int:
+        fid = self._next_field
+        self._next_field += 1
+        return fid
+
+    def mark_field_persistent(self, fid: int, name: str) -> None:
+        self.persistent[fid] = name
+
+    def num_localities(self) -> int:
+        return 1
+
+
+class _FakeRuntime:
+    def __init__(self) -> None:
+        self._rt = _FakeCoreRuntime()
+
+    def alloc_field_id(self, name: str) -> int:
+        return self._rt.alloc_field_id(name)
+
+
+class _FakeDataset:
+    def __init__(self, runtime: _FakeRuntime, *, step: int = 0, level: int = 0) -> None:
+        self.runtime = runtime
+        self.step = step
+        self.level = level
+
+
+@dataclass(frozen=True)
+class _Box:
+    lo: tuple[int, int, int]
+    hi: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
+class _Geom:
+    dx: tuple[float, float, float]
+    x0: tuple[float, float, float]
+    index_origin: tuple[int, int, int]
+    ref_ratio: int = 1
+
+
+@dataclass(frozen=True)
+class _Level:
+    geom: _Geom
+    boxes: list[_Box]
+
+
+@dataclass(frozen=True)
+class _Step:
+    step: int
+    levels: list[_Level]
+
+
+@dataclass(frozen=True)
+class _RunMeta:
+    steps: list[_Step]
+
+
+def _set_block_double(
+    ds,
+    *,
+    step: int,
+    level: int,
+    field: int,
+    block: int,
+    values: np.ndarray,
+) -> None:
+    arr = np.asarray(values, dtype=np.float64)
+    ds._h.set_chunk_ref(step, level, field, 0, block, arr.tobytes(order="C"))
+
+
+def _runmeta_with_step_index(step: int, levels: list[LevelMeta]) -> RunMeta:
+    return RunMeta(steps=[StepMeta(step=i, levels=levels) for i in range(step + 1)])
+
+
+def _one_cell_state(*, rho: float, momx: float, energy: float, scalar: float, bz: float) -> dict[int, np.ndarray]:
+    return {
+        1: np.array([[[rho]]], dtype=np.float64),
+        2: np.array([[[momx]]], dtype=np.float64),
+        3: np.array([[[0.0]]], dtype=np.float64),
+        4: np.array([[[0.0]]], dtype=np.float64),
+        5: np.array([[[energy]]], dtype=np.float64),
+        6: np.array([[[scalar]]], dtype=np.float64),
+        7: np.array([[[0.0]]], dtype=np.float64),
+        8: np.array([[[0.0]]], dtype=np.float64),
+        9: np.array([[[bz]]], dtype=np.float64),
+    }
+
+
+def test_flux_surface_integral_lowering_wires_accumulate_reduce_and_covered_boxes() -> None:
+    rt = _FakeRuntime()
+    runmeta = _RunMeta(
+        steps=[
+            _Step(
+                step=0,
+                levels=[
+                    _Level(
+                        geom=_Geom(
+                            dx=(1.0, 1.0, 1.0),
+                            x0=(0.0, 0.0, 0.0),
+                            index_origin=(0, 0, 0),
+                            ref_ratio=2,
+                        ),
+                        boxes=[_Box((0, 0, 0), (1, 1, 1)), _Box((2, 0, 0), (3, 1, 1))],
+                    ),
+                    _Level(
+                        geom=_Geom(
+                            dx=(0.5, 0.5, 0.5),
+                            x0=(0.0, 0.0, 0.0),
+                            index_origin=(0, 0, 0),
+                            ref_ratio=1,
+                        ),
+                        boxes=[_Box((0, 0, 0), (1, 3, 3))],
+                    ),
+                ],
+            )
+        ]
+    )
+    ds = _FakeDataset(rt)
+
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    flux = pipe.flux_surface_integral(
+        1,
+        momentum=(2, 3, 4),
+        energy=5,
+        passive_scalar=6,
+        magnetic_field=(7, 8, 9),
+        radius=2.5,
+        out="flux",
+        bytes_per_value=8,
+        reduce_fan_in=2,
+    )
+    plan = pipe.plan()
+
+    assert flux.components == (
+        "mass_flux_sphere",
+        "hydro_energy_flux_sphere",
+        "mhd_energy_flux_sphere",
+        "passive_scalar_flux_sphere",
+    )
+    templates = [tmpl for stage in plan.stages for tmpl in stage.templates]
+    accum = [tmpl for tmpl in templates if tmpl.kernel == "flux_surface_integral_accumulate"]
+    assert len(accum) == 3
+    assert all(len(tmpl.inputs) == 9 for tmpl in accum)
+    assert all(tmpl.output_bytes == [32] for tmpl in accum)
+
+    coarse = [tmpl for tmpl in accum if tmpl.domain.level == 0]
+    fine = [tmpl for tmpl in accum if tmpl.domain.level == 1]
+    assert coarse
+    assert fine
+    assert [[0, 0, 0], [0, 1, 1]] in coarse[0].params["covered_boxes"]
+    assert fine[0].params["covered_boxes"] == []
+
+    reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
+    assert reducers
+    assert all(tmpl.params["bytes_per_value"] == 8 for tmpl in reducers)
+
+
+def test_flux_surface_integral_rejects_invalid_radius() -> None:
+    rt = _FakeRuntime()
+    runmeta = _RunMeta(
+        steps=[
+            _Step(
+                step=0,
+                levels=[
+                    _Level(
+                        geom=_Geom(
+                            dx=(1.0, 1.0, 1.0),
+                            x0=(0.0, 0.0, 0.0),
+                            index_origin=(0, 0, 0),
+                        ),
+                        boxes=[_Box((0, 0, 0), (0, 0, 0))],
+                    )
+                ],
+            )
+        ]
+    )
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=_FakeDataset(rt))
+
+    with pytest.raises(ValueError, match="radius"):
+        pipe.flux_surface_integral(
+            1,
+            momentum=(2, 3, 4),
+            energy=5,
+            passive_scalar=6,
+            magnetic_field=(7, 8, 9),
+            radius=0.0,
+            bytes_per_value=8,
+        )
+
+
+def test_flux_surface_integral_runtime_one_cell_mhd_energy_term() -> None:
+    rt = Runtime()
+    step = 4
+    levels = [
+        LevelMeta(
+            geom=LevelGeom(
+                dx=(1.0, 1.0, 1.0),
+                x0=(0.0, -0.5, -0.5),
+                ref_ratio=1,
+            ),
+            boxes=[BlockBox((0, 0, 0), (0, 0, 0))],
+        )
+    ]
+    runmeta = _runmeta_with_step_index(step, levels)
+    ds = open_dataset("memory://flux-one-cell", runmeta=runmeta, step=step, level=0, runtime=rt)
+    for name, fid in {
+        "rho": 1,
+        "momx": 2,
+        "momy": 3,
+        "momz": 4,
+        "energy": 5,
+        "scalar": 6,
+        "bx": 7,
+        "by": 8,
+        "bz": 9,
+    }.items():
+        ds.register_field(name, fid)
+
+    # Cell edges are x=[0,1], y=[-0.5,0.5], z=[-0.5,0.5].
+    # At R=0.5 the Quokka tangent-plane section area is exactly 1.
+    for fid, values in _one_cell_state(rho=2.0, momx=6.0, energy=21.5, scalar=5.0, bz=1.0).items():
+        _set_block_double(ds, step=step, level=0, field=fid, block=0, values=values)
+
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    flux = pipe.flux_surface_integral(
+        pipe.field(1),
+        momentum=(pipe.field(2), pipe.field(3), pipe.field(4)),
+        energy=pipe.field(5),
+        passive_scalar=pipe.field(6),
+        magnetic_field=(pipe.field(7), pipe.field(8), pipe.field(9)),
+        radius=0.5,
+        out="flux",
+        bytes_per_value=8,
+    )
+    pipe.run()
+
+    raw = rt.get_task_chunk_array(
+        step=step,
+        level=0,
+        field=flux.field,
+        shape=(4,),
+        dtype=np.float64,
+        dataset=ds,
+        block=0,
+    )
+    assert np.allclose(raw, np.array([6.0, 87.0, 90.0, 15.0]))
+
+
+def test_flux_surface_integral_runtime_multiblock_reduction() -> None:
+    rt = Runtime()
+    step = 5
+    levels = [
+        LevelMeta(
+            geom=LevelGeom(
+                dx=(1.0, 1.0, 1.0),
+                x0=(-1.0, -0.5, -0.5),
+                ref_ratio=1,
+            ),
+            boxes=[
+                BlockBox((0, 0, 0), (0, 0, 0)),
+                BlockBox((1, 0, 0), (1, 0, 0)),
+            ],
+        )
+    ]
+    runmeta = _runmeta_with_step_index(step, levels)
+    ds = open_dataset("memory://flux-two-block", runmeta=runmeta, step=step, level=0, runtime=rt)
+    for fid in range(1, 10):
+        ds.register_field(f"f{fid}", fid)
+
+    left = _one_cell_state(rho=2.0, momx=-6.0, energy=21.0, scalar=5.0, bz=0.0)
+    right = _one_cell_state(rho=2.0, momx=6.0, energy=21.0, scalar=5.0, bz=0.0)
+    for fid, values in left.items():
+        _set_block_double(ds, step=step, level=0, field=fid, block=0, values=values)
+    for fid, values in right.items():
+        _set_block_double(ds, step=step, level=0, field=fid, block=1, values=values)
+
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    flux = pipe.flux_surface_integral(
+        1,
+        momentum=(2, 3, 4),
+        energy=5,
+        passive_scalar=6,
+        magnetic_field=(7, 8, 9),
+        radius=0.5,
+        reduce_fan_in=2,
+        bytes_per_value=8,
+    )
+    pipe.run()
+
+    raw = rt.get_task_chunk_array(
+        step=step,
+        level=0,
+        field=flux.field,
+        shape=(4,),
+        dtype=np.float64,
+        dataset=ds,
+        block=0,
+    )
+    assert np.allclose(raw, np.array([12.0, 174.0, 174.0, 30.0]))
+
+
+def test_flux_surface_integral_runtime_amr_covered_cells_are_excluded() -> None:
+    rt = Runtime()
+    step = 6
+    levels = [
+        LevelMeta(
+            geom=LevelGeom(
+                dx=(1.0, 1.0, 1.0),
+                x0=(0.0, -0.5, -0.5),
+                ref_ratio=2,
+            ),
+            boxes=[BlockBox((0, 0, 0), (0, 0, 0))],
+        ),
+        LevelMeta(
+            geom=LevelGeom(
+                dx=(0.5, 0.5, 0.5),
+                x0=(0.0, -0.5, -0.5),
+                ref_ratio=1,
+            ),
+            boxes=[BlockBox((0, 0, 0), (1, 1, 1))],
+        ),
+    ]
+    runmeta = _runmeta_with_step_index(step, levels)
+    ds = open_dataset("memory://flux-amr-mask", runmeta=runmeta, step=step, level=0, runtime=rt)
+    for fid in range(1, 10):
+        ds.register_field(f"f{fid}", fid)
+
+    coarse = _one_cell_state(rho=2.0, momx=6.0, energy=21.0, scalar=5.0, bz=0.0)
+    for fid, values in coarse.items():
+        _set_block_double(ds, step=step, level=0, field=fid, block=0, values=values)
+
+    fine_zero = np.zeros((2, 2, 2), dtype=np.float64)
+    for fid in range(1, 10):
+        _set_block_double(ds, step=step, level=1, field=fid, block=0, values=fine_zero)
+
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    flux = pipe.flux_surface_integral(
+        1,
+        momentum=(2, 3, 4),
+        energy=5,
+        passive_scalar=6,
+        magnetic_field=(7, 8, 9),
+        radius=0.5,
+        bytes_per_value=8,
+    )
+    pipe.run()
+
+    raw = rt.get_task_chunk_array(
+        step=step,
+        level=0,
+        field=flux.field,
+        shape=(4,),
+        dtype=np.float64,
+        dataset=ds,
+        block=0,
+    )
+    assert np.allclose(raw, np.zeros(4))

@@ -1248,7 +1248,9 @@ hpx::future<void> Executor::run_block_task(const TaskTemplateIR& tmpl, int32_t s
   }
   int here = hpx::get_locality_id();
   if (target == here) {
-    return run_block_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, block, meta_, data_, adj_);
+    return hpx::unwrap(hpx::async([this, tmpl, stage_idx, tmpl_idx, block]() mutable {
+      return run_block_task_impl(tmpl, plan_id_, stage_idx, tmpl_idx, block, meta_, data_, adj_);
+    }));
   }
 
   auto localities = hpx::find_all_localities();

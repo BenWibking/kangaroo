@@ -20,6 +20,8 @@ class PlotfileBackend : public DatasetBackend {
   // Helpers for field mapping
   void register_field(int32_t field_id, int32_t component_index);
   int32_t get_component_index(int32_t field_id) const;
+  std::map<int32_t, int32_t> field_map() const;
+  void set_field_map(std::map<int32_t, int32_t> field_map);
   
   // Access underlying reader if needed (e.g. for variable names)
   const plotfile::PlotfileReader& reader() const { return reader_; }

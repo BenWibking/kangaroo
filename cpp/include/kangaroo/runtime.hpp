@@ -13,6 +13,7 @@
 #include "kangaroo/runmeta.hpp"
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -56,6 +57,8 @@ struct DatasetHandle {
       } else if (auto plt = std::dynamic_pointer_cast<PlotfileBackend>(backend)) {
         is_plotfile = true;
         ar& is_memory& is_plotfile& is_openpmd& is_parthenon;
+        auto field_map = plt->field_map();
+        ar& field_map;
 #ifdef KANGAROO_USE_OPENPMD
       } else if (auto opmd = std::dynamic_pointer_cast<OpenPMDBackend>(backend)) {
         is_openpmd = true;
@@ -99,6 +102,9 @@ struct DatasetHandle {
         path = path.substr(7);
       }
       backend = std::make_shared<PlotfileBackend>(path);
+      std::map<int32_t, int32_t> field_map;
+      ar& field_map;
+      std::dynamic_pointer_cast<PlotfileBackend>(backend)->set_field_map(std::move(field_map));
     } else if (is_openpmd) {
 #ifdef KANGAROO_USE_OPENPMD
       backend = std::make_shared<OpenPMDBackend>(uri);
