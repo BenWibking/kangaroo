@@ -1684,6 +1684,36 @@ class FluxSurfaceIntegral:
             input_flux = flux_field
             current_blocks = list(blocks)
             reduce_idx = 0
+            if num_inputs == 1 and current_blocks[0] != 0:
+                reduce_stage = ctx.stage(
+                    "flux_surface_integral_reduce",
+                    plane="graph",
+                    after=[stages[-1]],
+                )
+                reduce_stage.map_blocks(
+                    name="flux_surface_integral_reduce_single",
+                    kernel="uniform_slice_reduce",
+                    domain=ctx.domain(step=ds.step, level=level_idx),
+                    inputs=[input_flux],
+                    outputs=[flux_field],
+                    output_bytes=[out_bytes],
+                    deps={"kind": "None"},
+                    params={
+                        "graph_kind": "reduce",
+                        "fan_in": 1,
+                        "num_inputs": 1,
+                        "input_base": 0,
+                        "output_base": 0,
+                        "input_blocks": [current_blocks[0]],
+                        "output_blocks": [0],
+                        "group_offsets": [0, 1],
+                        "bytes_per_value": 8,
+                    },
+                )
+                stages.append(reduce_stage)
+                producer_stage[flux_field.field] = reduce_stage
+                current_blocks = [0]
+
             while num_inputs > 1:
                 input_blocks, output_blocks, group_offsets = _reduce_group_plan(
                     ctx,
@@ -1731,7 +1761,7 @@ class FluxSurfaceIntegral:
             flux_fields.append((input_flux, level_idx))
 
         if not flux_fields:
-            return ctx.fragment([])
+            raise ValueError("radius does not intersect any mesh block")
 
         def reduce_pairwise(fields: list[tuple[FieldRef, int]]) -> tuple[FieldRef, int]:
             if len(fields) == 1:
