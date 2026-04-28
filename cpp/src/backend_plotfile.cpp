@@ -94,4 +94,14 @@ int32_t PlotfileBackend::get_component_index(int32_t field_id) const {
   return -1;
 }
 
+std::map<int32_t, int32_t> PlotfileBackend::field_map() const {
+  std::lock_guard<std::mutex> lock(map_mutex_);
+  return field_map_;
+}
+
+void PlotfileBackend::set_field_map(std::map<int32_t, int32_t> field_map) {
+  std::lock_guard<std::mutex> lock(map_mutex_);
+  field_map_ = std::move(field_map);
+}
+
 }  // namespace kangaroo

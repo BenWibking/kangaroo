@@ -23,6 +23,7 @@ __all__ = [
     "PlotfileReader",
     "Pipeline",
     "FieldHandle",
+    "FluxSurfaceIntegralHandle",
     "Histogram1DHandle",
     "Histogram2DHandle",
     "ParticleArrayHandle",
@@ -87,6 +88,7 @@ def __getattr__(name):
     if name in {
         "Pipeline",
         "FieldHandle",
+        "FluxSurfaceIntegralHandle",
         "Histogram1DHandle",
         "Histogram2DHandle",
         "ParticleArrayHandle",
@@ -95,6 +97,7 @@ def __getattr__(name):
     }:
         from .pipeline import (
             FieldHandle,
+            FluxSurfaceIntegralHandle,
             Histogram1DHandle,
             Histogram2DHandle,
             ParticleArrayHandle,
@@ -106,6 +109,7 @@ def __getattr__(name):
         return {
             "Pipeline": Pipeline,
             "FieldHandle": FieldHandle,
+            "FluxSurfaceIntegralHandle": FluxSurfaceIntegralHandle,
             "Histogram1DHandle": Histogram1DHandle,
             "Histogram2DHandle": Histogram2DHandle,
             "ParticleArrayHandle": ParticleArrayHandle,

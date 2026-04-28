@@ -1546,6 +1546,234 @@ bool covered_box_contains(const CoveredBoxIR& box, int i, int j, int k) {
          k >= box.lo[2] && k <= box.hi[2];
 }
 
+double min_dist_sq_to_interval(double a0, double a1) {
+  if (a1 < 0.0) {
+    return a1 * a1;
+  }
+  if (a0 > 0.0) {
+    return a0 * a0;
+  }
+  return 0.0;
+}
+
+double max_dist_sq_to_interval(double a0, double a1) {
+  const double aa0 = std::abs(a0);
+  const double aa1 = std::abs(a1);
+  const double amax = (aa0 > aa1) ? aa0 : aa1;
+  return amax * amax;
+}
+
+struct FluxPoint {
+  double x = 0.0;
+  double y = 0.0;
+  double z = 0.0;
+};
+
+void add_point_unique(std::array<FluxPoint, 16>& pts,
+                      int& npts,
+                      double x,
+                      double y,
+                      double z,
+                      double tol) {
+  const double tol2 = tol * tol;
+  for (int i = 0; i < npts; ++i) {
+    const double dx = pts[static_cast<std::size_t>(i)].x - x;
+    const double dy = pts[static_cast<std::size_t>(i)].y - y;
+    const double dz = pts[static_cast<std::size_t>(i)].z - z;
+    if ((dx * dx + dy * dy + dz * dz) <= tol2) {
+      return;
+    }
+  }
+  if (npts < static_cast<int>(pts.size())) {
+    pts[static_cast<std::size_t>(npts)] = FluxPoint{x, y, z};
+    ++npts;
+  }
+}
+
+double plane_box_section_area(double x0,
+                              double x1,
+                              double y0,
+                              double y1,
+                              double z0,
+                              double z1,
+                              double nx,
+                              double ny,
+                              double nz,
+                              double d) {
+  const double scale = std::abs(x0) + std::abs(x1) + std::abs(y0) + std::abs(y1) +
+                       std::abs(z0) + std::abs(z1) + std::abs(d) + 1.0;
+  const double tol = 1.0e-12 * scale;
+
+  const std::array<FluxPoint, 8> verts{
+      FluxPoint{x0, y0, z0}, FluxPoint{x1, y0, z0}, FluxPoint{x0, y1, z0},
+      FluxPoint{x1, y1, z0}, FluxPoint{x0, y0, z1}, FluxPoint{x1, y0, z1},
+      FluxPoint{x0, y1, z1}, FluxPoint{x1, y1, z1}};
+  const std::array<std::array<int, 2>, 12> edges{
+      std::array<int, 2>{0, 1}, std::array<int, 2>{2, 3},
+      std::array<int, 2>{4, 5}, std::array<int, 2>{6, 7},
+      std::array<int, 2>{0, 2}, std::array<int, 2>{1, 3},
+      std::array<int, 2>{4, 6}, std::array<int, 2>{5, 7},
+      std::array<int, 2>{0, 4}, std::array<int, 2>{1, 5},
+      std::array<int, 2>{2, 6}, std::array<int, 2>{3, 7}};
+
+  std::array<FluxPoint, 16> pts{};
+  int npts = 0;
+
+  for (const auto& edge : edges) {
+    const int i0 = edge[0];
+    const int i1 = edge[1];
+    const auto& p0 = verts[static_cast<std::size_t>(i0)];
+    const auto& p1 = verts[static_cast<std::size_t>(i1)];
+
+    double f0 = nx * p0.x + ny * p0.y + nz * p0.z - d;
+    double f1 = nx * p1.x + ny * p1.y + nz * p1.z - d;
+    if (std::abs(f0) <= tol) {
+      f0 = 0.0;
+    }
+    if (std::abs(f1) <= tol) {
+      f1 = 0.0;
+    }
+
+    if (f0 == 0.0 && f1 == 0.0) {
+      add_point_unique(pts, npts, p0.x, p0.y, p0.z, tol);
+      add_point_unique(pts, npts, p1.x, p1.y, p1.z, tol);
+      continue;
+    }
+    if (f0 == 0.0) {
+      add_point_unique(pts, npts, p0.x, p0.y, p0.z, tol);
+      continue;
+    }
+    if (f1 == 0.0) {
+      add_point_unique(pts, npts, p1.x, p1.y, p1.z, tol);
+      continue;
+    }
+    if ((f0 < 0.0 && f1 > 0.0) || (f0 > 0.0 && f1 < 0.0)) {
+      const double t = f0 / (f0 - f1);
+      const double x = p0.x + t * (p1.x - p0.x);
+      const double y = p0.y + t * (p1.y - p0.y);
+      const double z = p0.z + t * (p1.z - p0.z);
+      add_point_unique(pts, npts, x, y, z, tol);
+    }
+  }
+
+  if (npts < 3) {
+    return 0.0;
+  }
+
+  double cx = 0.0;
+  double cy = 0.0;
+  double cz = 0.0;
+  for (int i = 0; i < npts; ++i) {
+    cx += pts[static_cast<std::size_t>(i)].x;
+    cy += pts[static_cast<std::size_t>(i)].y;
+    cz += pts[static_cast<std::size_t>(i)].z;
+  }
+  cx /= static_cast<double>(npts);
+  cy /= static_cast<double>(npts);
+  cz /= static_cast<double>(npts);
+
+  double ax = 1.0;
+  double ay = 0.0;
+  double az = 0.0;
+  if (std::abs(nx) > 0.9) {
+    ax = 0.0;
+    ay = 1.0;
+    az = 0.0;
+  }
+  double e1x = ny * az - nz * ay;
+  double e1y = nz * ax - nx * az;
+  double e1z = nx * ay - ny * ax;
+  const double e1norm = std::sqrt(e1x * e1x + e1y * e1y + e1z * e1z);
+  if (e1norm <= 0.0) {
+    return 0.0;
+  }
+  e1x /= e1norm;
+  e1y /= e1norm;
+  e1z /= e1norm;
+
+  const double e2x = ny * e1z - nz * e1y;
+  const double e2y = nz * e1x - nx * e1z;
+  const double e2z = nx * e1y - ny * e1x;
+
+  std::array<double, 16> u{};
+  std::array<double, 16> v{};
+  std::array<double, 16> ang{};
+  for (int i = 0; i < npts; ++i) {
+    const std::size_t idx = static_cast<std::size_t>(i);
+    const double rx = pts[idx].x - cx;
+    const double ry = pts[idx].y - cy;
+    const double rz = pts[idx].z - cz;
+    u[idx] = rx * e1x + ry * e1y + rz * e1z;
+    v[idx] = rx * e2x + ry * e2y + rz * e2z;
+    ang[idx] = std::atan2(v[idx], u[idx]);
+  }
+
+  for (int i = 1; i < npts; ++i) {
+    const std::size_t idx = static_cast<std::size_t>(i);
+    const double key_ang = ang[idx];
+    const double key_u = u[idx];
+    const double key_v = v[idx];
+    int j = i - 1;
+    while (j >= 0 && ang[static_cast<std::size_t>(j)] > key_ang) {
+      const std::size_t dst = static_cast<std::size_t>(j + 1);
+      const std::size_t src = static_cast<std::size_t>(j);
+      ang[dst] = ang[src];
+      u[dst] = u[src];
+      v[dst] = v[src];
+      --j;
+    }
+    const std::size_t dst = static_cast<std::size_t>(j + 1);
+    ang[dst] = key_ang;
+    u[dst] = key_u;
+    v[dst] = key_v;
+  }
+
+  double area2 = 0.0;
+  for (int i = 0; i < npts; ++i) {
+    const std::size_t idx = static_cast<std::size_t>(i);
+    const std::size_t next = static_cast<std::size_t>((i + 1 < npts) ? (i + 1) : 0);
+    area2 += u[idx] * v[next] - v[idx] * u[next];
+  }
+  return 0.5 * std::abs(area2);
+}
+
+double spherical_section_area_in_cell(double radius,
+                                      double x0,
+                                      double x1,
+                                      double y0,
+                                      double y1,
+                                      double z0,
+                                      double z1) {
+  const double radius2 = radius * radius;
+  const double r2_min = min_dist_sq_to_interval(x0, x1) +
+                        min_dist_sq_to_interval(y0, y1) +
+                        min_dist_sq_to_interval(z0, z1);
+  const double r2_max = max_dist_sq_to_interval(x0, x1) +
+                        max_dist_sq_to_interval(y0, y1) +
+                        max_dist_sq_to_interval(z0, z1);
+  if (radius2 < r2_min || radius2 > r2_max) {
+    return 0.0;
+  }
+
+  const double dx = x1 - x0;
+  const double dy = y1 - y0;
+  const double dz = z1 - z0;
+  const double vol = dx * dy * dz;
+  if (vol <= 0.0) {
+    return 0.0;
+  }
+
+  const double xc = 0.5 * (x0 + x1);
+  const double yc = 0.5 * (y0 + y1);
+  const double zc = 0.5 * (z0 + z1);
+  const double rc = std::sqrt(xc * xc + yc * yc + zc * zc);
+  if (rc <= 0.0) {
+    return 0.0;
+  }
+
+  return plane_box_section_area(x0, x1, y0, y1, z0, z1, xc / rc, yc / rc, zc / rc, radius);
+}
+
 void register_default_kernels(KernelRegistry& registry) {
   static const bool log_locality = []() {
     const char* env = std::getenv("KANGAROO_LOG_LOCALITY");
@@ -4720,6 +4948,188 @@ void register_default_kernels(KernelRegistry& registry) {
               }
               out[static_cast<std::size_t>(iy) * static_cast<std::size_t>(nx_bins) +
                   static_cast<std::size_t>(ix)] += weight;
+            }
+          }
+        }
+        return hpx::make_ready_future();
+        },
+        make_covered_box_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
+      double radius = 0.0;
+      double gamma = 5.0 / 3.0;
+      int bytes_per_value = 8;
+      std::shared_ptr<const CoveredBoxListIR> covered_boxes;
+    };
+
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      if (const auto* radius = find_msgpack_map_value(root, "radius");
+          radius && (radius->type == msgpack::type::FLOAT ||
+                     radius->type == msgpack::type::POSITIVE_INTEGER ||
+                     radius->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.radius = radius->as<double>();
+      }
+      if (const auto* gamma = find_msgpack_map_value(root, "gamma");
+          gamma && (gamma->type == msgpack::type::FLOAT ||
+                    gamma->type == msgpack::type::POSITIVE_INTEGER ||
+                    gamma->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.gamma = gamma->as<double>();
+      }
+      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
+          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.bytes_per_value = bpv->as<int>();
+      }
+      params.covered_boxes = parse_covered_boxes_param(root);
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "flux_surface_integral_accumulate", .n_inputs = 9, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+        const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+
+        const std::size_t out_bytes = 4 * sizeof(double);
+        if (outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        if (outputs[0].data.size() != out_bytes) {
+          outputs[0].data.assign(out_bytes, 0);
+        } else {
+          std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
+        }
+        if (inputs.size() < 9 || !std::isfinite(params.radius) || params.radius <= 0.0 ||
+            !std::isfinite(params.gamma) || params.gamma <= 1.0) {
+          return hpx::make_ready_future();
+        }
+        if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
+          return hpx::make_ready_future();
+        }
+
+        const auto& box = level.boxes.at(static_cast<std::size_t>(block));
+        const int nx = box.hi.x - box.lo.x + 1;
+        const int ny = box.hi.y - box.lo.y + 1;
+        const int nz = box.hi.z - box.lo.z + 1;
+        if (nx <= 0 || ny <= 0 || nz <= 0) {
+          return hpx::make_ready_future();
+        }
+
+        auto covered = [&](int ix, int iy, int iz) -> bool {
+          if (!params.covered_boxes) {
+            return false;
+          }
+          for (const auto& b : *params.covered_boxes) {
+            if (covered_box_contains(b, ix, iy, iz)) {
+              return true;
+            }
+          }
+          return false;
+        };
+        auto in_index = [&](int i, int j, int k) -> std::size_t {
+          return static_cast<std::size_t>((i * ny + j) * nz + k);
+        };
+        auto read_value = [&](const HostView& view, std::size_t idx) -> double {
+          const auto& data = view.data;
+          if (params.bytes_per_value == 4) {
+            if ((idx + 1) * sizeof(float) <= data.size()) {
+              return static_cast<double>(reinterpret_cast<const float*>(data.data())[idx]);
+            }
+          } else if (params.bytes_per_value == 8) {
+            if ((idx + 1) * sizeof(double) <= data.size()) {
+              return reinterpret_cast<const double*>(data.data())[idx];
+            }
+          }
+          return 0.0;
+        };
+        auto cell_edge = [&](int axis, int global_idx) -> double {
+          return level.geom.x0[axis] +
+                 (static_cast<double>(global_idx - level.geom.index_origin[axis]) *
+                  level.geom.dx[axis]);
+        };
+
+        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+        const double gamma_minus_one = params.gamma - 1.0;
+
+        for (int i = 0; i < nx; ++i) {
+          const int gi = box.lo.x + i;
+          const double x0 = cell_edge(0, gi);
+          const double x1 = x0 + level.geom.dx[0];
+          const double x = 0.5 * (x0 + x1);
+          for (int j = 0; j < ny; ++j) {
+            const int gj = box.lo.y + j;
+            const double y0 = cell_edge(1, gj);
+            const double y1 = y0 + level.geom.dx[1];
+            const double y = 0.5 * (y0 + y1);
+            for (int k = 0; k < nz; ++k) {
+              const int gk = box.lo.z + k;
+              if (covered(gi, gj, gk)) {
+                continue;
+              }
+
+              const double z0 = cell_edge(2, gk);
+              const double z1 = z0 + level.geom.dx[2];
+              const double z = 0.5 * (z0 + z1);
+              const double r = std::sqrt(x * x + y * y + z * z);
+              const auto idx = in_index(i, j, k);
+
+              const double rho = read_value(inputs[0], idx);
+              if (r <= 0.0 || rho <= 0.0 || !std::isfinite(rho)) {
+                continue;
+              }
+
+              const double momx = read_value(inputs[1], idx);
+              const double momy = read_value(inputs[2], idx);
+              const double momz = read_value(inputs[3], idx);
+              const double energy_density = read_value(inputs[4], idx);
+              const double scalar_density = read_value(inputs[5], idx);
+              const double bx = read_value(inputs[6], idx);
+              const double by = read_value(inputs[7], idx);
+              const double bz = read_value(inputs[8], idx);
+              if (!std::isfinite(momx) || !std::isfinite(momy) || !std::isfinite(momz) ||
+                  !std::isfinite(energy_density) || !std::isfinite(scalar_density) ||
+                  !std::isfinite(bx) || !std::isfinite(by) || !std::isfinite(bz)) {
+                continue;
+              }
+
+              const double area =
+                  spherical_section_area_in_cell(params.radius, x0, x1, y0, y1, z0, z1);
+              if (area <= 0.0) {
+                continue;
+              }
+
+              const double vx = momx / rho;
+              const double vy = momy / rho;
+              const double vz = momz / rho;
+              const double vr = (x * momx + y * momy + z * momz) / (rho * r);
+              const double rhat_x = x / r;
+              const double rhat_y = y / r;
+              const double rhat_z = z / r;
+
+              const double kinetic =
+                  0.5 * (momx * momx + momy * momy + momz * momz) / rho;
+              const double emag = 0.5 * (bx * bx + by * by + bz * bz);
+              const double ehydro = energy_density - emag;
+              const double pgas = gamma_minus_one * (ehydro - kinetic);
+              if (!std::isfinite(vr) || !std::isfinite(pgas)) {
+                continue;
+              }
+
+              const double bdotv = vx * bx + vy * by + vz * bz;
+              const double br = rhat_x * bx + rhat_y * by + rhat_z * bz;
+              const double mass_flux_density = rho * vr;
+              const double hydro_energy_flux_density = (ehydro + pgas) * vr;
+              const double mhd_energy_flux_density =
+                  (energy_density + pgas + emag) * vr - bdotv * br;
+
+              out[0] += mass_flux_density * area;
+              out[1] += hydro_energy_flux_density * area;
+              out[2] += mhd_energy_flux_density * area;
+              out[3] += (scalar_density * vr) * area;
             }
           }
         }
