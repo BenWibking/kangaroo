@@ -79,30 +79,73 @@ def _finite_radius(value: float) -> float:
     return radius
 
 
-def _validate_selected_fields(ds, rt, runmeta, fields: dict[str, tuple[str, int]]) -> None:
+def _bounds_1d(lo: int, hi: int, x0: float, dx: float, origin: int) -> tuple[float, float]:
+    return x0 + (lo - origin) * dx, x0 + (hi + 1 - origin) * dx
+
+
+def _block_intersects_sphere(level_meta, block, radius: float) -> bool:
+    radius2 = radius * radius
+    geom = level_meta.geom
+    lo2 = 0.0
+    hi2 = 0.0
+    for axis in range(3):
+        x0, x1 = _bounds_1d(
+            block.lo[axis],
+            block.hi[axis],
+            geom.x0[axis],
+            geom.dx[axis],
+            geom.index_origin[axis],
+        )
+        if x1 < 0.0:
+            lo2 += x1 * x1
+        elif x0 > 0.0:
+            lo2 += x0 * x0
+        hi2 += max(abs(x0), abs(x1)) ** 2
+    return lo2 <= radius2 <= hi2
+
+
+def _intersecting_validation_blocks(ds, runmeta, *, radius: float) -> list[tuple[int, int]]:
+    samples: list[tuple[int, int]] = []
+    for level_idx, level in enumerate(runmeta.steps[ds.step].levels):
+        for block_idx, block in enumerate(level.boxes):
+            if _block_intersects_sphere(level, block, radius):
+                samples.append((level_idx, block_idx))
+                break
+    if not samples:
+        raise ValueError("radius does not intersect any mesh block")
+    return samples
+
+
+def _validate_selected_fields(
+    ds,
+    rt,
+    runmeta,
+    fields: dict[str, tuple[str, int]],
+    *,
+    radius: float,
+) -> None:
+    validation_blocks = _intersecting_validation_blocks(ds, runmeta, radius=radius)
     for role, (name, field_id) in fields.items():
-        for level_idx, level in enumerate(runmeta.steps[ds.step].levels):
-            if not level.boxes:
-                continue
+        for level_idx, block_idx in validation_blocks:
             try:
                 raw = rt.get_task_chunk(
                     step=ds.step,
                     level=level_idx,
                     field=field_id,
                     version=0,
-                    block=0,
+                    block=block_idx,
                     dataset=ds,
                 )
             except Exception as exc:  # noqa: BLE001
                 raise RuntimeError(
                     f"Selected field {role!r} -> {name!r} is not readable at level {level_idx}, "
-                    "block 0. Use --list-fields and pass explicit field names if inference picked "
-                    "the wrong component."
+                    f"block {block_idx}. Use --list-fields and pass explicit field names if "
+                    "inference picked the wrong component."
                 ) from exc
             if not raw:
                 raise RuntimeError(
                     f"Selected field {role!r} -> {name!r} returned an empty chunk at "
-                    f"level {level_idx}, block 0."
+                    f"level {level_idx}, block {block_idx}."
                 )
 
 
@@ -164,7 +207,7 @@ def main() -> int:
             file=sys.stderr,
             flush=True,
         )
-        _validate_selected_fields(ds, rt, runmeta, fields)
+        _validate_selected_fields(ds, rt, runmeta, fields, radius=radius)
 
         bytes_per_value = ds.infer_bytes_per_value(rt, field=fields["density"][1], level=0)
 
