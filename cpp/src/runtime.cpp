@@ -29,6 +29,7 @@
 #include <string_view>
 #include <variant>
 #include <unordered_map>
+#include <vector>
 #include <msgpack.hpp>
 #include <unistd.h>
 #include <sys/resource.h>
@@ -1563,6 +1564,22 @@ double max_dist_sq_to_interval(double a0, double a1) {
   return amax * amax;
 }
 
+bool sphere_may_intersect_cell(double radius2,
+                               double x0,
+                               double x1,
+                               double y0,
+                               double y1,
+                               double z0,
+                               double z1) {
+  const double r2_min = min_dist_sq_to_interval(x0, x1) +
+                        min_dist_sq_to_interval(y0, y1) +
+                        min_dist_sq_to_interval(z0, z1);
+  const double r2_max = max_dist_sq_to_interval(x0, x1) +
+                        max_dist_sq_to_interval(y0, y1) +
+                        max_dist_sq_to_interval(z0, z1);
+  return radius2 >= r2_min && radius2 <= r2_max;
+}
+
 struct FluxPoint {
   double x = 0.0;
   double y = 0.0;
@@ -1737,24 +1754,13 @@ double plane_box_section_area(double x0,
   return 0.5 * std::abs(area2);
 }
 
-double spherical_section_area_in_cell(double radius,
-                                      double x0,
-                                      double x1,
-                                      double y0,
-                                      double y1,
-                                      double z0,
-                                      double z1) {
-  const double radius2 = radius * radius;
-  const double r2_min = min_dist_sq_to_interval(x0, x1) +
-                        min_dist_sq_to_interval(y0, y1) +
-                        min_dist_sq_to_interval(z0, z1);
-  const double r2_max = max_dist_sq_to_interval(x0, x1) +
-                        max_dist_sq_to_interval(y0, y1) +
-                        max_dist_sq_to_interval(z0, z1);
-  if (radius2 < r2_min || radius2 > r2_max) {
-    return 0.0;
-  }
-
+double spherical_section_area_in_intersecting_cell(double radius,
+                                                   double x0,
+                                                   double x1,
+                                                   double y0,
+                                                   double y1,
+                                                   double z0,
+                                                   double z1) {
   const double dx = x1 - x0;
   const double dy = y1 - y0;
   const double dz = z1 - z0;
@@ -1772,6 +1778,20 @@ double spherical_section_area_in_cell(double radius,
   }
 
   return plane_box_section_area(x0, x1, y0, y1, z0, z1, xc / rc, yc / rc, zc / rc, radius);
+}
+
+double spherical_section_area_in_cell(double radius,
+                                      double x0,
+                                      double x1,
+                                      double y0,
+                                      double y1,
+                                      double z0,
+                                      double z1) {
+  const double radius2 = radius * radius;
+  if (!sphere_may_intersect_cell(radius2, x0, x1, y0, y1, z0, z1)) {
+    return 0.0;
+  }
+  return spherical_section_area_in_intersecting_cell(radius, x0, x1, y0, y1, z0, z1);
 }
 
 void register_default_kernels(KernelRegistry& registry) {
@@ -5019,20 +5039,39 @@ void register_default_kernels(KernelRegistry& registry) {
           return hpx::make_ready_future();
         }
 
-        auto covered = [&](int ix, int iy, int iz) -> bool {
-          if (!params.covered_boxes) {
-            return false;
-          }
-          for (const auto& b : *params.covered_boxes) {
-            if (covered_box_contains(b, ix, iy, iz)) {
-              return true;
-            }
-          }
-          return false;
-        };
         auto in_index = [&](int i, int j, int k) -> std::size_t {
           return static_cast<std::size_t>((i * ny + j) * nz + k);
         };
+        std::vector<std::uint8_t> covered_mask;
+        if (params.covered_boxes && !params.covered_boxes->empty()) {
+          const std::size_t block_cells = static_cast<std::size_t>(nx) *
+                                          static_cast<std::size_t>(ny) *
+                                          static_cast<std::size_t>(nz);
+          for (const auto& b : *params.covered_boxes) {
+            const int gx0 = std::max(box.lo.x, b.lo[0]);
+            const int gy0 = std::max(box.lo.y, b.lo[1]);
+            const int gz0 = std::max(box.lo.z, b.lo[2]);
+            const int gx1 = std::min(box.hi.x, b.hi[0]);
+            const int gy1 = std::min(box.hi.y, b.hi[1]);
+            const int gz1 = std::min(box.hi.z, b.hi[2]);
+            if (gx0 > gx1 || gy0 > gy1 || gz0 > gz1) {
+              continue;
+            }
+            if (covered_mask.empty()) {
+              covered_mask.assign(block_cells, 0);
+            }
+            for (int gx = gx0; gx <= gx1; ++gx) {
+              const int i = gx - box.lo.x;
+              for (int gy = gy0; gy <= gy1; ++gy) {
+                const int j = gy - box.lo.y;
+                for (int gz = gz0; gz <= gz1; ++gz) {
+                  const int k = gz - box.lo.z;
+                  covered_mask[in_index(i, j, k)] = 1;
+                }
+              }
+            }
+          }
+        }
         auto read_value = [&](const HostView& view, std::size_t idx) -> double {
           const auto& data = view.data;
           if (params.bytes_per_value == 4) {
@@ -5054,6 +5093,7 @@ void register_default_kernels(KernelRegistry& registry) {
 
         auto* out = reinterpret_cast<double*>(outputs[0].data.data());
         const double gamma_minus_one = params.gamma - 1.0;
+        const double radius2 = params.radius * params.radius;
 
         for (int i = 0; i < nx; ++i) {
           const int gi = box.lo.x + i;
@@ -5067,15 +5107,25 @@ void register_default_kernels(KernelRegistry& registry) {
             const double y = 0.5 * (y0 + y1);
             for (int k = 0; k < nz; ++k) {
               const int gk = box.lo.z + k;
-              if (covered(gi, gj, gk)) {
+              const double z0 = cell_edge(2, gk);
+              const double z1 = z0 + level.geom.dx[2];
+              if (!sphere_may_intersect_cell(radius2, x0, x1, y0, y1, z0, z1)) {
                 continue;
               }
 
-              const double z0 = cell_edge(2, gk);
-              const double z1 = z0 + level.geom.dx[2];
+              const auto idx = in_index(i, j, k);
+              if (!covered_mask.empty() && covered_mask[idx] != 0) {
+                continue;
+              }
+
+              const double area = spherical_section_area_in_intersecting_cell(
+                  params.radius, x0, x1, y0, y1, z0, z1);
+              if (area <= 0.0) {
+                continue;
+              }
+
               const double z = 0.5 * (z0 + z1);
               const double r = std::sqrt(x * x + y * y + z * z);
-              const auto idx = in_index(i, j, k);
 
               const double rho = read_value(inputs[0], idx);
               if (r <= 0.0 || rho <= 0.0 || !std::isfinite(rho)) {
@@ -5093,12 +5143,6 @@ void register_default_kernels(KernelRegistry& registry) {
               if (!std::isfinite(momx) || !std::isfinite(momy) || !std::isfinite(momz) ||
                   !std::isfinite(energy_density) || !std::isfinite(scalar_density) ||
                   !std::isfinite(bx) || !std::isfinite(by) || !std::isfinite(bz)) {
-                continue;
-              }
-
-              const double area =
-                  spherical_section_area_in_cell(params.radius, x0, x1, y0, y1, z0, z1);
-              if (area <= 0.0) {
                 continue;
               }
 
