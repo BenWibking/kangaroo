@@ -6,12 +6,19 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
 #include <exception>
 #include <functional>
 #include <iostream>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include <hpx/include/actions.hpp>
 #include <hpx/include/async.hpp>
+#include <hpx/include/post.hpp>
 #include <hpx/runtime_local/get_worker_thread_num.hpp>
 
 HPX_PLAIN_ACTION(kangaroo::data_get_local_impl, kangaroo_data_get_local_action)
@@ -52,6 +59,23 @@ double now_seconds() {
   return std::chrono::duration<double>(now.time_since_epoch()).count();
 }
 
+int dataset_load_concurrency() {
+  static const int value = []() {
+    const char* env = std::getenv("KANGAROO_DATASET_LOAD_CONCURRENCY");
+    if (env != nullptr && *env != '\0') {
+      try {
+        const int parsed = std::stoi(env);
+        if (parsed > 0) {
+          return parsed;
+        }
+      } catch (...) {
+      }
+    }
+    return 2;
+  }();
+  return value;
+}
+
 void log_dataflow_event(const char* op,
                         const char* status,
                         const ChunkRef& ref,
@@ -75,6 +99,36 @@ void log_dataflow_event(const char* op,
   event.ts = end;
   event.start = start;
   event.end = end;
+  log_data_event(event);
+}
+
+void log_dataset_load_event(const char* op,
+                            const char* status,
+                            const ChunkRef& ref,
+                            std::size_t bytes,
+                            double start,
+                            double end,
+                            int32_t queue_depth,
+                            int32_t in_flight) {
+  if (!has_event_log()) {
+    return;
+  }
+  const int here = hpx::get_locality_id();
+  DataEvent event;
+  event.op = op;
+  event.mode = "local";
+  event.status = status;
+  event.ref = ref;
+  event.locality = here;
+  event.target_locality = here;
+  event.worker = static_cast<int32_t>(hpx::get_worker_thread_num());
+  event.bytes = bytes;
+  event.ts = end;
+  event.start = start;
+  event.end = end;
+  event.queue_depth = queue_depth;
+  event.in_flight = in_flight;
+  event.concurrency = dataset_load_concurrency();
   log_data_event(event);
 }
 
@@ -211,6 +265,133 @@ void fail_dataset_load(const std::shared_ptr<ChunkStore>& chunk_store,
   promise->set_exception(error);
 }
 
+struct DatasetLoadRequest {
+  std::shared_ptr<const DatasetHandle> dataset;
+  std::shared_ptr<ChunkStore> chunk_store;
+  ChunkRef ref;
+  double enqueue_time = 0.0;
+  int32_t queue_depth_at_start = 0;
+  int32_t in_flight_at_start = 0;
+};
+
+class DatasetLoadQueue;
+DatasetLoadQueue& dataset_load_queue();
+
+class DatasetLoadQueue {
+ public:
+  void enqueue(DatasetLoadRequest request) {
+    std::vector<DatasetLoadRequest> ready;
+    request.enqueue_time = now_seconds();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      pending_.push_back(std::move(request));
+      const auto& queued = pending_.back();
+      log_dataset_load_event("dataset_load_queue",
+                             "end",
+                             queued.ref,
+                             0,
+                             queued.enqueue_time,
+                             queued.enqueue_time,
+                             static_cast<int32_t>(pending_.size()),
+                             in_flight_);
+      pump_locked(ready);
+    }
+    post_ready(std::move(ready));
+  }
+
+  void run(DatasetLoadRequest request) {
+    struct FinishGuard {
+      DatasetLoadQueue& queue;
+      ~FinishGuard() { queue.finish_one(); }
+    } finish_guard{*this};
+
+    const double read_start = now_seconds();
+    log_dataset_load_event("dataset_load_start",
+                           "end",
+                           request.ref,
+                           0,
+                           request.enqueue_time,
+                           read_start,
+                           request.queue_depth_at_start,
+                           request.in_flight_at_start);
+
+    std::size_t bytes = 0;
+    try {
+      if (!request.dataset) {
+        throw std::runtime_error("dataset not initialized");
+      }
+      auto view = request.dataset->get_chunk(request.ref);
+      if (!view.has_value()) {
+        throw std::runtime_error("dataset chunk disappeared during load");
+      }
+      bytes = view->data.size();
+      fulfill_dataset_load(request.chunk_store, request.ref, std::move(*view));
+      const double read_end = now_seconds();
+      log_dataset_load_event("dataset_load_read",
+                             "end",
+                             request.ref,
+                             bytes,
+                             read_start,
+                             read_end,
+                             request.queue_depth_at_start,
+                             request.in_flight_at_start);
+    } catch (...) {
+      const double read_end = now_seconds();
+      log_dataset_load_event("dataset_load_read",
+                             "error",
+                             request.ref,
+                             bytes,
+                             read_start,
+                             read_end,
+                             request.queue_depth_at_start,
+                             request.in_flight_at_start);
+      fail_dataset_load(request.chunk_store, request.ref, std::current_exception());
+    }
+  }
+
+ private:
+  void pump_locked(std::vector<DatasetLoadRequest>& ready) {
+    const int32_t max_in_flight = dataset_load_concurrency();
+    while (in_flight_ < max_in_flight && !pending_.empty()) {
+      DatasetLoadRequest request = std::move(pending_.front());
+      pending_.pop_front();
+      ++in_flight_;
+      request.queue_depth_at_start = static_cast<int32_t>(pending_.size());
+      request.in_flight_at_start = in_flight_;
+      ready.push_back(std::move(request));
+    }
+  }
+
+  void finish_one() {
+    std::vector<DatasetLoadRequest> ready;
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      if (in_flight_ > 0) {
+        --in_flight_;
+      }
+      pump_locked(ready);
+    }
+    post_ready(std::move(ready));
+  }
+
+  static void post_ready(std::vector<DatasetLoadRequest> ready) {
+    for (auto& request : ready) {
+      hpx::post([request = std::move(request)]() mutable {
+        dataset_load_queue().run(std::move(request));
+      });
+    }
+  }
+
+  std::mutex mutex_;
+  std::deque<DatasetLoadRequest> pending_;
+  int32_t in_flight_ = 0;
+};
+
+DatasetLoadQueue& dataset_load_queue() {
+  static DatasetLoadQueue queue;
+  return queue;
+}
+
 }  // namespace
 
 DataServiceLocal::DataServiceLocal(int32_t run_id,
@@ -308,6 +489,13 @@ hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_local_shared
     return future;
   }
 
+  std::shared_ptr<const DatasetHandle> dataset_for_load;
+  if (ctx) {
+    dataset_for_load = std::shared_ptr<const DatasetHandle>(ctx, &ctx->dataset);
+  } else if (dataset != nullptr) {
+    dataset_for_load = std::make_shared<DatasetHandle>(*dataset);
+  }
+
   bool start_load = false;
   {
     std::lock_guard<std::mutex> lock(chunk_store->mutex);
@@ -321,18 +509,11 @@ hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_local_shared
   }
 
   if (start_load) {
-    try {
-      if (dataset == nullptr) {
-        throw std::runtime_error("dataset not initialized");
-      }
-      auto view = dataset->get_chunk(ref);
-      if (!view.has_value()) {
-        throw std::runtime_error("dataset chunk disappeared during load");
-      }
-      fulfill_dataset_load(chunk_store, ref, std::move(*view));
-    } catch (...) {
-      fail_dataset_load(chunk_store, ref, std::current_exception());
-    }
+    DatasetLoadRequest request;
+    request.dataset = std::move(dataset_for_load);
+    request.chunk_store = std::move(chunk_store);
+    request.ref = ref;
+    dataset_load_queue().enqueue(std::move(request));
   }
 
   return future;

@@ -249,6 +249,9 @@ struct DataEvent {
   int32_t worker = -1;
   std::string worker_label;
   std::size_t bytes = 0;
+  int32_t queue_depth = -1;
+  int32_t in_flight = -1;
+  int32_t concurrency = -1;
   double ts = 0.0;
   double start = 0.0;
   double end = 0.0;
