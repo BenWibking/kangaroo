@@ -398,6 +398,15 @@ struct EventLogWorker {
           out << ",\"worker\":\"worker-" << event.worker << '"';
         }
         out << ",\"bytes\":" << event.bytes;
+        if (event.queue_depth >= 0) {
+          out << ",\"queue_depth\":" << event.queue_depth;
+        }
+        if (event.in_flight >= 0) {
+          out << ",\"in_flight\":" << event.in_flight;
+        }
+        if (event.concurrency >= 0) {
+          out << ",\"concurrency\":" << event.concurrency;
+        }
         out << ",\"elapsed\":" << (event.end - event.start);
         out << ",\"ts\":" << event.ts;
         out << ",\"start\":" << event.start;
