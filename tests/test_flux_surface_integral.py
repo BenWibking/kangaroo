@@ -157,8 +157,17 @@ def test_flux_surface_integral_lowering_wires_accumulate_reduce_and_covered_boxe
         "passive_scalar_flux_sphere",
     )
     templates = [tmpl for stage in plan.stages for tmpl in stage.templates]
+    accum_stages = [
+        stage
+        for stage in plan.stages
+        if any(tmpl.kernel == "flux_surface_integral_accumulate" for tmpl in stage.templates)
+    ]
+    assert len(accum_stages) == 1
+    assert accum_stages[0].after == []
+
     accum = [tmpl for tmpl in templates if tmpl.kernel == "flux_surface_integral_accumulate"]
     assert len(accum) == 3
+    assert accum_stages[0].templates == accum
     assert all(len(tmpl.inputs) == 9 for tmpl in accum)
     assert all(tmpl.output_bytes == [32] for tmpl in accum)
 
@@ -172,6 +181,14 @@ def test_flux_surface_integral_lowering_wires_accumulate_reduce_and_covered_boxe
     reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
     assert reducers
     assert all(tmpl.params["bytes_per_value"] == 8 for tmpl in reducers)
+    first_reduce_stages = [
+        stage
+        for stage in plan.stages
+        if stage.plane == "graph"
+        and accum_stages[0] in stage.after
+        and any(tmpl.kernel == "uniform_slice_reduce" for tmpl in stage.templates)
+    ]
+    assert first_reduce_stages
 
 
 def test_flux_surface_integral_lowering_normalizes_single_nonzero_block() -> None:

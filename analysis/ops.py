@@ -1641,7 +1641,8 @@ class FluxSurfaceIntegral:
         out_bytes = 4 * 8
 
         flux_fields: list[tuple[FieldRef, int]] = []
-        stages: list = []
+        accumulate_stage = ctx.stage("flux_surface_integral")
+        stages: list = [accumulate_stage]
         producer_stage: dict[int, object] = {}
 
         for level_idx in range(len(levels) - 1, -1, -1):
@@ -1658,10 +1659,9 @@ class FluxSurfaceIntegral:
             covered_payload = [[list(c_lo), list(c_hi)] for c_lo, c_hi in covered_boxes]
             flux_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 
-            stage = ctx.stage("flux_surface_integral")
             for block in blocks:
                 dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
-                stage.map_blocks(
+                accumulate_stage.map_blocks(
                     name=f"flux_surface_integral_b{block}",
                     kernel="flux_surface_integral_accumulate",
                     domain=dom,
@@ -1676,19 +1676,19 @@ class FluxSurfaceIntegral:
                         "covered_boxes": covered_payload,
                     },
                 )
-            stages.append(stage)
-            producer_stage[flux_field.field] = stage
+            producer_stage[flux_field.field] = accumulate_stage
 
             num_inputs = len(blocks)
             fan_in = self._reduce_fan_in(num_inputs)
             input_flux = flux_field
             current_blocks = list(blocks)
             reduce_idx = 0
+            level_tail = accumulate_stage
             if num_inputs == 1 and current_blocks[0] != 0:
                 reduce_stage = ctx.stage(
                     "flux_surface_integral_reduce",
                     plane="graph",
-                    after=[stages[-1]],
+                    after=[level_tail],
                 )
                 reduce_stage.map_blocks(
                     name="flux_surface_integral_reduce_single",
@@ -1712,6 +1712,7 @@ class FluxSurfaceIntegral:
                 )
                 stages.append(reduce_stage)
                 producer_stage[flux_field.field] = reduce_stage
+                level_tail = reduce_stage
                 current_blocks = [0]
 
             while num_inputs > 1:
@@ -1729,7 +1730,7 @@ class FluxSurfaceIntegral:
                 reduce_stage = ctx.stage(
                     "flux_surface_integral_reduce",
                     plane="graph",
-                    after=[stages[-1]],
+                    after=[level_tail],
                 )
                 reduce_stage.map_blocks(
                     name=f"flux_surface_integral_reduce_s{reduce_idx}",
@@ -1753,6 +1754,7 @@ class FluxSurfaceIntegral:
                 )
                 stages.append(reduce_stage)
                 producer_stage[out_flux.field] = reduce_stage
+                level_tail = reduce_stage
                 input_flux = out_flux
                 current_blocks = output_blocks
                 num_inputs = num_groups
