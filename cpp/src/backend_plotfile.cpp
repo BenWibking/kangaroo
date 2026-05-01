@@ -264,6 +264,25 @@ bool PlotfileBackend::has_chunk(const ChunkRef& ref) const {
   return get_component_index(ref.field) >= 0;
 }
 
+std::size_t PlotfileBackend::estimate_chunk_bytes(const ChunkRef& ref) const {
+  if (ref.level < 0 || ref.level >= reader_.num_levels()) {
+    return 0;
+  }
+  const auto& header = reader_.vismf_header(ref.level);
+  const auto block = static_cast<std::size_t>(ref.block);
+  if (ref.block < 0 || block >= header.box_array.boxes.size()) {
+    return 0;
+  }
+  if (get_component_index(ref.field) < 0) {
+    return 0;
+  }
+  const auto points = header.box_array.boxes[block].num_pts();
+  if (points <= 0) {
+    return 0;
+  }
+  return static_cast<std::size_t>(points) * sizeof(double);
+}
+
 DatasetMetadata PlotfileBackend::get_metadata() const {
   DatasetMetadata meta;
   const auto& h = reader_.header();

@@ -13,6 +13,7 @@ class MemoryBackend : public DatasetBackend {
 
   std::optional<HostView> get_chunk(const ChunkRef& ref) override;
   bool has_chunk(const ChunkRef& ref) const override;
+  std::size_t estimate_chunk_bytes(const ChunkRef& ref) const override;
   DatasetMetadata get_metadata() const override;
 
   void set_chunk(const ChunkRef& ref, HostView view);

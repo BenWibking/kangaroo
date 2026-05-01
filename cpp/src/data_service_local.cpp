@@ -10,10 +10,12 @@
 #include <exception>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -26,6 +28,10 @@
 
 HPX_PLAIN_ACTION(kangaroo::data_get_local_impl, kangaroo_data_get_local_action)
 HPX_PLAIN_ACTION(kangaroo::data_put_local_impl, kangaroo_data_put_local_action)
+HPX_PLAIN_ACTION(kangaroo::data_register_input_consumers_local_impl,
+                 kangaroo_data_register_input_consumers_action)
+HPX_PLAIN_ACTION(kangaroo::data_release_consumed_inputs_local_impl,
+                 kangaroo_data_release_consumed_inputs_action)
 
 namespace kangaroo {
 
@@ -90,6 +96,55 @@ int dataset_load_concurrency() {
   return value;
 }
 
+std::size_t parse_size_env(const char* name, std::size_t fallback) {
+  const char* env = std::getenv(name);
+  if (env == nullptr || *env == '\0') {
+    return fallback;
+  }
+  try {
+    std::string value(env);
+    std::size_t multiplier = 1;
+    if (!value.empty()) {
+      const char suffix = value.back();
+      if (suffix == 'k' || suffix == 'K') {
+        multiplier = 1024;
+        value.pop_back();
+      } else if (suffix == 'm' || suffix == 'M') {
+        multiplier = 1024 * 1024;
+        value.pop_back();
+      } else if (suffix == 'g' || suffix == 'G') {
+        multiplier = 1024ull * 1024ull * 1024ull;
+        value.pop_back();
+      }
+    }
+    const auto parsed = static_cast<std::size_t>(std::stoull(value));
+    return parsed > 0 ? parsed * multiplier : fallback;
+  } catch (...) {
+    return fallback;
+  }
+}
+
+std::size_t dataset_load_max_bytes_in_flight() {
+  if (const auto parsed = parse_size_env("KANGAROO_PLOTFILE_READ_MAX_BYTES_IN_FLIGHT", 0);
+      parsed > 0) {
+    return parsed;
+  }
+  if (const auto parsed = parse_size_env("KANGAROO_DATASET_LOAD_MAX_BYTES_IN_FLIGHT", 0);
+      parsed > 0) {
+    return parsed;
+  }
+  return std::size_t{0};
+}
+
+int64_t signed_size_or_disabled(std::size_t value) {
+  if (value == 0) {
+    return -1;
+  }
+  return value > static_cast<std::size_t>(std::numeric_limits<int64_t>::max())
+             ? std::numeric_limits<int64_t>::max()
+             : static_cast<int64_t>(value);
+}
+
 void log_dataflow_event(const char* op,
                         const char* status,
                         const ChunkRef& ref,
@@ -125,6 +180,27 @@ void log_dataflow_marker(const char* op,
   log_dataflow_event(op, "end", ref, here, target, bytes, start);
 }
 
+void log_chunk_store_event(const char* op, const ChunkRef& ref, std::size_t bytes) {
+  if (!has_event_log()) {
+    return;
+  }
+  const int here = hpx::get_locality_id();
+  const double ts = now_seconds();
+  DataEvent event;
+  event.op = op;
+  event.mode = "local";
+  event.status = "end";
+  event.ref = ref;
+  event.locality = here;
+  event.target_locality = here;
+  event.worker = static_cast<int32_t>(hpx::get_worker_thread_num());
+  event.bytes = bytes;
+  event.ts = ts;
+  event.start = ts;
+  event.end = ts;
+  log_data_event(event);
+}
+
 void log_dataset_load_event(const char* op,
                             const char* status,
                             const ChunkRef& ref,
@@ -132,7 +208,10 @@ void log_dataset_load_event(const char* op,
                             double start,
                             double end,
                             int32_t queue_depth,
-                            int32_t in_flight) {
+                            int32_t in_flight,
+                            std::size_t estimated_bytes = 0,
+                            std::size_t in_flight_bytes = 0,
+                            std::size_t byte_limit = 0) {
   if (!has_event_log()) {
     return;
   }
@@ -146,12 +225,17 @@ void log_dataset_load_event(const char* op,
   event.target_locality = here;
   event.worker = static_cast<int32_t>(hpx::get_worker_thread_num());
   event.bytes = bytes;
+  event.estimated_bytes = estimated_bytes;
   event.ts = end;
   event.start = start;
   event.end = end;
   event.queue_depth = queue_depth;
   event.in_flight = in_flight;
   event.concurrency = dataset_load_concurrency();
+  if (byte_limit > 0) {
+    event.in_flight_bytes = signed_size_or_disabled(in_flight_bytes);
+    event.byte_limit = signed_size_or_disabled(byte_limit);
+  }
   log_data_event(event);
 }
 
@@ -285,16 +369,76 @@ void fail_dataset_load(const std::shared_ptr<ChunkStore>& chunk_store,
   });
 }
 
+std::size_t estimate_dataset_load_bytes(const DatasetHandle* dataset, const ChunkRef& ref) {
+  if (dataset == nullptr) {
+    return 0;
+  }
+  try {
+    return dataset->estimate_chunk_bytes(ref);
+  } catch (...) {
+    return 0;
+  }
+}
+
 struct DatasetLoadRequest {
   std::shared_ptr<const DatasetHandle> dataset;
   std::shared_ptr<ChunkStore> chunk_store;
   ChunkRef ref;
   double enqueue_time = 0.0;
+  std::size_t estimated_bytes = 0;
   int32_t queue_depth_at_start = 0;
   int32_t in_flight_at_start = 0;
+  std::size_t in_flight_bytes_at_start = 0;
+  std::size_t byte_limit_at_start = 0;
 };
 
 using DatasetLoadBatch = std::vector<DatasetLoadRequest>;
+
+std::size_t estimated_batch_bytes(const DatasetLoadBatch& requests) {
+  std::size_t total = 0;
+  for (const auto& request : requests) {
+    total += request.estimated_bytes;
+  }
+  return total;
+}
+
+void log_dataset_load_unit_event(const char* op,
+                                 const char* status,
+                                 const DatasetLoadBatch& requests,
+                                 std::size_t bytes,
+                                 double start,
+                                 double end,
+                                 int32_t queue_depth,
+                                 int32_t in_flight,
+                                 std::size_t in_flight_bytes = 0,
+                                 std::size_t byte_limit = 0) {
+  if (!has_event_log() || requests.empty()) {
+    return;
+  }
+  const int here = hpx::get_locality_id();
+  DataEvent event;
+  event.op = op;
+  event.mode = "local";
+  event.status = status;
+  event.ref = requests.front().ref;
+  event.locality = here;
+  event.target_locality = here;
+  event.worker = static_cast<int32_t>(hpx::get_worker_thread_num());
+  event.bytes = bytes;
+  event.estimated_bytes = estimated_batch_bytes(requests);
+  event.ts = end;
+  event.start = start;
+  event.end = end;
+  event.queue_depth = queue_depth;
+  event.in_flight = in_flight;
+  event.concurrency = dataset_load_concurrency();
+  event.comp_count = static_cast<int32_t>(requests.size());
+  if (byte_limit > 0) {
+    event.in_flight_bytes = signed_size_or_disabled(in_flight_bytes);
+    event.byte_limit = signed_size_or_disabled(byte_limit);
+  }
+  log_data_event(event);
+}
 
 class DatasetLoadQueue;
 DatasetLoadQueue& dataset_load_queue();
@@ -345,6 +489,7 @@ class DatasetLoadQueue {
       }
     }
 
+    bool post_pump = false;
     {
       std::lock_guard<hpx::mutex> lock(mutex_);
       for (auto& batch : batches) {
@@ -360,6 +505,16 @@ class DatasetLoadQueue {
           pending_.push_back(std::move(batch));
           const auto& queued = pending_.back();
           const int32_t queue_depth = static_cast<int32_t>(pending_.size());
+          log_dataset_load_unit_event("dataset_load_unit_queue",
+                                      "end",
+                                      queued,
+                                      0,
+                                      enqueue_time,
+                                      enqueue_time,
+                                      queue_depth,
+                                      in_flight_,
+                                      in_flight_bytes_,
+                                      dataset_load_max_bytes_in_flight());
           for (const auto& request : queued) {
             log_dataset_load_event("dataset_load_queue",
                                    "end",
@@ -368,12 +523,16 @@ class DatasetLoadQueue {
                                    request.enqueue_time,
                                    request.enqueue_time,
                                    queue_depth,
-                                   in_flight_);
+                                   in_flight_,
+                                   request.estimated_bytes,
+                                   in_flight_bytes_,
+                                   dataset_load_max_bytes_in_flight());
           }
           continue;
         }
 
         const int32_t queue_depth = static_cast<int32_t>(pending_.size());
+        const double merge_time = now_seconds();
         for (auto& request : batch) {
           log_dataset_load_event("dataset_load_queue",
                                  "end",
@@ -382,25 +541,52 @@ class DatasetLoadQueue {
                                  request.enqueue_time,
                                  request.enqueue_time,
                                  queue_depth,
-                                 in_flight_);
+                                 in_flight_,
+                                 request.estimated_bytes,
+                                 in_flight_bytes_,
+                                 dataset_load_max_bytes_in_flight());
           pending_it->push_back(std::move(request));
         }
+        log_dataset_load_unit_event("dataset_load_unit_queue",
+                                    "end",
+                                    *pending_it,
+                                    0,
+                                    enqueue_time,
+                                    merge_time,
+                                    queue_depth,
+                                    in_flight_,
+                                    in_flight_bytes_,
+                                    dataset_load_max_bytes_in_flight());
       }
-      schedule_pump_locked();
+      post_pump = mark_pump_scheduled_locked();
+    }
+    if (post_pump) {
+      post_pump_task();
     }
   }
 
   void run(DatasetLoadBatch requests) {
     struct FinishGuard {
       DatasetLoadQueue& queue;
-      ~FinishGuard() { queue.finish_one(); }
-    } finish_guard{*this};
+      std::size_t estimated_bytes = 0;
+      ~FinishGuard() { queue.finish_one(estimated_bytes); }
+    } finish_guard{*this, estimated_batch_bytes(requests)};
 
     if (requests.empty()) {
       return;
     }
 
     const double read_start = now_seconds();
+    log_dataset_load_unit_event("dataset_load_unit_start",
+                                "end",
+                                requests,
+                                0,
+                                requests.front().enqueue_time,
+                                read_start,
+                                requests.front().queue_depth_at_start,
+                                requests.front().in_flight_at_start,
+                                requests.front().in_flight_bytes_at_start,
+                                requests.front().byte_limit_at_start);
     for (const auto& request : requests) {
       log_dataset_load_event("dataset_load_start",
                              "end",
@@ -409,7 +595,10 @@ class DatasetLoadQueue {
                              request.enqueue_time,
                              read_start,
                              request.queue_depth_at_start,
-                             request.in_flight_at_start);
+                             request.in_flight_at_start,
+                             request.estimated_bytes,
+                             request.in_flight_bytes_at_start,
+                             request.byte_limit_at_start);
     }
 
     try {
@@ -426,6 +615,22 @@ class DatasetLoadQueue {
         throw std::runtime_error("dataset backend returned wrong number of chunks");
       }
       const double read_end = now_seconds();
+      std::size_t total_bytes = 0;
+      for (const auto& view : views) {
+        if (view.has_value()) {
+          total_bytes += view->data.size();
+        }
+      }
+      log_dataset_load_unit_event("dataset_load_unit_read",
+                                  "end",
+                                  requests,
+                                  total_bytes,
+                                  read_start,
+                                  read_end,
+                                  requests.front().queue_depth_at_start,
+                                  requests.front().in_flight_at_start,
+                                  requests.front().in_flight_bytes_at_start,
+                                  requests.front().byte_limit_at_start);
       for (std::size_t i = 0; i < requests.size(); ++i) {
         const auto& request = requests[i];
         if (!views[i].has_value()) {
@@ -436,7 +641,10 @@ class DatasetLoadQueue {
                                  read_start,
                                  read_end,
                                  request.queue_depth_at_start,
-                                 request.in_flight_at_start);
+                                 request.in_flight_at_start,
+                                 request.estimated_bytes,
+                                 request.in_flight_bytes_at_start,
+                                 request.byte_limit_at_start);
           fail_dataset_load(request.chunk_store,
                             request.ref,
                             std::make_exception_ptr(
@@ -452,10 +660,23 @@ class DatasetLoadQueue {
                                read_start,
                                read_end,
                                request.queue_depth_at_start,
-                               request.in_flight_at_start);
+                               request.in_flight_at_start,
+                               request.estimated_bytes,
+                               request.in_flight_bytes_at_start,
+                               request.byte_limit_at_start);
       }
     } catch (...) {
       const double read_end = now_seconds();
+      log_dataset_load_unit_event("dataset_load_unit_read",
+                                  "error",
+                                  requests,
+                                  0,
+                                  read_start,
+                                  read_end,
+                                  requests.front().queue_depth_at_start,
+                                  requests.front().in_flight_at_start,
+                                  requests.front().in_flight_bytes_at_start,
+                                  requests.front().byte_limit_at_start);
       for (const auto& request : requests) {
         log_dataset_load_event("dataset_load_read",
                                "error",
@@ -464,61 +685,91 @@ class DatasetLoadQueue {
                                read_start,
                                read_end,
                                request.queue_depth_at_start,
-                               request.in_flight_at_start);
+                               request.in_flight_at_start,
+                               request.estimated_bytes,
+                               request.in_flight_bytes_at_start,
+                               request.byte_limit_at_start);
         fail_dataset_load(request.chunk_store, request.ref, std::current_exception());
       }
     }
   }
 
  private:
-  void schedule_pump_locked() {
+  bool mark_pump_scheduled_locked() {
     if (pump_scheduled_) {
-      return;
+      return false;
     }
     pump_scheduled_ = true;
+    return true;
+  }
+
+  static void post_pump_task() {
     hpx::post([] { dataset_load_queue().pump(); });
   }
 
   void pump() {
     std::vector<DatasetLoadBatch> ready;
+    bool post_pump = false;
     {
       std::lock_guard<hpx::mutex> lock(mutex_);
       pump_scheduled_ = false;
       pump_locked(ready);
-      if (!pending_.empty() && in_flight_ < dataset_load_concurrency()) {
-        schedule_pump_locked();
+      if (has_admissible_locked()) {
+        post_pump = mark_pump_scheduled_locked();
       }
     }
     post_ready(std::move(ready));
+    if (post_pump) {
+      post_pump_task();
+    }
   }
 
   void pump_locked(std::vector<DatasetLoadBatch>& ready) {
     const int32_t max_in_flight = dataset_load_concurrency();
     while (in_flight_ < max_in_flight && !pending_.empty()) {
-      DatasetLoadBatch batch = std::move(pending_.front());
-      pending_.pop_front();
+      auto it = std::find_if(pending_.begin(), pending_.end(), [&](const auto& batch) {
+        return can_admit_locked(batch);
+      });
+      if (it == pending_.end()) {
+        break;
+      }
+
+      DatasetLoadBatch batch = std::move(*it);
+      pending_.erase(it);
+      const std::size_t estimated = estimated_batch_bytes(batch);
+      const std::size_t max_bytes = dataset_load_max_bytes_in_flight();
       ++in_flight_;
+      in_flight_bytes_ += estimated;
       for (auto& request : batch) {
         request.queue_depth_at_start = static_cast<int32_t>(pending_.size());
         request.in_flight_at_start = in_flight_;
+        request.in_flight_bytes_at_start = in_flight_bytes_;
+        request.byte_limit_at_start = max_bytes;
       }
       ready.push_back(std::move(batch));
     }
   }
 
-  void finish_one() {
+  void finish_one(std::size_t estimated_bytes) {
     std::vector<DatasetLoadBatch> ready;
+    bool post_pump = false;
     {
       std::lock_guard<hpx::mutex> lock(mutex_);
       if (in_flight_ > 0) {
         --in_flight_;
       }
+      in_flight_bytes_ = estimated_bytes > in_flight_bytes_
+                             ? 0
+                             : in_flight_bytes_ - estimated_bytes;
       pump_locked(ready);
-      if (!pending_.empty() && in_flight_ < dataset_load_concurrency()) {
-        schedule_pump_locked();
+      if (has_admissible_locked()) {
+        post_pump = mark_pump_scheduled_locked();
       }
     }
     post_ready(std::move(ready));
+    if (post_pump) {
+      post_pump_task();
+    }
   }
 
   static void post_ready(std::vector<DatasetLoadBatch> ready) {
@@ -527,9 +778,31 @@ class DatasetLoadQueue {
     }
   }
 
+  bool can_admit_locked(const DatasetLoadBatch& batch) const {
+    if (in_flight_ >= dataset_load_concurrency()) {
+      return false;
+    }
+    const std::size_t max_bytes = dataset_load_max_bytes_in_flight();
+    const std::size_t estimated = estimated_batch_bytes(batch);
+    if (max_bytes == 0 || estimated == 0) {
+      return true;
+    }
+    if (in_flight_ == 0) {
+      return true;
+    }
+    return in_flight_bytes_ + estimated <= max_bytes;
+  }
+
+  bool has_admissible_locked() const {
+    return std::any_of(pending_.begin(), pending_.end(), [&](const auto& batch) {
+      return can_admit_locked(batch);
+    });
+  }
+
   hpx::mutex mutex_;
   std::deque<DatasetLoadBatch> pending_;
   int32_t in_flight_ = 0;
+  std::size_t in_flight_bytes_ = 0;
   bool pump_scheduled_ = false;
 };
 
@@ -668,6 +941,46 @@ hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_local_shared
     return future;
   }
 
+  if (run_id_ == 0 && dataset != nullptr) {
+    std::shared_ptr<hpx::promise<std::shared_ptr<HostView>>> promise;
+    try {
+      auto view = dataset->get_chunk(ref);
+      if (!view.has_value()) {
+        throw std::runtime_error("dataset chunk disappeared during load");
+      }
+      auto shared_view = std::make_shared<HostView>(std::move(*view));
+      {
+        std::lock_guard<ChunkStore::Mutex> lock(chunk_store->mutex);
+        auto [it, inserted] = chunk_store->data.try_emplace(ref, make_pending_slot());
+        (void)inserted;
+        if (it->second.ready) {
+          return it->second.future;
+        }
+        it->second.ready = true;
+        it->second.dataset_load_started = false;
+        it->second.value = shared_view;
+        promise = it->second.promise;
+        future = it->second.future;
+      }
+      promise->set_value(std::move(shared_view));
+    } catch (...) {
+      {
+        std::lock_guard<ChunkStore::Mutex> lock(chunk_store->mutex);
+        auto [it, inserted] = chunk_store->data.try_emplace(ref, make_pending_slot());
+        (void)inserted;
+        if (it->second.ready) {
+          return it->second.future;
+        }
+        it->second.ready = true;
+        it->second.dataset_load_started = false;
+        promise = it->second.promise;
+        future = it->second.future;
+      }
+      promise->set_exception(std::current_exception());
+    }
+    return future;
+  }
+
   std::shared_ptr<const DatasetHandle> dataset_for_load;
   if (ctx) {
     dataset_for_load = std::shared_ptr<const DatasetHandle>(ctx, &ctx->dataset);
@@ -692,6 +1005,7 @@ hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_local_shared
     request.dataset = std::move(dataset_for_load);
     request.chunk_store = std::move(chunk_store);
     request.ref = ref;
+    request.estimated_bytes = estimate_dataset_load_bytes(request.dataset.get(), request.ref);
     dataset_load_queue().enqueue(std::move(request));
   }
 
@@ -782,6 +1096,7 @@ DataServiceLocal::get_local_shared_batch_impl(const std::vector<ChunkRef>& refs)
     request.dataset = dataset_for_load;
     request.chunk_store = chunk_store;
     request.ref = ref;
+    request.estimated_bytes = estimate_dataset_load_bytes(request.dataset.get(), request.ref);
     load_requests.push_back(std::move(request));
   }
 
@@ -857,6 +1172,176 @@ hpx::future<HostView> data_get_local_impl(int32_t run_id, const ChunkRef& ref) {
 void data_put_local_impl(int32_t run_id, const ChunkRef& ref, HostView view) {
   DataServiceLocal data_service(run_id);
   data_service.put_local_impl(ref, std::move(view));
+}
+
+std::vector<ChunkConsumerCount> combine_ref_counts(const std::vector<ChunkRef>& refs) {
+  std::unordered_map<ChunkRef, std::int64_t, ChunkRefHash, ChunkRefEq> counts;
+  for (const auto& ref : refs) {
+    counts[ref] += 1;
+  }
+  std::vector<ChunkConsumerCount> out;
+  out.reserve(counts.size());
+  for (const auto& [ref, count] : counts) {
+    if (count > 0) {
+      out.push_back(ChunkConsumerCount{ref, count});
+    }
+  }
+  return out;
+}
+
+std::vector<std::vector<ChunkConsumerCount>> counts_by_home(DataServiceLocal& data_service,
+                                                            const std::vector<ChunkConsumerCount>& counts) {
+  const auto localities = hpx::find_all_localities();
+  std::vector<std::vector<ChunkConsumerCount>> by_home(localities.size());
+  for (const auto& entry : counts) {
+    if (entry.count <= 0) {
+      continue;
+    }
+    const int target = data_service.home_rank(entry.ref);
+    if (target < 0 || static_cast<std::size_t>(target) >= by_home.size()) {
+      throw std::runtime_error("chunk consumer count target locality out of range");
+    }
+    by_home[static_cast<std::size_t>(target)].push_back(entry);
+  }
+  return by_home;
+}
+
+void data_register_input_consumers_local_impl(
+    int32_t run_id,
+    const std::vector<ChunkConsumerCount>& counts) {
+  DataServiceLocal data_service(run_id);
+  auto chunk_store = data_service.resolve_chunk_store();
+  if (chunk_store == nullptr) {
+    throw std::runtime_error("chunk store not initialized");
+  }
+  std::lock_guard<ChunkStore::Mutex> lock(chunk_store->mutex);
+  for (const auto& entry : counts) {
+    if (entry.count <= 0) {
+      continue;
+    }
+    chunk_store->consumer_counts[entry.ref] += entry.count;
+  }
+}
+
+void data_release_consumed_inputs_local_impl(
+    int32_t run_id,
+    const std::vector<ChunkConsumerCount>& counts) {
+  DataServiceLocal data_service(run_id);
+  auto chunk_store = data_service.resolve_chunk_store();
+  const DatasetHandle* dataset = data_service.resolve_dataset();
+  if (chunk_store == nullptr) {
+    throw std::runtime_error("chunk store not initialized");
+  }
+
+  struct EvictedChunk {
+    ChunkRef ref;
+    std::size_t bytes = 0;
+  };
+  std::vector<EvictedChunk> evicted;
+
+  {
+    std::lock_guard<ChunkStore::Mutex> lock(chunk_store->mutex);
+    for (const auto& entry : counts) {
+      if (entry.count <= 0) {
+        continue;
+      }
+      auto count_it = chunk_store->consumer_counts.find(entry.ref);
+      if (count_it == chunk_store->consumer_counts.end()) {
+        continue;
+      }
+      if (entry.count < count_it->second) {
+        count_it->second -= entry.count;
+        continue;
+      }
+
+      chunk_store->consumer_counts.erase(count_it);
+      const bool dataset_backed = dataset != nullptr && dataset->has_chunk(entry.ref);
+      const bool produced_by_plan =
+          run_id != 0 && execution_context_may_produce_chunk(run_id, entry.ref);
+      if (!dataset_backed || produced_by_plan) {
+        continue;
+      }
+
+      auto data_it = chunk_store->data.find(entry.ref);
+      if (data_it == chunk_store->data.end() || !data_it->second.ready ||
+          !data_it->second.value) {
+        continue;
+      }
+      const std::size_t bytes = data_it->second.value->data.size();
+      chunk_store->data.erase(data_it);
+      evicted.push_back(EvictedChunk{entry.ref, bytes});
+    }
+  }
+
+  for (const auto& item : evicted) {
+    log_chunk_store_event("chunk_evict", item.ref, item.bytes);
+  }
+}
+
+hpx::future<void> DataServiceLocal::register_input_consumers(
+    const std::vector<ChunkConsumerCount>& counts) {
+  if (counts.empty()) {
+    return hpx::make_ready_future();
+  }
+  const auto localities = hpx::find_all_localities();
+  const int here = hpx::get_locality_id();
+  auto by_home = counts_by_home(*this, counts);
+  std::vector<hpx::future<void>> futures;
+  futures.reserve(by_home.size());
+  for (std::size_t target = 0; target < by_home.size(); ++target) {
+    if (by_home[target].empty()) {
+      continue;
+    }
+    if (static_cast<int>(target) == here) {
+      data_register_input_consumers_local_impl(run_id_, by_home[target]);
+      continue;
+    }
+    futures.push_back(
+        hpx::async<::kangaroo_data_register_input_consumers_action>(
+            localities.at(target), run_id_, std::move(by_home[target])));
+  }
+  if (futures.empty()) {
+    return hpx::make_ready_future();
+  }
+  return hpx::when_all(std::move(futures)).then([](auto&& ready) {
+    auto results = ready.get();
+    for (auto& result : results) {
+      result.get();
+    }
+  });
+}
+
+hpx::future<void> DataServiceLocal::release_consumed_inputs(const std::vector<ChunkRef>& refs) {
+  if (refs.empty()) {
+    return hpx::make_ready_future();
+  }
+  auto counts = combine_ref_counts(refs);
+  const auto localities = hpx::find_all_localities();
+  const int here = hpx::get_locality_id();
+  auto by_home = counts_by_home(*this, counts);
+  std::vector<hpx::future<void>> futures;
+  futures.reserve(by_home.size());
+  for (std::size_t target = 0; target < by_home.size(); ++target) {
+    if (by_home[target].empty()) {
+      continue;
+    }
+    if (static_cast<int>(target) == here) {
+      data_release_consumed_inputs_local_impl(run_id_, by_home[target]);
+      continue;
+    }
+    futures.push_back(
+        hpx::async<::kangaroo_data_release_consumed_inputs_action>(
+            localities.at(target), run_id_, std::move(by_home[target])));
+  }
+  if (futures.empty()) {
+    return hpx::make_ready_future();
+  }
+  return hpx::when_all(std::move(futures)).then([](auto&& ready) {
+    auto results = ready.get();
+    for (auto& result : results) {
+      result.get();
+    }
+  });
 }
 
 void DataServiceLocal::put_local_impl(const ChunkRef& ref, HostView view) {

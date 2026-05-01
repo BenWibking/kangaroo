@@ -8,18 +8,23 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <cstdlib>
+#include <exception>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <queue>
 #include <sstream>
 #include <stdexcept>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include <hpx/include/actions.hpp>
 #include <hpx/include/async.hpp>
 #include <hpx/include/lcos.hpp>
+#include <hpx/async_combinators/when_any.hpp>
 #include <hpx/runtime_distributed/find_localities.hpp>
 #include <hpx/runtime_local/get_locality_id.hpp>
 #include <hpx/runtime_local/get_worker_thread_num.hpp>
@@ -290,6 +295,144 @@ InputLocation resolve_input_location(const TaskTemplateIR& tmpl,
     return loc;
   }
   throw std::runtime_error("task block not in input domain blocks");
+}
+
+std::size_t checked_positive_extent(int32_t lo, int32_t hi) {
+  if (hi < lo) {
+    return 0;
+  }
+  return static_cast<std::size_t>(hi - lo + 1);
+}
+
+std::size_t block_cell_count(const RunMeta& meta, int32_t step, int16_t level, int32_t block) {
+  const auto& box = meta.steps.at(static_cast<std::size_t>(step))
+                        .levels.at(static_cast<std::size_t>(level))
+                        .boxes.at(static_cast<std::size_t>(block));
+  const std::size_t nx = checked_positive_extent(box.lo.x, box.hi.x);
+  const std::size_t ny = checked_positive_extent(box.lo.y, box.hi.y);
+  const std::size_t nz = checked_positive_extent(box.lo.z, box.hi.z);
+  return nx * ny * nz;
+}
+
+std::size_t estimate_block_bytes(const RunMeta& meta, const ChunkRef& ref, int32_t bytes_per_value) {
+  if (bytes_per_value <= 0) {
+    return 0;
+  }
+  return block_cell_count(meta, ref.step, ref.level, ref.block) *
+         static_cast<std::size_t>(bytes_per_value);
+}
+
+std::vector<int32_t> input_bytes_per_value_from_params(const TaskTemplateIR& tmpl) {
+  std::vector<int32_t> values;
+  try {
+    const auto& root = cached_params_root(std::span<const std::uint8_t>(
+        tmpl.params_msgpack.data(), tmpl.params_msgpack.size()));
+    if (const auto* input_bpvs = find_msgpack_map_value(root, "input_bytes_per_value");
+        input_bpvs != nullptr && input_bpvs->type == msgpack::type::ARRAY) {
+      values.reserve(input_bpvs->via.array.size);
+      for (uint32_t i = 0; i < input_bpvs->via.array.size; ++i) {
+        const auto& value = input_bpvs->via.array.ptr[i];
+        if (value.type == msgpack::type::POSITIVE_INTEGER ||
+            value.type == msgpack::type::NEGATIVE_INTEGER) {
+          values.push_back(value.as<int32_t>());
+        } else {
+          values.push_back(0);
+        }
+      }
+      return values;
+    }
+    if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
+        bpv != nullptr && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                           bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+      values.assign(tmpl.inputs.size(), bpv->as<int32_t>());
+    }
+  } catch (...) {
+    values.clear();
+  }
+  return values;
+}
+
+std::size_t template_output_bytes(const TaskTemplateIR& tmpl) {
+  std::size_t bytes = 0;
+  for (int64_t value : tmpl.output_bytes) {
+    if (value > 0) {
+      bytes += static_cast<std::size_t>(value);
+    }
+  }
+  return bytes;
+}
+
+using ChunkByteMap = std::unordered_map<ChunkRef, std::size_t, ChunkRefHash, ChunkRefEq>;
+
+void add_known_output_bytes(ChunkByteMap& known,
+                            const ChunkRef& ref,
+                            std::size_t bytes) {
+  if (bytes == 0) {
+    return;
+  }
+  known[ref] = bytes;
+}
+
+ChunkByteMap build_known_output_bytes(const PlanIR& plan, const RunMeta& meta) {
+  ChunkByteMap known;
+  for (const auto& stage : plan.stages) {
+    for (const auto& tmpl : stage.templates) {
+      const std::size_t bytes = template_output_bytes(tmpl);
+      if (bytes == 0 || tmpl.outputs.empty()) {
+        continue;
+      }
+      if (tmpl.plane == ExecPlane::Chunk) {
+        const auto& level = meta.steps.at(static_cast<std::size_t>(tmpl.domain.step))
+                                .levels.at(static_cast<std::size_t>(tmpl.domain.level));
+        std::vector<int32_t> blocks;
+        if (tmpl.domain.blocks.has_value()) {
+          blocks.assign(tmpl.domain.blocks->begin(), tmpl.domain.blocks->end());
+        } else {
+          const int32_t nblocks = static_cast<int32_t>(level.boxes.size());
+          blocks.reserve(static_cast<std::size_t>(nblocks));
+          for (int32_t block = 0; block < nblocks; ++block) {
+            blocks.push_back(block);
+          }
+        }
+        for (int32_t block : blocks) {
+          for (const auto& out : tmpl.outputs) {
+            add_known_output_bytes(
+                known,
+                ChunkRef{tmpl.domain.step, tmpl.domain.level, out.field, out.version, block},
+                bytes);
+          }
+        }
+      } else if (tmpl.plane == ExecPlane::Graph) {
+        const auto& params = prepared_graph_reduce(tmpl);
+        const int32_t n_groups = graph_reduce_group_count(params);
+        for (int32_t group_idx = 0; group_idx < n_groups; ++group_idx) {
+          const int32_t out_block = graph_reduce_output_block(params, group_idx);
+          for (const auto& out : tmpl.outputs) {
+            add_known_output_bytes(
+                known,
+                ChunkRef{tmpl.domain.step, tmpl.domain.level, out.field, out.version, out_block},
+                bytes);
+          }
+        }
+      }
+    }
+  }
+  return known;
+}
+
+std::size_t estimate_task_input_ref_bytes(const RunMeta& meta,
+                                          const ChunkByteMap& known_outputs,
+                                          const ChunkRef& ref,
+                                          int32_t bytes_per_value) {
+  auto it = known_outputs.find(ref);
+  if (it != known_outputs.end()) {
+    return it->second;
+  }
+  try {
+    return estimate_block_bytes(meta, ref, bytes_per_value);
+  } catch (...) {
+    return 0;
+  }
 }
 
 TaskEvent base_task_event(const TaskTemplateIR& tmpl,
@@ -997,6 +1140,302 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
   });
 }
 
+struct StorageUnitKey {
+  int32_t step = 0;
+  int16_t level = 0;
+  int32_t version = 0;
+  int32_t block = 0;
+
+  bool operator==(const StorageUnitKey& other) const {
+    return step == other.step && level == other.level && version == other.version &&
+           block == other.block;
+  }
+};
+
+struct StorageUnitKeyHash {
+  std::size_t operator()(const StorageUnitKey& key) const {
+    std::size_t h = 0xcbf29ce484222325ull;
+    auto mix = [&](auto v) {
+      h ^= static_cast<std::size_t>(v) + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2);
+    };
+    mix(key.step);
+    mix(key.level);
+    mix(key.version);
+    mix(key.block);
+    return h;
+  }
+};
+
+std::vector<StorageUnitKey> task_storage_units(const TaskInstance& task) {
+  std::vector<StorageUnitKey> units;
+  units.reserve(task.input_refs.size());
+  for (const auto& ref : task.input_refs) {
+    StorageUnitKey key{ref.step, ref.level, ref.version, ref.block};
+    if (std::find(units.begin(), units.end(), key) == units.end()) {
+      units.push_back(key);
+    }
+  }
+  return units;
+}
+
+hpx::future<void> run_stage_partition_impl(int32_t plan_id,
+                                           const PlanIR& plan,
+                                           const RunMeta& meta,
+                                           DataService& data,
+                                           AdjacencyService& adj,
+                                           std::vector<TaskInstance> tasks,
+                                           std::size_t max_active_tasks,
+                                           std::size_t max_active_storage_units,
+                                           std::size_t max_input_bytes,
+                                           std::size_t max_output_bytes) {
+  if (tasks.empty()) {
+    return hpx::make_ready_future();
+  }
+
+  struct ActiveTask {
+    hpx::future<void> future;
+    std::vector<StorageUnitKey> storage_units;
+    std::vector<ChunkRef> input_refs;
+    std::size_t input_bytes = 0;
+    std::size_t output_bytes = 0;
+  };
+
+  struct Runner : std::enable_shared_from_this<Runner> {
+    int32_t plan_id = 0;
+    const PlanIR* plan = nullptr;
+    const RunMeta* meta = nullptr;
+    DataService* data = nullptr;
+    AdjacencyService* adj = nullptr;
+    std::vector<TaskInstance> pending;
+    std::size_t max_active_tasks = 1;
+    std::size_t max_active_storage_units = 0;
+    std::size_t max_input_bytes = 0;
+    std::size_t max_output_bytes = 0;
+    std::vector<ActiveTask> active;
+    std::unordered_map<StorageUnitKey, int32_t, StorageUnitKeyHash> active_storage_units;
+    std::size_t active_storage_unit_count = 0;
+    std::size_t active_input_bytes = 0;
+    std::size_t active_output_bytes = 0;
+    hpx::promise<void> done;
+
+    hpx::future<void> start() {
+      auto out = done.get_future();
+      try {
+        refill();
+        wait_next();
+      } catch (...) {
+        done.set_exception(std::current_exception());
+      }
+      return out;
+    }
+
+    hpx::future<void> launch(const TaskInstance& task) {
+      const auto& stage = plan->stages.at(static_cast<std::size_t>(task.stage_idx));
+      const auto tmpl = stage.templates.at(static_cast<std::size_t>(task.tmpl_idx));
+      if (task.kind == TaskKind::Chunk) {
+        return hpx::unwrap(hpx::async([tmpl,
+                                       plan_id = plan_id,
+                                       stage_idx = task.stage_idx,
+                                       tmpl_idx = task.tmpl_idx,
+                                       block = task.block_or_group,
+                                       meta = meta,
+                                       data = data,
+                                       adj = adj]() mutable {
+          return run_block_task_impl(tmpl, plan_id, stage_idx, tmpl_idx, block, *meta, *data, *adj);
+        }));
+      }
+      return hpx::unwrap(hpx::async([tmpl,
+                                     plan_id = plan_id,
+                                     stage_idx = task.stage_idx,
+                                     tmpl_idx = task.tmpl_idx,
+                                     group_idx = task.block_or_group,
+                                     meta = meta,
+                                     data = data]() mutable {
+        return run_graph_task_impl(tmpl, plan_id, stage_idx, tmpl_idx, group_idx, *meta, *data);
+      }));
+    }
+
+    std::size_t new_storage_unit_count(const std::vector<StorageUnitKey>& units) const {
+      std::size_t count = 0;
+      for (const auto& unit : units) {
+        if (active_storage_units.find(unit) == active_storage_units.end()) {
+          ++count;
+        }
+      }
+      return count;
+    }
+
+    bool can_admit(const TaskInstance& task, const std::vector<StorageUnitKey>& units) const {
+      if (active.size() >= max_active_tasks) {
+        return false;
+      }
+      if (max_active_storage_units == 0 || units.empty()) {
+        return can_admit_bytes(task);
+      }
+      const std::size_t new_units = new_storage_unit_count(units);
+      if (active.empty()) {
+        return true;
+      }
+      return active_storage_unit_count + new_units <= max_active_storage_units &&
+             can_admit_bytes(task);
+    }
+
+    bool can_admit_bytes(const TaskInstance& task) const {
+      if (active.empty()) {
+        return true;
+      }
+      if (max_input_bytes > 0 && task.estimated_input_bytes > 0 &&
+          active_input_bytes + task.estimated_input_bytes > max_input_bytes) {
+        return false;
+      }
+      if (max_output_bytes > 0 && task.estimated_output_bytes > 0 &&
+          active_output_bytes + task.estimated_output_bytes > max_output_bytes) {
+        return false;
+      }
+      return true;
+    }
+
+    void add_task_bytes(const TaskInstance& task) {
+      active_input_bytes += task.estimated_input_bytes;
+      active_output_bytes += task.estimated_output_bytes;
+    }
+
+    void remove_task_bytes(const ActiveTask& task) {
+      active_input_bytes = task.input_bytes > active_input_bytes
+                               ? 0
+                               : active_input_bytes - task.input_bytes;
+      active_output_bytes = task.output_bytes > active_output_bytes
+                                ? 0
+                                : active_output_bytes - task.output_bytes;
+    }
+
+    void add_storage_units(const std::vector<StorageUnitKey>& units) {
+      for (const auto& unit : units) {
+        auto [it, inserted] = active_storage_units.emplace(unit, 0);
+        if (inserted) {
+          ++active_storage_unit_count;
+        }
+        it->second += 1;
+      }
+    }
+
+    void remove_storage_units(const std::vector<StorageUnitKey>& units) {
+      for (const auto& unit : units) {
+        auto it = active_storage_units.find(unit);
+        if (it == active_storage_units.end()) {
+          continue;
+        }
+        it->second -= 1;
+        if (it->second <= 0) {
+          active_storage_units.erase(it);
+          if (active_storage_unit_count > 0) {
+            --active_storage_unit_count;
+          }
+        }
+      }
+    }
+
+    void release_consumed_inputs(const std::vector<ChunkRef>& refs) {
+      if (refs.empty()) {
+        return;
+      }
+      auto* local_data = dynamic_cast<DataServiceLocal*>(data);
+      if (local_data == nullptr) {
+        return;
+      }
+      local_data->release_consumed_inputs(refs).get();
+    }
+
+    void refill() {
+      while (!pending.empty() && active.size() < max_active_tasks) {
+        bool admitted = false;
+        for (std::size_t i = 0; i < pending.size(); ++i) {
+          auto units = task_storage_units(pending[i]);
+          if (!can_admit(pending[i], units)) {
+            continue;
+          }
+          TaskInstance task = std::move(pending[i]);
+          pending.erase(pending.begin() + static_cast<std::ptrdiff_t>(i));
+          std::vector<ChunkRef> input_refs = task.input_refs;
+          add_storage_units(units);
+          add_task_bytes(task);
+          active.push_back(ActiveTask{launch(task),
+                                      std::move(units),
+                                      std::move(input_refs),
+                                      task.estimated_input_bytes,
+                                      task.estimated_output_bytes});
+          admitted = true;
+          break;
+        }
+        if (!admitted) {
+          break;
+        }
+      }
+    }
+
+    void wait_next() {
+      if (active.empty()) {
+        if (pending.empty()) {
+          done.set_value();
+          return;
+        }
+        refill();
+        if (active.empty()) {
+          done.set_exception(std::make_exception_ptr(
+              std::runtime_error("streaming partition could not admit pending task")));
+          return;
+        }
+      }
+
+      std::vector<hpx::future<void>> waiting;
+      waiting.reserve(active.size());
+      for (auto& task : active) {
+        waiting.push_back(std::move(task.future));
+      }
+      hpx::when_any(std::move(waiting))
+          .then([self = this->shared_from_this()](auto&& ready) mutable {
+            self->handle_ready(std::move(ready));
+          });
+    }
+
+    void handle_ready(hpx::future<hpx::when_any_result<std::vector<hpx::future<void>>>> ready) {
+      try {
+        auto result = ready.get();
+        if (result.index >= result.futures.size() || result.index >= active.size()) {
+          throw std::runtime_error("streaming partition received invalid when_any index");
+        }
+        for (std::size_t i = 0; i < active.size(); ++i) {
+          if (i != result.index) {
+            active[i].future = std::move(result.futures[i]);
+          }
+        }
+        result.futures[result.index].get();
+        release_consumed_inputs(active[result.index].input_refs);
+        remove_storage_units(active[result.index].storage_units);
+        remove_task_bytes(active[result.index]);
+        active.erase(active.begin() + static_cast<std::ptrdiff_t>(result.index));
+        refill();
+        wait_next();
+      } catch (...) {
+        done.set_exception(std::current_exception());
+      }
+    }
+  };
+
+  auto runner = std::make_shared<Runner>();
+  runner->plan_id = plan_id;
+  runner->plan = &plan;
+  runner->meta = &meta;
+  runner->data = &data;
+  runner->adj = &adj;
+  runner->pending = std::move(tasks);
+  runner->max_active_tasks = std::max<std::size_t>(1, max_active_tasks);
+  runner->max_active_storage_units = max_active_storage_units;
+  runner->max_input_bytes = max_input_bytes;
+  runner->max_output_bytes = max_output_bytes;
+  return runner->start();
+}
+
 hpx::future<void> run_block_task_remote(int32_t plan_id, int32_t stage_idx, int32_t tmpl_idx,
                                         int32_t block) {
   auto ctx = execution_context_shared(plan_id);
@@ -1022,12 +1461,40 @@ hpx::future<void> run_graph_task_remote(int32_t plan_id, int32_t stage_idx, int3
       });
 }
 
+hpx::future<void> run_stage_partition_remote(int32_t plan_id,
+                                             std::vector<TaskInstance> tasks,
+                                             int32_t max_active_tasks,
+                                             int32_t max_active_storage_units,
+                                             std::uint64_t max_input_bytes,
+                                             std::uint64_t max_output_bytes) {
+  auto ctx = execution_context_shared(plan_id);
+  auto data = std::make_shared<DataServiceLocal>(plan_id);
+  const std::size_t task_limit =
+      static_cast<std::size_t>(std::max<int32_t>(1, max_active_tasks));
+  const std::size_t storage_unit_limit =
+      static_cast<std::size_t>(std::max<int32_t>(0, max_active_storage_units));
+  return run_stage_partition_impl(plan_id,
+                                  ctx->plan,
+                                  ctx->meta,
+                                  *data,
+                                  *ctx->adjacency,
+                                  std::move(tasks),
+                                  task_limit,
+                                  storage_unit_limit,
+                                  static_cast<std::size_t>(max_input_bytes),
+                                  static_cast<std::size_t>(max_output_bytes))
+      .then([ctx = std::move(ctx), data = std::move(data)](auto&& done) mutable {
+        done.get();
+      });
+}
+
 }  // namespace
 
 }  // namespace kangaroo
 
 HPX_PLAIN_ACTION(kangaroo::run_block_task_remote, kangaroo_run_block_task_action)
 HPX_PLAIN_ACTION(kangaroo::run_graph_task_remote, kangaroo_run_graph_task_action)
+HPX_PLAIN_ACTION(kangaroo::run_stage_partition_remote, kangaroo_run_stage_partition_action)
 
 namespace kangaroo {
 
@@ -1069,8 +1536,77 @@ void prepare_plan(PlanIR& plan, KernelRegistry& kernels) {
   }
 }
 
+ExecutorOptions executor_options_from_environment() {
+  auto positive_env_int = [](const char* name, int32_t fallback) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || *raw == '\0') {
+      return fallback;
+    }
+    try {
+      int value = std::stoi(raw);
+      return value > 0 ? value : fallback;
+    } catch (...) {
+      return fallback;
+    }
+  };
+  auto positive_env_size = [](const char* name, std::size_t fallback) {
+    const char* raw = std::getenv(name);
+    if (raw == nullptr || *raw == '\0') {
+      return fallback;
+    }
+    try {
+      std::string value(raw);
+      char suffix = '\0';
+      if (!value.empty()) {
+        suffix = value.back();
+      }
+      std::size_t multiplier = 1;
+      if (suffix == 'k' || suffix == 'K') {
+        multiplier = 1024;
+        value.pop_back();
+      } else if (suffix == 'm' || suffix == 'M') {
+        multiplier = 1024 * 1024;
+        value.pop_back();
+      } else if (suffix == 'g' || suffix == 'G') {
+        multiplier = 1024ull * 1024ull * 1024ull;
+        value.pop_back();
+      }
+      std::size_t parsed = static_cast<std::size_t>(std::stoull(value));
+      return parsed > 0 ? parsed * multiplier : fallback;
+    } catch (...) {
+      return fallback;
+    }
+  };
+
+  ExecutorOptions options;
+  if (const char* mode = std::getenv("KANGAROO_EXECUTOR_MODE");
+      mode != nullptr && *mode != '\0') {
+    options.mode = mode;
+  }
+  options.max_active_tasks_per_locality = positive_env_int(
+      "KANGAROO_EXECUTOR_MAX_ACTIVE_TASKS_PER_LOCALITY",
+      options.max_active_tasks_per_locality);
+  options.max_active_storage_units_per_locality = positive_env_int(
+      "KANGAROO_EXECUTOR_MAX_ACTIVE_STORAGE_UNITS_PER_LOCALITY",
+      options.max_active_storage_units_per_locality);
+  options.max_active_tasks_per_stage = positive_env_int(
+      "KANGAROO_EXECUTOR_MAX_ACTIVE_TASKS_PER_STAGE",
+      options.max_active_tasks_per_stage);
+  options.max_input_bytes_per_locality = positive_env_size(
+      "KANGAROO_EXECUTOR_MAX_INPUT_BYTES_PER_LOCALITY",
+      options.max_input_bytes_per_locality);
+  options.max_output_bytes_per_locality = positive_env_size(
+      "KANGAROO_EXECUTOR_MAX_OUTPUT_BYTES_PER_LOCALITY",
+      options.max_output_bytes_per_locality);
+  return options;
+}
+
 Executor::Executor(int32_t plan_id, const RunMeta& meta, DataService& data, AdjacencyService& adj)
-    : plan_id_(plan_id), meta_(meta), data_(data), adj_(adj) {}
+    : Executor(plan_id, meta, data, adj, executor_options_from_environment()) {}
+
+Executor::Executor(int32_t plan_id, const RunMeta& meta, DataService& data, AdjacencyService& adj,
+                   ExecutorOptions options)
+    : plan_id_(plan_id), meta_(meta), data_(data), adj_(adj), options_(std::move(options)) {}
 
 hpx::future<void> Executor::run(const PlanIR& plan) {
   current_plan_ = &plan;
@@ -1116,6 +1652,14 @@ hpx::future<void> Executor::run(const PlanIR& plan) {
     current_plan_ = nullptr;
     return hpx::make_ready_future();
   }
+  if (options_.mode == "streaming") {
+    try {
+      register_streaming_input_consumers(plan).get();
+    } catch (...) {
+      current_plan_ = nullptr;
+      throw;
+    }
+  }
 
   std::vector<hpx::shared_future<void>> stage_futures(nstages);
   for (int32_t stage_idx : order) {
@@ -1156,6 +1700,17 @@ hpx::future<void> Executor::run(const PlanIR& plan) {
 }
 
 hpx::future<void> Executor::run_stage(int32_t stage_idx, const StageIR& stage) {
+  if (options_.mode == "streaming") {
+    return run_stage_streaming(stage_idx, stage);
+  }
+  if (options_.mode != "eager") {
+    return hpx::make_exceptional_future<void>(
+        std::runtime_error("unsupported KANGAROO_EXECUTOR_MODE: " + options_.mode));
+  }
+  return run_stage_eager(stage_idx, stage);
+}
+
+hpx::future<void> Executor::run_stage_eager(int32_t stage_idx, const StageIR& stage) {
   if (current_plan_ == nullptr) {
     throw std::runtime_error("executor run_stage requires active plan");
   }
@@ -1205,6 +1760,254 @@ hpx::future<void> Executor::run_stage(int32_t stage_idx, const StageIR& stage) {
     auto task_results = ready_tasks.get();
     for (auto& task : task_results) {
       task.get();
+    }
+    return;
+  });
+}
+
+std::size_t Executor::streaming_locality_task_window() const {
+  std::size_t limit =
+      static_cast<std::size_t>(std::max<int32_t>(1, options_.max_active_tasks_per_locality));
+  if (options_.max_active_tasks_per_stage > 0) {
+    const std::size_t localities = std::max<std::size_t>(1, hpx::find_all_localities().size());
+    const std::size_t stage_limit = static_cast<std::size_t>(options_.max_active_tasks_per_stage);
+    const std::size_t per_locality_stage_limit =
+        std::max<std::size_t>(1, (stage_limit + localities - 1) / localities);
+    limit = std::min(limit, per_locality_stage_limit);
+  }
+  return limit;
+}
+
+std::size_t Executor::streaming_locality_storage_unit_window() const {
+  if (options_.max_active_storage_units_per_locality > 0) {
+    return static_cast<std::size_t>(options_.max_active_storage_units_per_locality);
+  }
+  return streaming_locality_task_window();
+}
+
+std::size_t streaming_partition_action_limit(std::size_t value) {
+  return std::min<std::size_t>(
+      value,
+      static_cast<std::size_t>(std::numeric_limits<int32_t>::max()));
+}
+
+std::vector<std::vector<TaskInstance>> partition_tasks_by_locality(
+    std::vector<TaskInstance> tasks,
+    std::size_t locality_count) {
+  std::vector<std::vector<TaskInstance>> partitions(locality_count);
+  for (auto& task : tasks) {
+    if (task.target_locality < 0 ||
+        static_cast<std::size_t>(task.target_locality) >= locality_count) {
+      throw std::runtime_error("streaming task target locality out of range");
+    }
+    partitions[static_cast<std::size_t>(task.target_locality)].push_back(std::move(task));
+  }
+  return partitions;
+}
+
+std::vector<TaskInstance> Executor::expand_stage_tasks(int32_t stage_idx,
+                                                       const StageIR& stage) const {
+  if (current_plan_ == nullptr) {
+    throw std::runtime_error("executor expand_stage_tasks requires active plan");
+  }
+  const ChunkByteMap known_outputs = build_known_output_bytes(*current_plan_, meta_);
+  std::vector<TaskInstance> tasks;
+  for (std::size_t tmpl_idx_size = 0; tmpl_idx_size < stage.templates.size(); ++tmpl_idx_size) {
+    const int32_t tmpl_idx = static_cast<int32_t>(tmpl_idx_size);
+    const auto& tmpl = stage.templates[tmpl_idx_size];
+    const std::vector<int32_t> input_bpvs = input_bytes_per_value_from_params(tmpl);
+    if (stage.plane == ExecPlane::Chunk) {
+      if (tmpl.plane != ExecPlane::Chunk) {
+        throw std::runtime_error("chunk stage requires chunk templates");
+      }
+      const auto& level = meta_.steps.at(tmpl.domain.step).levels.at(tmpl.domain.level);
+      std::vector<int32_t> blocks;
+      if (tmpl.domain.blocks.has_value()) {
+        blocks.assign(tmpl.domain.blocks->begin(), tmpl.domain.blocks->end());
+      } else {
+        const int32_t nblocks = static_cast<int32_t>(level.boxes.size());
+        blocks.reserve(static_cast<std::size_t>(nblocks));
+        for (int32_t block = 0; block < nblocks; ++block) {
+          blocks.push_back(block);
+        }
+      }
+
+      for (int32_t block : blocks) {
+        TaskInstance task;
+        task.kind = TaskKind::Chunk;
+        task.stage_idx = stage_idx;
+        task.tmpl_idx = tmpl_idx;
+        task.block_or_group = block;
+        task.input_refs.reserve(tmpl.inputs.size());
+        for (std::size_t input_idx = 0; input_idx < tmpl.inputs.size(); ++input_idx) {
+          const auto& input = tmpl.inputs[input_idx];
+          const auto loc = resolve_input_location(tmpl, input, block);
+          ChunkRef ref{loc.step, loc.level, input.field, input.version, loc.block};
+          task.input_refs.push_back(ref);
+          const int32_t bpv = input_idx < input_bpvs.size() ? input_bpvs[input_idx] : 0;
+          task.estimated_input_bytes +=
+              estimate_task_input_ref_bytes(meta_, known_outputs, ref, bpv);
+        }
+        task.output_refs.reserve(tmpl.outputs.size());
+        for (const auto& out : tmpl.outputs) {
+          task.output_refs.push_back(
+              ChunkRef{tmpl.domain.step, tmpl.domain.level, out.field, out.version, block});
+        }
+        task.estimated_output_bytes = template_output_bytes(tmpl);
+        ChunkRef target_ref;
+        if (task.input_refs.empty()) {
+          if (task.output_refs.empty()) {
+            throw std::runtime_error("templates must specify outputs");
+          }
+          target_ref = task.output_refs.front();
+        } else {
+          target_ref = task.input_refs.front();
+        }
+        task.target_locality = data_.home_rank(target_ref);
+        tasks.push_back(std::move(task));
+      }
+    } else if (stage.plane == ExecPlane::Graph) {
+      if (tmpl.plane != ExecPlane::Graph) {
+        throw std::runtime_error("graph stage requires graph templates");
+      }
+      const auto& params = prepared_graph_reduce(tmpl);
+      const int32_t n_groups = graph_reduce_group_count(params);
+      for (int32_t group_idx = 0; group_idx < n_groups; ++group_idx) {
+        const int32_t start = graph_reduce_group_start(params, group_idx);
+        const int32_t end = graph_reduce_group_end(params, group_idx);
+        const int32_t out_block = graph_reduce_output_block(params, group_idx);
+        TaskInstance task;
+        task.kind = TaskKind::Graph;
+        task.stage_idx = stage_idx;
+        task.tmpl_idx = tmpl_idx;
+        task.block_or_group = group_idx;
+        task.input_refs.reserve(static_cast<std::size_t>(
+            std::max<int32_t>(0, end - start) * static_cast<int32_t>(tmpl.inputs.size())));
+        for (std::size_t input_idx = 0; input_idx < tmpl.inputs.size(); ++input_idx) {
+          const auto& input = tmpl.inputs[input_idx];
+          for (int32_t idx = start; idx < end; ++idx) {
+            const int32_t block_id = params.input_blocks.empty()
+                                         ? (params.input_base + idx)
+                                         : params.input_blocks.at(static_cast<std::size_t>(idx));
+            int32_t step = tmpl.domain.step;
+            int16_t level = tmpl.domain.level;
+            if (input.domain.has_value()) {
+              step = input.domain->step;
+              level = input.domain->level;
+            }
+            ChunkRef ref{step, level, input.field, input.version, block_id};
+            task.input_refs.push_back(ref);
+            const int32_t bpv = input_idx < input_bpvs.size() ? input_bpvs[input_idx] : 0;
+            task.estimated_input_bytes +=
+                estimate_task_input_ref_bytes(meta_, known_outputs, ref, bpv);
+          }
+        }
+        task.output_refs.reserve(tmpl.outputs.size());
+        for (const auto& out : tmpl.outputs) {
+          task.output_refs.push_back(
+              ChunkRef{tmpl.domain.step, tmpl.domain.level, out.field, out.version, out_block});
+        }
+        task.estimated_output_bytes = template_output_bytes(tmpl);
+        if (task.output_refs.empty()) {
+          throw std::runtime_error("graph templates must specify outputs");
+        }
+        task.target_locality = data_.home_rank(task.output_refs.front());
+        tasks.push_back(std::move(task));
+      }
+    } else {
+      throw std::runtime_error("unsupported execution plane");
+    }
+  }
+  return tasks;
+}
+
+hpx::future<void> Executor::register_streaming_input_consumers(const PlanIR& plan) const {
+  auto* local_data = dynamic_cast<DataServiceLocal*>(&data_);
+  if (local_data == nullptr) {
+    return hpx::make_ready_future();
+  }
+
+  std::unordered_map<ChunkRef, std::int64_t, ChunkRefHash, ChunkRefEq> counts;
+  for (std::size_t stage_idx = 0; stage_idx < plan.stages.size(); ++stage_idx) {
+    auto tasks = expand_stage_tasks(static_cast<int32_t>(stage_idx), plan.stages[stage_idx]);
+    for (const auto& task : tasks) {
+      for (const auto& ref : task.input_refs) {
+        counts[ref] += 1;
+      }
+    }
+  }
+
+  std::vector<ChunkConsumerCount> consumer_counts;
+  consumer_counts.reserve(counts.size());
+  for (const auto& [ref, count] : counts) {
+    if (count > 0) {
+      consumer_counts.push_back(ChunkConsumerCount{ref, count});
+    }
+  }
+  return local_data->register_input_consumers(consumer_counts);
+}
+
+hpx::future<void> Executor::run_stage_streaming(int32_t stage_idx, const StageIR& stage) {
+  auto tasks = expand_stage_tasks(stage_idx, stage);
+  if (tasks.empty()) {
+    return hpx::make_ready_future();
+  }
+
+  if (current_plan_ == nullptr) {
+    throw std::runtime_error("executor run_stage_streaming requires active plan");
+  }
+
+  const auto localities = hpx::find_all_localities();
+  const std::size_t locality_count = std::max<std::size_t>(1, localities.size());
+  auto partitions = partition_tasks_by_locality(std::move(tasks), locality_count);
+  const int here = hpx::get_locality_id();
+  const std::size_t task_limit = streaming_locality_task_window();
+  const std::size_t storage_unit_limit = streaming_locality_storage_unit_window();
+  const int32_t action_task_limit =
+      static_cast<int32_t>(streaming_partition_action_limit(task_limit));
+  const int32_t action_storage_unit_limit =
+      static_cast<int32_t>(streaming_partition_action_limit(storage_unit_limit));
+  const std::uint64_t action_input_byte_limit =
+      static_cast<std::uint64_t>(options_.max_input_bytes_per_locality);
+  const std::uint64_t action_output_byte_limit =
+      static_cast<std::uint64_t>(options_.max_output_bytes_per_locality);
+
+  std::vector<hpx::future<void>> partition_futures;
+  partition_futures.reserve(locality_count);
+  for (std::size_t target = 0; target < partitions.size(); ++target) {
+    if (partitions[target].empty()) {
+      continue;
+    }
+    if (static_cast<int>(target) == here) {
+      partition_futures.push_back(run_stage_partition_impl(plan_id_,
+                                                           *current_plan_,
+                                                           meta_,
+                                                           data_,
+                                                           adj_,
+                                                           std::move(partitions[target]),
+                                                           task_limit,
+                                                           storage_unit_limit,
+                                                           options_.max_input_bytes_per_locality,
+                                                           options_.max_output_bytes_per_locality));
+      continue;
+    }
+    partition_futures.push_back(
+        hpx::async<::kangaroo_run_stage_partition_action>(localities.at(target),
+                                                          plan_id_,
+                                                          std::move(partitions[target]),
+                                                          action_task_limit,
+                                                          action_storage_unit_limit,
+                                                          action_input_byte_limit,
+                                                          action_output_byte_limit));
+  }
+
+  if (partition_futures.empty()) {
+    return hpx::make_ready_future();
+  }
+  return hpx::when_all(partition_futures).then([](auto&& ready_partitions) {
+    auto partition_results = ready_partitions.get();
+    for (auto& partition : partition_results) {
+      partition.get();
     }
     return;
   });
