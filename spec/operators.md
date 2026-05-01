@@ -155,8 +155,9 @@ Behavior:
 ## 8. Spherical Flux Surface Integration
 
 `flux_surface_integral_accumulate` MUST:
-- Accumulate a four-component `float64` vector per block:
+- Accumulate a four-component `float64` vector per requested radius and block:
   mass flux, hydro energy flux, MHD energy flux, and passive scalar flux.
+- Accept a finite, positive radius or a finite, positive radius array.
 - Use the same spherical section area approximation as Quokka's
   `sphericalSectionAreaInCell`.
 - Exclude coarse cells covered by finer AMR levels via covered-box masking.
@@ -169,14 +170,16 @@ Behavior:
 - Sum block, level, and final outputs through the standard double-precision
   graph reduction kernels.
 
-The output order MUST be:
+The output is laid out with radius as the outer axis and component as the inner
+axis. For each radius, the component order MUST be:
 1. `mass_flux_sphere`
 2. `hydro_energy_flux_sphere`
 3. `mhd_energy_flux_sphere`
 4. `passive_scalar_flux_sphere`
 
 Validation:
-- Radius MUST be finite and positive.
+- Every radius MUST be finite and positive.
+- Every radius MUST intersect at least one mesh block.
 - `gamma` MUST be finite and greater than one for the ideal-gas pressure path.
 - MHD mode MUST receive all three cell-centered magnetic components.
 

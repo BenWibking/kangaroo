@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import numpy as np
 
@@ -57,6 +57,7 @@ class Histogram2DHandle:
 @dataclass(frozen=True)
 class FluxSurfaceIntegralHandle:
     fluxes: FieldHandle
+    radii: tuple[float, ...] = ()
     components: tuple[str, str, str, str] = (
         "mass_flux_sphere",
         "hydro_energy_flux_sphere",
@@ -656,7 +657,7 @@ class Pipeline:
         energy: int | FieldHandle,
         passive_scalar: int | FieldHandle,
         magnetic_field: tuple[int | FieldHandle, int | FieldHandle, int | FieldHandle],
-        radius: float,
+        radius: float | Sequence[float],
         out: str | None = None,
         gamma: float = 5.0 / 3.0,
         bytes_per_value: int | None = None,
@@ -667,7 +668,7 @@ class Pipeline:
         if len(magnetic_field) != 3:
             raise ValueError("magnetic_field must contain three cell-centered fields")
         out_name = out or self._unique_name("flux_surface_integral")
-        fragment = FluxSurfaceIntegral(
+        op = FluxSurfaceIntegral(
             density=self._as_field_id(density),
             momentum=tuple(self._as_field_id(comp) for comp in momentum),
             energy=self._as_field_id(energy),
@@ -678,10 +679,11 @@ class Pipeline:
             gamma=gamma,
             bytes_per_value=bytes_per_value,
             reduce_fan_in=reduce_fan_in,
-        ).lower(self._ctx)
+        )
+        fragment = op.lower(self._ctx)
         self._append_fragment(fragment)
         out_field = self._sink_fields(fragment)[-1]
-        return FluxSurfaceIntegralHandle(FieldHandle(self, out_field, out_name))
+        return FluxSurfaceIntegralHandle(FieldHandle(self, out_field, out_name), radii=op.radii)
 
     def histogram1d(
         self,

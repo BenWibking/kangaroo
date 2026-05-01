@@ -191,6 +191,50 @@ def test_flux_surface_integral_lowering_wires_accumulate_reduce_and_covered_boxe
     assert first_reduce_stages
 
 
+def test_flux_surface_integral_lowering_accepts_radius_array() -> None:
+    rt = _FakeRuntime()
+    runmeta = _RunMeta(
+        steps=[
+            _Step(
+                step=0,
+                levels=[
+                    _Level(
+                        geom=_Geom(
+                            dx=(1.0, 1.0, 1.0),
+                            x0=(0.0, -0.5, -0.5),
+                            index_origin=(0, 0, 0),
+                        ),
+                        boxes=[_Box((0, 0, 0), (0, 0, 0))],
+                    )
+                ],
+            )
+        ]
+    )
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=_FakeDataset(rt))
+
+    flux = pipe.flux_surface_integral(
+        1,
+        momentum=(2, 3, 4),
+        energy=5,
+        passive_scalar=6,
+        magnetic_field=(7, 8, 9),
+        radius=np.array([0.25, 0.5, 0.75]),
+        out="flux",
+        bytes_per_value=8,
+    )
+    plan = pipe.plan()
+
+    assert flux.radii == (0.25, 0.5, 0.75)
+    templates = [tmpl for stage in plan.stages for tmpl in stage.templates]
+    accum = [tmpl for tmpl in templates if tmpl.kernel == "flux_surface_integral_accumulate"]
+    assert len(accum) == 1
+    assert accum[0].params["radii"] == [0.25, 0.5, 0.75]
+    assert accum[0].output_bytes == [96]
+    reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
+    assert reducers
+    assert all(tmpl.output_bytes == [96] for tmpl in reducers)
+
+
 def test_flux_surface_integral_lowering_normalizes_single_nonzero_block() -> None:
     rt = _FakeRuntime()
     runmeta = _RunMeta(
@@ -277,6 +321,39 @@ def test_flux_surface_integral_rejects_invalid_radius() -> None:
         )
 
 
+def test_flux_surface_integral_rejects_invalid_radius_array_value() -> None:
+    rt = _FakeRuntime()
+    runmeta = _RunMeta(
+        steps=[
+            _Step(
+                step=0,
+                levels=[
+                    _Level(
+                        geom=_Geom(
+                            dx=(1.0, 1.0, 1.0),
+                            x0=(0.0, 0.0, 0.0),
+                            index_origin=(0, 0, 0),
+                        ),
+                        boxes=[_Box((0, 0, 0), (0, 0, 0))],
+                    )
+                ],
+            )
+        ]
+    )
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=_FakeDataset(rt))
+
+    with pytest.raises(ValueError, match="radius"):
+        pipe.flux_surface_integral(
+            1,
+            momentum=(2, 3, 4),
+            energy=5,
+            passive_scalar=6,
+            magnetic_field=(7, 8, 9),
+            radius=[0.5, 0.0],
+            bytes_per_value=8,
+        )
+
+
 def test_flux_surface_integral_rejects_radius_with_no_intersecting_blocks() -> None:
     rt = _FakeRuntime()
     runmeta = _RunMeta(
@@ -306,6 +383,39 @@ def test_flux_surface_integral_rejects_radius_with_no_intersecting_blocks() -> N
             passive_scalar=6,
             magnetic_field=(7, 8, 9),
             radius=10.0,
+            bytes_per_value=8,
+        )
+
+
+def test_flux_surface_integral_rejects_radius_array_with_missing_intersection() -> None:
+    rt = _FakeRuntime()
+    runmeta = _RunMeta(
+        steps=[
+            _Step(
+                step=0,
+                levels=[
+                    _Level(
+                        geom=_Geom(
+                            dx=(1.0, 1.0, 1.0),
+                            x0=(0.0, -0.5, -0.5),
+                            index_origin=(0, 0, 0),
+                        ),
+                        boxes=[_Box((0, 0, 0), (0, 0, 0))],
+                    )
+                ],
+            )
+        ]
+    )
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=_FakeDataset(rt))
+
+    with pytest.raises(ValueError, match="do not intersect any mesh block"):
+        pipe.flux_surface_integral(
+            1,
+            momentum=(2, 3, 4),
+            energy=5,
+            passive_scalar=6,
+            magnetic_field=(7, 8, 9),
+            radius=[0.5, 10.0],
             bytes_per_value=8,
         )
 
@@ -366,6 +476,52 @@ def test_flux_surface_integral_runtime_one_cell_mhd_energy_term() -> None:
         block=0,
     )
     assert np.allclose(raw, np.array([6.0, 87.0, 90.0, 15.0]))
+
+
+def test_flux_surface_integral_runtime_radius_array() -> None:
+    rt = Runtime()
+    step = 8
+    levels = [
+        LevelMeta(
+            geom=LevelGeom(
+                dx=(1.0, 1.0, 1.0),
+                x0=(0.0, -0.5, -0.5),
+                ref_ratio=1,
+            ),
+            boxes=[BlockBox((0, 0, 0), (0, 0, 0))],
+        )
+    ]
+    runmeta = _runmeta_with_step_index(step, levels)
+    ds = open_dataset("memory://flux-radius-array", runmeta=runmeta, step=step, level=0, runtime=rt)
+    for fid in range(1, 10):
+        ds.register_field(f"f{fid}", fid)
+
+    for fid, values in _one_cell_state(rho=2.0, momx=6.0, energy=21.5, scalar=5.0, bz=1.0).items():
+        _set_block_double(ds, step=step, level=0, field=fid, block=0, values=values)
+
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    flux = pipe.flux_surface_integral(
+        1,
+        momentum=(2, 3, 4),
+        energy=5,
+        passive_scalar=6,
+        magnetic_field=(7, 8, 9),
+        radius=[0.25, 0.5, 0.75],
+        bytes_per_value=8,
+    )
+    pipe.run()
+
+    raw = rt.get_task_chunk_array(
+        step=step,
+        level=0,
+        field=flux.field,
+        shape=(3, 4),
+        dtype=np.float64,
+        dataset=ds,
+        block=0,
+    )
+    expected = np.tile(np.array([6.0, 87.0, 90.0, 15.0]), (3, 1))
+    assert np.allclose(raw, expected)
 
 
 def test_flux_surface_integral_runtime_single_nonzero_block() -> None:

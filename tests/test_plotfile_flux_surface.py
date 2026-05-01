@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
+
 from scripts.plotfile_flux_surface import (
     _intersecting_validation_blocks,
+    _pick_field,
     _validate_selected_fields,
 )
 
@@ -40,15 +43,15 @@ class _RunMeta:
 @dataclass(frozen=True)
 class _Dataset:
     step: int = 0
+    metadata: dict | None = None
 
-
-class _Runtime:
-    def __init__(self) -> None:
-        self.calls: list[dict] = []
-
-    def get_task_chunk(self, **kwargs):
-        self.calls.append(kwargs)
-        return b"x"
+    def __post_init__(self) -> None:
+        if self.metadata is None:
+            object.__setattr__(
+                self,
+                "metadata",
+                {"var_names": ["rho", "E"]},
+            )
 
 
 def _runmeta_with_intersecting_and_far_levels() -> _RunMeta:
@@ -83,21 +86,33 @@ def test_flux_surface_validation_samples_only_intersecting_levels() -> None:
 
     assert _intersecting_validation_blocks(ds, runmeta, radius=0.5) == [(0, 0), (1, 1)]
 
-    rt = _Runtime()
     _validate_selected_fields(
         ds,
-        rt,
         runmeta,
         {
             "density": ("rho", 1),
             "energy": ("E", 2),
         },
-        radius=0.5,
+        radii=[0.5],
     )
 
-    assert [(call["level"], call["block"], call["field"]) for call in rt.calls] == [
-        (0, 0, 1),
-        (1, 1, 1),
-        (0, 0, 2),
-        (1, 1, 2),
-    ]
+
+def test_flux_surface_validation_rejects_fields_using_metadata_only() -> None:
+    ds = _Dataset()
+    runmeta = _runmeta_with_intersecting_and_far_levels()
+
+    with pytest.raises(RuntimeError, match="metadata"):
+        _validate_selected_fields(
+            ds,
+            runmeta,
+            {
+                "density": ("rho", 1),
+                "energy": ("missing", 2),
+            },
+            radii=[0.5],
+        )
+
+
+def test_flux_surface_explicit_field_must_exist_in_metadata() -> None:
+    with pytest.raises(RuntimeError, match="--list-fields"):
+        _pick_field("density", "missing", ["rho", "E"])

@@ -28,7 +28,11 @@ class DataServiceLocal : public DataService {
 
   int home_rank(const ChunkRef& ref) const override;
   HostView alloc_host(const ChunkRef& ref, std::size_t bytes) override;
+  hpx::shared_future<std::shared_ptr<HostView>> get_host_shared(const ChunkRef& ref);
+  std::vector<hpx::shared_future<std::shared_ptr<HostView>>> get_hosts_shared(
+      const std::vector<ChunkRef>& refs);
   hpx::future<HostView> get_host(const ChunkRef& ref) override;
+  std::vector<hpx::future<HostView>> get_hosts(const std::vector<ChunkRef>& refs) override;
   hpx::future<SubboxView> get_subbox(const ChunkSubboxRef& ref) override;
   hpx::future<void> put_host(const ChunkRef& ref, HostView view) override;
   static void preload(const RunMeta& meta,
@@ -43,6 +47,8 @@ class DataServiceLocal : public DataService {
   const DatasetHandle* resolve_dataset() const;
   std::shared_ptr<ChunkStore> resolve_chunk_store() const;
   hpx::shared_future<std::shared_ptr<HostView>> get_local_shared_impl(const ChunkRef& ref);
+  std::vector<hpx::shared_future<std::shared_ptr<HostView>>> get_local_shared_batch_impl(
+      const std::vector<ChunkRef>& refs);
   hpx::future<HostView> get_local_impl(const ChunkRef& ref);
   void put_local_impl(const ChunkRef& ref, HostView view);
 
