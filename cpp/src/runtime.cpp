@@ -38,6 +38,7 @@
 #include <hpx/collectives/broadcast_direct.hpp>
 #include <hpx/hpx_start.hpp>
 #include <hpx/include/lcos.hpp>
+#include <hpx/include/resource_partitioner.hpp>
 #include <hpx/runtime_distributed/find_localities.hpp>
 #include <hpx/runtime_local/get_locality_id.hpp>
 #include <hpx/runtime.hpp>
@@ -66,6 +67,7 @@ bool g_perfetto_trace_enabled = false;
 std::atomic<int32_t> g_active_plan_runs{0};
 std::atomic<int32_t> g_locality_hint{-1};
 std::atomic<int32_t> g_perfetto_metrics_active_runs{0};
+std::atomic<int32_t> g_next_runtime_run_id{1};
 std::mutex g_console_release_mutex;
 std::shared_ptr<hpx::promise<void>> g_console_release_promise;
 hpx::shared_future<void> g_console_release_future;
@@ -85,9 +87,81 @@ struct ActivePlanRunGuard {
   ~ActivePlanRunGuard() { g_active_plan_runs.fetch_sub(1, std::memory_order_acq_rel); }
 };
 
+int32_t allocate_runtime_run_id() {
+  return g_next_runtime_run_id.fetch_add(1, std::memory_order_acq_rel);
+}
+
 bool debug_projection_enabled() {
   static const bool enabled = std::getenv("KANGAROO_DEBUG_PROJECTION") != nullptr;
   return enabled;
+}
+
+int positive_env_int(const char* name) {
+  const char* env = std::getenv(name);
+  if (env == nullptr || *env == '\0') {
+    return 0;
+  }
+  try {
+    const int parsed = std::stoi(env);
+    if (parsed > 0) {
+      return parsed;
+    }
+  } catch (...) {
+  }
+  return 0;
+}
+
+std::string plotfile_io_pool_name() {
+  const char* env = std::getenv("KANGAROO_PLOTFILE_IO_POOL");
+  if (env != nullptr && *env != '\0') {
+    return env;
+  }
+  return "plotfile_io";
+}
+
+int plotfile_io_pool_threads() {
+  return positive_env_int("KANGAROO_PLOTFILE_IO_POOL_THREADS");
+}
+
+bool plotfile_zero_copy_reads_enabled() {
+  static const bool enabled = [] {
+    const char* env = std::getenv("KANGAROO_PLOTFILE_ZERO_COPY_READS");
+    if (env == nullptr || *env == '\0') {
+      return true;
+    }
+    const std::string value(env);
+    return value != "0" && value != "false" && value != "FALSE" && value != "off" &&
+           value != "OFF";
+  }();
+  return enabled;
+}
+
+void configure_plotfile_io_pool(hpx::resource::partitioner& rp) {
+  const std::string pool_name = plotfile_io_pool_name();
+  const int requested_threads = plotfile_io_pool_threads();
+  if (pool_name.empty() || requested_threads <= 0) {
+    return;
+  }
+
+  std::vector<hpx::resource::pu> pus;
+  for (const auto& domain : rp.numa_domains()) {
+    for (const auto& core : domain.cores()) {
+      for (const auto& pu : core.pus()) {
+        pus.push_back(pu);
+      }
+    }
+  }
+  if (pus.empty()) {
+    return;
+  }
+
+  try {
+    rp.create_thread_pool(pool_name);
+  } catch (...) {
+  }
+  for (int i = 0; i < requested_threads; ++i) {
+    rp.add_resource(pus[static_cast<std::size_t>(i) % pus.size()], pool_name, false);
+  }
 }
 
 void log_projection_kernel_summary(const char* kernel,
@@ -384,6 +458,10 @@ struct EventLogWorker {
         write_string("mode", event.mode);
         out << ',';
         write_string("status", event.status);
+        if (!event.file.empty()) {
+          out << ',';
+          write_string("file", event.file);
+        }
         out << ",\"step\":" << event.ref.step;
         out << ",\"level\":" << event.ref.level;
         out << ",\"field\":" << event.ref.field;
@@ -398,6 +476,15 @@ struct EventLogWorker {
           out << ",\"worker\":\"worker-" << event.worker << '"';
         }
         out << ",\"bytes\":" << event.bytes;
+        if (event.file_offset >= 0) {
+          out << ",\"file_offset\":" << event.file_offset;
+        }
+        if (event.comp_start >= 0) {
+          out << ",\"comp_start\":" << event.comp_start;
+        }
+        if (event.comp_count >= 0) {
+          out << ",\"comp_count\":" << event.comp_count;
+        }
         if (event.queue_depth >= 0) {
           out << ",\"queue_depth\":" << event.queue_depth;
         }
@@ -1333,23 +1420,10 @@ std::optional<double> patch_value_at(const SamplePatch& p, int32_t i, int32_t j,
   const int32_t li = i - p.box.lo[0];
   const int32_t lj = j - p.box.lo[1];
   const int32_t lk = k - p.box.lo[2];
-  const std::size_t idx = (static_cast<std::size_t>(li) * static_cast<std::size_t>(ny) +
-                           static_cast<std::size_t>(lj)) *
-                              static_cast<std::size_t>(nz) +
-                          static_cast<std::size_t>(lk);
-  if (p.bytes_per_value == 4) {
-    const std::size_t pos = idx * sizeof(float);
-    if (pos + sizeof(float) > p.view.data.size()) {
-      return std::nullopt;
-    }
-    return static_cast<double>(reinterpret_cast<const float*>(p.view.data.data())[idx]);
-  }
-  if (p.bytes_per_value == 8) {
-    const std::size_t pos = idx * sizeof(double);
-    if (pos + sizeof(double) > p.view.data.size()) {
-      return std::nullopt;
-    }
-    return reinterpret_cast<const double*>(p.view.data.data())[idx];
+  HostGridView3D view(p.view, nx, ny, nz, p.bytes_per_value);
+  double value = 0.0;
+  if (view.get_double(li, lj, lk, value)) {
+    return value;
   }
   return std::nullopt;
 }
@@ -2193,24 +2267,19 @@ void register_default_kernels(KernelRegistry& registry) {
                      static_cast<std::size_t>(nz) +
                  static_cast<std::size_t>(k);
         };
-        auto read_self = [&](std::size_t idx) -> double {
-          if (bytes_per_value == 4) {
-            return static_cast<double>(reinterpret_cast<const float*>(in.data())[idx]);
-          }
-          return reinterpret_cast<const double*>(in.data())[idx];
-        };
+        HostGridView3D self_input(inputs[0], nx, ny, nz, bytes_per_value);
 
         for (int i = 0; i < nx; ++i) {
           const int32_t gi = box.lo.x + i;
           const double xc = cell_center(target_geom, 0, gi);
           for (int j = 0; j < ny; ++j) {
             const int32_t gj = box.lo.y + j;
-            const double yc = cell_center(target_geom, 1, gj);
+              const double yc = cell_center(target_geom, 1, gj);
             for (int k = 0; k < nz; ++k) {
               const int32_t gk = box.lo.z + k;
               const double zc = cell_center(target_geom, 2, gk);
               const std::size_t idx = self_index(i, j, k);
-              const double f0 = read_self(idx);
+              const double f0 = self_input.get_double_or(i, j, k);
 
               std::vector<SamplePoint> samples;
               const int32_t width = 2 * stencil_radius + 1;
@@ -2368,6 +2437,14 @@ void register_default_kernels(KernelRegistry& registry) {
 
         auto data = reader->read_fab(params.level, block, params.comp, 1);
         if (data.ncomp < 1 || data.nx != nx || data.ny != ny || data.nz != nz) {
+          return hpx::make_ready_future();
+        }
+
+        const int file_bytes_per_value = data.type == plotfile::RealType::kFloat32 ? 4 : 8;
+        if (plotfile_zero_copy_reads_enabled() &&
+            params.bytes_per_value == file_bytes_per_value) {
+          outputs[0].data = std::move(data.bytes);
+          outputs[0].layout = HostViewLayout::kPlotfileKJI;
           return hpx::make_ready_future();
         }
 
@@ -2534,10 +2611,6 @@ void register_default_kernels(KernelRegistry& registry) {
             return hpx::make_ready_future();
           }
 
-          auto in_index = [&](int i, int j, int k) -> std::size_t {
-            return static_cast<std::size_t>((i * ny + j) * nz + k);
-          };
-
           auto covered = [&](int ix, int iy, int iz) -> bool {
             if (!params.covered_boxes) {
               return false;
@@ -2550,7 +2623,7 @@ void register_default_kernels(KernelRegistry& registry) {
             return false;
           };
 
-          const auto& in = inputs[0].data;
+          HostGridView3D input(inputs[0], nx, ny, nz, params.bytes_per_value);
           auto* out_sum = reinterpret_cast<double*>(outputs[0].data.data());
           auto* out_area = reinterpret_cast<double*>(outputs[1].data.data());
 
@@ -2578,17 +2651,7 @@ void register_default_kernels(KernelRegistry& registry) {
               idx_local[axis] = k_local;
               idx_local[u_axis] = u_local;
               idx_local[v_axis] = v_local;
-              const auto data_idx = in_index(idx_local[0], idx_local[1], idx_local[2]);
-              double value = 0.0;
-              if (params.bytes_per_value == 4) {
-                if (data_idx * sizeof(float) < in.size()) {
-                  value = reinterpret_cast<const float*>(in.data())[data_idx];
-                }
-              } else if (params.bytes_per_value == 8) {
-                if (data_idx * sizeof(double) < in.size()) {
-                  value = reinterpret_cast<const double*>(in.data())[data_idx];
-                }
-              }
+              const double value = input.get_double_or(idx_local[0], idx_local[1], idx_local[2]);
 
               const double u_cell_lo = cell_edge(u_axis, u_global);
               const double u_cell_hi = u_cell_lo + level.geom.dx[u_axis];
@@ -2748,8 +2811,9 @@ void register_default_kernels(KernelRegistry& registry) {
             return hpx::make_ready_future();
           }
 
-          auto in_index = [&](int i, int j, int k) -> std::size_t {
-            return static_cast<std::size_t>((i * ny + j) * nz + k);
+          HostGridView3D input(inputs[0], nx, ny, nz, params.bytes_per_value);
+          auto logical_index = [&](int i, int j, int k) -> std::size_t {
+            return input.logical_index(i, j, k);
           };
 
           std::vector<std::uint8_t> covered_mask;
@@ -2774,7 +2838,7 @@ void register_default_kernels(KernelRegistry& registry) {
                   const int j = gy - box.lo.y;
                   for (int gz = gz0; gz <= gz1; ++gz) {
                     const int k = gz - box.lo.z;
-                    covered_mask[in_index(i, j, k)] = 1;
+                    covered_mask[logical_index(i, j, k)] = 1;
                   }
                 }
               }
@@ -2785,7 +2849,6 @@ void register_default_kernels(KernelRegistry& registry) {
             return level.geom.x0[ax] + (idx - level.geom.index_origin[ax]) * level.geom.dx[ax];
           };
 
-          const auto& in = inputs[0].data;
           auto* out_sum = reinterpret_cast<double*>(outputs[0].data.data());
           std::size_t candidate_cells = 0;
           std::size_t covered_skips = 0;
@@ -2798,7 +2861,7 @@ void register_default_kernels(KernelRegistry& registry) {
               const int gy = box.lo.y + j;
               for (int k = 0; k < nz; ++k) {
                 ++candidate_cells;
-                const auto data_idx = in_index(i, j, k);
+                const auto data_idx = logical_index(i, j, k);
                 if (!covered_mask.empty() && covered_mask[data_idx] != 0) {
                   ++covered_skips;
                   continue;
@@ -2835,16 +2898,7 @@ void register_default_kernels(KernelRegistry& registry) {
                 i1 = std::min(i1, out_nx - 1);
                 j1 = std::min(j1, out_ny - 1);
 
-                double value = 0.0;
-                if (params.bytes_per_value == 4) {
-                  if (data_idx * sizeof(float) < in.size()) {
-                    value = reinterpret_cast<const float*>(in.data())[data_idx];
-                  }
-                } else if (params.bytes_per_value == 8) {
-                  if (data_idx * sizeof(double) < in.size()) {
-                    value = reinterpret_cast<const double*>(in.data())[data_idx];
-                  }
-                }
+                const double value = input.get_double_or(i, j, k);
 
                 for (int jj = j0; jj <= j1; ++jj) {
                   const double pv0 = vmin + static_cast<double>(jj) * dv;
@@ -2936,7 +2990,7 @@ void register_default_kernels(KernelRegistry& registry) {
 
     registry.register_kernel(
         KernelDesc{.name = "field_expr", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
                         const NeighborViews&, std::span<HostView> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
         const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
@@ -2965,32 +3019,33 @@ void register_default_kernels(KernelRegistry& registry) {
           input_bytes_per_value.resize(inputs.size(), 8);
         }
 
+        int nx = 0;
+        int ny = 0;
+        int nz = 0;
+        if (block >= 0 && static_cast<std::size_t>(block) < level.boxes.size()) {
+          const auto& box = level.boxes.at(static_cast<std::size_t>(block));
+          nx = box.hi.x - box.lo.x + 1;
+          ny = box.hi.y - box.lo.y + 1;
+          nz = box.hi.z - box.lo.z + 1;
+        }
+
+        std::vector<HostGridView3D> input_views;
+        input_views.reserve(inputs.size());
+        for (std::size_t iv = 0; iv < inputs.size(); ++iv) {
+          input_views.emplace_back(inputs[iv], nx, ny, nz, input_bytes_per_value[iv]);
+        }
+
         auto read_value = [&](int iv, std::size_t idx) -> double {
-          const auto& data = inputs[static_cast<std::size_t>(iv)].data;
-          const int bpv = input_bytes_per_value[static_cast<std::size_t>(iv)];
-          if (bpv == 4) {
-            const std::size_t pos = idx * sizeof(float);
-            if (pos < data.size()) {
-              return static_cast<double>(reinterpret_cast<const float*>(data.data())[idx]);
-            }
-          } else if (bpv == 8) {
-            const std::size_t pos = idx * sizeof(double);
-            if (pos < data.size()) {
-              return reinterpret_cast<const double*>(data.data())[idx];
-            }
-          }
-          return 0.0;
+          return input_views[static_cast<std::size_t>(iv)].get_logical_or(idx);
         };
 
         std::size_t n = std::numeric_limits<std::size_t>::max();
         for (std::size_t iv = 0; iv < inputs.size(); ++iv) {
-          const auto& in = inputs[iv].data;
           const int bpv = input_bytes_per_value[iv];
           if (bpv != 4 && bpv != 8) {
             throw std::runtime_error("field_expr input_bytes_per_value must be 4 or 8");
           }
-          const std::size_t count = in.size() / static_cast<std::size_t>(bpv);
-          n = std::min(n, count);
+          n = std::min(n, input_views[iv].logical_cell_count());
         }
         if (n == std::numeric_limits<std::size_t>::max()) {
           n = 0;
@@ -3228,13 +3283,40 @@ void register_default_kernels(KernelRegistry& registry) {
           const double du = (out_nx > 0) ? (u1 - u0) / static_cast<double>(out_nx) : 0.0;
           const double dv = (out_ny > 0) ? (v1 - v0) / static_cast<double>(out_ny) : 0.0;
 
-          auto in_index = [&](int i, int j, int k) -> std::size_t {
-            return static_cast<std::size_t>((i * ny + j) * nz + k);
+          HostGridView3D input(inputs[0], nx, ny, nz, params.bytes_per_value);
+          auto sample_input = [&](int u_local, int v_local) -> double {
+            if (u_local < 0 || v_local < 0) {
+              return 0.0;
+            }
+            if (!((u_axis == 0 && u_local < nx) || (u_axis == 1 && u_local < ny) ||
+                  (u_axis == 2 && u_local < nz))) {
+              return 0.0;
+            }
+            if (!((v_axis == 0 && v_local < nx) || (v_axis == 1 && v_local < ny) ||
+                  (v_axis == 2 && v_local < nz))) {
+              return 0.0;
+            }
+
+            int ii = 0;
+            int jj = 0;
+            int kk = 0;
+            if (axis == 0) {
+              ii = k_local;
+              jj = u_axis == 1 ? u_local : v_local;
+              kk = u_axis == 2 ? u_local : v_local;
+            } else if (axis == 1) {
+              ii = u_axis == 0 ? u_local : v_local;
+              jj = k_local;
+              kk = u_axis == 2 ? u_local : v_local;
+            } else {
+              ii = u_axis == 0 ? u_local : v_local;
+              jj = u_axis == 1 ? u_local : v_local;
+              kk = k_local;
+            }
+            return input.get_double_or(ii, jj, kk);
           };
 
-          const auto& in = inputs[0].data;
           if (params.bytes_per_value == 4) {
-            const auto* in_f = reinterpret_cast<const float*>(in.data());
             auto* out_f = reinterpret_cast<float*>(outputs[0].data.data());
             for (int j = 0; j < out_ny; ++j) {
               const double v = v0 + (static_cast<double>(j) + 0.5) * dv;
@@ -3248,40 +3330,11 @@ void register_default_kernels(KernelRegistry& registry) {
                 const int u_local = u_axis == 0 ? u_global - box.lo.x
                                                 : (u_axis == 1 ? u_global - box.lo.y
                                                                : u_global - box.lo.z);
-                float value = 0.0f;
-                if (u_local >= 0 && v_local >= 0) {
-                  if ((u_axis == 0 && u_local < nx) || (u_axis == 1 && u_local < ny) ||
-                      (u_axis == 2 && u_local < nz)) {
-                    if ((v_axis == 0 && v_local < nx) || (v_axis == 1 && v_local < ny) ||
-                        (v_axis == 2 && v_local < nz)) {
-                      int ii = 0;
-                      int jj = 0;
-                      int kk = 0;
-                      if (axis == 0) {
-                        ii = k_local;
-                        jj = u_axis == 1 ? u_local : v_local;
-                        kk = u_axis == 2 ? u_local : v_local;
-                      } else if (axis == 1) {
-                        ii = u_axis == 0 ? u_local : v_local;
-                        jj = k_local;
-                        kk = u_axis == 2 ? u_local : v_local;
-                      } else {
-                        ii = u_axis == 0 ? u_local : v_local;
-                        jj = u_axis == 1 ? u_local : v_local;
-                        kk = k_local;
-                      }
-                      const auto idx = in_index(ii, jj, kk);
-                      if (idx * sizeof(float) < in.size()) {
-                        value = in_f[idx];
-                      }
-                    }
-                  }
-                }
-                out_f[static_cast<std::size_t>(j) * out_nx + i] = value;
+                out_f[static_cast<std::size_t>(j) * out_nx + i] =
+                    static_cast<float>(sample_input(u_local, v_local));
               }
             }
           } else if (params.bytes_per_value == 8) {
-            const auto* in_d = reinterpret_cast<const double*>(in.data());
             auto* out_d = reinterpret_cast<double*>(outputs[0].data.data());
             for (int j = 0; j < out_ny; ++j) {
               const double v = v0 + (static_cast<double>(j) + 0.5) * dv;
@@ -3295,36 +3348,8 @@ void register_default_kernels(KernelRegistry& registry) {
                 const int u_local = u_axis == 0 ? u_global - box.lo.x
                                                 : (u_axis == 1 ? u_global - box.lo.y
                                                                : u_global - box.lo.z);
-                double value = 0.0;
-                if (u_local >= 0 && v_local >= 0) {
-                  if ((u_axis == 0 && u_local < nx) || (u_axis == 1 && u_local < ny) ||
-                      (u_axis == 2 && u_local < nz)) {
-                    if ((v_axis == 0 && v_local < nx) || (v_axis == 1 && v_local < ny) ||
-                        (v_axis == 2 && v_local < nz)) {
-                      int ii = 0;
-                      int jj = 0;
-                      int kk = 0;
-                      if (axis == 0) {
-                        ii = k_local;
-                        jj = u_axis == 1 ? u_local : v_local;
-                        kk = u_axis == 2 ? u_local : v_local;
-                      } else if (axis == 1) {
-                        ii = u_axis == 0 ? u_local : v_local;
-                        jj = k_local;
-                        kk = u_axis == 2 ? u_local : v_local;
-                      } else {
-                        ii = u_axis == 0 ? u_local : v_local;
-                        jj = u_axis == 1 ? u_local : v_local;
-                        kk = k_local;
-                      }
-                      const auto idx = in_index(ii, jj, kk);
-                      if (idx * sizeof(double) < in.size()) {
-                        value = in_d[idx];
-                      }
-                    }
-                  }
-                }
-                out_d[static_cast<std::size_t>(j) * out_nx + i] = value;
+                out_d[static_cast<std::size_t>(j) * out_nx + i] =
+                    sample_input(u_local, v_local);
               }
             }
           }
@@ -4765,24 +4790,9 @@ void register_default_kernels(KernelRegistry& registry) {
           }
           return false;
         };
-        auto in_index = [&](int i, int j, int k) -> std::size_t {
-          return static_cast<std::size_t>((i * ny + j) * nz + k);
-        };
-        auto read_value = [&](const HostView& view, std::size_t idx) -> double {
-          const auto& data = view.data;
-          if (params.bytes_per_value == 4) {
-            if (idx * sizeof(float) < data.size()) {
-              return static_cast<double>(reinterpret_cast<const float*>(data.data())[idx]);
-            }
-          } else if (params.bytes_per_value == 8) {
-            if (idx * sizeof(double) < data.size()) {
-              return reinterpret_cast<const double*>(data.data())[idx];
-            }
-          }
-          return 0.0;
-        };
-
         const bool weighted = inputs.size() >= 2;
+        HostGridView3D value_input(inputs[0], nx, ny, nz, params.bytes_per_value);
+        HostGridView3D weight_input(inputs[weighted ? 1 : 0], nx, ny, nz, params.bytes_per_value);
         const double inv_dx = static_cast<double>(params.bins) / (hi - lo);
         auto* out = reinterpret_cast<double*>(outputs[0].data.data());
 
@@ -4795,8 +4805,7 @@ void register_default_kernels(KernelRegistry& registry) {
               if (covered(gi, gj, gk)) {
                 continue;
               }
-              const auto idx = in_index(i, j, k);
-              const double value = read_value(inputs[0], idx);
+              const double value = value_input.get_double_or(i, j, k);
               if (!std::isfinite(value) || value < lo || value > hi) {
                 continue;
               }
@@ -4811,7 +4820,7 @@ void register_default_kernels(KernelRegistry& registry) {
               }
               double weight = 1.0;
               if (weighted) {
-                weight = read_value(inputs[1], idx);
+                weight = weight_input.get_double_or(i, j, k);
                 if (!std::isfinite(weight)) {
                   continue;
                 }
@@ -4918,24 +4927,10 @@ void register_default_kernels(KernelRegistry& registry) {
           }
           return false;
         };
-        auto in_index = [&](int i, int j, int k) -> std::size_t {
-          return static_cast<std::size_t>((i * ny + j) * nz + k);
-        };
-        auto read_value = [&](const HostView& view, std::size_t idx) -> double {
-          const auto& data = view.data;
-          if (params.bytes_per_value == 4) {
-            if (idx * sizeof(float) < data.size()) {
-              return static_cast<double>(reinterpret_cast<const float*>(data.data())[idx]);
-            }
-          } else if (params.bytes_per_value == 8) {
-            if (idx * sizeof(double) < data.size()) {
-              return reinterpret_cast<const double*>(data.data())[idx];
-            }
-          }
-          return 0.0;
-        };
-
         const bool weighted = inputs.size() >= 3;
+        HostGridView3D x_input(inputs[0], nx, ny, nz, params.bytes_per_value);
+        HostGridView3D y_input(inputs[1], nx, ny, nz, params.bytes_per_value);
+        HostGridView3D weight_input(inputs[weighted ? 2 : 0], nx, ny, nz, params.bytes_per_value);
         const double cell_volume = level.geom.dx[0] * level.geom.dx[1] * level.geom.dx[2];
         const double inv_dx = static_cast<double>(nx_bins) / (xhi - xlo);
         const double inv_dy = static_cast<double>(ny_bins) / (yhi - ylo);
@@ -4950,9 +4945,8 @@ void register_default_kernels(KernelRegistry& registry) {
               if (covered(gi, gj, gk)) {
                 continue;
               }
-              const auto idx = in_index(i, j, k);
-              const double x = read_value(inputs[0], idx);
-              const double y = read_value(inputs[1], idx);
+              const double x = x_input.get_double_or(i, j, k);
+              const double y = y_input.get_double_or(i, j, k);
               if (!std::isfinite(x) || !std::isfinite(y) || x < xlo || x > xhi || y < ylo || y > yhi) {
                 continue;
               }
@@ -4963,7 +4957,7 @@ void register_default_kernels(KernelRegistry& registry) {
               }
               double weight = 1.0;
               if (weighted) {
-                weight = read_value(inputs[2], idx);
+                weight = weight_input.get_double_or(i, j, k);
                 if (!std::isfinite(weight)) {
                   continue;
                 }
@@ -4986,7 +4980,7 @@ void register_default_kernels(KernelRegistry& registry) {
   }
   {
     struct Params {
-      double radius = 0.0;
+      std::vector<double> radii;
       double gamma = 5.0 / 3.0;
       int bytes_per_value = 8;
       std::shared_ptr<const CoveredBoxListIR> covered_boxes;
@@ -4994,11 +4988,26 @@ void register_default_kernels(KernelRegistry& registry) {
 
     auto decode_params = [](const msgpack::object& root) {
       Params params;
+      auto append_radius = [](const msgpack::object& obj, std::vector<double>& radii) {
+        if (obj.type == msgpack::type::FLOAT ||
+            obj.type == msgpack::type::POSITIVE_INTEGER ||
+            obj.type == msgpack::type::NEGATIVE_INTEGER) {
+          radii.push_back(obj.as<double>());
+        }
+      };
+      if (const auto* radii = find_msgpack_map_value(root, "radii");
+          radii && radii->type == msgpack::type::ARRAY) {
+        params.radii.reserve(radii->via.array.size);
+        for (uint32_t i = 0; i < radii->via.array.size; ++i) {
+          append_radius(radii->via.array.ptr[i], params.radii);
+        }
+      }
       if (const auto* radius = find_msgpack_map_value(root, "radius");
           radius && (radius->type == msgpack::type::FLOAT ||
                      radius->type == msgpack::type::POSITIVE_INTEGER ||
-                     radius->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.radius = radius->as<double>();
+                     radius->type == msgpack::type::NEGATIVE_INTEGER) &&
+              params.radii.empty()) {
+        append_radius(*radius, params.radii);
       }
       if (const auto* gamma = find_msgpack_map_value(root, "gamma");
           gamma && (gamma->type == msgpack::type::FLOAT ||
@@ -5023,7 +5032,7 @@ void register_default_kernels(KernelRegistry& registry) {
                         std::span<const std::uint8_t> params_msgpack) {
         const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
-        const std::size_t out_bytes = 4 * sizeof(double);
+        const std::size_t out_bytes = params.radii.size() * 4 * sizeof(double);
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }
@@ -5032,9 +5041,17 @@ void register_default_kernels(KernelRegistry& registry) {
         } else {
           std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
         }
-        if (inputs.size() < 9 || !std::isfinite(params.radius) || params.radius <= 0.0 ||
+        if (inputs.size() < 9 || params.radii.empty() ||
             !std::isfinite(params.gamma) || params.gamma <= 1.0) {
           return hpx::make_ready_future();
+        }
+        std::vector<double> radii2;
+        radii2.reserve(params.radii.size());
+        for (double radius : params.radii) {
+          if (!std::isfinite(radius) || radius <= 0.0) {
+            return hpx::make_ready_future();
+          }
+          radii2.push_back(radius * radius);
         }
         if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
           return hpx::make_ready_future();
@@ -5048,8 +5065,9 @@ void register_default_kernels(KernelRegistry& registry) {
           return hpx::make_ready_future();
         }
 
-        auto in_index = [&](int i, int j, int k) -> std::size_t {
-          return static_cast<std::size_t>((i * ny + j) * nz + k);
+        HostGridView3D first_input(inputs[0], nx, ny, nz, params.bytes_per_value);
+        auto logical_index = [&](int i, int j, int k) -> std::size_t {
+          return first_input.logical_index(i, j, k);
         };
         std::vector<std::uint8_t> covered_mask;
         if (params.covered_boxes && !params.covered_boxes->empty()) {
@@ -5075,24 +5093,19 @@ void register_default_kernels(KernelRegistry& registry) {
                 const int j = gy - box.lo.y;
                 for (int gz = gz0; gz <= gz1; ++gz) {
                   const int k = gz - box.lo.z;
-                  covered_mask[in_index(i, j, k)] = 1;
+                  covered_mask[logical_index(i, j, k)] = 1;
                 }
               }
             }
           }
         }
-        auto read_value = [&](const HostView& view, std::size_t idx) -> double {
-          const auto& data = view.data;
-          if (params.bytes_per_value == 4) {
-            if ((idx + 1) * sizeof(float) <= data.size()) {
-              return static_cast<double>(reinterpret_cast<const float*>(data.data())[idx]);
-            }
-          } else if (params.bytes_per_value == 8) {
-            if ((idx + 1) * sizeof(double) <= data.size()) {
-              return reinterpret_cast<const double*>(data.data())[idx];
-            }
-          }
-          return 0.0;
+        std::vector<HostGridView3D> input_views;
+        input_views.reserve(inputs.size());
+        for (const auto& input : inputs) {
+          input_views.emplace_back(input, nx, ny, nz, params.bytes_per_value);
+        }
+        auto read_value = [&](std::size_t input_idx, int i, int j, int k) -> double {
+          return input_views[input_idx].get_double_or(i, j, k);
         };
         auto cell_edge = [&](int axis, int global_idx) -> double {
           return level.geom.x0[axis] +
@@ -5102,7 +5115,8 @@ void register_default_kernels(KernelRegistry& registry) {
 
         auto* out = reinterpret_cast<double*>(outputs[0].data.data());
         const double gamma_minus_one = params.gamma - 1.0;
-        const double radius2 = params.radius * params.radius;
+        std::vector<std::size_t> intersecting_radii;
+        intersecting_radii.reserve(params.radii.size());
 
         for (int i = 0; i < nx; ++i) {
           const int gi = box.lo.x + i;
@@ -5118,37 +5132,37 @@ void register_default_kernels(KernelRegistry& registry) {
               const int gk = box.lo.z + k;
               const double z0 = cell_edge(2, gk);
               const double z1 = z0 + level.geom.dx[2];
-              if (!sphere_may_intersect_cell(radius2, x0, x1, y0, y1, z0, z1)) {
+              intersecting_radii.clear();
+              for (std::size_t radius_idx = 0; radius_idx < radii2.size(); ++radius_idx) {
+                if (sphere_may_intersect_cell(radii2[radius_idx], x0, x1, y0, y1, z0, z1)) {
+                  intersecting_radii.push_back(radius_idx);
+                }
+              }
+              if (intersecting_radii.empty()) {
                 continue;
               }
 
-              const auto idx = in_index(i, j, k);
+              const auto idx = logical_index(i, j, k);
               if (!covered_mask.empty() && covered_mask[idx] != 0) {
-                continue;
-              }
-
-              const double area = spherical_section_area_in_intersecting_cell(
-                  params.radius, x0, x1, y0, y1, z0, z1);
-              if (area <= 0.0) {
                 continue;
               }
 
               const double z = 0.5 * (z0 + z1);
               const double r = std::sqrt(x * x + y * y + z * z);
 
-              const double rho = read_value(inputs[0], idx);
+              const double rho = read_value(0, i, j, k);
               if (r <= 0.0 || rho <= 0.0 || !std::isfinite(rho)) {
                 continue;
               }
 
-              const double momx = read_value(inputs[1], idx);
-              const double momy = read_value(inputs[2], idx);
-              const double momz = read_value(inputs[3], idx);
-              const double energy_density = read_value(inputs[4], idx);
-              const double scalar_density = read_value(inputs[5], idx);
-              const double bx = read_value(inputs[6], idx);
-              const double by = read_value(inputs[7], idx);
-              const double bz = read_value(inputs[8], idx);
+              const double momx = read_value(1, i, j, k);
+              const double momy = read_value(2, i, j, k);
+              const double momz = read_value(3, i, j, k);
+              const double energy_density = read_value(4, i, j, k);
+              const double scalar_density = read_value(5, i, j, k);
+              const double bx = read_value(6, i, j, k);
+              const double by = read_value(7, i, j, k);
+              const double bz = read_value(8, i, j, k);
               if (!std::isfinite(momx) || !std::isfinite(momy) || !std::isfinite(momz) ||
                   !std::isfinite(energy_density) || !std::isfinite(scalar_density) ||
                   !std::isfinite(bx) || !std::isfinite(by) || !std::isfinite(bz)) {
@@ -5179,10 +5193,18 @@ void register_default_kernels(KernelRegistry& registry) {
               const double mhd_energy_flux_density =
                   (energy_density + pgas + emag) * vr - bdotv * br;
 
-              out[0] += mass_flux_density * area;
-              out[1] += hydro_energy_flux_density * area;
-              out[2] += mhd_energy_flux_density * area;
-              out[3] += (scalar_density * vr) * area;
+              for (std::size_t radius_idx : intersecting_radii) {
+                const double area = spherical_section_area_in_intersecting_cell(
+                    params.radii[radius_idx], x0, x1, y0, y1, z0, z1);
+                if (area <= 0.0) {
+                  continue;
+                }
+                const std::size_t out_base = radius_idx * 4;
+                out[out_base + 0] += mass_flux_density * area;
+                out[out_base + 1] += hydro_energy_flux_density * area;
+                out[out_base + 2] += mhd_energy_flux_density * area;
+                out[out_base + 3] += (scalar_density * vr) * area;
+              }
             }
           }
         }
@@ -5507,6 +5529,14 @@ void ensure_hpx_started() {
     if (g_hpx_cfg_set && !g_hpx_cfg.empty()) {
       params.cfg = g_hpx_cfg;
     }
+    if (plotfile_io_pool_threads() > 0) {
+      params.rp_mode = static_cast<hpx::resource::partitioner_mode>(
+          static_cast<int>(hpx::resource::partitioner_mode::allow_dynamic_pools) |
+          static_cast<int>(hpx::resource::partitioner_mode::allow_oversubscription));
+      params.rp_callback =
+          [](hpx::resource::partitioner& rp,
+             hpx::program_options::variables_map const&) { configure_plotfile_io_pool(rp); };
+    }
     hpx::start(nullptr, argc, argv.data(), params);
     g_hpx_started = true;
   });
@@ -5707,6 +5737,14 @@ std::optional<HostView> DatasetHandle::get_chunk(const ChunkRef& ref) const {
   return std::nullopt;
 }
 
+std::vector<std::optional<HostView>> DatasetHandle::get_chunks(
+    const std::vector<ChunkRef>& refs) const {
+  if (backend) {
+    return backend->get_chunks(refs);
+  }
+  return std::vector<std::optional<HostView>>(refs.size());
+}
+
 bool DatasetHandle::has_chunk(const ChunkRef& ref) const {
   if (backend) {
     return backend->has_chunk(ref);
@@ -5862,7 +5900,7 @@ void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
     });
   }
   const bool reused_preload_context = preload_run_id_ != 0;
-  int32_t plan_id = reused_preload_context ? preload_run_id_ : next_plan_id_++;
+  int32_t plan_id = reused_preload_context ? preload_run_id_ : allocate_runtime_run_id();
   preload_run_id_ = 0;
   timed_phase("runtime_broadcast_execution_context", "kangaroo.runtime.setup", [&]() {
     hpx::lcos::broadcast<::kangaroo_set_execution_context_action>(
@@ -5932,7 +5970,7 @@ void Runtime::preload_dataset(const RunMetaHandle& runmeta,
         retained_output_run_ids_.end());
     preload_run_id_ = 0;
   }
-  preload_run_id_ = next_plan_id_++;
+  preload_run_id_ = allocate_runtime_run_id();
   hpx::lcos::broadcast<::kangaroo_set_execution_context_action>(
       localities, preload_run_id_, runmeta.meta, dataset, PlanIR{})
       .get();

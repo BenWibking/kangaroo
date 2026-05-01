@@ -443,9 +443,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
   if (log_enabled) {
     issue_inputs_event = start_span(base_event, "issue_get_inputs");
   }
-  for (const auto& cref : input_refs) {
-    input_futures.push_back(data.get_host(cref));
-  }
+  input_futures = data.get_hosts(input_refs);
   if (log_enabled) {
     end_span(issue_inputs_event);
   }
@@ -488,19 +486,20 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
       }
     }
 
-    std::vector<hpx::future<HostView>> futs;
-    futs.reserve(visited.size() > 0 ? visited.size() - 1 : 0);
+    std::vector<ChunkRef> refs;
+    refs.reserve(visited.size() > 0 ? visited.size() - 1 : 0);
     for (int32_t nbr : visited) {
       if (nbr == block) {
         continue;
       }
       ChunkRef cref{step, level, field, ver, nbr};
-      futs.push_back(data.get_host(cref));
+      refs.push_back(std::move(cref));
     }
-    if (futs.empty()) {
+    if (refs.empty()) {
       return hpx::make_ready_future(std::vector<HostView>{});
     }
-    return hpx::when_all(futs).then([](auto&& all) {
+    auto host_futures = data.get_hosts(refs);
+    return hpx::when_all(host_futures).then([](auto&& all) {
       std::vector<HostView> out;
       out.reserve(all.get().size());
       for (auto& f : all.get()) {
@@ -837,9 +836,7 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
   if (log_enabled) {
     issue_inputs_event = start_span(base_event, "issue_get_inputs");
   }
-  for (const auto& cref : input_refs) {
-    input_futures.push_back(data.get_host(cref));
-  }
+  input_futures = data.get_hosts(input_refs);
   if (log_enabled) {
     end_span(issue_inputs_event);
   }

@@ -21,6 +21,12 @@
 - Naming: tests use `tests/test_*.py`; script names are descriptive (`plotfile_projection.py`, `smoke_demo.py`).
 - Keep modules focused and avoid cross-layer leakage between Python DSL concerns and C++ runtime internals.
 
+## Runtime Concurrency Guidelines
+- Prefer HPX concurrency primitives throughout the C++ runtime.
+- Do not introduce `std::thread`, `std::mutex`, `std::condition_variable`, or similar standard-library concurrency primitives in runtime hot paths unless there is a documented compatibility boundary and no HPX equivalent is appropriate.
+- Use HPX futures, actions, executors, resource-partitioned thread pools, synchronization primitives, and scheduling facilities so work remains visible to the HPX scheduler and does not starve continuations or worker threads.
+- For blocking I/O, use a dedicated HPX executor/thread pool rather than unmanaged native threads.
+
 ## Testing Guidelines
 - Framework: `pytest` (`pyproject.toml` sets `testpaths = ["tests"]`).
 - Add unit tests next to related coverage area (runtime, operators, dataset, etc.).

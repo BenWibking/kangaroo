@@ -4,6 +4,64 @@ import json
 import struct
 
 
+def test_task_inputs_for_same_block_are_loaded_as_one_batch(tmp_path) -> None:
+    from analysis import Runtime
+    from analysis.dataset import open_dataset
+    from analysis.pipeline import Pipeline
+    from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
+
+    rt = Runtime()
+    log_path = tmp_path / "coalesced-inputs.events.jsonl"
+    runmeta = RunMeta(
+        steps=[
+            StepMeta(
+                step=0,
+                levels=[
+                    LevelMeta(
+                        geom=LevelGeom(dx=(1.0, 1.0, 1.0), x0=(0.0, 0.0, 0.0), ref_ratio=1),
+                        boxes=[BlockBox((0, 0, 0), (0, 0, 0))],
+                    )
+                ],
+            )
+        ]
+    )
+    ds = open_dataset("memory://coalesced-inputs", runmeta=runmeta, step=0, level=0, runtime=rt)
+    ds.register_field("a", 101)
+    ds.register_field("b", 102)
+    ds._h.set_chunk_ref(0, 0, 101, 0, 0, struct.pack("<d", 2.0))
+    ds._h.set_chunk_ref(0, 0, 102, 0, 0, struct.pack("<d", 3.0))
+
+    rt.set_event_log_path(str(log_path))
+    try:
+        pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+        pipe.field_add(pipe.field(101), pipe.field(102), out="sum")
+        pipe.run()
+    finally:
+        rt.set_event_log_path("")
+
+    events = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    starts = [
+        event
+        for event in events
+        if event.get("type") == "dataflow" and event.get("op") == "dataset_load_start"
+    ]
+    reads = [
+        event
+        for event in events
+        if event.get("type") == "dataflow" and event.get("op") == "dataset_load_read"
+    ]
+
+    assert [event["field"] for event in starts] == [101, 102]
+    assert [event["field"] for event in reads] == [101, 102]
+    assert len({event["start"] for event in starts}) == 1
+    assert len({event["start"] for event in reads}) == 1
+    assert {event["in_flight"] for event in starts} == {1}
+
+
 def _pack_f32_chunk(nx: int, ny: int, nz: int, base: float) -> bytes:
     buf = bytearray()
     for i in range(nx):

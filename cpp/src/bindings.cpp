@@ -828,7 +828,141 @@ NB_MODULE(_core, m) {
              view.data = std::move(buffer);
              kangaroo::ChunkRef ref{step, level, field, version, block};
              self.set_chunk(ref, std::move(view));
-           });
+           })
+      .def("read_chunk_ref",
+           [](kangaroo::DatasetHandle& self,
+              int32_t step,
+              int16_t level,
+              int32_t field,
+              int32_t version,
+              int32_t block) -> nb::object {
+             kangaroo::ChunkRef ref{step, level, field, version, block};
+             std::optional<kangaroo::HostView> view;
+             {
+               nb::gil_scoped_release release;
+               view = self.get_chunk(ref);
+             }
+             if (!view.has_value()) {
+               return nb::none();
+             }
+             return nb::cast(host_view_bytes(*view));
+           },
+           nb::arg("step"),
+           nb::arg("level"),
+           nb::arg("field"),
+           nb::arg("version"),
+           nb::arg("block"))
+      .def("read_chunks_ref",
+           [](kangaroo::DatasetHandle& self, nb::list ref_items) {
+             std::vector<kangaroo::ChunkRef> refs;
+             refs.reserve(ref_items.size());
+             for (auto item : ref_items) {
+               auto tuple = nb::cast<nb::tuple>(item);
+               if (tuple.size() != 5) {
+                 throw std::runtime_error(
+                     "read_chunks_ref expects refs as (step, level, field, version, block)");
+               }
+               refs.push_back(kangaroo::ChunkRef{
+                   nb::cast<int32_t>(tuple[0]),
+                   nb::cast<int16_t>(tuple[1]),
+                   nb::cast<int32_t>(tuple[2]),
+                   nb::cast<int32_t>(tuple[3]),
+                   nb::cast<int32_t>(tuple[4]),
+               });
+             }
+
+             std::vector<std::optional<kangaroo::HostView>> views;
+             {
+               nb::gil_scoped_release release;
+               views = self.get_chunks(refs);
+             }
+
+             nb::list out;
+             for (const auto& view : views) {
+               if (view.has_value()) {
+                 out.append(host_view_bytes(*view));
+               } else {
+                 out.append(nb::none());
+               }
+             }
+             return out;
+           },
+           nb::arg("refs"))
+      .def("read_chunks_ref_sizes",
+           [](kangaroo::DatasetHandle& self, nb::list ref_items) {
+             std::vector<kangaroo::ChunkRef> refs;
+             refs.reserve(ref_items.size());
+             for (auto item : ref_items) {
+               auto tuple = nb::cast<nb::tuple>(item);
+               if (tuple.size() != 5) {
+                 throw std::runtime_error(
+                     "read_chunks_ref_sizes expects refs as (step, level, field, version, block)");
+               }
+               refs.push_back(kangaroo::ChunkRef{
+                   nb::cast<int32_t>(tuple[0]),
+                   nb::cast<int16_t>(tuple[1]),
+                   nb::cast<int32_t>(tuple[2]),
+                   nb::cast<int32_t>(tuple[3]),
+                   nb::cast<int32_t>(tuple[4]),
+               });
+             }
+
+             std::vector<std::optional<kangaroo::HostView>> views;
+             {
+               nb::gil_scoped_release release;
+               views = self.get_chunks(refs);
+             }
+
+             nb::list out;
+             for (const auto& view : views) {
+               out.append(view.has_value() ? static_cast<std::uint64_t>(view->data.size())
+                                           : static_cast<std::uint64_t>(0));
+             }
+             return out;
+           },
+           nb::arg("refs"))
+      .def("read_chunks_ref_sizes_data_service",
+           [](kangaroo::DatasetHandle& self, nb::list ref_items) {
+             std::vector<kangaroo::ChunkRef> refs;
+             refs.reserve(ref_items.size());
+             for (auto item : ref_items) {
+               auto tuple = nb::cast<nb::tuple>(item);
+               if (tuple.size() != 5) {
+                 throw std::runtime_error(
+                     "read_chunks_ref_sizes_data_service expects refs as "
+                     "(step, level, field, version, block)");
+               }
+               refs.push_back(kangaroo::ChunkRef{
+                   nb::cast<int32_t>(tuple[0]),
+                   nb::cast<int16_t>(tuple[1]),
+                   nb::cast<int32_t>(tuple[2]),
+                   nb::cast<int32_t>(tuple[3]),
+                   nb::cast<int32_t>(tuple[4]),
+               });
+             }
+
+             std::vector<std::uint64_t> sizes;
+             sizes.reserve(refs.size());
+             {
+               nb::gil_scoped_release release;
+               (void)binding_runtime().locality_id();
+               kangaroo::DataServiceLocal data_service(0, &self);
+               auto futures = data_service.get_hosts_shared(refs);
+               auto ready = hpx::when_all(std::move(futures)).get();
+               for (auto& future : ready) {
+                 auto view = future.get();
+                 sizes.push_back(view ? static_cast<std::uint64_t>(view->data.size())
+                                      : static_cast<std::uint64_t>(0));
+               }
+             }
+
+             nb::list out;
+             for (std::uint64_t size : sizes) {
+               out.append(size);
+             }
+             return out;
+           },
+           nb::arg("refs"));
 
 }
 #endif

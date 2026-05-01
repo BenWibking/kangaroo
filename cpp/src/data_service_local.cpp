@@ -12,13 +12,16 @@
 #include <iostream>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <hpx/executors/parallel_executor.hpp>
 #include <hpx/include/actions.hpp>
 #include <hpx/include/async.hpp>
 #include <hpx/include/post.hpp>
+#include <hpx/runtime_local/thread_pool_helpers.hpp>
 #include <hpx/runtime_local/get_worker_thread_num.hpp>
 
 HPX_PLAIN_ACTION(kangaroo::data_get_local_impl, kangaroo_data_get_local_action)
@@ -61,8 +64,11 @@ double now_seconds() {
 
 int dataset_load_concurrency() {
   static const int value = []() {
-    const char* env = std::getenv("KANGAROO_DATASET_LOAD_CONCURRENCY");
-    if (env != nullptr && *env != '\0') {
+    auto parse_env = [](const char* name) -> int {
+      const char* env = std::getenv(name);
+      if (env == nullptr || *env == '\0') {
+        return 0;
+      }
       try {
         const int parsed = std::stoi(env);
         if (parsed > 0) {
@@ -70,8 +76,16 @@ int dataset_load_concurrency() {
         }
       } catch (...) {
       }
+      return 0;
+    };
+
+    if (const int parsed = parse_env("KANGAROO_PLOTFILE_READ_CONCURRENCY"); parsed > 0) {
+      return parsed;
     }
-    return 2;
+    if (const int parsed = parse_env("KANGAROO_DATASET_LOAD_CONCURRENCY"); parsed > 0) {
+      return parsed;
+    }
+    return 16;
   }();
   return value;
 }
@@ -100,6 +114,15 @@ void log_dataflow_event(const char* op,
   event.start = start;
   event.end = end;
   log_data_event(event);
+}
+
+void log_dataflow_marker(const char* op,
+                         const ChunkRef& ref,
+                         int here,
+                         int target,
+                         std::size_t bytes) {
+  const double start = now_seconds();
+  log_dataflow_event(op, "end", ref, here, target, bytes, start);
 }
 
 void log_dataset_load_event(const char* op,
@@ -184,12 +207,6 @@ SubboxView build_subbox_view(const HostView& chunk, const ChunkSubboxRef& ref) {
                                 static_cast<std::size_t>(onz) * bytes_per;
   out.data.data.resize(out_bytes, 0);
 
-  auto in_index = [&](int32_t i, int32_t j, int32_t k) -> std::size_t {
-    return (static_cast<std::size_t>(i) * static_cast<std::size_t>(ny) +
-            static_cast<std::size_t>(j)) *
-               static_cast<std::size_t>(nz) +
-           static_cast<std::size_t>(k);
-  };
   auto out_index = [&](int32_t i, int32_t j, int32_t k) -> std::size_t {
     return (static_cast<std::size_t>(i) * static_cast<std::size_t>(ony) +
             static_cast<std::size_t>(j)) *
@@ -197,7 +214,7 @@ SubboxView build_subbox_view(const HostView& chunk, const ChunkSubboxRef& ref) {
            static_cast<std::size_t>(k);
   };
 
-  const auto* src = chunk.data.data();
+  HostGridView3D input(chunk, nx, ny, nz, ref.bytes_per_value);
   auto* dst = out.data.data.data();
   for (int32_t i = 0; i < onx; ++i) {
     const int32_t gi = ox0 + i;
@@ -208,9 +225,8 @@ SubboxView build_subbox_view(const HostView& chunk, const ChunkSubboxRef& ref) {
       for (int32_t k = 0; k < onz; ++k) {
         const int32_t gk = oz0 + k;
         const int32_t lk = gk - ref.chunk_box.lo[2];
-        const std::size_t src_byte = in_index(li, lj, lk) * bytes_per;
         const std::size_t dst_byte = out_index(i, j, k) * bytes_per;
-        std::memcpy(dst + dst_byte, src + src_byte, bytes_per);
+        (void)input.copy_value_bytes(li, lj, lk, dst + dst_byte);
       }
     }
   }
@@ -231,7 +247,7 @@ void fulfill_dataset_load(const std::shared_ptr<ChunkStore>& chunk_store,
   auto shared_view = std::make_shared<HostView>(std::move(view));
   std::shared_ptr<hpx::promise<std::shared_ptr<HostView>>> promise;
   {
-    std::lock_guard<std::mutex> lock(chunk_store->mutex);
+    std::lock_guard<ChunkStore::Mutex> lock(chunk_store->mutex);
     auto [it, inserted] = chunk_store->data.try_emplace(ref, make_pending_slot());
     (void)inserted;
     if (it->second.ready) {
@@ -243,7 +259,9 @@ void fulfill_dataset_load(const std::shared_ptr<ChunkStore>& chunk_store,
     promise = it->second.promise;
   }
 
-  promise->set_value(std::move(shared_view));
+  hpx::post([promise = std::move(promise), shared_view = std::move(shared_view)]() mutable {
+    promise->set_value(std::move(shared_view));
+  });
 }
 
 void fail_dataset_load(const std::shared_ptr<ChunkStore>& chunk_store,
@@ -251,7 +269,7 @@ void fail_dataset_load(const std::shared_ptr<ChunkStore>& chunk_store,
                        std::exception_ptr error) {
   std::shared_ptr<hpx::promise<std::shared_ptr<HostView>>> promise;
   {
-    std::lock_guard<std::mutex> lock(chunk_store->mutex);
+    std::lock_guard<ChunkStore::Mutex> lock(chunk_store->mutex);
     auto [it, inserted] = chunk_store->data.try_emplace(ref, make_pending_slot());
     (void)inserted;
     if (it->second.ready) {
@@ -262,7 +280,9 @@ void fail_dataset_load(const std::shared_ptr<ChunkStore>& chunk_store,
     promise = it->second.promise;
   }
 
-  promise->set_exception(error);
+  hpx::post([promise = std::move(promise), error = std::move(error)]() mutable {
+    promise->set_exception(error);
+  });
 }
 
 struct DatasetLoadRequest {
@@ -274,118 +294,277 @@ struct DatasetLoadRequest {
   int32_t in_flight_at_start = 0;
 };
 
+using DatasetLoadBatch = std::vector<DatasetLoadRequest>;
+
 class DatasetLoadQueue;
 DatasetLoadQueue& dataset_load_queue();
+void post_dataset_load(DatasetLoadBatch batch);
+
+bool same_load_batch(const DatasetLoadRequest& a, const DatasetLoadRequest& b) {
+  return a.dataset.get() == b.dataset.get() &&
+         a.chunk_store.get() == b.chunk_store.get() &&
+         a.ref.step == b.ref.step &&
+         a.ref.level == b.ref.level &&
+         a.ref.version == b.ref.version &&
+         a.ref.block == b.ref.block;
+}
+
+bool same_load_batch(const DatasetLoadBatch& a, const DatasetLoadBatch& b) {
+  return !a.empty() && !b.empty() && same_load_batch(a.front(), b.front());
+}
+
+bool same_load_batch(const DatasetLoadBatch& batch, const DatasetLoadRequest& request) {
+  return !batch.empty() && same_load_batch(batch.front(), request);
+}
 
 class DatasetLoadQueue {
  public:
   void enqueue(DatasetLoadRequest request) {
-    std::vector<DatasetLoadRequest> ready;
-    request.enqueue_time = now_seconds();
-    {
-      std::lock_guard<std::mutex> lock(mutex_);
-      pending_.push_back(std::move(request));
-      const auto& queued = pending_.back();
-      log_dataset_load_event("dataset_load_queue",
-                             "end",
-                             queued.ref,
-                             0,
-                             queued.enqueue_time,
-                             queued.enqueue_time,
-                             static_cast<int32_t>(pending_.size()),
-                             in_flight_);
-      pump_locked(ready);
-    }
-    post_ready(std::move(ready));
+    DatasetLoadBatch requests;
+    requests.push_back(std::move(request));
+    enqueue_many(std::move(requests));
   }
 
-  void run(DatasetLoadRequest request) {
+  void enqueue_many(DatasetLoadBatch requests) {
+    if (requests.empty()) {
+      return;
+    }
+    const double enqueue_time = now_seconds();
+    std::vector<DatasetLoadBatch> batches;
+    for (auto& request : requests) {
+      request.enqueue_time = enqueue_time;
+      auto it = std::find_if(batches.begin(), batches.end(), [&](const auto& batch) {
+        return same_load_batch(batch, request);
+      });
+      if (it == batches.end()) {
+        DatasetLoadBatch batch;
+        batch.push_back(std::move(request));
+        batches.push_back(std::move(batch));
+      } else {
+        it->push_back(std::move(request));
+      }
+    }
+
+    {
+      std::lock_guard<hpx::mutex> lock(mutex_);
+      for (auto& batch : batches) {
+        if (batch.empty()) {
+          continue;
+        }
+
+        auto pending_it = std::find_if(pending_.begin(), pending_.end(), [&](const auto& pending) {
+          return same_load_batch(pending, batch);
+        });
+
+        if (pending_it == pending_.end()) {
+          pending_.push_back(std::move(batch));
+          const auto& queued = pending_.back();
+          const int32_t queue_depth = static_cast<int32_t>(pending_.size());
+          for (const auto& request : queued) {
+            log_dataset_load_event("dataset_load_queue",
+                                   "end",
+                                   request.ref,
+                                   0,
+                                   request.enqueue_time,
+                                   request.enqueue_time,
+                                   queue_depth,
+                                   in_flight_);
+          }
+          continue;
+        }
+
+        const int32_t queue_depth = static_cast<int32_t>(pending_.size());
+        for (auto& request : batch) {
+          log_dataset_load_event("dataset_load_queue",
+                                 "end",
+                                 request.ref,
+                                 0,
+                                 request.enqueue_time,
+                                 request.enqueue_time,
+                                 queue_depth,
+                                 in_flight_);
+          pending_it->push_back(std::move(request));
+        }
+      }
+      schedule_pump_locked();
+    }
+  }
+
+  void run(DatasetLoadBatch requests) {
     struct FinishGuard {
       DatasetLoadQueue& queue;
       ~FinishGuard() { queue.finish_one(); }
     } finish_guard{*this};
 
-    const double read_start = now_seconds();
-    log_dataset_load_event("dataset_load_start",
-                           "end",
-                           request.ref,
-                           0,
-                           request.enqueue_time,
-                           read_start,
-                           request.queue_depth_at_start,
-                           request.in_flight_at_start);
+    if (requests.empty()) {
+      return;
+    }
 
-    std::size_t bytes = 0;
-    try {
-      if (!request.dataset) {
-        throw std::runtime_error("dataset not initialized");
-      }
-      auto view = request.dataset->get_chunk(request.ref);
-      if (!view.has_value()) {
-        throw std::runtime_error("dataset chunk disappeared during load");
-      }
-      bytes = view->data.size();
-      fulfill_dataset_load(request.chunk_store, request.ref, std::move(*view));
-      const double read_end = now_seconds();
-      log_dataset_load_event("dataset_load_read",
+    const double read_start = now_seconds();
+    for (const auto& request : requests) {
+      log_dataset_load_event("dataset_load_start",
                              "end",
                              request.ref,
-                             bytes,
+                             0,
+                             request.enqueue_time,
                              read_start,
-                             read_end,
                              request.queue_depth_at_start,
                              request.in_flight_at_start);
+    }
+
+    try {
+      if (!requests.front().dataset) {
+        throw std::runtime_error("dataset not initialized");
+      }
+      std::vector<ChunkRef> refs;
+      refs.reserve(requests.size());
+      for (const auto& request : requests) {
+        refs.push_back(request.ref);
+      }
+      auto views = requests.front().dataset->get_chunks(refs);
+      if (views.size() != requests.size()) {
+        throw std::runtime_error("dataset backend returned wrong number of chunks");
+      }
+      const double read_end = now_seconds();
+      for (std::size_t i = 0; i < requests.size(); ++i) {
+        const auto& request = requests[i];
+        if (!views[i].has_value()) {
+          log_dataset_load_event("dataset_load_read",
+                                 "error",
+                                 request.ref,
+                                 0,
+                                 read_start,
+                                 read_end,
+                                 request.queue_depth_at_start,
+                                 request.in_flight_at_start);
+          fail_dataset_load(request.chunk_store,
+                            request.ref,
+                            std::make_exception_ptr(
+                                std::runtime_error("dataset chunk disappeared during load")));
+          continue;
+        }
+        const std::size_t bytes = views[i]->data.size();
+        fulfill_dataset_load(request.chunk_store, request.ref, std::move(*views[i]));
+        log_dataset_load_event("dataset_load_read",
+                               "end",
+                               request.ref,
+                               bytes,
+                               read_start,
+                               read_end,
+                               request.queue_depth_at_start,
+                               request.in_flight_at_start);
+      }
     } catch (...) {
       const double read_end = now_seconds();
-      log_dataset_load_event("dataset_load_read",
-                             "error",
-                             request.ref,
-                             bytes,
-                             read_start,
-                             read_end,
-                             request.queue_depth_at_start,
-                             request.in_flight_at_start);
-      fail_dataset_load(request.chunk_store, request.ref, std::current_exception());
+      for (const auto& request : requests) {
+        log_dataset_load_event("dataset_load_read",
+                               "error",
+                               request.ref,
+                               0,
+                               read_start,
+                               read_end,
+                               request.queue_depth_at_start,
+                               request.in_flight_at_start);
+        fail_dataset_load(request.chunk_store, request.ref, std::current_exception());
+      }
     }
   }
 
  private:
-  void pump_locked(std::vector<DatasetLoadRequest>& ready) {
-    const int32_t max_in_flight = dataset_load_concurrency();
-    while (in_flight_ < max_in_flight && !pending_.empty()) {
-      DatasetLoadRequest request = std::move(pending_.front());
-      pending_.pop_front();
-      ++in_flight_;
-      request.queue_depth_at_start = static_cast<int32_t>(pending_.size());
-      request.in_flight_at_start = in_flight_;
-      ready.push_back(std::move(request));
+  void schedule_pump_locked() {
+    if (pump_scheduled_) {
+      return;
     }
+    pump_scheduled_ = true;
+    hpx::post([] { dataset_load_queue().pump(); });
   }
 
-  void finish_one() {
-    std::vector<DatasetLoadRequest> ready;
+  void pump() {
+    std::vector<DatasetLoadBatch> ready;
     {
-      std::lock_guard<std::mutex> lock(mutex_);
-      if (in_flight_ > 0) {
-        --in_flight_;
-      }
+      std::lock_guard<hpx::mutex> lock(mutex_);
+      pump_scheduled_ = false;
       pump_locked(ready);
+      if (!pending_.empty() && in_flight_ < dataset_load_concurrency()) {
+        schedule_pump_locked();
+      }
     }
     post_ready(std::move(ready));
   }
 
-  static void post_ready(std::vector<DatasetLoadRequest> ready) {
-    for (auto& request : ready) {
-      hpx::post([request = std::move(request)]() mutable {
-        dataset_load_queue().run(std::move(request));
-      });
+  void pump_locked(std::vector<DatasetLoadBatch>& ready) {
+    const int32_t max_in_flight = dataset_load_concurrency();
+    while (in_flight_ < max_in_flight && !pending_.empty()) {
+      DatasetLoadBatch batch = std::move(pending_.front());
+      pending_.pop_front();
+      ++in_flight_;
+      for (auto& request : batch) {
+        request.queue_depth_at_start = static_cast<int32_t>(pending_.size());
+        request.in_flight_at_start = in_flight_;
+      }
+      ready.push_back(std::move(batch));
     }
   }
 
-  std::mutex mutex_;
-  std::deque<DatasetLoadRequest> pending_;
+  void finish_one() {
+    std::vector<DatasetLoadBatch> ready;
+    {
+      std::lock_guard<hpx::mutex> lock(mutex_);
+      if (in_flight_ > 0) {
+        --in_flight_;
+      }
+      pump_locked(ready);
+      if (!pending_.empty() && in_flight_ < dataset_load_concurrency()) {
+        schedule_pump_locked();
+      }
+    }
+    post_ready(std::move(ready));
+  }
+
+  static void post_ready(std::vector<DatasetLoadBatch> ready) {
+    for (auto& batch : ready) {
+      post_dataset_load(std::move(batch));
+    }
+  }
+
+  hpx::mutex mutex_;
+  std::deque<DatasetLoadBatch> pending_;
   int32_t in_flight_ = 0;
+  bool pump_scheduled_ = false;
 };
+
+std::string dataset_load_pool_name() {
+  static const std::string value = []() -> std::string {
+    const char* env = std::getenv("KANGAROO_PLOTFILE_IO_POOL");
+    if (env != nullptr && *env != '\0') {
+      return env;
+    }
+    return "plotfile_io";
+  }();
+  return value;
+}
+
+void post_dataset_load(DatasetLoadBatch batch) {
+  auto batch_ptr = std::make_shared<DatasetLoadBatch>(std::move(batch));
+  const auto task = [batch_ptr]() {
+    dataset_load_queue().run(std::move(*batch_ptr));
+  };
+
+  const std::string pool_name = dataset_load_pool_name();
+  if (!pool_name.empty()) {
+    try {
+      if (hpx::resource::pool_exists(pool_name)) {
+        auto& pool = hpx::resource::get_thread_pool(pool_name);
+        hpx::execution::parallel_executor exec(&pool);
+        hpx::post(exec, std::move(task));
+        return;
+      }
+    } catch (...) {
+    }
+  }
+
+  hpx::post(std::move(task));
+}
 
 DatasetLoadQueue& dataset_load_queue() {
   static DatasetLoadQueue queue;
@@ -461,7 +640,7 @@ hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_local_shared
 
   hpx::shared_future<std::shared_ptr<HostView>> future;
   {
-    std::lock_guard<std::mutex> lock(chunk_store->mutex);
+    std::lock_guard<ChunkStore::Mutex> lock(chunk_store->mutex);
     auto it = chunk_store->data.find(ref);
     if (it != chunk_store->data.end() &&
         (it->second.ready || it->second.dataset_load_started || dataset == nullptr)) {
@@ -478,7 +657,7 @@ hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_local_shared
 
   bool can_probe_dataset = false;
   {
-    std::lock_guard<std::mutex> lock(chunk_store->mutex);
+    std::lock_guard<ChunkStore::Mutex> lock(chunk_store->mutex);
     auto [it, inserted] = chunk_store->data.try_emplace(ref, make_pending_slot());
     (void)inserted;
     future = it->second.future;
@@ -498,7 +677,7 @@ hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_local_shared
 
   bool start_load = false;
   {
-    std::lock_guard<std::mutex> lock(chunk_store->mutex);
+    std::lock_guard<ChunkStore::Mutex> lock(chunk_store->mutex);
     auto it = chunk_store->data.find(ref);
     if (it != chunk_store->data.end() && !it->second.ready && !it->second.dataset_load_started &&
         dataset_has_chunk) {
@@ -519,6 +698,100 @@ hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_local_shared
   return future;
 }
 
+std::vector<hpx::shared_future<std::shared_ptr<HostView>>>
+DataServiceLocal::get_local_shared_batch_impl(const std::vector<ChunkRef>& refs) {
+  std::shared_ptr<ExecutionContext> ctx;
+  const DatasetHandle* dataset = dataset_;
+  auto chunk_store = chunk_store_;
+  if (run_id_ != 0) {
+    ctx = execution_context_shared(run_id_);
+    if (dataset == nullptr) {
+      dataset = &ctx->dataset;
+    }
+    if (chunk_store == nullptr) {
+      chunk_store = ctx->chunk_store;
+    }
+  }
+  if (chunk_store == nullptr) {
+    throw std::runtime_error("chunk store not initialized");
+  }
+
+  std::vector<hpx::shared_future<std::shared_ptr<HostView>>> futures(refs.size());
+  std::vector<std::size_t> unresolved;
+  unresolved.reserve(refs.size());
+  {
+    std::lock_guard<ChunkStore::Mutex> lock(chunk_store->mutex);
+    for (std::size_t i = 0; i < refs.size(); ++i) {
+      auto it = chunk_store->data.find(refs[i]);
+      if (it != chunk_store->data.end() &&
+          (it->second.ready || it->second.dataset_load_started || dataset == nullptr)) {
+        futures[i] = it->second.future;
+      } else {
+        unresolved.push_back(i);
+      }
+    }
+  }
+
+  struct PendingRef {
+    std::size_t index = 0;
+    ChunkRef ref;
+    bool dataset_has_chunk = false;
+  };
+
+  std::vector<PendingRef> pending_refs;
+  pending_refs.reserve(unresolved.size());
+  for (std::size_t idx : unresolved) {
+    const auto& ref = refs[idx];
+    const bool dataset_has_chunk = dataset != nullptr && dataset->has_chunk(ref);
+    if (!dataset_has_chunk && run_id_ != 0 && !execution_context_may_produce_chunk(run_id_, ref)) {
+      futures[idx] = hpx::make_exceptional_future<std::shared_ptr<HostView>>(
+                         std::runtime_error(
+                             "chunk is not available from run dataset or planned outputs"))
+                         .share();
+      continue;
+    }
+    pending_refs.push_back(PendingRef{idx, ref, dataset_has_chunk});
+  }
+
+  std::shared_ptr<const DatasetHandle> dataset_for_load;
+  if (ctx) {
+    dataset_for_load = std::shared_ptr<const DatasetHandle>(ctx, &ctx->dataset);
+  } else if (dataset != nullptr) {
+    dataset_for_load = std::make_shared<DatasetHandle>(*dataset);
+  }
+
+  std::vector<ChunkRef> load_refs;
+  load_refs.reserve(pending_refs.size());
+  {
+    std::lock_guard<ChunkStore::Mutex> lock(chunk_store->mutex);
+    for (const auto& pending : pending_refs) {
+      auto [it, inserted] = chunk_store->data.try_emplace(pending.ref, make_pending_slot());
+      (void)inserted;
+      futures[pending.index] = it->second.future;
+      if (!it->second.ready && !it->second.dataset_load_started && pending.dataset_has_chunk) {
+        it->second.dataset_load_started = true;
+        load_refs.push_back(pending.ref);
+      }
+    }
+  }
+
+  DatasetLoadBatch load_requests;
+  load_requests.reserve(load_refs.size());
+  for (const auto& ref : load_refs) {
+    DatasetLoadRequest request;
+    request.dataset = dataset_for_load;
+    request.chunk_store = chunk_store;
+    request.ref = ref;
+    load_requests.push_back(std::move(request));
+  }
+
+  if (!load_requests.empty()) {
+    dataset_load_queue().enqueue_many(std::move(load_requests));
+  }
+
+  return futures;
+}
+
 hpx::future<HostView> DataServiceLocal::get_local_impl(const ChunkRef& ref) {
   auto ready = get_local_shared_impl(ref);
   if (ready.is_ready()) {
@@ -529,6 +802,51 @@ hpx::future<HostView> DataServiceLocal::get_local_impl(const ChunkRef& ref) {
     auto view = ready_ref.get();
     return *view;
   });
+}
+
+hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_host_shared(
+    const ChunkRef& ref) {
+  const int target = home_rank(ref);
+  const int here = hpx::get_locality_id();
+  if (target == here) {
+    return get_local_shared_impl(ref);
+  }
+
+  return get_host(ref).then([](auto&& result) {
+    return std::make_shared<HostView>(result.get());
+  }).share();
+}
+
+std::vector<hpx::shared_future<std::shared_ptr<HostView>>> DataServiceLocal::get_hosts_shared(
+    const std::vector<ChunkRef>& refs) {
+  std::vector<hpx::shared_future<std::shared_ptr<HostView>>> out(refs.size());
+  if (refs.empty()) {
+    return out;
+  }
+
+  const int here = hpx::get_locality_id();
+  std::vector<std::size_t> local_indices;
+  std::vector<ChunkRef> local_refs;
+  local_indices.reserve(refs.size());
+  local_refs.reserve(refs.size());
+
+  for (std::size_t i = 0; i < refs.size(); ++i) {
+    if (home_rank(refs[i]) == here) {
+      local_indices.push_back(i);
+      local_refs.push_back(refs[i]);
+    } else {
+      out[i] = get_host_shared(refs[i]);
+    }
+  }
+
+  if (!local_refs.empty()) {
+    auto local = get_local_shared_batch_impl(local_refs);
+    for (std::size_t j = 0; j < local_refs.size(); ++j) {
+      out[local_indices[j]] = std::move(local[j]);
+    }
+  }
+
+  return out;
 }
 
 hpx::future<HostView> data_get_local_impl(int32_t run_id, const ChunkRef& ref) {
@@ -542,30 +860,44 @@ void data_put_local_impl(int32_t run_id, const ChunkRef& ref, HostView view) {
 }
 
 void DataServiceLocal::put_local_impl(const ChunkRef& ref, HostView view) {
+  const int here = hpx::get_locality_id();
+  const std::size_t bytes = view.data.size();
+  log_dataflow_marker("put_local_enter", ref, here, here, bytes);
+
   auto chunk_store = resolve_chunk_store();
   if (chunk_store == nullptr) {
     throw std::runtime_error("chunk store not initialized");
   }
   auto shared_view = std::make_shared<HostView>(std::move(view));
   std::shared_ptr<hpx::promise<std::shared_ptr<HostView>>> promise;
+  log_dataflow_marker("put_local_before_lock", ref, here, here, bytes);
+  const double lock_wait_start = now_seconds();
+  double lock_hold_start = 0.0;
   {
-    std::lock_guard<std::mutex> lock(chunk_store->mutex);
+    std::unique_lock<ChunkStore::Mutex> lock(chunk_store->mutex);
+    log_dataflow_event("put_local_lock_wait", "end", ref, here, here, bytes, lock_wait_start);
+    lock_hold_start = now_seconds();
+    log_dataflow_marker("put_local_after_lock", ref, here, here, bytes);
     auto it = chunk_store->data.find(ref);
     if (it == chunk_store->data.end() || it->second.ready) {
       ChunkSlot slot = make_pending_slot();
       slot.ready = true;
       slot.value = shared_view;
-      slot.promise->set_value(shared_view);
+      promise = slot.promise;
       chunk_store->data[ref] = std::move(slot);
-      return;
+    } else {
+      it->second.ready = true;
+      it->second.dataset_load_started = false;
+      it->second.value = shared_view;
+      promise = it->second.promise;
     }
-    it->second.ready = true;
-    it->second.dataset_load_started = false;
-    it->second.value = shared_view;
-    promise = it->second.promise;
+    log_dataflow_marker("put_local_after_store_update", ref, here, here, bytes);
   }
+  log_dataflow_event("put_local_lock_hold", "end", ref, here, here, bytes, lock_hold_start);
 
+  log_dataflow_marker("put_local_promise_set_begin", ref, here, here, bytes);
   promise->set_value(std::move(shared_view));
+  log_dataflow_marker("put_local_promise_set_end", ref, here, here, bytes);
 }
 
 hpx::future<HostView> DataServiceLocal::get_host(const ChunkRef& ref) {
@@ -608,6 +940,63 @@ hpx::future<HostView> DataServiceLocal::get_host(const ChunkRef& ref) {
       });
 }
 
+std::vector<hpx::future<HostView>> DataServiceLocal::get_hosts(
+    const std::vector<ChunkRef>& refs) {
+  std::vector<hpx::future<HostView>> out(refs.size());
+  if (refs.empty()) {
+    return out;
+  }
+
+  const int here = hpx::get_locality_id();
+  std::vector<std::size_t> local_indices;
+  std::vector<ChunkRef> local_refs;
+  std::vector<double> local_starts;
+  local_indices.reserve(refs.size());
+  local_refs.reserve(refs.size());
+  local_starts.reserve(refs.size());
+
+  for (std::size_t i = 0; i < refs.size(); ++i) {
+    const int target = home_rank(refs[i]);
+    if (target == here) {
+      local_indices.push_back(i);
+      local_refs.push_back(refs[i]);
+      local_starts.push_back(now_seconds());
+    } else {
+      out[i] = get_host(refs[i]);
+    }
+  }
+
+  if (!local_refs.empty()) {
+    auto shared_futures = get_local_shared_batch_impl(local_refs);
+    for (std::size_t j = 0; j < local_refs.size(); ++j) {
+      const auto ref = local_refs[j];
+      const int target = here;
+      const double start = local_starts[j];
+      auto ready = std::move(shared_futures[j]);
+      if (ready.is_ready()) {
+        HostView view = *ready.get();
+        log_dataflow_fetch("get_host_local", ref, here, target, view.data.size());
+        log_dataflow_event("get_host", "end", ref, here, target, view.data.size(), start);
+        out[local_indices[j]] = hpx::make_ready_future(std::move(view));
+      } else {
+        out[local_indices[j]] = ready.then([ref, here, target, start](auto&& result) mutable {
+          try {
+            HostView view = *result.get();
+            log_dataflow_fetch("get_host_local", ref, here, target, view.data.size());
+            log_dataflow_event("get_host", "end", ref, here, target, view.data.size(), start);
+            return view;
+          } catch (...) {
+            log_dataflow_event("get_host", "error", ref, here, target, 0, start);
+            throw;
+          }
+        });
+      }
+    }
+  }
+
+  return out;
+}
+
 hpx::future<SubboxView> DataServiceLocal::get_subbox(const ChunkSubboxRef& ref) {
   return get_host(ref.chunk).then([ref](auto&& result) {
     HostView chunk = result.get();
@@ -620,19 +1009,26 @@ hpx::future<void> DataServiceLocal::put_host(const ChunkRef& ref, HostView view)
   int here = hpx::get_locality_id();
   const double start = now_seconds();
   const std::size_t bytes = view.data.size();
+  log_dataflow_marker("put_host_enter", ref, here, target, bytes);
   log_dataflow_fetch("put_host", ref, here, target, bytes);
   if (target == here) {
+    log_dataflow_marker("put_host_local_begin", ref, here, target, bytes);
     put_local_impl(ref, std::move(view));
+    log_dataflow_marker("put_host_local_return", ref, here, target, bytes);
     log_dataflow_event("put_host", "end", ref, here, target, bytes, start);
+    log_dataflow_marker("put_host_return", ref, here, target, bytes);
     return hpx::make_ready_future();
   }
   auto localities = hpx::find_all_localities();
+  log_dataflow_marker("put_host_remote_begin", ref, here, target, bytes);
   return hpx::async<::kangaroo_data_put_local_action>(localities.at(target), run_id_, ref,
                                                       std::move(view))
       .then([ref, here, target, bytes, start](auto&& result) mutable {
         try {
           result.get();
+          log_dataflow_marker("put_host_remote_return", ref, here, target, bytes);
           log_dataflow_event("put_host", "end", ref, here, target, bytes, start);
+          log_dataflow_marker("put_host_return", ref, here, target, bytes);
           return;
         } catch (...) {
           log_dataflow_event("put_host", "error", ref, here, target, bytes, start);

@@ -22,6 +22,8 @@
 #include <vector>
 
 #include <hpx/include/lcos.hpp>
+#include <hpx/synchronization/mutex.hpp>
+#include <hpx/synchronization/recursive_mutex.hpp>
 
 namespace kangaroo {
 
@@ -38,6 +40,7 @@ struct DatasetHandle {
 
   void set_chunk(const ChunkRef& ref, HostView view);
   std::optional<HostView> get_chunk(const ChunkRef& ref) const;
+  std::vector<std::optional<HostView>> get_chunks(const std::vector<ChunkRef>& refs) const;
   bool has_chunk(const ChunkRef& ref) const;
 
   template <typename Archive>
@@ -139,8 +142,9 @@ struct ChunkSlot {
 
 struct ChunkStore {
   using MapT = std::unordered_map<ChunkRef, ChunkSlot, ChunkRefHash, ChunkRefEq>;
+  using Mutex = hpx::recursive_mutex;
 
-  std::mutex mutex;
+  Mutex mutex;
   MapT data;
 };
 
@@ -199,7 +203,6 @@ class Runtime {
 
  private:
   int32_t next_field_id_ = 1000;
-  int32_t next_plan_id_ = 1;
   int32_t retained_output_run_id_ = 0;
   std::vector<int32_t> retained_output_run_ids_;
   int32_t preload_run_id_ = 0;
@@ -243,12 +246,16 @@ struct DataEvent {
   std::string op;
   std::string mode;
   std::string status;
+  std::string file;
   ChunkRef ref;
   int32_t locality = -1;
   int32_t target_locality = -1;
   int32_t worker = -1;
   std::string worker_label;
   std::size_t bytes = 0;
+  int64_t file_offset = -1;
+  int32_t comp_start = -1;
+  int32_t comp_count = -1;
   int32_t queue_depth = -1;
   int32_t in_flight = -1;
   int32_t concurrency = -1;

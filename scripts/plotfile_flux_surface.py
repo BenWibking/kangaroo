@@ -53,10 +53,15 @@ def _metadata_var_names(meta: dict) -> list[str]:
 
 
 def _pick_field(role: str, explicit: str | None, available: Iterable[str]) -> str:
-    if explicit:
-        return explicit
     names = list(available)
     name_set = set(names)
+    if explicit:
+        if explicit not in name_set:
+            raise RuntimeError(
+                f"Field {explicit!r} for {role!r} is not listed in plotfile metadata. "
+                f"Use --list-fields; available fields include: {', '.join(names[:40])}"
+            )
+        return explicit
     for candidate in FIELD_CANDIDATES[role]:
         if candidate in name_set:
             return candidate
@@ -77,6 +82,13 @@ def _finite_radius(value: float) -> float:
     if not math.isfinite(radius) or radius <= 0.0:
         raise ValueError("radius must be finite and positive")
     return radius
+
+
+def _finite_radii(values: Iterable[float]) -> np.ndarray:
+    radii = np.asarray([float(value) for value in values], dtype=np.float64)
+    if radii.size == 0 or not np.all(np.isfinite(radii)) or np.any(radii <= 0.0):
+        raise ValueError("radii must be finite and positive")
+    return radii
 
 
 def _bounds_1d(lo: int, hi: int, x0: float, dx: float, origin: int) -> tuple[float, float]:
@@ -116,37 +128,32 @@ def _intersecting_validation_blocks(ds, runmeta, *, radius: float) -> list[tuple
     return samples
 
 
+def _intersecting_validation_blocks_for_radii(ds, runmeta, *, radii: Iterable[float]) -> list[tuple[int, int]]:
+    samples: list[tuple[int, int]] = []
+    seen: set[tuple[int, int]] = set()
+    for radius in radii:
+        for sample in _intersecting_validation_blocks(ds, runmeta, radius=float(radius)):
+            if sample not in seen:
+                seen.add(sample)
+                samples.append(sample)
+    return samples
+
+
 def _validate_selected_fields(
     ds,
-    rt,
     runmeta,
     fields: dict[str, tuple[str, int]],
     *,
-    radius: float,
+    radii: Iterable[float],
 ) -> None:
-    validation_blocks = _intersecting_validation_blocks(ds, runmeta, radius=radius)
+    _intersecting_validation_blocks_for_radii(ds, runmeta, radii=radii)
+    available = set(_metadata_var_names(ds.metadata))
     for role, (name, field_id) in fields.items():
-        for level_idx, block_idx in validation_blocks:
-            try:
-                raw = rt.get_task_chunk(
-                    step=ds.step,
-                    level=level_idx,
-                    field=field_id,
-                    version=0,
-                    block=block_idx,
-                    dataset=ds,
-                )
-            except Exception as exc:  # noqa: BLE001
-                raise RuntimeError(
-                    f"Selected field {role!r} -> {name!r} is not readable at level {level_idx}, "
-                    f"block {block_idx}. Use --list-fields and pass explicit field names if "
-                    "inference picked the wrong component."
-                ) from exc
-            if not raw:
-                raise RuntimeError(
-                    f"Selected field {role!r} -> {name!r} returned an empty chunk at "
-                    f"level {level_idx}, block {block_idx}."
-                )
+        if name not in available:
+            raise RuntimeError(
+                f"Selected field {role!r} -> {name!r} is not listed in plotfile metadata. "
+                f"field_id={field_id}"
+            )
 
 
 def main() -> int:
@@ -156,6 +163,27 @@ def main() -> int:
     p.add_argument("plotfile")
     p.add_argument("--radius", type=float, help="Sphere radius in plotfile coordinate units.")
     p.add_argument("--radius-kpc", type=float, help="Sphere radius in kpc; converted to cm.")
+    p.add_argument(
+        "--rmin-kpc",
+        "--rmin_kpc",
+        dest="rmin_kpc",
+        type=float,
+        help="Minimum sphere radius in kpc.",
+    )
+    p.add_argument(
+        "--rmax-kpc",
+        "--rmax_kpc",
+        dest="rmax_kpc",
+        type=float,
+        help="Maximum sphere radius in kpc.",
+    )
+    p.add_argument(
+        "--nbins",
+        dest="nbins",
+        type=int,
+        default=64,
+        help="Number of log-spaced radii for --rmin-kpc/--rmax-kpc.",
+    )
     p.add_argument("--density")
     p.add_argument("--momx")
     p.add_argument("--momy")
@@ -166,6 +194,13 @@ def main() -> int:
     p.add_argument("--by")
     p.add_argument("--bz")
     p.add_argument("--gamma", type=float, default=5.0 / 3.0)
+    p.add_argument(
+        "--bytes-per-value",
+        type=int,
+        choices=(4, 8),
+        default=8,
+        help="Input field precision in bytes; defaults to 8 for double-precision plotfiles.",
+    )
     p.add_argument("--output-json", help="Write flux values and field bindings to this JSON file.")
     p.add_argument("--list-fields", action="store_true", help="Print plotfile field names and exit.")
     p.add_argument("--progress", action="store_true", help="Show Kangaroo task progress.")
@@ -184,13 +219,34 @@ def main() -> int:
                 print(f"{idx:03d} {name}")
             return 0
 
-        if a.radius is None and a.radius_kpc is None:
-            raise RuntimeError("Pass either --radius or --radius-kpc")
-        if a.radius is not None and a.radius_kpc is not None:
-            raise RuntimeError("Pass only one of --radius or --radius-kpc")
-
         pc_cm = 3.0856775814913673e18
-        radius = _finite_radius(a.radius if a.radius is not None else float(a.radius_kpc) * 1.0e3 * pc_cm)
+        single_radius_count = sum(value is not None for value in (a.radius, a.radius_kpc))
+        range_radius_count = sum(value is not None for value in (a.rmin_kpc, a.rmax_kpc))
+        if single_radius_count == 0 and range_radius_count == 0:
+            raise RuntimeError("Pass --radius, --radius-kpc, or both --rmin-kpc and --rmax-kpc")
+        if single_radius_count > 0 and range_radius_count > 0:
+            raise RuntimeError("Pass either a single radius or --rmin-kpc/--rmax-kpc, not both")
+        if single_radius_count > 1:
+            raise RuntimeError("Pass only one of --radius or --radius-kpc")
+        if range_radius_count not in (0, 2):
+            raise RuntimeError("Pass both --rmin-kpc and --rmax-kpc")
+
+        if range_radius_count == 2:
+            if int(a.nbins) <= 0:
+                raise ValueError("nbins must be positive")
+            rmin_kpc = _finite_radius(a.rmin_kpc)
+            rmax_kpc = _finite_radius(a.rmax_kpc)
+            if rmin_kpc > rmax_kpc:
+                raise ValueError("rmin_kpc must be less than or equal to rmax_kpc")
+            radii_kpc = _finite_radii(
+                np.logspace(np.log10(rmin_kpc), np.log10(rmax_kpc), int(a.nbins))
+            )
+            radii = _finite_radii(radii_kpc * 1.0e3 * pc_cm)
+        else:
+            radius = _finite_radius(
+                a.radius if a.radius is not None else float(a.radius_kpc) * 1.0e3 * pc_cm
+            )
+            radii = _finite_radii([radius])
 
         fields: dict[str, tuple[str, int]] = {}
         for role in FIELD_CANDIDATES:
@@ -207,9 +263,8 @@ def main() -> int:
             file=sys.stderr,
             flush=True,
         )
-        _validate_selected_fields(ds, rt, runmeta, fields, radius=radius)
-
-        bytes_per_value = ds.infer_bytes_per_value(rt, field=fields["density"][1], level=0)
+        _validate_selected_fields(ds, runmeta, fields, radii=radii)
+        bytes_per_value = int(a.bytes_per_value)
 
         pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
         flux = pipe.flux_surface_integral(
@@ -226,7 +281,7 @@ def main() -> int:
                 pipe.field(fields["by"][1]),
                 pipe.field(fields["bz"][1]),
             ),
-            radius=radius,
+            radius=radii,
             gamma=float(a.gamma),
             bytes_per_value=bytes_per_value,
             out="flux_surface_integral",
@@ -239,25 +294,47 @@ def main() -> int:
             field=flux.field,
             version=0,
             block=0,
-            shape=(4,),
+            shape=(len(radii), 4),
             dtype=np.float64,
             dataset=ds,
         )
 
+        flux_rows = [
+            {
+                "radius": float(radii[i]),
+                "radius_kpc": float(radii[i] / (1.0e3 * pc_cm)),
+                "fluxes": {name: float(values[i, j]) for j, name in enumerate(COMPONENTS)},
+            }
+            for i in range(len(radii))
+        ]
         result = {
             "plotfile": a.plotfile,
-            "radius": radius,
-            "radius_kpc": radius / (1.0e3 * pc_cm),
+            "radius": float(radii[0]) if len(radii) == 1 else None,
+            "radius_kpc": float(radii[0] / (1.0e3 * pc_cm)) if len(radii) == 1 else None,
+            "radii": [float(radius) for radius in radii],
+            "radii_kpc": [float(radius / (1.0e3 * pc_cm)) for radius in radii],
+            "nbins": int(len(radii)),
             "gamma": float(a.gamma),
             "bytes_per_value": int(bytes_per_value),
             "fields": {role: name for role, (name, _) in fields.items()},
-            "fluxes": {name: float(values[i]) for i, name in enumerate(COMPONENTS)},
+            "fluxes": flux_rows[0]["fluxes"] if len(radii) == 1 else None,
+            "fluxes_by_radius": flux_rows,
         }
 
         msun_g = 1.98847e33
         yr_s = 365.25 * 24.0 * 3600.0
         result["derived"] = {
-            "mass_flux_msun_per_yr": float(values[0] * yr_s / msun_g),
+            "mass_flux_msun_per_yr": (
+                float(values[0, 0] * yr_s / msun_g) if len(radii) == 1 else None
+            ),
+            "mass_flux_msun_per_yr_by_radius": [
+                {
+                    "radius": float(radii[i]),
+                    "radius_kpc": float(radii[i] / (1.0e3 * pc_cm)),
+                    "mass_flux_msun_per_yr": float(values[i, 0] * yr_s / msun_g),
+                }
+                for i in range(len(radii))
+            ],
         }
 
         print(json.dumps(result, indent=2, sort_keys=True))

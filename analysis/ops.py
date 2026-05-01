@@ -1541,7 +1541,7 @@ class FluxSurfaceIntegral:
         energy: int,
         passive_scalar: int,
         magnetic_field: tuple[int, int, int],
-        radius: float,
+        radius: float | Sequence[float],
         out_name: str = "flux_surface_integral",
         gamma: float = 5.0 / 3.0,
         bytes_per_value: int | None = None,
@@ -1552,11 +1552,20 @@ class FluxSurfaceIntegral:
         self.energy = int(energy)
         self.passive_scalar = int(passive_scalar)
         self.magnetic_field = tuple(int(v) for v in magnetic_field)
-        self.radius = float(radius)
+        self.radii = self._coerce_radii(radius)
         self.out_name = out_name
         self.gamma = float(gamma)
         self.bytes_per_value = bytes_per_value
         self.reduce_fan_in = reduce_fan_in
+
+    def _coerce_radii(self, radius: float | Sequence[float]) -> tuple[float, ...]:
+        if isinstance(radius, (str, bytes)):
+            raise TypeError("radius must be a number or a sequence of numbers")
+        try:
+            values = tuple(float(v) for v in radius)  # type: ignore[arg-type]
+        except TypeError:
+            values = (float(radius),)
+        return values
 
     def _reduce_fan_in(self, num_inputs: int) -> int:
         if self.reduce_fan_in is None:
@@ -1594,8 +1603,7 @@ class FluxSurfaceIntegral:
                 )
         return covered
 
-    def _block_intersects_sphere(self, level_meta, block) -> bool:
-        radius2 = self.radius * self.radius
+    def _block_radius_bounds2(self, level_meta, block) -> tuple[float, float]:
         geom = level_meta.geom
         lo2 = 0.0
         hi2 = 0.0
@@ -1612,12 +1620,14 @@ class FluxSurfaceIntegral:
             elif x0 > 0.0:
                 lo2 += x0 * x0
             hi2 += max(abs(x0), abs(x1)) ** 2
-        return lo2 <= radius2 <= hi2
+        return lo2, hi2
 
     def lower(self, ctx: LoweringContext):
         ds = ctx.dataset
-        if not math.isfinite(self.radius) or self.radius <= 0.0:
-            raise ValueError("radius must be finite and positive")
+        if not self.radii:
+            raise ValueError("radius must contain at least one value")
+        if any(not math.isfinite(radius) or radius <= 0.0 for radius in self.radii):
+            raise ValueError("radius values must be finite and positive")
         if not math.isfinite(self.gamma) or self.gamma <= 1.0:
             raise ValueError("gamma must be finite and greater than 1")
         if len(self.momentum) != 3:
@@ -1638,7 +1648,9 @@ class FluxSurfaceIntegral:
             *self.magnetic_field,
         ]
         levels = ctx.runmeta.steps[ds.step].levels
-        out_bytes = 4 * 8
+        out_bytes = len(self.radii) * 4 * 8
+        radii2 = [radius * radius for radius in self.radii]
+        radius_intersects = [False] * len(self.radii)
 
         flux_fields: list[tuple[FieldRef, int]] = []
         accumulate_stage = ctx.stage("flux_surface_integral")
@@ -1647,11 +1659,16 @@ class FluxSurfaceIntegral:
 
         for level_idx in range(len(levels) - 1, -1, -1):
             level_meta = levels[level_idx]
-            blocks = [
-                block_idx
-                for block_idx, block in enumerate(level_meta.boxes)
-                if self._block_intersects_sphere(level_meta, block)
-            ]
+            blocks: list[int] = []
+            for block_idx, block in enumerate(level_meta.boxes):
+                lo2, hi2 = self._block_radius_bounds2(level_meta, block)
+                intersects_block = False
+                for radius_idx, radius2 in enumerate(radii2):
+                    if lo2 <= radius2 <= hi2:
+                        radius_intersects[radius_idx] = True
+                        intersects_block = True
+                if intersects_block:
+                    blocks.append(block_idx)
             if not blocks:
                 continue
 
@@ -1670,7 +1687,7 @@ class FluxSurfaceIntegral:
                     output_bytes=[out_bytes],
                     deps={"kind": "None"},
                     params={
-                        "radius": self.radius,
+                        "radii": list(self.radii),
                         "gamma": self.gamma,
                         "bytes_per_value": int(bpv),
                         "covered_boxes": covered_payload,
@@ -1763,7 +1780,18 @@ class FluxSurfaceIntegral:
             flux_fields.append((input_flux, level_idx))
 
         if not flux_fields:
+            if len(self.radii) > 1:
+                raise ValueError(
+                    f"radius values do not intersect any mesh block: {list(self.radii)}"
+                )
             raise ValueError("radius does not intersect any mesh block")
+        if not all(radius_intersects):
+            missing = [
+                radius
+                for radius, intersects in zip(self.radii, radius_intersects)
+                if not intersects
+            ]
+            raise ValueError(f"radius values do not intersect any mesh block: {missing}")
 
         def reduce_pairwise(fields: list[tuple[FieldRef, int]]) -> tuple[FieldRef, int]:
             if len(fields) == 1:
