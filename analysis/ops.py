@@ -1659,25 +1659,27 @@ class FluxSurfaceIntegral:
 
         for level_idx in range(len(levels) - 1, -1, -1):
             level_meta = levels[level_idx]
-            blocks: list[int] = []
+            block_radius_indices: list[tuple[int, list[int]]] = []
             for block_idx, block in enumerate(level_meta.boxes):
                 lo2, hi2 = self._block_radius_bounds2(level_meta, block)
-                intersects_block = False
+                active_radius_indices: list[int] = []
                 for radius_idx, radius2 in enumerate(radii2):
                     if lo2 <= radius2 <= hi2:
                         radius_intersects[radius_idx] = True
-                        intersects_block = True
-                if intersects_block:
-                    blocks.append(block_idx)
-            if not blocks:
+                        active_radius_indices.append(radius_idx)
+                if active_radius_indices:
+                    block_radius_indices.append((block_idx, active_radius_indices))
+            if not block_radius_indices:
                 continue
+            blocks = [block_idx for block_idx, _ in block_radius_indices]
 
             covered_boxes = self._covered_boxes_for_level(ctx, level=level_idx)
             covered_payload = [[list(c_lo), list(c_hi)] for c_lo, c_hi in covered_boxes]
             flux_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 
-            for block in blocks:
+            for block, active_radius_indices in block_radius_indices:
                 dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
+                active_radii = [self.radii[radius_idx] for radius_idx in active_radius_indices]
                 accumulate_stage.map_blocks(
                     name=f"flux_surface_integral_b{block}",
                     kernel="flux_surface_integral_accumulate",
@@ -1687,7 +1689,9 @@ class FluxSurfaceIntegral:
                     output_bytes=[out_bytes],
                     deps={"kind": "None"},
                     params={
-                        "radii": list(self.radii),
+                        "radii": list(active_radii),
+                        "radius_indices": list(active_radius_indices),
+                        "num_radii": len(self.radii),
                         "gamma": self.gamma,
                         "bytes_per_value": int(bpv),
                         "covered_boxes": covered_payload,

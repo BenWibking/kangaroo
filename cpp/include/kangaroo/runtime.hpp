@@ -42,6 +42,7 @@ struct DatasetHandle {
   std::optional<HostView> get_chunk(const ChunkRef& ref) const;
   std::vector<std::optional<HostView>> get_chunks(const std::vector<ChunkRef>& refs) const;
   bool has_chunk(const ChunkRef& ref) const;
+  std::size_t estimate_chunk_bytes(const ChunkRef& ref) const;
 
   template <typename Archive>
   void save(Archive& ar, unsigned) const {
@@ -142,10 +143,12 @@ struct ChunkSlot {
 
 struct ChunkStore {
   using MapT = std::unordered_map<ChunkRef, ChunkSlot, ChunkRefHash, ChunkRefEq>;
+  using ConsumerMapT = std::unordered_map<ChunkRef, std::int64_t, ChunkRefHash, ChunkRefEq>;
   using Mutex = hpx::recursive_mutex;
 
   Mutex mutex;
   MapT data;
+  ConsumerMapT consumer_counts;
 };
 
 struct ExecutionContext {
@@ -253,12 +256,15 @@ struct DataEvent {
   int32_t worker = -1;
   std::string worker_label;
   std::size_t bytes = 0;
+  std::size_t estimated_bytes = 0;
   int64_t file_offset = -1;
   int32_t comp_start = -1;
   int32_t comp_count = -1;
   int32_t queue_depth = -1;
   int32_t in_flight = -1;
   int32_t concurrency = -1;
+  int64_t in_flight_bytes = -1;
+  int64_t byte_limit = -1;
   double ts = 0.0;
   double start = 0.0;
   double end = 0.0;

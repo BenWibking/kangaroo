@@ -476,6 +476,9 @@ struct EventLogWorker {
           out << ",\"worker\":\"worker-" << event.worker << '"';
         }
         out << ",\"bytes\":" << event.bytes;
+        if (event.estimated_bytes > 0) {
+          out << ",\"estimated_bytes\":" << event.estimated_bytes;
+        }
         if (event.file_offset >= 0) {
           out << ",\"file_offset\":" << event.file_offset;
         }
@@ -493,6 +496,12 @@ struct EventLogWorker {
         }
         if (event.concurrency >= 0) {
           out << ",\"concurrency\":" << event.concurrency;
+        }
+        if (event.in_flight_bytes >= 0) {
+          out << ",\"in_flight_bytes\":" << event.in_flight_bytes;
+        }
+        if (event.byte_limit >= 0) {
+          out << ",\"byte_limit\":" << event.byte_limit;
         }
         out << ",\"elapsed\":" << (event.end - event.start);
         out << ",\"ts\":" << event.ts;
@@ -4981,6 +4990,8 @@ void register_default_kernels(KernelRegistry& registry) {
   {
     struct Params {
       std::vector<double> radii;
+      std::vector<int32_t> radius_indices;
+      std::size_t num_radii = 0;
       double gamma = 5.0 / 3.0;
       int bytes_per_value = 8;
       std::shared_ptr<const CoveredBoxListIR> covered_boxes;
@@ -5002,12 +5013,46 @@ void register_default_kernels(KernelRegistry& registry) {
           append_radius(radii->via.array.ptr[i], params.radii);
         }
       }
+      if (const auto* radius_indices = find_msgpack_map_value(root, "radius_indices");
+          radius_indices && radius_indices->type == msgpack::type::ARRAY) {
+        params.radius_indices.reserve(radius_indices->via.array.size);
+        for (uint32_t i = 0; i < radius_indices->via.array.size; ++i) {
+          const auto& idx = radius_indices->via.array.ptr[i];
+          if (idx.type == msgpack::type::POSITIVE_INTEGER ||
+              idx.type == msgpack::type::NEGATIVE_INTEGER) {
+            params.radius_indices.push_back(idx.as<int32_t>());
+          }
+        }
+      }
       if (const auto* radius = find_msgpack_map_value(root, "radius");
           radius && (radius->type == msgpack::type::FLOAT ||
                      radius->type == msgpack::type::POSITIVE_INTEGER ||
                      radius->type == msgpack::type::NEGATIVE_INTEGER) &&
               params.radii.empty()) {
         append_radius(*radius, params.radii);
+      }
+      if (params.radius_indices.empty()) {
+        params.radius_indices.reserve(params.radii.size());
+        for (std::size_t i = 0; i < params.radii.size(); ++i) {
+          params.radius_indices.push_back(static_cast<int32_t>(i));
+        }
+      }
+      if (const auto* count = find_msgpack_map_value(root, "num_radii");
+          count && (count->type == msgpack::type::POSITIVE_INTEGER ||
+                    count->type == msgpack::type::NEGATIVE_INTEGER)) {
+        const int parsed = count->as<int>();
+        if (parsed > 0) {
+          params.num_radii = static_cast<std::size_t>(parsed);
+        }
+      }
+      if (params.num_radii == 0) {
+        params.num_radii = params.radii.size();
+        for (int32_t idx : params.radius_indices) {
+          if (idx >= 0) {
+            params.num_radii =
+                std::max(params.num_radii, static_cast<std::size_t>(idx) + 1);
+          }
+        }
       }
       if (const auto* gamma = find_msgpack_map_value(root, "gamma");
           gamma && (gamma->type == msgpack::type::FLOAT ||
@@ -5032,7 +5077,7 @@ void register_default_kernels(KernelRegistry& registry) {
                         std::span<const std::uint8_t> params_msgpack) {
         const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
-        const std::size_t out_bytes = params.radii.size() * 4 * sizeof(double);
+        const std::size_t out_bytes = params.num_radii * 4 * sizeof(double);
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }
@@ -5042,13 +5087,20 @@ void register_default_kernels(KernelRegistry& registry) {
           std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
         }
         if (inputs.size() < 9 || params.radii.empty() ||
+            params.radius_indices.size() != params.radii.size() ||
             !std::isfinite(params.gamma) || params.gamma <= 1.0) {
           return hpx::make_ready_future();
         }
         std::vector<double> radii2;
         radii2.reserve(params.radii.size());
-        for (double radius : params.radii) {
+        for (std::size_t radius_idx = 0; radius_idx < params.radii.size(); ++radius_idx) {
+          const double radius = params.radii[radius_idx];
+          const int32_t output_idx = params.radius_indices[radius_idx];
           if (!std::isfinite(radius) || radius <= 0.0) {
+            return hpx::make_ready_future();
+          }
+          if (output_idx < 0 ||
+              static_cast<std::size_t>(output_idx) >= params.num_radii) {
             return hpx::make_ready_future();
           }
           radii2.push_back(radius * radius);
@@ -5199,7 +5251,8 @@ void register_default_kernels(KernelRegistry& registry) {
                 if (area <= 0.0) {
                   continue;
                 }
-                const std::size_t out_base = radius_idx * 4;
+                const std::size_t out_base =
+                    static_cast<std::size_t>(params.radius_indices[radius_idx]) * 4;
                 out[out_base + 0] += mass_flux_density * area;
                 out[out_base + 1] += hydro_energy_flux_density * area;
                 out[out_base + 2] += mhd_energy_flux_density * area;
@@ -5442,6 +5495,9 @@ std::shared_ptr<ExecutionContext> build_execution_context_impl(int32_t run_id,
   ctx->chunk_store = std::move(chunk_store);
   if (ctx->chunk_store == nullptr) {
     ctx->chunk_store = std::make_shared<ChunkStore>();
+  } else {
+    std::lock_guard<ChunkStore::Mutex> lock(ctx->chunk_store->mutex);
+    ctx->chunk_store->consumer_counts.clear();
   }
   return ctx;
 }
@@ -5750,6 +5806,13 @@ bool DatasetHandle::has_chunk(const ChunkRef& ref) const {
     return backend->has_chunk(ref);
   }
   return false;
+}
+
+std::size_t DatasetHandle::estimate_chunk_bytes(const ChunkRef& ref) const {
+  if (backend) {
+    return backend->estimate_chunk_bytes(ref);
+  }
+  return 0;
 }
 
 int32_t Runtime::alloc_field_id(const std::string&) {
