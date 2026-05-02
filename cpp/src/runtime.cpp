@@ -1672,6 +1672,39 @@ bool sphere_may_intersect_cell(double radius2,
   return radius2 >= r2_min && radius2 <= r2_max;
 }
 
+struct CellIndexRange {
+  int first = 0;
+  int last = -1;
+
+  bool empty() const { return first > last; }
+};
+
+CellIndexRange cells_intersecting_axis_band(double band_lo,
+                                            double band_hi,
+                                            double x0,
+                                            double dx,
+                                            int32_t index_origin,
+                                            int32_t block_lo,
+                                            int32_t block_hi) {
+  if (!std::isfinite(band_lo) || !std::isfinite(band_hi) || dx <= 0.0 ||
+      band_hi < band_lo || block_hi < block_lo) {
+    return {};
+  }
+
+  const double scaled_first = (band_lo - x0) / dx + static_cast<double>(index_origin) - 1.0;
+  const double scaled_last = (band_hi - x0) / dx + static_cast<double>(index_origin);
+  constexpr double pad = 1.0e-12;
+  const auto raw_first = static_cast<int64_t>(std::ceil(scaled_first - pad)) - 1;
+  const auto raw_last = static_cast<int64_t>(std::floor(scaled_last + pad)) + 1;
+  const int64_t clamped_first = std::max<int64_t>(static_cast<int64_t>(block_lo), raw_first);
+  const int64_t clamped_last = std::min<int64_t>(static_cast<int64_t>(block_hi), raw_last);
+  if (clamped_first > clamped_last) {
+    return {};
+  }
+  return CellIndexRange{static_cast<int>(clamped_first - block_lo),
+                        static_cast<int>(clamped_last - block_lo)};
+}
+
 struct FluxPoint {
   double x = 0.0;
   double y = 0.0;
@@ -5167,96 +5200,174 @@ void register_default_kernels(KernelRegistry& registry) {
 
         auto* out = reinterpret_cast<double*>(outputs[0].data.data());
         const double gamma_minus_one = params.gamma - 1.0;
-        std::vector<std::size_t> intersecting_radii;
-        intersecting_radii.reserve(params.radii.size());
+        auto box_lo_axis = [&](int axis) -> int32_t {
+          if (axis == 0) {
+            return box.lo.x;
+          }
+          return axis == 1 ? box.lo.y : box.lo.z;
+        };
+        auto box_hi_axis = [&](int axis) -> int32_t {
+          if (axis == 0) {
+            return box.hi.x;
+          }
+          return axis == 1 ? box.hi.y : box.hi.z;
+        };
+        auto axis_band = [&](int axis, double lo, double hi) {
+          return cells_intersecting_axis_band(lo,
+                                              hi,
+                                              level.geom.x0[axis],
+                                              level.geom.dx[axis],
+                                              level.geom.index_origin[axis],
+                                              box_lo_axis(axis),
+                                              box_hi_axis(axis));
+        };
 
-        for (int i = 0; i < nx; ++i) {
-          const int gi = box.lo.x + i;
-          const double x0 = cell_edge(0, gi);
-          const double x1 = x0 + level.geom.dx[0];
+        auto accumulate_cell = [&](std::size_t radius_idx,
+                                   int i,
+                                   int j,
+                                   int k,
+                                   double x0,
+                                   double x1,
+                                   double y0,
+                                   double y1,
+                                   double z0,
+                                   double z1) {
+          if (!sphere_may_intersect_cell(radii2[radius_idx], x0, x1, y0, y1, z0, z1)) {
+            return;
+          }
+
+          const auto idx = logical_index(i, j, k);
+          if (!covered_mask.empty() && covered_mask[idx] != 0) {
+            return;
+          }
+
           const double x = 0.5 * (x0 + x1);
-          for (int j = 0; j < ny; ++j) {
-            const int gj = box.lo.y + j;
-            const double y0 = cell_edge(1, gj);
-            const double y1 = y0 + level.geom.dx[1];
-            const double y = 0.5 * (y0 + y1);
-            for (int k = 0; k < nz; ++k) {
-              const int gk = box.lo.z + k;
-              const double z0 = cell_edge(2, gk);
-              const double z1 = z0 + level.geom.dx[2];
-              intersecting_radii.clear();
-              for (std::size_t radius_idx = 0; radius_idx < radii2.size(); ++radius_idx) {
-                if (sphere_may_intersect_cell(radii2[radius_idx], x0, x1, y0, y1, z0, z1)) {
-                  intersecting_radii.push_back(radius_idx);
-                }
-              }
-              if (intersecting_radii.empty()) {
+          const double y = 0.5 * (y0 + y1);
+          const double z = 0.5 * (z0 + z1);
+          const double r = std::sqrt(x * x + y * y + z * z);
+
+          const double rho = read_value(0, i, j, k);
+          if (r <= 0.0 || rho <= 0.0 || !std::isfinite(rho)) {
+            return;
+          }
+
+          const double momx = read_value(1, i, j, k);
+          const double momy = read_value(2, i, j, k);
+          const double momz = read_value(3, i, j, k);
+          const double energy_density = read_value(4, i, j, k);
+          const double scalar_density = read_value(5, i, j, k);
+          const double bx = read_value(6, i, j, k);
+          const double by = read_value(7, i, j, k);
+          const double bz = read_value(8, i, j, k);
+          if (!std::isfinite(momx) || !std::isfinite(momy) || !std::isfinite(momz) ||
+              !std::isfinite(energy_density) || !std::isfinite(scalar_density) ||
+              !std::isfinite(bx) || !std::isfinite(by) || !std::isfinite(bz)) {
+            return;
+          }
+
+          const double vx = momx / rho;
+          const double vy = momy / rho;
+          const double vz = momz / rho;
+          const double vr = (x * momx + y * momy + z * momz) / (rho * r);
+          const double rhat_x = x / r;
+          const double rhat_y = y / r;
+          const double rhat_z = z / r;
+
+          const double kinetic =
+              0.5 * (momx * momx + momy * momy + momz * momz) / rho;
+          const double emag = 0.5 * (bx * bx + by * by + bz * bz);
+          const double ehydro = energy_density - emag;
+          const double pgas = gamma_minus_one * (ehydro - kinetic);
+          if (!std::isfinite(vr) || !std::isfinite(pgas)) {
+            return;
+          }
+
+          const double area = spherical_section_area_in_intersecting_cell(
+              params.radii[radius_idx], x0, x1, y0, y1, z0, z1);
+          if (area <= 0.0) {
+            return;
+          }
+
+          const double bdotv = vx * bx + vy * by + vz * bz;
+          const double br = rhat_x * bx + rhat_y * by + rhat_z * bz;
+          const double mass_flux_density = rho * vr;
+          const double hydro_energy_flux_density = (ehydro + pgas) * vr;
+          const double mhd_energy_flux_density =
+              (energy_density + pgas + emag) * vr - bdotv * br;
+          const std::size_t out_base =
+              static_cast<std::size_t>(params.radius_indices[radius_idx]) * 4;
+          out[out_base + 0] += mass_flux_density * area;
+          out[out_base + 1] += hydro_energy_flux_density * area;
+          out[out_base + 2] += mhd_energy_flux_density * area;
+          out[out_base + 3] += (scalar_density * vr) * area;
+        };
+
+        for (std::size_t radius_idx = 0; radius_idx < params.radii.size(); ++radius_idx) {
+          const double radius = params.radii[radius_idx];
+          const double radius2 = radii2[radius_idx];
+          const auto i_range = axis_band(0, -radius, radius);
+          if (i_range.empty()) {
+            continue;
+          }
+
+          for (int i = i_range.first; i <= i_range.last; ++i) {
+            const int gi = box.lo.x + i;
+            const double x0 = cell_edge(0, gi);
+            const double x1 = x0 + level.geom.dx[0];
+            const double min_x = min_dist_sq_to_interval(x0, x1);
+            if (min_x > radius2) {
+              continue;
+            }
+
+            const double y_extent = std::sqrt(std::max(0.0, radius2 - min_x));
+            const auto j_range = axis_band(1, -y_extent, y_extent);
+            if (j_range.empty()) {
+              continue;
+            }
+
+            const double max_x = max_dist_sq_to_interval(x0, x1);
+            for (int j = j_range.first; j <= j_range.last; ++j) {
+              const int gj = box.lo.y + j;
+              const double y0 = cell_edge(1, gj);
+              const double y1 = y0 + level.geom.dx[1];
+              const double min_xy = min_x + min_dist_sq_to_interval(y0, y1);
+              if (min_xy > radius2) {
                 continue;
               }
 
-              const auto idx = logical_index(i, j, k);
-              if (!covered_mask.empty() && covered_mask[idx] != 0) {
-                continue;
+              const double max_xy = max_x + max_dist_sq_to_interval(y0, y1);
+              const double near_z = std::sqrt(std::max(0.0, radius2 - min_xy));
+              const double far_z2 = radius2 - max_xy;
+
+              std::array<CellIndexRange, 2> k_ranges{};
+              int num_k_ranges = 0;
+              if (far_z2 <= 0.0) {
+                k_ranges[0] = axis_band(2, -near_z, near_z);
+                num_k_ranges = 1;
+              } else {
+                const double far_z = std::sqrt(far_z2);
+                k_ranges[0] = axis_band(2, -near_z, -far_z);
+                k_ranges[1] = axis_band(2, far_z, near_z);
+                num_k_ranges = 2;
               }
 
-              const double z = 0.5 * (z0 + z1);
-              const double r = std::sqrt(x * x + y * y + z * z);
-
-              const double rho = read_value(0, i, j, k);
-              if (r <= 0.0 || rho <= 0.0 || !std::isfinite(rho)) {
-                continue;
-              }
-
-              const double momx = read_value(1, i, j, k);
-              const double momy = read_value(2, i, j, k);
-              const double momz = read_value(3, i, j, k);
-              const double energy_density = read_value(4, i, j, k);
-              const double scalar_density = read_value(5, i, j, k);
-              const double bx = read_value(6, i, j, k);
-              const double by = read_value(7, i, j, k);
-              const double bz = read_value(8, i, j, k);
-              if (!std::isfinite(momx) || !std::isfinite(momy) || !std::isfinite(momz) ||
-                  !std::isfinite(energy_density) || !std::isfinite(scalar_density) ||
-                  !std::isfinite(bx) || !std::isfinite(by) || !std::isfinite(bz)) {
-                continue;
-              }
-
-              const double vx = momx / rho;
-              const double vy = momy / rho;
-              const double vz = momz / rho;
-              const double vr = (x * momx + y * momy + z * momz) / (rho * r);
-              const double rhat_x = x / r;
-              const double rhat_y = y / r;
-              const double rhat_z = z / r;
-
-              const double kinetic =
-                  0.5 * (momx * momx + momy * momy + momz * momz) / rho;
-              const double emag = 0.5 * (bx * bx + by * by + bz * bz);
-              const double ehydro = energy_density - emag;
-              const double pgas = gamma_minus_one * (ehydro - kinetic);
-              if (!std::isfinite(vr) || !std::isfinite(pgas)) {
-                continue;
-              }
-
-              const double bdotv = vx * bx + vy * by + vz * bz;
-              const double br = rhat_x * bx + rhat_y * by + rhat_z * bz;
-              const double mass_flux_density = rho * vr;
-              const double hydro_energy_flux_density = (ehydro + pgas) * vr;
-              const double mhd_energy_flux_density =
-                  (energy_density + pgas + emag) * vr - bdotv * br;
-
-              for (std::size_t radius_idx : intersecting_radii) {
-                const double area = spherical_section_area_in_intersecting_cell(
-                    params.radii[radius_idx], x0, x1, y0, y1, z0, z1);
-                if (area <= 0.0) {
+              int last_k = -1;
+              for (int range_idx = 0; range_idx < num_k_ranges; ++range_idx) {
+                auto k_range = k_ranges[static_cast<std::size_t>(range_idx)];
+                if (k_range.empty()) {
                   continue;
                 }
-                const std::size_t out_base =
-                    static_cast<std::size_t>(params.radius_indices[radius_idx]) * 4;
-                out[out_base + 0] += mass_flux_density * area;
-                out[out_base + 1] += hydro_energy_flux_density * area;
-                out[out_base + 2] += mhd_energy_flux_density * area;
-                out[out_base + 3] += (scalar_density * vr) * area;
+                k_range.first = std::max(k_range.first, last_k + 1);
+                if (k_range.empty()) {
+                  continue;
+                }
+                for (int k = k_range.first; k <= k_range.last; ++k) {
+                  const int gk = box.lo.z + k;
+                  const double z0 = cell_edge(2, gk);
+                  const double z1 = z0 + level.geom.dx[2];
+                  accumulate_cell(radius_idx, i, j, k, x0, x1, y0, y1, z0, z1);
+                }
+                last_k = k_range.last;
               }
             }
           }
