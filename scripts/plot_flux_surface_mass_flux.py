@@ -12,11 +12,16 @@ import numpy as np
 
 
 MSUN_PER_YEAR_LABEL = r"$M_\odot\,yr^{-1}$"
+SECONDS_PER_YEAR = 365.25 * 24.0 * 3600.0
+SECONDS_PER_MYR = 1.0e6 * SECONDS_PER_YEAR
 
 
-def _load_mass_flux(path: Path) -> tuple[np.ndarray, np.ndarray]:
+def _load_mass_flux(path: Path) -> tuple[np.ndarray, np.ndarray, float | None]:
     with path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
+
+    time = data.get("time")
+    time_myr = None if time is None else float(time) / SECONDS_PER_MYR
 
     rows = data.get("derived", {}).get("mass_flux_msun_per_yr_by_radius")
     if rows is not None:
@@ -35,10 +40,12 @@ def _load_mass_flux(path: Path) -> tuple[np.ndarray, np.ndarray]:
             )
 
         msun_g = 1.98847e33
-        yr_s = 365.25 * 24.0 * 3600.0
         radius = np.asarray(radii_kpc, dtype=np.float64)
         mass_flux = np.asarray(
-            [row["fluxes"]["mass_flux_sphere"] * yr_s / msun_g for row in flux_rows],
+            [
+                row["fluxes"]["mass_flux_sphere"] * SECONDS_PER_YEAR / msun_g
+                for row in flux_rows
+            ],
             dtype=np.float64,
         )
 
@@ -50,7 +57,7 @@ def _load_mass_flux(path: Path) -> tuple[np.ndarray, np.ndarray]:
         raise ValueError("Radius and mass-flux values must be finite.")
 
     order = np.argsort(radius)
-    return radius[order], mass_flux[order]
+    return radius[order], mass_flux[order], time_myr
 
 
 def main() -> int:
@@ -81,7 +88,10 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    radius_kpc, mass_flux = _load_mass_flux(Path(args.input))
+    radius_kpc, mass_flux, time_myr = _load_mass_flux(Path(args.input))
+    title = args.title
+    if time_myr is not None:
+        title = f"{title}, t = {time_myr:.3f} Myr"
 
     fig, ax = plt.subplots(figsize=(7, 4.5))
     ax.plot(radius_kpc, mass_flux, marker="o", linewidth=1.6, markersize=4)
@@ -91,7 +101,7 @@ def main() -> int:
         ax.set_yscale("symlog", linthresh=0.1)
     ax.set_xlabel("radius [kpc]")
     ax.set_ylabel(f"mass flux [{MSUN_PER_YEAR_LABEL}]")
-    ax.set_title(args.title)
+    ax.set_title(title)
     ax.grid(True, which="both", alpha=0.25)
     fig.tight_layout()
     fig.savefig(args.output, dpi=200)
