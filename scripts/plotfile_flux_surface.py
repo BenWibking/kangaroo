@@ -309,6 +309,7 @@ def main() -> int:
         ]
         result = {
             "plotfile": a.plotfile,
+            "time": float(bundle.dataset["time"]) if "time" in bundle.dataset else None,
             "radius": float(radii[0]) if len(radii) == 1 else None,
             "radius_kpc": float(radii[0] / (1.0e3 * pc_cm)) if len(radii) == 1 else None,
             "radii": [float(radius) for radius in radii],
