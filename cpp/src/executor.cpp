@@ -1218,9 +1218,67 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
     std::size_t active_output_bytes = 0;
     hpx::promise<void> done;
 
+    void log_partition_state(const char* reason,
+                             std::size_t admitted = 0,
+                             std::size_t scanned = 0) const {
+      if (!has_event_log()) {
+        return;
+      }
+      std::size_t admissible = 0;
+      std::size_t pending_input_bytes = 0;
+      for (const auto& task : pending) {
+        pending_input_bytes += task.estimated_input_bytes;
+        auto units = task_storage_units(task);
+        if (can_admit(task, units)) {
+          ++admissible;
+        }
+      }
+      const double ts = now_seconds();
+      DataEvent event;
+      event.op = std::string("executor_partition_state_") + reason;
+      event.mode = "local";
+      event.status = "end";
+      event.ref = ChunkRef{0, 0, -1, 0, -1};
+      event.locality = hpx::get_locality_id();
+      event.target_locality = event.locality;
+      event.worker = static_cast<int32_t>(hpx::get_worker_thread_num());
+      event.bytes = admitted;
+      event.estimated_bytes = pending_input_bytes;
+      event.file_offset = static_cast<int64_t>(std::min<std::size_t>(
+          scanned, static_cast<std::size_t>(std::numeric_limits<int64_t>::max())));
+      event.comp_start = static_cast<int32_t>(
+          std::min<std::size_t>(active_storage_unit_count,
+                                static_cast<std::size_t>(std::numeric_limits<int32_t>::max())));
+      event.comp_count = static_cast<int32_t>(
+          std::min<std::size_t>(max_active_storage_units,
+                                static_cast<std::size_t>(std::numeric_limits<int32_t>::max())));
+      event.queue_depth = static_cast<int32_t>(
+          std::min<std::size_t>(pending.size(),
+                                static_cast<std::size_t>(std::numeric_limits<int32_t>::max())));
+      event.in_flight = static_cast<int32_t>(
+          std::min<std::size_t>(active.size(),
+                                static_cast<std::size_t>(std::numeric_limits<int32_t>::max())));
+      event.concurrency = static_cast<int32_t>(
+          std::min<std::size_t>(max_active_tasks,
+                                static_cast<std::size_t>(std::numeric_limits<int32_t>::max())));
+      event.in_flight_bytes = active_input_bytes > static_cast<std::size_t>(
+                                                     std::numeric_limits<int64_t>::max())
+                                  ? std::numeric_limits<int64_t>::max()
+                                  : static_cast<int64_t>(active_input_bytes);
+      event.byte_limit = max_input_bytes > static_cast<std::size_t>(
+                                             std::numeric_limits<int64_t>::max())
+                             ? std::numeric_limits<int64_t>::max()
+                             : static_cast<int64_t>(max_input_bytes);
+      event.ts = ts;
+      event.start = ts;
+      event.end = ts;
+      log_data_event(event);
+    }
+
     hpx::future<void> start() {
       auto out = done.get_future();
       try {
+        log_partition_state("start");
         refill();
         wait_next();
       } catch (...) {
@@ -1347,9 +1405,13 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
     }
 
     void refill() {
+      std::size_t admitted_total = 0;
+      std::size_t scanned_total = 0;
+      log_partition_state("refill_begin");
       while (!pending.empty() && active.size() < max_active_tasks) {
         bool admitted = false;
         for (std::size_t i = 0; i < pending.size(); ++i) {
+          ++scanned_total;
           auto units = task_storage_units(pending[i]);
           if (!can_admit(pending[i], units)) {
             continue;
@@ -1364,6 +1426,8 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
                                       std::move(input_refs),
                                       task.estimated_input_bytes,
                                       task.estimated_output_bytes});
+          ++admitted_total;
+          log_partition_state("launch", admitted_total, scanned_total);
           admitted = true;
           break;
         }
@@ -1371,6 +1435,7 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
           break;
         }
       }
+      log_partition_state("refill_end", admitted_total, scanned_total);
     }
 
     void wait_next() {
@@ -1414,6 +1479,7 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
         remove_storage_units(active[result.index].storage_units);
         remove_task_bytes(active[result.index]);
         active.erase(active.begin() + static_cast<std::ptrdiff_t>(result.index));
+        log_partition_state("complete");
         refill();
         wait_next();
       } catch (...) {

@@ -558,6 +558,7 @@ class DatasetLoadQueue {
                                     in_flight_bytes_,
                                     dataset_load_max_bytes_in_flight());
       }
+      log_queue_state_locked("enqueue");
       post_pump = mark_pump_scheduled_locked();
     }
     if (post_pump) {
@@ -703,6 +704,40 @@ class DatasetLoadQueue {
     return true;
   }
 
+  void log_queue_state_locked(const char* reason) const {
+    if (!has_event_log()) {
+      return;
+    }
+    int32_t admissible = 0;
+    std::size_t admissible_bytes = 0;
+    for (const auto& batch : pending_) {
+      if (can_admit_locked(batch)) {
+        ++admissible;
+        admissible_bytes += estimated_batch_bytes(batch);
+      }
+    }
+    const double ts = now_seconds();
+    DataEvent event;
+    event.op = std::string("dataset_load_queue_state_") + reason;
+    event.mode = "local";
+    event.status = "end";
+    event.ref = ChunkRef{0, 0, -1, 0, -1};
+    event.locality = hpx::get_locality_id();
+    event.target_locality = event.locality;
+    event.worker = static_cast<int32_t>(hpx::get_worker_thread_num());
+    event.estimated_bytes = admissible_bytes;
+    event.queue_depth = static_cast<int32_t>(pending_.size());
+    event.in_flight = in_flight_;
+    event.concurrency = dataset_load_concurrency();
+    event.in_flight_bytes = signed_size_or_disabled(in_flight_bytes_);
+    event.byte_limit = signed_size_or_disabled(dataset_load_max_bytes_in_flight());
+    event.bytes = static_cast<std::size_t>(std::max<int32_t>(0, admissible));
+    event.ts = ts;
+    event.start = ts;
+    event.end = ts;
+    log_data_event(event);
+  }
+
   static void post_pump_task() {
     hpx::post([] { dataset_load_queue().pump(); });
   }
@@ -714,6 +749,7 @@ class DatasetLoadQueue {
       std::lock_guard<hpx::mutex> lock(mutex_);
       pump_scheduled_ = false;
       pump_locked(ready);
+      log_queue_state_locked("pump");
       if (has_admissible_locked()) {
         post_pump = mark_pump_scheduled_locked();
       }
@@ -762,6 +798,7 @@ class DatasetLoadQueue {
                              ? 0
                              : in_flight_bytes_ - estimated_bytes;
       pump_locked(ready);
+      log_queue_state_locked("finish");
       if (has_admissible_locked()) {
         post_pump = mark_pump_scheduled_locked();
       }
@@ -844,6 +881,16 @@ DatasetLoadQueue& dataset_load_queue() {
   return queue;
 }
 
+hpx::id_type const& locality_for_rank(std::size_t rank) {
+  static const std::vector<hpx::id_type> localities = hpx::find_all_localities();
+  return localities.at(rank);
+}
+
+std::size_t cached_locality_count() {
+  static const std::size_t count = std::max<std::size_t>(1, hpx::find_all_localities().size());
+  return count;
+}
+
 }  // namespace
 
 DataServiceLocal::DataServiceLocal(int32_t run_id,
@@ -883,8 +930,7 @@ int DataServiceLocal::home_rank(const ChunkRef& ref) const {
   mix(ref.step);
   mix(ref.level);
   mix(ref.block);
-  auto localities = hpx::find_all_localities();
-  return static_cast<int>(h % localities.size());
+  return static_cast<int>(h % cached_locality_count());
 }
 
 HostView DataServiceLocal::alloc_host(const ChunkRef&, std::size_t bytes) {
@@ -1014,6 +1060,31 @@ hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_local_shared
 
 std::vector<hpx::shared_future<std::shared_ptr<HostView>>>
 DataServiceLocal::get_local_shared_batch_impl(const std::vector<ChunkRef>& refs) {
+  auto log_batch_issue_phase = [&](const char* op,
+                                   double start,
+                                   std::size_t count,
+                                   std::size_t estimated_bytes = 0) {
+    if (!has_event_log()) {
+      return;
+    }
+    const double end = now_seconds();
+    DataEvent event;
+    event.op = op;
+    event.mode = "local";
+    event.status = "end";
+    event.ref = refs.empty() ? ChunkRef{0, 0, -1, 0, -1} : refs.front();
+    event.locality = hpx::get_locality_id();
+    event.target_locality = event.locality;
+    event.worker = static_cast<int32_t>(hpx::get_worker_thread_num());
+    event.bytes = count;
+    event.estimated_bytes = estimated_bytes;
+    event.ts = end;
+    event.start = start;
+    event.end = end;
+    log_data_event(event);
+  };
+
+  const double total_start = now_seconds();
   std::shared_ptr<ExecutionContext> ctx;
   const DatasetHandle* dataset = dataset_;
   auto chunk_store = chunk_store_;
@@ -1033,6 +1104,7 @@ DataServiceLocal::get_local_shared_batch_impl(const std::vector<ChunkRef>& refs)
   std::vector<hpx::shared_future<std::shared_ptr<HostView>>> futures(refs.size());
   std::vector<std::size_t> unresolved;
   unresolved.reserve(refs.size());
+  double phase_start = now_seconds();
   {
     std::lock_guard<ChunkStore::Mutex> lock(chunk_store->mutex);
     for (std::size_t i = 0; i < refs.size(); ++i) {
@@ -1045,6 +1117,7 @@ DataServiceLocal::get_local_shared_batch_impl(const std::vector<ChunkRef>& refs)
       }
     }
   }
+  log_batch_issue_phase("get_local_batch_initial_store_scan", phase_start, unresolved.size());
 
   struct PendingRef {
     std::size_t index = 0;
@@ -1054,6 +1127,7 @@ DataServiceLocal::get_local_shared_batch_impl(const std::vector<ChunkRef>& refs)
 
   std::vector<PendingRef> pending_refs;
   pending_refs.reserve(unresolved.size());
+  phase_start = now_seconds();
   for (std::size_t idx : unresolved) {
     const auto& ref = refs[idx];
     const bool dataset_has_chunk = dataset != nullptr && dataset->has_chunk(ref);
@@ -1066,16 +1140,20 @@ DataServiceLocal::get_local_shared_batch_impl(const std::vector<ChunkRef>& refs)
     }
     pending_refs.push_back(PendingRef{idx, ref, dataset_has_chunk});
   }
+  log_batch_issue_phase("get_local_batch_has_chunk_probe", phase_start, pending_refs.size());
 
+  phase_start = now_seconds();
   std::shared_ptr<const DatasetHandle> dataset_for_load;
   if (ctx) {
     dataset_for_load = std::shared_ptr<const DatasetHandle>(ctx, &ctx->dataset);
   } else if (dataset != nullptr) {
     dataset_for_load = std::make_shared<DatasetHandle>(*dataset);
   }
+  log_batch_issue_phase("get_local_batch_dataset_handle", phase_start, dataset_for_load ? 1 : 0);
 
   std::vector<ChunkRef> load_refs;
   load_refs.reserve(pending_refs.size());
+  phase_start = now_seconds();
   {
     std::lock_guard<ChunkStore::Mutex> lock(chunk_store->mutex);
     for (const auto& pending : pending_refs) {
@@ -1088,22 +1166,37 @@ DataServiceLocal::get_local_shared_batch_impl(const std::vector<ChunkRef>& refs)
       }
     }
   }
+  log_batch_issue_phase("get_local_batch_mark_pending", phase_start, load_refs.size());
 
   DatasetLoadBatch load_requests;
   load_requests.reserve(load_refs.size());
+  std::size_t request_bytes = 0;
+  phase_start = now_seconds();
   for (const auto& ref : load_refs) {
     DatasetLoadRequest request;
     request.dataset = dataset_for_load;
     request.chunk_store = chunk_store;
     request.ref = ref;
     request.estimated_bytes = estimate_dataset_load_bytes(request.dataset.get(), request.ref);
+    request_bytes += request.estimated_bytes;
     load_requests.push_back(std::move(request));
   }
+  log_batch_issue_phase("get_local_batch_build_requests",
+                        phase_start,
+                        load_requests.size(),
+                        request_bytes);
 
   if (!load_requests.empty()) {
+    phase_start = now_seconds();
+    const std::size_t request_count = load_requests.size();
     dataset_load_queue().enqueue_many(std::move(load_requests));
+    log_batch_issue_phase("get_local_batch_enqueue_many",
+                          phase_start,
+                          request_count,
+                          request_bytes);
   }
 
+  log_batch_issue_phase("get_local_batch_total", total_start, refs.size(), request_bytes);
   return futures;
 }
 
@@ -1409,9 +1502,8 @@ hpx::future<HostView> DataServiceLocal::get_host(const ChunkRef& ref) {
       }
     });
   }
-  auto localities = hpx::find_all_localities();
   return hpx::unwrap(
-             hpx::async<::kangaroo_data_get_local_action>(localities.at(target), run_id_, ref))
+             hpx::async<::kangaroo_data_get_local_action>(locality_for_rank(target), run_id_, ref))
       .then([ref, here, target, start](auto&& result) mutable {
         try {
           HostView view = result.get();
@@ -1427,8 +1519,34 @@ hpx::future<HostView> DataServiceLocal::get_host(const ChunkRef& ref) {
 
 std::vector<hpx::future<HostView>> DataServiceLocal::get_hosts(
     const std::vector<ChunkRef>& refs) {
+  auto log_get_hosts_phase = [&](const char* op,
+                                 double start,
+                                 std::size_t count,
+                                 std::size_t estimated_bytes = 0) {
+    if (!has_event_log()) {
+      return;
+    }
+    const double end = now_seconds();
+    DataEvent event;
+    event.op = op;
+    event.mode = "local";
+    event.status = "end";
+    event.ref = refs.empty() ? ChunkRef{0, 0, -1, 0, -1} : refs.front();
+    event.locality = hpx::get_locality_id();
+    event.target_locality = event.locality;
+    event.worker = static_cast<int32_t>(hpx::get_worker_thread_num());
+    event.bytes = count;
+    event.estimated_bytes = estimated_bytes;
+    event.ts = end;
+    event.start = start;
+    event.end = end;
+    log_data_event(event);
+  };
+
+  const double total_start = now_seconds();
   std::vector<hpx::future<HostView>> out(refs.size());
   if (refs.empty()) {
+    log_get_hosts_phase("get_hosts_total", total_start, 0);
     return out;
   }
 
@@ -1440,6 +1558,8 @@ std::vector<hpx::future<HostView>> DataServiceLocal::get_hosts(
   local_refs.reserve(refs.size());
   local_starts.reserve(refs.size());
 
+  double phase_start = now_seconds();
+  std::size_t remote_count = 0;
   for (std::size_t i = 0; i < refs.size(); ++i) {
     const int target = home_rank(refs[i]);
     if (target == here) {
@@ -1447,18 +1567,25 @@ std::vector<hpx::future<HostView>> DataServiceLocal::get_hosts(
       local_refs.push_back(refs[i]);
       local_starts.push_back(now_seconds());
     } else {
+      ++remote_count;
       out[i] = get_host(refs[i]);
     }
   }
+  log_get_hosts_phase("get_hosts_partition_refs", phase_start, local_refs.size(), remote_count);
 
   if (!local_refs.empty()) {
+    phase_start = now_seconds();
     auto shared_futures = get_local_shared_batch_impl(local_refs);
+    log_get_hosts_phase("get_hosts_local_batch_call", phase_start, shared_futures.size());
+    phase_start = now_seconds();
+    std::size_t ready_count = 0;
     for (std::size_t j = 0; j < local_refs.size(); ++j) {
       const auto ref = local_refs[j];
       const int target = here;
       const double start = local_starts[j];
       auto ready = std::move(shared_futures[j]);
       if (ready.is_ready()) {
+        ++ready_count;
         HostView view = *ready.get();
         log_dataflow_fetch("get_host_local", ref, here, target, view.data.size());
         log_dataflow_event("get_host", "end", ref, here, target, view.data.size(), start);
@@ -1477,8 +1604,10 @@ std::vector<hpx::future<HostView>> DataServiceLocal::get_hosts(
         });
       }
     }
+    log_get_hosts_phase("get_hosts_wrap_local_futures", phase_start, local_refs.size(), ready_count);
   }
 
+  log_get_hosts_phase("get_hosts_total", total_start, refs.size());
   return out;
 }
 
