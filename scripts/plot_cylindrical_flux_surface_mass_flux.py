@@ -392,8 +392,8 @@ def main() -> int:
             output,
             data.height_kpc,
             [
-                (data.positive, "positive", "-"),
-                (data.negative, "negative", "-"),
+                (data.negative, "inflows", "-"),
+                (data.positive, "outflows", "-"),
                 (data.net, "net", "--"),
             ],
             title,
@@ -405,6 +405,13 @@ def main() -> int:
 
     temp = data.temperature
     net_by_temperature = temp.negative + temp.positive
+    total_inflows = np.sum(temp.negative, axis=0)
+    total_outflows = np.sum(temp.positive, axis=0)
+    total_net = total_inflows + total_outflows
+    total_axis_limits = _compute_axis_limits(
+        data.height_kpc,
+        [total_inflows, total_outflows, total_net],
+    )
     axis_limits = _compute_axis_limits(
         data.height_kpc,
         [
@@ -414,6 +421,20 @@ def main() -> int:
         ],
     )
     outputs: list[Path] = []
+
+    _plot_lines(
+        output,
+        data.height_kpc,
+        [
+            (total_inflows, "inflows", "-"),
+            (total_outflows, "outflows", "-"),
+            (total_net, "net", "--"),
+        ],
+        f"{title}: all temperature phases",
+        args.linear_y,
+        total_axis_limits,
+    )
+    outputs.append(output)
 
     inflows_output = _output_with_suffix(output, "inflows_by_temperature")
     _plot_lines(
