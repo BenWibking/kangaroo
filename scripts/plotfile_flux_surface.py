@@ -113,6 +113,16 @@ def _finite_temperature_bins(values: Iterable[float]) -> np.ndarray:
     return bins
 
 
+def _parse_temperature_bins(values: Iterable[str]) -> np.ndarray:
+    edges: list[float] = []
+    for value in values:
+        for token in str(value).split(","):
+            token = token.strip()
+            if token:
+                edges.append(float(token))
+    return _finite_temperature_bins(edges)
+
+
 def _flux_rows_and_derived(
     radii: np.ndarray,
     values: np.ndarray,
@@ -348,9 +358,11 @@ def main() -> int:
     p.add_argument("--temperature")
     p.add_argument(
         "--temperature-bins",
-        type=float,
         nargs="+",
-        help="Temperature bin edges. Requires the plotfile temperature field.",
+        help=(
+            "Temperature bin edges, separated by spaces or commas. "
+            "Requires the plotfile temperature field."
+        ),
     )
     p.add_argument("--gamma", type=float, default=5.0 / 3.0)
     p.add_argument(
@@ -407,7 +419,7 @@ def main() -> int:
             )
             radii = _finite_radii([radius])
         temperature_bins = (
-            _finite_temperature_bins(a.temperature_bins)
+            _parse_temperature_bins(a.temperature_bins)
             if a.temperature_bins is not None
             else None
         )

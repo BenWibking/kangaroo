@@ -8,6 +8,7 @@ import pytest
 from scripts.plotfile_flux_surface import (
     _flux_rows_and_derived,
     _intersecting_validation_blocks,
+    _parse_temperature_bins,
     _pick_field,
     _validate_selected_fields,
 )
@@ -118,6 +119,13 @@ def test_flux_surface_validation_rejects_fields_using_metadata_only() -> None:
 def test_flux_surface_explicit_field_must_exist_in_metadata() -> None:
     with pytest.raises(RuntimeError, match="--list-fields"):
         _pick_field("density", "missing", ["rho", "E"])
+
+
+def test_flux_surface_temperature_bins_accept_commas_and_spaces() -> None:
+    np.testing.assert_allclose(
+        _parse_temperature_bins(["0,980,4126", "7105", "2.0e4,5.0e5,1.0e9"]),
+        np.array([0.0, 980.0, 4126.0, 7105.0, 2.0e4, 5.0e5, 1.0e9]),
+    )
 
 
 def test_flux_surface_json_includes_negative_and_positive_bins() -> None:
