@@ -1,0 +1,134 @@
+#!/bin/bash
+#SBATCH -t 00:15:00
+#SBATCH -A ast236
+#SBATCH -N 4
+#SBATCH -p gpu
+#SBATCH -J kangaroo-cylflux-p2
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=28
+
+set -euo pipefail
+
+module load gcc/14.2.0
+
+: "${PLOTFILE:=/lustre/orion/ast236/proj-shared/wibking/MW_Gen1_Phase2/plt0426651}"
+: "${RADIUS_KPC:=20.0}"
+: "${ZMIN_KPC:=5.0}"
+: "${ZMAX_KPC:=100.0}"
+: "${KANGAROO_FLUX_PROFILE:=production}"
+
+case "$KANGAROO_FLUX_PROFILE" in
+  production)
+    : "${NBINS:=50}"
+    : "${OUTPUT_JSON:=cylindrical_flux_surface.json}"
+    ;;
+  diagnostic)
+    : "${NBINS:=8}"
+    : "${OUTPUT_JSON:=cylindrical_flux_surface.diagnostic.json}"
+    : "${KANGAROO_EVENT_LOG:=auto}"
+    : "${KANGAROO_PROGRESS:=1}"
+    ;;
+  *)
+    echo "Unsupported KANGAROO_FLUX_PROFILE='$KANGAROO_FLUX_PROFILE' (use production or diagnostic)" >&2
+    exit 2
+    ;;
+esac
+
+: "${KANGAROO_EXECUTOR_MODE:=streaming}"
+: "${KANGAROO_EXECUTOR_MAX_ACTIVE_TASKS_PER_LOCALITY:=128}"
+: "${KANGAROO_PLOTFILE_READ_CONCURRENCY:=16}"
+: "${KANGAROO_EXECUTOR_MAX_ACTIVE_STORAGE_UNITS_PER_LOCALITY:=64}"
+: "${KANGAROO_EXECUTOR_MAX_INPUT_BYTES_PER_LOCALITY:=64G}"
+: "${KANGAROO_EXECUTOR_MAX_OUTPUT_BYTES_PER_LOCALITY:=2G}"
+: "${KANGAROO_PLOTFILE_READ_MAX_BYTES_IN_FLIGHT:=64G}"
+: "${KANGAROO_PLOTFILE_IO_POOL:=plotfile_io}"
+: "${KANGAROO_PLOTFILE_IO_POOL_THREADS:=16}"
+: "${KANGAROO_PLOTFILE_ZERO_COPY_READS:=1}"
+export KANGAROO_EXECUTOR_MODE
+export KANGAROO_EXECUTOR_MAX_ACTIVE_TASKS_PER_LOCALITY
+export KANGAROO_EXECUTOR_MAX_ACTIVE_STORAGE_UNITS_PER_LOCALITY
+export KANGAROO_EXECUTOR_MAX_INPUT_BYTES_PER_LOCALITY
+export KANGAROO_EXECUTOR_MAX_OUTPUT_BYTES_PER_LOCALITY
+export KANGAROO_PLOTFILE_READ_MAX_BYTES_IN_FLIGHT
+export KANGAROO_PLOTFILE_READ_CONCURRENCY
+export KANGAROO_PLOTFILE_IO_POOL
+export KANGAROO_PLOTFILE_IO_POOL_THREADS
+export KANGAROO_PLOTFILE_ZERO_COPY_READS
+
+PROGRESS_ARGS=()
+if [[ "${KANGAROO_PROGRESS:-0}" == "1" ]]; then
+  PROGRESS_ARGS+=(--progress)
+fi
+if [[ -n "${KANGAROO_EVENT_LOG:-}" ]]; then
+  mkdir -p event_logs
+  if [[ "$KANGAROO_EVENT_LOG" == "1" || "$KANGAROO_EVENT_LOG" == "auto" ]]; then
+    KANGAROO_EVENT_LOG="$PWD/event_logs/cylindrical_flux_surface.${SLURM_JOB_ID:-manual}.events.jsonl"
+  fi
+  export KANGAROO_EVENT_LOG
+fi
+
+export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=1
+
+export SPACK_HPX_PREFIX="$(spack location -i hpx@1.11.0%gcc@14.2.0)"
+export LD_LIBRARY_PATH="$SPACK_HPX_PREFIX/lib64:${LD_LIBRARY_PATH:-}"
+
+NNODES="${SLURM_NNODES:-4}"
+CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-28}"
+if [[ "${SLURM_TRES_PER_TASK:-}" =~ (^|,)cpu=([0-9]+)(,|$) ]]; then
+  CPUS_PER_TASK="${BASH_REMATCH[2]}"
+  if [[ "${SLURM_CPUS_PER_TASK:-}" != "$CPUS_PER_TASK" ]]; then
+    echo "Normalizing SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK:-unset} to SLURM_TRES_PER_TASK cpu=${CPUS_PER_TASK}"
+  fi
+  export SLURM_CPUS_PER_TASK="$CPUS_PER_TASK"
+fi
+
+HPX_GUARD_PAGE_ARG=--hpx:ini=hpx.stacks.use_guard_pages=0
+export HPXRUN_ARGS="${HPXRUN_ARGS:+${HPXRUN_ARGS} }${HPX_GUARD_PAGE_ARG}"
+
+date
+echo "host=$(hostname)"
+echo "SLURM_JOB_ID=${SLURM_JOB_ID:-manual}"
+echo "NNODES=${NNODES}"
+echo "CPUS_PER_TASK=${CPUS_PER_TASK}"
+echo "SPACK_HPX_PREFIX=${SPACK_HPX_PREFIX}"
+echo "HPXRUN_ARGS=${HPXRUN_ARGS}"
+echo "KANGAROO_FLUX_PROFILE=${KANGAROO_FLUX_PROFILE}"
+echo "KANGAROO_EXECUTOR_MODE=${KANGAROO_EXECUTOR_MODE}"
+echo "KANGAROO_EXECUTOR_MAX_ACTIVE_TASKS_PER_LOCALITY=${KANGAROO_EXECUTOR_MAX_ACTIVE_TASKS_PER_LOCALITY}"
+echo "KANGAROO_EXECUTOR_MAX_ACTIVE_STORAGE_UNITS_PER_LOCALITY=${KANGAROO_EXECUTOR_MAX_ACTIVE_STORAGE_UNITS_PER_LOCALITY}"
+echo "KANGAROO_EXECUTOR_MAX_INPUT_BYTES_PER_LOCALITY=${KANGAROO_EXECUTOR_MAX_INPUT_BYTES_PER_LOCALITY}"
+echo "KANGAROO_EXECUTOR_MAX_OUTPUT_BYTES_PER_LOCALITY=${KANGAROO_EXECUTOR_MAX_OUTPUT_BYTES_PER_LOCALITY}"
+echo "KANGAROO_PLOTFILE_READ_CONCURRENCY=${KANGAROO_PLOTFILE_READ_CONCURRENCY}"
+echo "KANGAROO_PLOTFILE_READ_MAX_BYTES_IN_FLIGHT=${KANGAROO_PLOTFILE_READ_MAX_BYTES_IN_FLIGHT}"
+echo "KANGAROO_PLOTFILE_IO_POOL=${KANGAROO_PLOTFILE_IO_POOL}"
+echo "KANGAROO_PLOTFILE_IO_POOL_THREADS=${KANGAROO_PLOTFILE_IO_POOL_THREADS}"
+echo "KANGAROO_PLOTFILE_ZERO_COPY_READS=${KANGAROO_PLOTFILE_ZERO_COPY_READS}"
+echo "KANGAROO_EVENT_LOG=${KANGAROO_EVENT_LOG:-disabled}"
+echo "plotfile=${PLOTFILE}"
+echo "radius_kpc=${RADIUS_KPC}"
+echo "nbins=${NBINS}"
+echo "output_json=${OUTPUT_JSON}"
+
+"$SPACK_HPX_PREFIX/bin/hpxrun.py" \
+  -r srun \
+  -p tcp \
+  -l "$NNODES" \
+  -t "$CPUS_PER_TASK" \
+  "$PWD/.pixi/envs/default/bin/python" \
+  "$PWD/scripts/plotfile_cylindrical_flux_surface.py" \
+  -- \
+  "$PLOTFILE" \
+  --radius-kpc "$RADIUS_KPC" \
+  --zmin-kpc "$ZMIN_KPC" --zmax-kpc "$ZMAX_KPC" \
+  --nbins "$NBINS" \
+  --temperature-bins 0,980,4126,7105,2.0e4,5.0e5,1.0e9 \
+  --density gasDensity \
+  --momx x-GasMomentum --momy y-GasMomentum --momz z-GasMomentum \
+  --energy gasEnergy \
+  --scalar scalar_0 \
+  --bx x-BField --by y-BField --bz z-BField \
+  "${PROGRESS_ARGS[@]}" \
+  --output-json "$OUTPUT_JSON"
+
+date

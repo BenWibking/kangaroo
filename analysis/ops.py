@@ -1921,6 +1921,387 @@ class FluxSurfaceIntegral:
         return ctx.fragment(stages)
 
 
+class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
+    def __init__(
+        self,
+        *,
+        density: int,
+        momentum: tuple[int, int, int],
+        energy: int,
+        passive_scalar: int,
+        magnetic_field: tuple[int, int, int],
+        radius: float,
+        height: float | Sequence[float],
+        temperature: int | None = None,
+        temperature_bins: Sequence[float] | None = None,
+        out_name: str = "cylindrical_flux_surface_integral",
+        gamma: float = 5.0 / 3.0,
+        bytes_per_value: int | None = None,
+        reduce_fan_in: Optional[int] = None,
+    ) -> None:
+        super().__init__(
+            density=density,
+            momentum=momentum,
+            energy=energy,
+            passive_scalar=passive_scalar,
+            magnetic_field=magnetic_field,
+            radius=radius,
+            temperature=temperature,
+            temperature_bins=temperature_bins,
+            out_name=out_name,
+            gamma=gamma,
+            bytes_per_value=bytes_per_value,
+            reduce_fan_in=reduce_fan_in,
+        )
+        self.radius = self.radii[0]
+        if len(self.radii) != 1:
+            raise ValueError("radius must be a single fixed value")
+        self.heights = self._coerce_heights(height)
+
+    def _coerce_heights(self, height: float | Sequence[float]) -> tuple[float, ...]:
+        if isinstance(height, (str, bytes)):
+            raise TypeError("height must be a number or a sequence of numbers")
+        try:
+            values = tuple(float(v) for v in height)  # type: ignore[arg-type]
+        except TypeError:
+            values = (float(height),)
+        return values
+
+    def _block_cylinder_bounds(self, level_meta, block) -> tuple[float, float, float, float]:
+        geom = level_meta.geom
+        x0, x1 = _bounds_1d(
+            block.lo[0],
+            block.hi[0],
+            geom.x0[0],
+            geom.dx[0],
+            geom.index_origin[0],
+        )
+        y0, y1 = _bounds_1d(
+            block.lo[1],
+            block.hi[1],
+            geom.x0[1],
+            geom.dx[1],
+            geom.index_origin[1],
+        )
+        z0, z1 = _bounds_1d(
+            block.lo[2],
+            block.hi[2],
+            geom.x0[2],
+            geom.dx[2],
+            geom.index_origin[2],
+        )
+        lo2 = 0.0
+        if x1 < 0.0:
+            lo2 += x1 * x1
+        elif x0 > 0.0:
+            lo2 += x0 * x0
+        if y1 < 0.0:
+            lo2 += y1 * y1
+        elif y0 > 0.0:
+            lo2 += y0 * y0
+        hi2 = max(abs(x0), abs(x1)) ** 2 + max(abs(y0), abs(y1)) ** 2
+        z_abs_min = 0.0 if z0 <= 0.0 <= z1 else min(abs(z0), abs(z1))
+        z_abs_max = max(abs(z0), abs(z1))
+        return lo2, hi2, z_abs_min, z_abs_max
+
+    def lower(self, ctx: LoweringContext):
+        ds = ctx.dataset
+        if not self.heights:
+            raise ValueError("height must contain at least one value")
+        if any(not math.isfinite(height) or height <= 0.0 for height in self.heights):
+            raise ValueError("height values must be finite and positive")
+        if any(not math.isfinite(radius) or radius <= 0.0 for radius in self.radii):
+            raise ValueError("radius values must be finite and positive")
+        if self.temperature_bins is not None:
+            if self.temperature is None:
+                raise ValueError("temperature must be provided when temperature_bins are set")
+            if len(self.temperature_bins) < 2:
+                raise ValueError("temperature_bins must contain at least two edges")
+            if any(not math.isfinite(edge) for edge in self.temperature_bins):
+                raise ValueError("temperature_bins values must be finite")
+            if any(
+                right <= left
+                for left, right in zip(self.temperature_bins, self.temperature_bins[1:])
+            ):
+                raise ValueError("temperature_bins values must be strictly increasing")
+        if not math.isfinite(self.gamma) or self.gamma <= 1.0:
+            raise ValueError("gamma must be finite and greater than 1")
+        if len(self.momentum) != 3:
+            raise ValueError("momentum must contain three fields")
+        if len(self.magnetic_field) != 3:
+            raise ValueError("magnetic_field must contain three cell-centered fields")
+
+        bpv = _resolve_bytes_per_value(
+            ctx,
+            field=self.density,
+            bytes_per_value=self.bytes_per_value,
+        )
+        input_fields = [
+            self.density,
+            *self.momentum,
+            self.energy,
+            self.passive_scalar,
+            *self.magnetic_field,
+        ]
+        if self.temperature is not None:
+            input_fields.append(self.temperature)
+        levels = ctx.runmeta.steps[ds.step].levels
+        num_temperature_bins = (
+            len(self.temperature_bins) - 1 if self.temperature_bins is not None else 1
+        )
+        out_bytes = len(self.heights) * 2 * num_temperature_bins * 4 * 8
+        radius2 = self.radius * self.radius
+        height_intersects = [False] * len(self.heights)
+
+        flux_fields: list[tuple[FieldRef, int]] = []
+        accumulate_stage = ctx.stage("cylindrical_flux_surface_integral")
+        stages: list = [accumulate_stage]
+        producer_stage: dict[int, object] = {}
+
+        for level_idx in range(len(levels) - 1, -1, -1):
+            level_meta = levels[level_idx]
+            block_height_indices: list[tuple[int, list[int]]] = []
+            for block_idx, block in enumerate(level_meta.boxes):
+                lo2, hi2, z_abs_min, z_abs_max = self._block_cylinder_bounds(level_meta, block)
+                if not (lo2 <= radius2 <= hi2):
+                    continue
+                active_height_indices: list[int] = []
+                for height_idx, height in enumerate(self.heights):
+                    if z_abs_min <= height and z_abs_max >= 0.0:
+                        height_intersects[height_idx] = True
+                        active_height_indices.append(height_idx)
+                if active_height_indices:
+                    block_height_indices.append((block_idx, active_height_indices))
+            if not block_height_indices:
+                continue
+            blocks = [block_idx for block_idx, _ in block_height_indices]
+
+            covered_boxes = self._covered_boxes_for_level(ctx, level=level_idx)
+            covered_payload = [[list(c_lo), list(c_hi)] for c_lo, c_hi in covered_boxes]
+            flux_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
+
+            for block, active_height_indices in block_height_indices:
+                dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
+                active_heights = [self.heights[idx] for idx in active_height_indices]
+                accumulate_stage.map_blocks(
+                    name=f"cylindrical_flux_surface_integral_b{block}",
+                    kernel="cylindrical_flux_surface_integral_accumulate",
+                    domain=dom,
+                    inputs=[FieldRef(fid) for fid in input_fields],
+                    outputs=[flux_field],
+                    output_bytes=[out_bytes],
+                    deps={"kind": "None"},
+                    params={
+                        "radius": self.radius,
+                        "heights": list(active_heights),
+                        "height_indices": list(active_height_indices),
+                        "num_heights": len(self.heights),
+                        "temperature_bins": (
+                            list(self.temperature_bins)
+                            if self.temperature_bins is not None
+                            else []
+                        ),
+                        "gamma": self.gamma,
+                        "bytes_per_value": int(bpv),
+                        "covered_boxes": covered_payload,
+                    },
+                )
+            producer_stage[flux_field.field] = accumulate_stage
+
+            num_inputs = len(blocks)
+            fan_in = self._reduce_fan_in(num_inputs)
+            input_flux = flux_field
+            current_blocks = list(blocks)
+            reduce_idx = 0
+            level_tail = accumulate_stage
+            if num_inputs == 1 and current_blocks[0] != 0:
+                reduce_stage = ctx.stage(
+                    "cylindrical_flux_surface_integral_reduce",
+                    plane="graph",
+                    after=[level_tail],
+                )
+                reduce_stage.map_blocks(
+                    name="cylindrical_flux_surface_integral_reduce_single",
+                    kernel="uniform_slice_reduce",
+                    domain=ctx.domain(step=ds.step, level=level_idx),
+                    inputs=[input_flux],
+                    outputs=[flux_field],
+                    output_bytes=[out_bytes],
+                    deps={"kind": "None"},
+                    params={
+                        "graph_kind": "reduce",
+                        "fan_in": 1,
+                        "num_inputs": 1,
+                        "input_base": 0,
+                        "output_base": 0,
+                        "input_blocks": [current_blocks[0]],
+                        "output_blocks": [0],
+                        "group_offsets": [0, 1],
+                        "bytes_per_value": 8,
+                    },
+                )
+                stages.append(reduce_stage)
+                producer_stage[flux_field.field] = reduce_stage
+                level_tail = reduce_stage
+                current_blocks = [0]
+
+            while num_inputs > 1:
+                input_blocks, output_blocks, group_offsets = _reduce_group_plan(
+                    ctx,
+                    step=ds.step,
+                    level=level_idx,
+                    input_blocks=current_blocks,
+                    fan_in=fan_in,
+                )
+                num_groups = len(output_blocks)
+                out_flux = flux_field if num_groups == 1 else ctx.temp_field(
+                    f"{self.out_name}_sum_reduce_{level_idx}_{reduce_idx}"
+                )
+                reduce_stage = ctx.stage(
+                    "cylindrical_flux_surface_integral_reduce",
+                    plane="graph",
+                    after=[level_tail],
+                )
+                reduce_stage.map_blocks(
+                    name=f"cylindrical_flux_surface_integral_reduce_s{reduce_idx}",
+                    kernel="uniform_slice_reduce",
+                    domain=ctx.domain(step=ds.step, level=level_idx),
+                    inputs=[input_flux],
+                    outputs=[out_flux],
+                    output_bytes=[out_bytes],
+                    deps={"kind": "None"},
+                    params={
+                        "graph_kind": "reduce",
+                        "fan_in": fan_in,
+                        "num_inputs": num_inputs,
+                        "input_base": 0,
+                        "output_base": 0,
+                        "input_blocks": list(input_blocks),
+                        "output_blocks": list(output_blocks),
+                        "group_offsets": list(group_offsets),
+                        "bytes_per_value": 8,
+                    },
+                )
+                stages.append(reduce_stage)
+                producer_stage[out_flux.field] = reduce_stage
+                level_tail = reduce_stage
+                input_flux = out_flux
+                current_blocks = output_blocks
+                num_inputs = num_groups
+                reduce_idx += 1
+
+            flux_fields.append((input_flux, level_idx))
+
+        if not flux_fields:
+            if len(self.heights) > 1:
+                raise ValueError(
+                    f"height values do not intersect any mesh block: {list(self.heights)}"
+                )
+            raise ValueError("cylindrical surface does not intersect any mesh block")
+        if not all(height_intersects):
+            missing = [
+                height
+                for height, intersects in zip(self.heights, height_intersects)
+                if not intersects
+            ]
+            raise ValueError(f"height values do not intersect any mesh block: {missing}")
+
+        def reduce_pairwise(fields: list[tuple[FieldRef, int]]) -> tuple[FieldRef, int]:
+            if len(fields) == 1:
+                return fields[0]
+            current = fields
+            reduce_round = 0
+            while len(current) > 1:
+                next_fields: list[tuple[FieldRef, int]] = []
+                for i in range(0, len(current), 2):
+                    if i + 1 >= len(current):
+                        next_fields.append(current[i])
+                        continue
+                    left, left_level = current[i]
+                    right, right_level = current[i + 1]
+                    left_ref = FieldRef(
+                        left.field,
+                        version=left.version,
+                        domain=ctx.domain(step=ds.step, level=left_level),
+                    )
+                    right_ref = FieldRef(
+                        right.field,
+                        version=right.version,
+                        domain=ctx.domain(step=ds.step, level=right_level),
+                    )
+                    out_field = ctx.temp_field(f"{self.out_name}_sum_add_{reduce_round}_{i}")
+                    deps = [
+                        s
+                        for s in (
+                            producer_stage.get(left.field),
+                            producer_stage.get(right.field),
+                        )
+                        if s is not None
+                    ]
+                    add_stage = ctx.stage(
+                        "cylindrical_flux_surface_integral_add",
+                        plane="graph",
+                        after=deps,
+                    )
+                    add_stage.map_blocks(
+                        name=f"cylindrical_flux_surface_integral_add_{reduce_round}_{i}",
+                        kernel="uniform_slice_add",
+                        domain=ctx.domain(step=ds.step, level=ds.level),
+                        inputs=[left_ref, right_ref],
+                        outputs=[out_field],
+                        output_bytes=[out_bytes],
+                        deps={"kind": "None"},
+                        params={
+                            "graph_kind": "reduce",
+                            "fan_in": 1,
+                            "num_inputs": 1,
+                            "input_base": 0,
+                            "output_base": 0,
+                            "bytes_per_value": 8,
+                        },
+                    )
+                    stages.append(add_stage)
+                    producer_stage[out_field.field] = add_stage
+                    next_fields.append((out_field, ds.level))
+                current = next_fields
+                reduce_round += 1
+            return current[0]
+
+        total_flux, total_flux_level = reduce_pairwise(flux_fields)
+        out_field = ctx.output_field(self.out_name)
+        finalize_deps = [s for s in (producer_stage.get(total_flux.field),) if s is not None]
+        finalize = ctx.stage(
+            "cylindrical_flux_surface_integral_output",
+            plane="graph",
+            after=finalize_deps,
+        )
+        finalize.map_blocks(
+            name="cylindrical_flux_surface_integral_output",
+            kernel="uniform_slice_reduce",
+            domain=ctx.domain(step=ds.step, level=ds.level),
+            inputs=[
+                FieldRef(
+                    total_flux.field,
+                    version=total_flux.version,
+                    domain=ctx.domain(step=ds.step, level=total_flux_level),
+                )
+            ],
+            outputs=[out_field],
+            output_bytes=[out_bytes],
+            deps={"kind": "None"},
+            params={
+                "graph_kind": "reduce",
+                "fan_in": 1,
+                "num_inputs": 1,
+                "input_base": 0,
+                "output_base": 0,
+                "bytes_per_value": 8,
+            },
+        )
+        stages.append(finalize)
+        return ctx.fragment(stages)
+
+
 class Histogram1D:
     def __init__(
         self,

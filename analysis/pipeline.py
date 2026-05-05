@@ -7,6 +7,7 @@ import numpy as np
 
 from .ctx import LoweringContext
 from .ops import (
+    CylindricalFluxSurfaceIntegral,
     FluxSurfaceIntegral,
     Histogram1D,
     Histogram2D,
@@ -68,6 +69,32 @@ class FluxSurfaceIntegralHandle:
         "hydro_energy_flux_sphere_positive",
         "mhd_energy_flux_sphere_positive",
         "passive_scalar_flux_sphere_positive",
+    )
+
+    @property
+    def field(self) -> int:
+        return self.fluxes.field
+
+    @property
+    def name(self) -> str | None:
+        return self.fluxes.name
+
+
+@dataclass(frozen=True)
+class CylindricalFluxSurfaceIntegralHandle:
+    fluxes: FieldHandle
+    radius: float
+    heights: tuple[float, ...] = ()
+    temperature_bins: tuple[float, ...] | None = None
+    components: tuple[str, ...] = (
+        "mass_flux_cylinder_negative",
+        "hydro_energy_flux_cylinder_negative",
+        "mhd_energy_flux_cylinder_negative",
+        "passive_scalar_flux_cylinder_negative",
+        "mass_flux_cylinder_positive",
+        "hydro_energy_flux_cylinder_positive",
+        "mhd_energy_flux_cylinder_positive",
+        "passive_scalar_flux_cylinder_positive",
     )
 
     @property
@@ -697,6 +724,55 @@ class Pipeline:
         return FluxSurfaceIntegralHandle(
             FieldHandle(self, out_field, out_name),
             radii=op.radii,
+            temperature_bins=op.temperature_bins,
+        )
+
+    def cylindrical_flux_surface_integral(
+        self,
+        density: int | FieldHandle,
+        *,
+        momentum: tuple[int | FieldHandle, int | FieldHandle, int | FieldHandle],
+        energy: int | FieldHandle,
+        passive_scalar: int | FieldHandle,
+        magnetic_field: tuple[int | FieldHandle, int | FieldHandle, int | FieldHandle],
+        radius: float,
+        height: float | Sequence[float],
+        temperature: int | FieldHandle | None = None,
+        temperature_bins: Sequence[float] | None = None,
+        out: str | None = None,
+        gamma: float = 5.0 / 3.0,
+        bytes_per_value: int | None = None,
+        reduce_fan_in: int | None = None,
+    ) -> CylindricalFluxSurfaceIntegralHandle:
+        if len(momentum) != 3:
+            raise ValueError("momentum must contain three fields")
+        if len(magnetic_field) != 3:
+            raise ValueError("magnetic_field must contain three cell-centered fields")
+        out_name = out or self._unique_name("cylindrical_flux_surface_integral")
+        op = CylindricalFluxSurfaceIntegral(
+            density=self._as_field_id(density),
+            momentum=tuple(self._as_field_id(comp) for comp in momentum),
+            energy=self._as_field_id(energy),
+            passive_scalar=self._as_field_id(passive_scalar),
+            magnetic_field=tuple(self._as_field_id(comp) for comp in magnetic_field),
+            radius=radius,
+            height=height,
+            temperature=(
+                None if temperature is None else self._as_field_id(temperature)
+            ),
+            temperature_bins=temperature_bins,
+            out_name=out_name,
+            gamma=gamma,
+            bytes_per_value=bytes_per_value,
+            reduce_fan_in=reduce_fan_in,
+        )
+        fragment = op.lower(self._ctx)
+        self._append_fragment(fragment)
+        out_field = self._sink_fields(fragment)[-1]
+        return CylindricalFluxSurfaceIntegralHandle(
+            FieldHandle(self, out_field, out_name),
+            radius=op.radius,
+            heights=op.heights,
             temperature_bins=op.temperature_bins,
         )
 
