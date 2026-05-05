@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import numpy as np
 import pytest
 
 from scripts.plotfile_flux_surface import (
+    _flux_rows_and_derived,
     _intersecting_validation_blocks,
     _pick_field,
     _validate_selected_fields,
@@ -116,3 +118,26 @@ def test_flux_surface_validation_rejects_fields_using_metadata_only() -> None:
 def test_flux_surface_explicit_field_must_exist_in_metadata() -> None:
     with pytest.raises(RuntimeError, match="--list-fields"):
         _pick_field("density", "missing", ["rho", "E"])
+
+
+def test_flux_surface_json_includes_negative_and_positive_bins() -> None:
+    radii = np.array([1.0, 2.0], dtype=np.float64)
+    values = np.array(
+        [
+            [[-2.0, -3.0, -4.0, -5.0], [7.0, 11.0, 13.0, 17.0]],
+            [[-19.0, -23.0, -29.0, -31.0], [37.0, 41.0, 43.0, 47.0]],
+        ],
+        dtype=np.float64,
+    )
+
+    rows, derived = _flux_rows_and_derived(radii, values, pc_cm=1.0)
+
+    assert rows[0]["flux_bins"]["negative"]["mass_flux_sphere"] == -2.0
+    assert rows[0]["flux_bins"]["positive"]["mass_flux_sphere"] == 7.0
+    assert rows[0]["fluxes"]["mass_flux_sphere"] == 5.0
+    assert rows[1]["flux_bins"]["negative"]["mhd_energy_flux_sphere"] == -29.0
+    assert rows[1]["flux_bins"]["positive"]["mhd_energy_flux_sphere"] == 43.0
+    assert rows[1]["fluxes"]["mhd_energy_flux_sphere"] == 14.0
+    assert derived["mass_flux_msun_per_yr"] is None
+    assert derived["mass_flux_msun_per_yr_bins"] is None
+    assert "mass_flux_msun_per_yr_bins" in derived["mass_flux_msun_per_yr_by_radius"][0]

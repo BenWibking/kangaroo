@@ -1648,7 +1648,7 @@ class FluxSurfaceIntegral:
             *self.magnetic_field,
         ]
         levels = ctx.runmeta.steps[ds.step].levels
-        out_bytes = len(self.radii) * 4 * 8
+        out_bytes = len(self.radii) * 2 * 4 * 8
         radii2 = [radius * radius for radius in self.radii]
         radius_intersects = [False] * len(self.radii)
 

@@ -58,11 +58,15 @@ class Histogram2DHandle:
 class FluxSurfaceIntegralHandle:
     fluxes: FieldHandle
     radii: tuple[float, ...] = ()
-    components: tuple[str, str, str, str] = (
-        "mass_flux_sphere",
-        "hydro_energy_flux_sphere",
-        "mhd_energy_flux_sphere",
-        "passive_scalar_flux_sphere",
+    components: tuple[str, ...] = (
+        "mass_flux_sphere_negative",
+        "hydro_energy_flux_sphere_negative",
+        "mhd_energy_flux_sphere_negative",
+        "passive_scalar_flux_sphere_negative",
+        "mass_flux_sphere_positive",
+        "hydro_energy_flux_sphere_positive",
+        "mhd_energy_flux_sphere_positive",
+        "passive_scalar_flux_sphere_positive",
     )
 
     @property

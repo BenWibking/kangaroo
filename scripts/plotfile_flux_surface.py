@@ -27,6 +27,9 @@ COMPONENTS = (
     "mhd_energy_flux_sphere",
     "passive_scalar_flux_sphere",
 )
+SIGN_BINS = ("negative", "positive")
+MSUN_G = 1.98847e33
+YR_S = 365.25 * 24.0 * 3600.0
 
 FIELD_CANDIDATES = {
     "density": ("density", "rho", "gasDensity", "Density"),
@@ -89,6 +92,59 @@ def _finite_radii(values: Iterable[float]) -> np.ndarray:
     if radii.size == 0 or not np.all(np.isfinite(radii)) or np.any(radii <= 0.0):
         raise ValueError("radii must be finite and positive")
     return radii
+
+
+def _flux_rows_and_derived(
+    radii: np.ndarray,
+    values: np.ndarray,
+    *,
+    pc_cm: float,
+) -> tuple[list[dict], dict]:
+    values = np.asarray(values, dtype=np.float64)
+    if values.shape != (len(radii), len(SIGN_BINS), len(COMPONENTS)):
+        raise ValueError("flux values must have shape (num_radii, 2, 4)")
+    summed_values = values.sum(axis=1)
+    flux_rows = [
+        {
+            "radius": float(radii[i]),
+            "radius_kpc": float(radii[i] / (1.0e3 * pc_cm)),
+            "fluxes": {name: float(summed_values[i, j]) for j, name in enumerate(COMPONENTS)},
+            "flux_bins": {
+                sign: {
+                    name: float(values[i, sign_idx, j])
+                    for j, name in enumerate(COMPONENTS)
+                }
+                for sign_idx, sign in enumerate(SIGN_BINS)
+            },
+        }
+        for i in range(len(radii))
+    ]
+    derived = {
+        "mass_flux_msun_per_yr": (
+            float(summed_values[0, 0] * YR_S / MSUN_G) if len(radii) == 1 else None
+        ),
+        "mass_flux_msun_per_yr_bins": (
+            {
+                sign: float(values[0, sign_idx, 0] * YR_S / MSUN_G)
+                for sign_idx, sign in enumerate(SIGN_BINS)
+            }
+            if len(radii) == 1
+            else None
+        ),
+        "mass_flux_msun_per_yr_by_radius": [
+            {
+                "radius": float(radii[i]),
+                "radius_kpc": float(radii[i] / (1.0e3 * pc_cm)),
+                "mass_flux_msun_per_yr": float(summed_values[i, 0] * YR_S / MSUN_G),
+                "mass_flux_msun_per_yr_bins": {
+                    sign: float(values[i, sign_idx, 0] * YR_S / MSUN_G)
+                    for sign_idx, sign in enumerate(SIGN_BINS)
+                },
+            }
+            for i in range(len(radii))
+        ],
+    }
+    return flux_rows, derived
 
 
 def _bounds_1d(lo: int, hi: int, x0: float, dx: float, origin: int) -> tuple[float, float]:
@@ -294,19 +350,11 @@ def main() -> int:
             field=flux.field,
             version=0,
             block=0,
-            shape=(len(radii), 4),
+            shape=(len(radii), 2, 4),
             dtype=np.float64,
             dataset=ds,
         )
-
-        flux_rows = [
-            {
-                "radius": float(radii[i]),
-                "radius_kpc": float(radii[i] / (1.0e3 * pc_cm)),
-                "fluxes": {name: float(values[i, j]) for j, name in enumerate(COMPONENTS)},
-            }
-            for i in range(len(radii))
-        ]
+        flux_rows, derived = _flux_rows_and_derived(radii, values, pc_cm=pc_cm)
         result = {
             "plotfile": a.plotfile,
             "time": float(bundle.dataset["time"]) if "time" in bundle.dataset else None,
@@ -319,24 +367,10 @@ def main() -> int:
             "bytes_per_value": int(bytes_per_value),
             "fields": {role: name for role, (name, _) in fields.items()},
             "fluxes": flux_rows[0]["fluxes"] if len(radii) == 1 else None,
+            "flux_bins": flux_rows[0]["flux_bins"] if len(radii) == 1 else None,
             "fluxes_by_radius": flux_rows,
         }
-
-        msun_g = 1.98847e33
-        yr_s = 365.25 * 24.0 * 3600.0
-        result["derived"] = {
-            "mass_flux_msun_per_yr": (
-                float(values[0, 0] * yr_s / msun_g) if len(radii) == 1 else None
-            ),
-            "mass_flux_msun_per_yr_by_radius": [
-                {
-                    "radius": float(radii[i]),
-                    "radius_kpc": float(radii[i] / (1.0e3 * pc_cm)),
-                    "mass_flux_msun_per_yr": float(values[i, 0] * yr_s / msun_g),
-                }
-                for i in range(len(radii))
-            ],
-        }
+        result["derived"] = derived
 
         print(json.dumps(result, indent=2, sort_keys=True))
         if a.output_json:
