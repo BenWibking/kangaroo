@@ -1,0 +1,41 @@
+#!/bin/bash
+#SBATCH -t 00:05:00
+#SBATCH -A ast236
+#SBATCH -N 1
+#SBATCH -p batch
+#SBATCH -J quokka
+#SBATCH --ntasks-per-node=1
+#SBATCH --cpus-per-task=32
+
+module load gcc/14.2.0
+
+PLOTFILE=/lustre/orion/ast236/proj-shared/wibking/MW_Gen1_Phase2/plt0426651
+
+export SPACK_HPX_PREFIX="$(spack location -i hpx@1.11.0%gcc@14.2.0)"
+export LD_LIBRARY_PATH="$SPACK_HPX_PREFIX/lib64:$LD_LIBRARY_PATH"
+
+date
+echo "host=$(hostname)"
+echo "SLURM_NNODES=${SLURM_NNODES}"
+echo "SLURM_CPUS_PER_TASK=${SLURM_CPUS_PER_TASK}"
+echo "SPACK_HPX_PREFIX=${SPACK_HPX_PREFIX}"
+
+echo "plotfile: ${PLOTFILE}"
+
+"$SPACK_HPX_PREFIX/bin/hpxrun.py" \
+  -r srun \
+  -p tcp \
+  -l "$SLURM_NNODES" \
+  -t "$SLURM_CPUS_PER_TASK" \
+  "$PWD/.pixi/envs/default/bin/python" \
+  "$PWD/scripts/plotfile_projection_cic_stellar.py" \
+  -- \
+  "${PLOTFILE}" \
+  --particle-type StochasticStellarPop_particles \
+  --zoom 100 \
+  --resolution 1000,1000 \
+  --output p2_stellar_projection_yz_plane.png \
+  --axis-bounds="-3.086e22,3.086e22" \
+  --axis x
+
+date
