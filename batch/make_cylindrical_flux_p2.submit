@@ -12,9 +12,9 @@ set -euo pipefail
 module load gcc/14.2.0
 
 : "${PLOTFILE:=/lustre/orion/ast236/proj-shared/wibking/MW_Gen1_Phase2/plt0426651}"
-: "${RADIUS_KPC:=20.0}"
-: "${ZMIN_KPC:=5.0}"
-: "${ZMAX_KPC:=100.0}"
+: "${RADIUS_KPC:=17.5}"
+: "${ZMIN_KPC:=0.5}"
+: "${ZMAX_KPC:=15.0}"
 : "${KANGAROO_FLUX_PROFILE:=production}"
 
 case "$KANGAROO_FLUX_PROFILE" in
