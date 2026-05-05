@@ -240,6 +240,87 @@ def test_flux_surface_integral_lowering_accepts_radius_array() -> None:
     assert all(tmpl.output_bytes == [192] for tmpl in reducers)
 
 
+def test_flux_surface_integral_lowering_accepts_temperature_bins() -> None:
+    rt = _FakeRuntime()
+    runmeta = _RunMeta(
+        steps=[
+            _Step(
+                step=0,
+                levels=[
+                    _Level(
+                        geom=_Geom(
+                            dx=(1.0, 1.0, 1.0),
+                            x0=(0.0, -0.5, -0.5),
+                            index_origin=(0, 0, 0),
+                        ),
+                        boxes=[_Box((0, 0, 0), (0, 0, 0))],
+                    )
+                ],
+            )
+        ]
+    )
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=_FakeDataset(rt))
+
+    flux = pipe.flux_surface_integral(
+        1,
+        momentum=(2, 3, 4),
+        energy=5,
+        passive_scalar=6,
+        magnetic_field=(7, 8, 9),
+        radius=np.array([0.5]),
+        temperature=10,
+        temperature_bins=np.array([1.0, 10.0, 100.0]),
+        out="flux",
+        bytes_per_value=8,
+    )
+    plan = pipe.plan()
+
+    assert flux.temperature_bins == (1.0, 10.0, 100.0)
+    templates = [tmpl for stage in plan.stages for tmpl in stage.templates]
+    accum = [tmpl for tmpl in templates if tmpl.kernel == "flux_surface_integral_accumulate"]
+    assert len(accum) == 1
+    assert len(accum[0].inputs) == 10
+    assert accum[0].params["temperature_bins"] == [1.0, 10.0, 100.0]
+    assert accum[0].output_bytes == [128]
+    reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
+    assert reducers
+    assert all(tmpl.output_bytes == [128] for tmpl in reducers)
+
+
+def test_flux_surface_integral_rejects_temperature_bins_without_temperature_field() -> None:
+    rt = _FakeRuntime()
+    runmeta = _RunMeta(
+        steps=[
+            _Step(
+                step=0,
+                levels=[
+                    _Level(
+                        geom=_Geom(
+                            dx=(1.0, 1.0, 1.0),
+                            x0=(0.0, -0.5, -0.5),
+                            index_origin=(0, 0, 0),
+                        ),
+                        boxes=[_Box((0, 0, 0), (0, 0, 0))],
+                    )
+                ],
+            )
+        ]
+    )
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=_FakeDataset(rt))
+
+    with pytest.raises(ValueError, match="temperature must be provided"):
+        pipe.flux_surface_integral(
+            1,
+            momentum=(2, 3, 4),
+            energy=5,
+            passive_scalar=6,
+            magnetic_field=(7, 8, 9),
+            radius=0.5,
+            temperature_bins=[1.0, 10.0],
+            bytes_per_value=8,
+        )
+
+
 def test_flux_surface_integral_lowering_uses_per_block_radius_subsets() -> None:
     rt = _FakeRuntime()
     runmeta = _RunMeta(
@@ -800,6 +881,80 @@ def test_flux_surface_integral_runtime_outputs_negative_and_positive_bins() -> N
 
     assert np.allclose(raw, np.array([[-6.0, -87.0, -87.0, -15.0], [6.0, 87.0, 87.0, 15.0]]))
     assert np.allclose(raw.sum(axis=0), np.zeros(4))
+
+
+def test_flux_surface_integral_runtime_outputs_temperature_bins() -> None:
+    rt = Runtime()
+    step = 10
+    levels = [
+        LevelMeta(
+            geom=LevelGeom(
+                dx=(1.0, 1.0, 1.0),
+                x0=(-1.0, -0.5, -0.5),
+                ref_ratio=1,
+            ),
+            boxes=[
+                BlockBox((0, 0, 0), (0, 0, 0)),
+                BlockBox((1, 0, 0), (1, 0, 0)),
+            ],
+        )
+    ]
+    runmeta = _runmeta_with_step_index(step, levels)
+    ds = open_dataset("memory://flux-temperature-bins", runmeta=runmeta, step=step, level=0, runtime=rt)
+    for fid in range(1, 11):
+        ds.register_field(f"f{fid}", fid)
+
+    state = _one_cell_state(rho=2.0, momx=6.0, energy=21.0, scalar=5.0, bz=0.0)
+    for block in (0, 1):
+        for fid, values in state.items():
+            _set_block_double(ds, step=step, level=0, field=fid, block=block, values=values)
+    _set_block_double(
+        ds,
+        step=step,
+        level=0,
+        field=10,
+        block=0,
+        values=np.array([[[5.0]]], dtype=np.float64),
+    )
+    _set_block_double(
+        ds,
+        step=step,
+        level=0,
+        field=10,
+        block=1,
+        values=np.array([[[15.0]]], dtype=np.float64),
+    )
+
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    flux = pipe.flux_surface_integral(
+        1,
+        momentum=(2, 3, 4),
+        energy=5,
+        passive_scalar=6,
+        magnetic_field=(7, 8, 9),
+        radius=0.5,
+        temperature=10,
+        temperature_bins=[0.0, 10.0, 20.0],
+        reduce_fan_in=2,
+        bytes_per_value=8,
+    )
+    pipe.run()
+
+    raw = rt.get_task_chunk_array(
+        step=step,
+        level=0,
+        field=flux.field,
+        shape=(2, 2, 4),
+        dtype=np.float64,
+        dataset=ds,
+        block=0,
+    )
+
+    assert np.allclose(raw[0, 0], np.array([-6.0, -87.0, -87.0, -15.0]))
+    assert np.allclose(raw[0, 1], np.zeros(4))
+    assert np.allclose(raw[1, 0], np.zeros(4))
+    assert np.allclose(raw[1, 1], np.array([6.0, 87.0, 87.0, 15.0]))
+    assert np.allclose(raw.sum(axis=(0, 1)), np.zeros(4))
 
 
 def test_flux_surface_integral_runtime_amr_covered_cells_are_excluded() -> None:

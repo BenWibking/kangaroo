@@ -58,6 +58,7 @@ class Histogram2DHandle:
 class FluxSurfaceIntegralHandle:
     fluxes: FieldHandle
     radii: tuple[float, ...] = ()
+    temperature_bins: tuple[float, ...] | None = None
     components: tuple[str, ...] = (
         "mass_flux_sphere_negative",
         "hydro_energy_flux_sphere_negative",
@@ -662,6 +663,8 @@ class Pipeline:
         passive_scalar: int | FieldHandle,
         magnetic_field: tuple[int | FieldHandle, int | FieldHandle, int | FieldHandle],
         radius: float | Sequence[float],
+        temperature: int | FieldHandle | None = None,
+        temperature_bins: Sequence[float] | None = None,
         out: str | None = None,
         gamma: float = 5.0 / 3.0,
         bytes_per_value: int | None = None,
@@ -679,6 +682,10 @@ class Pipeline:
             passive_scalar=self._as_field_id(passive_scalar),
             magnetic_field=tuple(self._as_field_id(comp) for comp in magnetic_field),
             radius=radius,
+            temperature=(
+                None if temperature is None else self._as_field_id(temperature)
+            ),
+            temperature_bins=temperature_bins,
             out_name=out_name,
             gamma=gamma,
             bytes_per_value=bytes_per_value,
@@ -687,7 +694,11 @@ class Pipeline:
         fragment = op.lower(self._ctx)
         self._append_fragment(fragment)
         out_field = self._sink_fields(fragment)[-1]
-        return FluxSurfaceIntegralHandle(FieldHandle(self, out_field, out_name), radii=op.radii)
+        return FluxSurfaceIntegralHandle(
+            FieldHandle(self, out_field, out_name),
+            radii=op.radii,
+            temperature_bins=op.temperature_bins,
+        )
 
     def histogram1d(
         self,

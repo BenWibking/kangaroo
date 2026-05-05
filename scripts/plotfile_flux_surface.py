@@ -42,6 +42,7 @@ FIELD_CANDIDATES = {
     "by": ("y-BField", "By", "by", "magy", "magnetic_y", "B_y", "cell_centered_By"),
     "bz": ("z-BField", "Bz", "bz", "magz", "magnetic_z", "B_z", "cell_centered_Bz"),
 }
+TEMPERATURE_CANDIDATES = ("temperature", "Temperature", "gasTemperature", "gas_temperature")
 
 
 def _parse_field_arg(value: str | None) -> str | None:
@@ -55,7 +56,13 @@ def _metadata_var_names(meta: dict) -> list[str]:
     return [str(v) for v in meta.get("var_names", [])]
 
 
-def _pick_field(role: str, explicit: str | None, available: Iterable[str]) -> str:
+def _pick_field(
+    role: str,
+    explicit: str | None,
+    available: Iterable[str],
+    *,
+    candidates: Iterable[str] | None = None,
+) -> str:
     names = list(available)
     name_set = set(names)
     if explicit:
@@ -65,7 +72,8 @@ def _pick_field(role: str, explicit: str | None, available: Iterable[str]) -> st
                 f"Use --list-fields; available fields include: {', '.join(names[:40])}"
             )
         return explicit
-    for candidate in FIELD_CANDIDATES[role]:
+    candidate_names = FIELD_CANDIDATES[role] if candidates is None else tuple(candidates)
+    for candidate in candidate_names:
         if candidate in name_set:
             return candidate
     raise RuntimeError(
@@ -94,16 +102,60 @@ def _finite_radii(values: Iterable[float]) -> np.ndarray:
     return radii
 
 
+def _finite_temperature_bins(values: Iterable[float]) -> np.ndarray:
+    bins = np.asarray([float(value) for value in values], dtype=np.float64)
+    if bins.size < 2:
+        raise ValueError("temperature bins must contain at least two edges")
+    if not np.all(np.isfinite(bins)):
+        raise ValueError("temperature bins must be finite")
+    if np.any(np.diff(bins) <= 0.0):
+        raise ValueError("temperature bins must be strictly increasing")
+    return bins
+
+
 def _flux_rows_and_derived(
     radii: np.ndarray,
     values: np.ndarray,
     *,
     pc_cm: float,
+    temperature_bins: np.ndarray | None = None,
 ) -> tuple[list[dict], dict]:
     values = np.asarray(values, dtype=np.float64)
-    if values.shape != (len(radii), len(SIGN_BINS), len(COMPONENTS)):
-        raise ValueError("flux values must have shape (num_radii, 2, 4)")
-    summed_values = values.sum(axis=1)
+    if temperature_bins is None:
+        if values.shape != (len(radii), len(SIGN_BINS), len(COMPONENTS)):
+            raise ValueError("flux values must have shape (num_radii, 2, 4)")
+        values_by_temperature = values[:, :, np.newaxis, :]
+        temperature_edges = None
+    else:
+        temperature_bins = _finite_temperature_bins(temperature_bins)
+        expected_shape = (
+            len(radii),
+            len(SIGN_BINS),
+            len(temperature_bins) - 1,
+            len(COMPONENTS),
+        )
+        if values.shape != expected_shape:
+            raise ValueError("flux values must have shape (num_radii, 2, num_temperature_bins, 4)")
+        values_by_temperature = values
+        temperature_edges = temperature_bins
+    sign_summed_values = values_by_temperature.sum(axis=2)
+    summed_values = sign_summed_values.sum(axis=1)
+
+    def temperature_bin_rows(radius_idx: int, sign_idx: int) -> list[dict]:
+        if temperature_edges is None:
+            return []
+        return [
+            {
+                "temperature_min": float(temperature_edges[temp_idx]),
+                "temperature_max": float(temperature_edges[temp_idx + 1]),
+                "fluxes": {
+                    name: float(values_by_temperature[radius_idx, sign_idx, temp_idx, j])
+                    for j, name in enumerate(COMPONENTS)
+                },
+            }
+            for temp_idx in range(len(temperature_edges) - 1)
+        ]
+
     flux_rows = [
         {
             "radius": float(radii[i]),
@@ -111,11 +163,19 @@ def _flux_rows_and_derived(
             "fluxes": {name: float(summed_values[i, j]) for j, name in enumerate(COMPONENTS)},
             "flux_bins": {
                 sign: {
-                    name: float(values[i, sign_idx, j])
+                    name: float(sign_summed_values[i, sign_idx, j])
                     for j, name in enumerate(COMPONENTS)
                 }
                 for sign_idx, sign in enumerate(SIGN_BINS)
             },
+            "flux_bins_by_temperature": (
+                {
+                    sign: temperature_bin_rows(i, sign_idx)
+                    for sign_idx, sign in enumerate(SIGN_BINS)
+                }
+                if temperature_edges is not None
+                else None
+            ),
         }
         for i in range(len(radii))
     ]
@@ -125,10 +185,27 @@ def _flux_rows_and_derived(
         ),
         "mass_flux_msun_per_yr_bins": (
             {
-                sign: float(values[0, sign_idx, 0] * YR_S / MSUN_G)
+                sign: float(sign_summed_values[0, sign_idx, 0] * YR_S / MSUN_G)
                 for sign_idx, sign in enumerate(SIGN_BINS)
             }
             if len(radii) == 1
+            else None
+        ),
+        "mass_flux_msun_per_yr_bins_by_temperature": (
+            {
+                sign: [
+                    {
+                        "temperature_min": float(temperature_edges[temp_idx]),
+                        "temperature_max": float(temperature_edges[temp_idx + 1]),
+                        "mass_flux_msun_per_yr": float(
+                            values_by_temperature[0, sign_idx, temp_idx, 0] * YR_S / MSUN_G
+                        ),
+                    }
+                    for temp_idx in range(len(temperature_edges) - 1)
+                ]
+                for sign_idx, sign in enumerate(SIGN_BINS)
+            }
+            if len(radii) == 1 and temperature_edges is not None
             else None
         ),
         "mass_flux_msun_per_yr_by_radius": [
@@ -137,9 +214,28 @@ def _flux_rows_and_derived(
                 "radius_kpc": float(radii[i] / (1.0e3 * pc_cm)),
                 "mass_flux_msun_per_yr": float(summed_values[i, 0] * YR_S / MSUN_G),
                 "mass_flux_msun_per_yr_bins": {
-                    sign: float(values[i, sign_idx, 0] * YR_S / MSUN_G)
+                    sign: float(sign_summed_values[i, sign_idx, 0] * YR_S / MSUN_G)
                     for sign_idx, sign in enumerate(SIGN_BINS)
                 },
+                "mass_flux_msun_per_yr_bins_by_temperature": (
+                    {
+                        sign: [
+                            {
+                                "temperature_min": float(temperature_edges[temp_idx]),
+                                "temperature_max": float(temperature_edges[temp_idx + 1]),
+                                "mass_flux_msun_per_yr": float(
+                                    values_by_temperature[i, sign_idx, temp_idx, 0]
+                                    * YR_S
+                                    / MSUN_G
+                                ),
+                            }
+                            for temp_idx in range(len(temperature_edges) - 1)
+                        ]
+                        for sign_idx, sign in enumerate(SIGN_BINS)
+                    }
+                    if temperature_edges is not None
+                    else None
+                ),
             }
             for i in range(len(radii))
         ],
@@ -249,6 +345,13 @@ def main() -> int:
     p.add_argument("--bx")
     p.add_argument("--by")
     p.add_argument("--bz")
+    p.add_argument("--temperature")
+    p.add_argument(
+        "--temperature-bins",
+        type=float,
+        nargs="+",
+        help="Temperature bin edges. Requires the plotfile temperature field.",
+    )
     p.add_argument("--gamma", type=float, default=5.0 / 3.0)
     p.add_argument(
         "--bytes-per-value",
@@ -303,6 +406,11 @@ def main() -> int:
                 a.radius if a.radius is not None else float(a.radius_kpc) * 1.0e3 * pc_cm
             )
             radii = _finite_radii([radius])
+        temperature_bins = (
+            _finite_temperature_bins(a.temperature_bins)
+            if a.temperature_bins is not None
+            else None
+        )
 
         fields: dict[str, tuple[str, int]] = {}
         for role in FIELD_CANDIDATES:
@@ -312,6 +420,15 @@ def main() -> int:
                 explicit=_parse_field_arg(getattr(a, role)),
                 available=available,
             )
+        if temperature_bins is not None:
+            temperature_name = _pick_field(
+                "temperature",
+                _parse_field_arg(a.temperature),
+                available,
+                candidates=TEMPERATURE_CANDIDATES,
+            )
+            resolved, field_id, _ = ds.resolve_field(temperature_name)
+            fields["temperature"] = (resolved, int(field_id))
 
         print(
             "flux surface fields: "
@@ -338,6 +455,12 @@ def main() -> int:
                 pipe.field(fields["bz"][1]),
             ),
             radius=radii,
+            temperature=(
+                pipe.field(fields["temperature"][1])
+                if temperature_bins is not None
+                else None
+            ),
+            temperature_bins=temperature_bins,
             gamma=float(a.gamma),
             bytes_per_value=bytes_per_value,
             out="flux_surface_integral",
@@ -350,11 +473,20 @@ def main() -> int:
             field=flux.field,
             version=0,
             block=0,
-            shape=(len(radii), 2, 4),
+            shape=(
+                (len(radii), 2, len(temperature_bins) - 1, 4)
+                if temperature_bins is not None
+                else (len(radii), 2, 4)
+            ),
             dtype=np.float64,
             dataset=ds,
         )
-        flux_rows, derived = _flux_rows_and_derived(radii, values, pc_cm=pc_cm)
+        flux_rows, derived = _flux_rows_and_derived(
+            radii,
+            values,
+            pc_cm=pc_cm,
+            temperature_bins=temperature_bins,
+        )
         result = {
             "plotfile": a.plotfile,
             "time": float(bundle.dataset["time"]) if "time" in bundle.dataset else None,
@@ -363,11 +495,21 @@ def main() -> int:
             "radii": [float(radius) for radius in radii],
             "radii_kpc": [float(radius / (1.0e3 * pc_cm)) for radius in radii],
             "nbins": int(len(radii)),
+            "temperature_bins": (
+                [float(edge) for edge in temperature_bins]
+                if temperature_bins is not None
+                else None
+            ),
             "gamma": float(a.gamma),
             "bytes_per_value": int(bytes_per_value),
             "fields": {role: name for role, (name, _) in fields.items()},
             "fluxes": flux_rows[0]["fluxes"] if len(radii) == 1 else None,
             "flux_bins": flux_rows[0]["flux_bins"] if len(radii) == 1 else None,
+            "flux_bins_by_temperature": (
+                flux_rows[0]["flux_bins_by_temperature"]
+                if len(radii) == 1 and temperature_bins is not None
+                else None
+            ),
             "fluxes_by_radius": flux_rows,
         }
         result["derived"] = derived
