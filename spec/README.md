@@ -68,6 +68,7 @@ The compatibility target is behavioral equivalence with the Kangaroo repository 
 - `spec/validation-and-errors.md`: normative validation and failure requirements.
 - `spec/glossary.md`: definitions for uncommon or overloaded terms.
 - `spec/performance-requirements.md`: normative requirements for a performant implementation profile (GPU offload, distributed-memory execution, memory-capped streaming/out-of-core).
+- `spec/implementation-pitfalls.md`: non-normative notes about runtime implementation hazards and known failure modes.
 
 ## Writing Convention
 

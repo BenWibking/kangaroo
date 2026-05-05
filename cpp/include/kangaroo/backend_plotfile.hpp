@@ -14,12 +14,16 @@ class PlotfileBackend : public DatasetBackend {
   explicit PlotfileBackend(std::string plotfile_dir);
 
   std::optional<HostView> get_chunk(const ChunkRef& ref) override;
+  std::vector<std::optional<HostView>> get_chunks(const std::vector<ChunkRef>& refs) override;
   bool has_chunk(const ChunkRef& ref) const override;
+  std::size_t estimate_chunk_bytes(const ChunkRef& ref) const override;
   DatasetMetadata get_metadata() const override;
 
   // Helpers for field mapping
   void register_field(int32_t field_id, int32_t component_index);
   int32_t get_component_index(int32_t field_id) const;
+  std::map<int32_t, int32_t> field_map() const;
+  void set_field_map(std::map<int32_t, int32_t> field_map);
   
   // Access underlying reader if needed (e.g. for variable names)
   const plotfile::PlotfileReader& reader() const { return reader_; }

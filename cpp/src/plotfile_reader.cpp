@@ -679,23 +679,21 @@ FabData read_fab_payload(std::istream& is, const FabHeader& hdr, int32_t comp_st
     throw std::runtime_error("invalid component range");
   }
   const size_t bytes_per = (hdr.real_desc.type == RealType::kFloat32) ? 4 : 8;
-  const size_t total_count = static_cast<size_t>(npts) * static_cast<size_t>(hdr.ncomp);
-  const size_t total_bytes = total_count * bytes_per;
-  std::vector<std::uint8_t> raw(total_bytes);
-  is.read(reinterpret_cast<char*>(raw.data()), static_cast<std::streamsize>(total_bytes));
+  const size_t comp_stride = static_cast<size_t>(npts) * bytes_per;
+  const size_t selected_count = static_cast<size_t>(npts) * static_cast<size_t>(comp_count);
+  const size_t selected_bytes = selected_count * bytes_per;
+  const size_t selected_offset = static_cast<size_t>(comp_start) * comp_stride;
+  if (selected_offset > 0) {
+    is.seekg(static_cast<std::streamoff>(selected_offset), std::ios::cur);
+  }
+  data.bytes.resize(selected_bytes);
+  is.read(reinterpret_cast<char*>(data.bytes.data()), static_cast<std::streamsize>(selected_bytes));
   if (!is.good()) {
     throw std::runtime_error("failed to read FAB payload");
   }
   const bool need_swap = (hdr.real_desc.little_endian != is_little_endian_host());
   if (need_swap) {
-    swap_bytes_inplace(raw.data(), total_count, bytes_per);
-  }
-  const size_t comp_stride = static_cast<size_t>(npts) * bytes_per;
-  data.bytes.resize(static_cast<size_t>(comp_count) * comp_stride);
-  for (int32_t c = 0; c < comp_count; ++c) {
-    const size_t src = static_cast<size_t>(comp_start + c) * comp_stride;
-    const size_t dst = static_cast<size_t>(c) * comp_stride;
-    std::memcpy(data.bytes.data() + dst, raw.data() + src, comp_stride);
+    swap_bytes_inplace(data.bytes.data(), selected_count, bytes_per);
   }
   data.nx = hdr.box.hi.x - hdr.box.lo.x + 1;
   data.ny = hdr.box.hi.y - hdr.box.lo.y + 1;
