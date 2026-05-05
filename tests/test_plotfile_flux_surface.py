@@ -141,3 +141,37 @@ def test_flux_surface_json_includes_negative_and_positive_bins() -> None:
     assert derived["mass_flux_msun_per_yr"] is None
     assert derived["mass_flux_msun_per_yr_bins"] is None
     assert "mass_flux_msun_per_yr_bins" in derived["mass_flux_msun_per_yr_by_radius"][0]
+
+
+def test_flux_surface_json_includes_temperature_bins() -> None:
+    radii = np.array([1.0], dtype=np.float64)
+    temperature_bins = np.array([0.0, 10.0, 20.0], dtype=np.float64)
+    values = np.array(
+        [
+            [
+                [[-2.0, -3.0, -4.0, -5.0], [-7.0, -11.0, -13.0, -17.0]],
+                [[19.0, 23.0, 29.0, 31.0], [37.0, 41.0, 43.0, 47.0]],
+            ]
+        ],
+        dtype=np.float64,
+    )
+
+    rows, derived = _flux_rows_and_derived(
+        radii,
+        values,
+        pc_cm=1.0,
+        temperature_bins=temperature_bins,
+    )
+
+    assert rows[0]["flux_bins"]["negative"]["mass_flux_sphere"] == -9.0
+    assert rows[0]["flux_bins"]["positive"]["mass_flux_sphere"] == 56.0
+    assert rows[0]["flux_bins_by_temperature"]["negative"][0]["temperature_min"] == 0.0
+    assert rows[0]["flux_bins_by_temperature"]["negative"][0]["temperature_max"] == 10.0
+    assert (
+        rows[0]["flux_bins_by_temperature"]["positive"][1]["fluxes"]["mhd_energy_flux_sphere"]
+        == 43.0
+    )
+    assert derived["mass_flux_msun_per_yr_bins_by_temperature"]["negative"][0][
+        "mass_flux_msun_per_yr"
+    ] < 0.0
+    assert "mass_flux_msun_per_yr_bins_by_temperature" in derived["mass_flux_msun_per_yr_by_radius"][0]

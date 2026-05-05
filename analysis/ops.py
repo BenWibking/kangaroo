@@ -1542,6 +1542,8 @@ class FluxSurfaceIntegral:
         passive_scalar: int,
         magnetic_field: tuple[int, int, int],
         radius: float | Sequence[float],
+        temperature: int | None = None,
+        temperature_bins: Sequence[float] | None = None,
         out_name: str = "flux_surface_integral",
         gamma: float = 5.0 / 3.0,
         bytes_per_value: int | None = None,
@@ -1553,6 +1555,8 @@ class FluxSurfaceIntegral:
         self.passive_scalar = int(passive_scalar)
         self.magnetic_field = tuple(int(v) for v in magnetic_field)
         self.radii = self._coerce_radii(radius)
+        self.temperature = None if temperature is None else int(temperature)
+        self.temperature_bins = self._coerce_temperature_bins(temperature_bins)
         self.out_name = out_name
         self.gamma = float(gamma)
         self.bytes_per_value = bytes_per_value
@@ -1565,6 +1569,16 @@ class FluxSurfaceIntegral:
             values = tuple(float(v) for v in radius)  # type: ignore[arg-type]
         except TypeError:
             values = (float(radius),)
+        return values
+
+    def _coerce_temperature_bins(
+        self, temperature_bins: Sequence[float] | None
+    ) -> tuple[float, ...] | None:
+        if temperature_bins is None:
+            return None
+        if isinstance(temperature_bins, (str, bytes)):
+            raise TypeError("temperature_bins must be a sequence of numbers")
+        values = tuple(float(v) for v in temperature_bins)
         return values
 
     def _reduce_fan_in(self, num_inputs: int) -> int:
@@ -1628,6 +1642,18 @@ class FluxSurfaceIntegral:
             raise ValueError("radius must contain at least one value")
         if any(not math.isfinite(radius) or radius <= 0.0 for radius in self.radii):
             raise ValueError("radius values must be finite and positive")
+        if self.temperature_bins is not None:
+            if self.temperature is None:
+                raise ValueError("temperature must be provided when temperature_bins are set")
+            if len(self.temperature_bins) < 2:
+                raise ValueError("temperature_bins must contain at least two edges")
+            if any(not math.isfinite(edge) for edge in self.temperature_bins):
+                raise ValueError("temperature_bins values must be finite")
+            if any(
+                right <= left
+                for left, right in zip(self.temperature_bins, self.temperature_bins[1:])
+            ):
+                raise ValueError("temperature_bins values must be strictly increasing")
         if not math.isfinite(self.gamma) or self.gamma <= 1.0:
             raise ValueError("gamma must be finite and greater than 1")
         if len(self.momentum) != 3:
@@ -1647,8 +1673,13 @@ class FluxSurfaceIntegral:
             self.passive_scalar,
             *self.magnetic_field,
         ]
+        if self.temperature is not None:
+            input_fields.append(self.temperature)
         levels = ctx.runmeta.steps[ds.step].levels
-        out_bytes = len(self.radii) * 2 * 4 * 8
+        num_temperature_bins = (
+            len(self.temperature_bins) - 1 if self.temperature_bins is not None else 1
+        )
+        out_bytes = len(self.radii) * 2 * num_temperature_bins * 4 * 8
         radii2 = [radius * radius for radius in self.radii]
         radius_intersects = [False] * len(self.radii)
 
@@ -1692,6 +1723,11 @@ class FluxSurfaceIntegral:
                         "radii": list(active_radii),
                         "radius_indices": list(active_radius_indices),
                         "num_radii": len(self.radii),
+                        "temperature_bins": (
+                            list(self.temperature_bins)
+                            if self.temperature_bins is not None
+                            else []
+                        ),
                         "gamma": self.gamma,
                         "bytes_per_value": int(bpv),
                         "covered_boxes": covered_payload,

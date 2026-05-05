@@ -5024,6 +5024,7 @@ void register_default_kernels(KernelRegistry& registry) {
     struct Params {
       std::vector<double> radii;
       std::vector<int32_t> radius_indices;
+      std::vector<double> temperature_bins;
       std::size_t num_radii = 0;
       double gamma = 5.0 / 3.0;
       int bytes_per_value = 8;
@@ -5087,6 +5088,13 @@ void register_default_kernels(KernelRegistry& registry) {
           }
         }
       }
+      if (const auto* bins = find_msgpack_map_value(root, "temperature_bins");
+          bins && bins->type == msgpack::type::ARRAY) {
+        params.temperature_bins.reserve(bins->via.array.size);
+        for (uint32_t i = 0; i < bins->via.array.size; ++i) {
+          append_radius(bins->via.array.ptr[i], params.temperature_bins);
+        }
+      }
       if (const auto* gamma = find_msgpack_map_value(root, "gamma");
           gamma && (gamma->type == msgpack::type::FLOAT ||
                     gamma->type == msgpack::type::POSITIVE_INTEGER ||
@@ -5110,7 +5118,11 @@ void register_default_kernels(KernelRegistry& registry) {
                         std::span<const std::uint8_t> params_msgpack) {
         const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
-        const std::size_t out_bytes = params.num_radii * 2 * 4 * sizeof(double);
+        const bool use_temperature_bins = params.temperature_bins.size() >= 2;
+        const std::size_t num_temperature_bins =
+            use_temperature_bins ? params.temperature_bins.size() - 1 : 1;
+        const std::size_t out_bytes =
+            params.num_radii * 2 * num_temperature_bins * 4 * sizeof(double);
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }
@@ -5119,10 +5131,23 @@ void register_default_kernels(KernelRegistry& registry) {
         } else {
           std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
         }
-        if (inputs.size() < 9 || params.radii.empty() ||
+        if (inputs.size() < 9 || (use_temperature_bins && inputs.size() < 10) ||
+            params.radii.empty() ||
             params.radius_indices.size() != params.radii.size() ||
             !std::isfinite(params.gamma) || params.gamma <= 1.0) {
           return hpx::make_ready_future();
+        }
+        if (use_temperature_bins) {
+          for (double edge : params.temperature_bins) {
+            if (!std::isfinite(edge)) {
+              return hpx::make_ready_future();
+            }
+          }
+          for (std::size_t i = 1; i < params.temperature_bins.size(); ++i) {
+            if (params.temperature_bins[i] <= params.temperature_bins[i - 1]) {
+              return hpx::make_ready_future();
+            }
+          }
         }
         std::vector<double> radii2;
         radii2.reserve(params.radii.size());
@@ -5259,9 +5284,32 @@ void register_default_kernels(KernelRegistry& registry) {
           const double bx = read_value(6, i, j, k);
           const double by = read_value(7, i, j, k);
           const double bz = read_value(8, i, j, k);
+          const double temperature =
+              use_temperature_bins ? read_value(9, i, j, k) : 0.0;
           if (!std::isfinite(momx) || !std::isfinite(momy) || !std::isfinite(momz) ||
               !std::isfinite(energy_density) || !std::isfinite(scalar_density) ||
-              !std::isfinite(bx) || !std::isfinite(by) || !std::isfinite(bz)) {
+              !std::isfinite(bx) || !std::isfinite(by) || !std::isfinite(bz) ||
+              (use_temperature_bins && !std::isfinite(temperature))) {
+            return;
+          }
+          std::size_t temperature_bin = 0;
+          if (use_temperature_bins) {
+            const auto upper =
+                std::upper_bound(params.temperature_bins.begin(),
+                                 params.temperature_bins.end(),
+                                 temperature);
+            if (upper == params.temperature_bins.begin() ||
+                upper == params.temperature_bins.end()) {
+              if (temperature != params.temperature_bins.back()) {
+                return;
+              }
+              temperature_bin = params.temperature_bins.size() - 2;
+            } else {
+              temperature_bin = static_cast<std::size_t>(
+                  std::distance(params.temperature_bins.begin(), upper) - 1);
+            }
+          }
+          if (temperature_bin >= num_temperature_bins) {
             return;
           }
 
@@ -5298,10 +5346,12 @@ void register_default_kernels(KernelRegistry& registry) {
           const std::array<double, 4> fluxes{
               mass_flux, hydro_energy_flux, mhd_energy_flux, scalar_flux};
           const std::size_t radius_base =
-              static_cast<std::size_t>(params.radius_indices[radius_idx]) * 2 * 4;
+              static_cast<std::size_t>(params.radius_indices[radius_idx]) *
+              2 * num_temperature_bins * 4;
           for (std::size_t component = 0; component < fluxes.size(); ++component) {
             const std::size_t sign_bin = fluxes[component] < 0.0 ? 0 : 1;
-            out[radius_base + sign_bin * 4 + component] += fluxes[component];
+            out[radius_base + sign_bin * num_temperature_bins * 4 +
+                temperature_bin * 4 + component] += fluxes[component];
           }
         };
 
