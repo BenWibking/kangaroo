@@ -5110,7 +5110,7 @@ void register_default_kernels(KernelRegistry& registry) {
                         std::span<const std::uint8_t> params_msgpack) {
         const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
-        const std::size_t out_bytes = params.num_radii * 4 * sizeof(double);
+        const std::size_t out_bytes = params.num_radii * 2 * 4 * sizeof(double);
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }
@@ -5290,16 +5290,19 @@ void register_default_kernels(KernelRegistry& registry) {
 
           const double bdotv = vx * bx + vy * by + vz * bz;
           const double br = rhat_x * bx + rhat_y * by + rhat_z * bz;
-          const double mass_flux_density = rho * vr;
-          const double hydro_energy_flux_density = (ehydro + pgas) * vr;
-          const double mhd_energy_flux_density =
-              (energy_density + pgas + emag) * vr - bdotv * br;
-          const std::size_t out_base =
-              static_cast<std::size_t>(params.radius_indices[radius_idx]) * 4;
-          out[out_base + 0] += mass_flux_density * area;
-          out[out_base + 1] += hydro_energy_flux_density * area;
-          out[out_base + 2] += mhd_energy_flux_density * area;
-          out[out_base + 3] += (scalar_density * vr) * area;
+          const double mass_flux = rho * vr * area;
+          const double hydro_energy_flux = (ehydro + pgas) * vr * area;
+          const double mhd_energy_flux =
+              ((energy_density + pgas + emag) * vr - bdotv * br) * area;
+          const double scalar_flux = scalar_density * vr * area;
+          const std::array<double, 4> fluxes{
+              mass_flux, hydro_energy_flux, mhd_energy_flux, scalar_flux};
+          const std::size_t radius_base =
+              static_cast<std::size_t>(params.radius_indices[radius_idx]) * 2 * 4;
+          for (std::size_t component = 0; component < fluxes.size(); ++component) {
+            const std::size_t sign_bin = fluxes[component] < 0.0 ? 0 : 1;
+            out[radius_base + sign_bin * 4 + component] += fluxes[component];
+          }
         };
 
         for (std::size_t radius_idx = 0; radius_idx < params.radii.size(); ++radius_idx) {

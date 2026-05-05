@@ -151,10 +151,14 @@ def test_flux_surface_integral_lowering_wires_accumulate_reduce_and_covered_boxe
     plan = pipe.plan()
 
     assert flux.components == (
-        "mass_flux_sphere",
-        "hydro_energy_flux_sphere",
-        "mhd_energy_flux_sphere",
-        "passive_scalar_flux_sphere",
+        "mass_flux_sphere_negative",
+        "hydro_energy_flux_sphere_negative",
+        "mhd_energy_flux_sphere_negative",
+        "passive_scalar_flux_sphere_negative",
+        "mass_flux_sphere_positive",
+        "hydro_energy_flux_sphere_positive",
+        "mhd_energy_flux_sphere_positive",
+        "passive_scalar_flux_sphere_positive",
     )
     templates = [tmpl for stage in plan.stages for tmpl in stage.templates]
     accum_stages = [
@@ -169,7 +173,7 @@ def test_flux_surface_integral_lowering_wires_accumulate_reduce_and_covered_boxe
     assert len(accum) == 3
     assert accum_stages[0].templates == accum
     assert all(len(tmpl.inputs) == 9 for tmpl in accum)
-    assert all(tmpl.output_bytes == [32] for tmpl in accum)
+    assert all(tmpl.output_bytes == [64] for tmpl in accum)
 
     coarse = [tmpl for tmpl in accum if tmpl.domain.level == 0]
     fine = [tmpl for tmpl in accum if tmpl.domain.level == 1]
@@ -181,6 +185,7 @@ def test_flux_surface_integral_lowering_wires_accumulate_reduce_and_covered_boxe
     reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
     assert reducers
     assert all(tmpl.params["bytes_per_value"] == 8 for tmpl in reducers)
+    assert all(tmpl.output_bytes == [64] for tmpl in reducers)
     first_reduce_stages = [
         stage
         for stage in plan.stages
@@ -229,10 +234,10 @@ def test_flux_surface_integral_lowering_accepts_radius_array() -> None:
     accum = [tmpl for tmpl in templates if tmpl.kernel == "flux_surface_integral_accumulate"]
     assert len(accum) == 1
     assert accum[0].params["radii"] == [0.25, 0.5, 0.75]
-    assert accum[0].output_bytes == [96]
+    assert accum[0].output_bytes == [192]
     reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
     assert reducers
-    assert all(tmpl.output_bytes == [96] for tmpl in reducers)
+    assert all(tmpl.output_bytes == [192] for tmpl in reducers)
 
 
 def test_flux_surface_integral_lowering_uses_per_block_radius_subsets() -> None:
@@ -280,7 +285,7 @@ def test_flux_surface_integral_lowering_uses_per_block_radius_subsets() -> None:
     assert by_block[1].params["radii"] == [3.5]
     assert by_block[1].params["radius_indices"] == [1]
     assert all(tmpl.params["num_radii"] == 2 for tmpl in accum)
-    assert all(tmpl.output_bytes == [64] for tmpl in accum)
+    assert all(tmpl.output_bytes == [128] for tmpl in accum)
 
 
 def test_flux_surface_integral_lowering_normalizes_single_nonzero_block() -> None:
@@ -518,12 +523,12 @@ def test_flux_surface_integral_runtime_one_cell_mhd_energy_term() -> None:
         step=step,
         level=0,
         field=flux.field,
-        shape=(4,),
+        shape=(2, 4),
         dtype=np.float64,
         dataset=ds,
         block=0,
     )
-    assert np.allclose(raw, np.array([6.0, 87.0, 90.0, 15.0]))
+    assert np.allclose(raw, np.array([[0.0, 0.0, 0.0, 0.0], [6.0, 87.0, 90.0, 15.0]]))
 
 
 def test_flux_surface_integral_runtime_radius_array() -> None:
@@ -563,12 +568,15 @@ def test_flux_surface_integral_runtime_radius_array() -> None:
         step=step,
         level=0,
         field=flux.field,
-        shape=(3, 4),
+        shape=(3, 2, 4),
         dtype=np.float64,
         dataset=ds,
         block=0,
     )
-    expected = np.tile(np.array([6.0, 87.0, 90.0, 15.0]), (3, 1))
+    expected = np.tile(
+        np.array([[0.0, 0.0, 0.0, 0.0], [6.0, 87.0, 90.0, 15.0]]),
+        (3, 1, 1),
+    )
     assert np.allclose(raw, expected)
 
 
@@ -620,7 +628,7 @@ def test_flux_surface_integral_runtime_sparse_radius_slots() -> None:
             step=step,
             level=0,
             field=flux.field,
-            shape=(len(radii), 4),
+            shape=(len(radii), 2, 4),
             dtype=np.float64,
             dataset=ds,
             block=0,
@@ -680,12 +688,12 @@ def test_flux_surface_integral_runtime_single_nonzero_block() -> None:
         step=step,
         level=0,
         field=flux.field,
-        shape=(4,),
+        shape=(2, 4),
         dtype=np.float64,
         dataset=ds,
         block=0,
     )
-    assert np.allclose(raw, np.array([6.0, 87.0, 90.0, 15.0]))
+    assert np.allclose(raw, np.array([[0.0, 0.0, 0.0, 0.0], [6.0, 87.0, 90.0, 15.0]]))
 
 
 def test_flux_surface_integral_runtime_multiblock_reduction() -> None:
@@ -733,12 +741,65 @@ def test_flux_surface_integral_runtime_multiblock_reduction() -> None:
         step=step,
         level=0,
         field=flux.field,
-        shape=(4,),
+        shape=(2, 4),
         dtype=np.float64,
         dataset=ds,
         block=0,
     )
-    assert np.allclose(raw, np.array([12.0, 174.0, 174.0, 30.0]))
+    assert np.allclose(raw, np.array([[0.0, 0.0, 0.0, 0.0], [12.0, 174.0, 174.0, 30.0]]))
+
+
+def test_flux_surface_integral_runtime_outputs_negative_and_positive_bins() -> None:
+    rt = Runtime()
+    step = 10
+    levels = [
+        LevelMeta(
+            geom=LevelGeom(
+                dx=(1.0, 1.0, 1.0),
+                x0=(-1.0, -0.5, -0.5),
+                ref_ratio=1,
+            ),
+            boxes=[
+                BlockBox((0, 0, 0), (0, 0, 0)),
+                BlockBox((1, 0, 0), (1, 0, 0)),
+            ],
+        )
+    ]
+    runmeta = _runmeta_with_step_index(step, levels)
+    ds = open_dataset("memory://flux-sign-bins", runmeta=runmeta, step=step, level=0, runtime=rt)
+    for fid in range(1, 10):
+        ds.register_field(f"f{fid}", fid)
+
+    state = _one_cell_state(rho=2.0, momx=6.0, energy=21.0, scalar=5.0, bz=0.0)
+    for block in (0, 1):
+        for fid, values in state.items():
+            _set_block_double(ds, step=step, level=0, field=fid, block=block, values=values)
+
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    flux = pipe.flux_surface_integral(
+        1,
+        momentum=(2, 3, 4),
+        energy=5,
+        passive_scalar=6,
+        magnetic_field=(7, 8, 9),
+        radius=0.5,
+        reduce_fan_in=2,
+        bytes_per_value=8,
+    )
+    pipe.run()
+
+    raw = rt.get_task_chunk_array(
+        step=step,
+        level=0,
+        field=flux.field,
+        shape=(2, 4),
+        dtype=np.float64,
+        dataset=ds,
+        block=0,
+    )
+
+    assert np.allclose(raw, np.array([[-6.0, -87.0, -87.0, -15.0], [6.0, 87.0, 87.0, 15.0]]))
+    assert np.allclose(raw.sum(axis=0), np.zeros(4))
 
 
 def test_flux_surface_integral_runtime_amr_covered_cells_are_excluded() -> None:
@@ -791,9 +852,9 @@ def test_flux_surface_integral_runtime_amr_covered_cells_are_excluded() -> None:
         step=step,
         level=0,
         field=flux.field,
-        shape=(4,),
+        shape=(2, 4),
         dtype=np.float64,
         dataset=ds,
         block=0,
     )
-    assert np.allclose(raw, np.zeros(4))
+    assert np.allclose(raw, np.zeros((2, 4)))
