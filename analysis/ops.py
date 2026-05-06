@@ -2049,7 +2049,10 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
         num_temperature_bins = (
             len(self.temperature_bins) - 1 if self.temperature_bins is not None else 1
         )
-        out_bytes = len(self.heights) * 2 * num_temperature_bins * 4 * 8
+        num_geometric_sections = 2
+        out_bytes = (
+            len(self.heights) * 2 * num_temperature_bins * num_geometric_sections * 4 * 8
+        )
         radius2 = self.radius * self.radius
         height_intersects = [False] * len(self.heights)
 

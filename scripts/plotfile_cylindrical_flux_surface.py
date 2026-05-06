@@ -35,6 +35,7 @@ from scripts.plotfile_flux_surface import (  # noqa: E402
 
 
 COMPONENTS = tuple(name.replace("_sphere", "_cylinder") for name in SPHERE_COMPONENTS)
+GEOMETRIC_SECTIONS = ("endcaps", "walls")
 
 
 def _finite_heights(values: Iterable[float]) -> np.ndarray:
@@ -53,23 +54,56 @@ def _flux_rows_and_derived(
 ) -> tuple[list[dict], dict]:
     values = np.asarray(values, dtype=np.float64)
     if temperature_bins is None:
-        if values.shape != (len(heights), len(SIGN_BINS), len(COMPONENTS)):
-            raise ValueError("flux values must have shape (num_heights, 2, 4)")
-        values_by_temperature = values[:, :, np.newaxis, :]
+        if values.shape == (len(heights), len(SIGN_BINS), len(COMPONENTS)):
+            values_by_temperature_section = np.zeros(
+                (
+                    len(heights),
+                    len(SIGN_BINS),
+                    1,
+                    len(GEOMETRIC_SECTIONS),
+                    len(COMPONENTS),
+                ),
+                dtype=np.float64,
+            )
+            values_by_temperature_section[:, :, 0, 1, :] = values
+        elif values.shape == (
+            len(heights),
+            len(SIGN_BINS),
+            len(GEOMETRIC_SECTIONS),
+            len(COMPONENTS),
+        ):
+            values_by_temperature_section = values[:, :, np.newaxis, :, :]
+        else:
+            raise ValueError("flux values must have shape (num_heights, 2, 2, 4)")
         temperature_edges = None
     else:
         expected_shape = (
             len(heights),
             len(SIGN_BINS),
             len(temperature_bins) - 1,
+            len(GEOMETRIC_SECTIONS),
             len(COMPONENTS),
         )
-        if values.shape != expected_shape:
-            raise ValueError("flux values must have shape (num_heights, 2, num_temperature_bins, 4)")
-        values_by_temperature = values
+        legacy_shape = (
+            len(heights),
+            len(SIGN_BINS),
+            len(temperature_bins) - 1,
+            len(COMPONENTS),
+        )
+        if values.shape == legacy_shape:
+            values_by_temperature_section = np.zeros(expected_shape, dtype=np.float64)
+            values_by_temperature_section[:, :, :, 1, :] = values
+        elif values.shape != expected_shape:
+            raise ValueError(
+                "flux values must have shape (num_heights, 2, num_temperature_bins, 2, 4)"
+            )
+        else:
+            values_by_temperature_section = values
         temperature_edges = temperature_bins
+    values_by_temperature = values_by_temperature_section.sum(axis=3)
     sign_summed_values = values_by_temperature.sum(axis=2)
     summed_values = sign_summed_values.sum(axis=1)
+    section_summed_values = values_by_temperature_section.sum(axis=2)
 
     def temperature_bin_rows(height_idx: int, sign_idx: int) -> list[dict]:
         if temperature_edges is None:
@@ -79,8 +113,21 @@ def _flux_rows_and_derived(
                 "temperature_min": float(temperature_edges[temp_idx]),
                 "temperature_max": float(temperature_edges[temp_idx + 1]),
                 "fluxes": {
-                    name: float(values_by_temperature[height_idx, sign_idx, temp_idx, j])
+                    name: float(
+                        values_by_temperature[height_idx, sign_idx, temp_idx, j]
+                    )
                     for j, name in enumerate(COMPONENTS)
+                },
+                "fluxes_by_geometric_section": {
+                    section: {
+                        name: float(
+                            values_by_temperature_section[
+                                height_idx, sign_idx, temp_idx, section_idx, j
+                            ]
+                        )
+                        for j, name in enumerate(COMPONENTS)
+                    }
+                    for section_idx, section in enumerate(GEOMETRIC_SECTIONS)
                 },
             }
             for temp_idx in range(len(temperature_edges) - 1)
@@ -97,6 +144,16 @@ def _flux_rows_and_derived(
                 sign: {
                     name: float(sign_summed_values[i, sign_idx, j])
                     for j, name in enumerate(COMPONENTS)
+                }
+                for sign_idx, sign in enumerate(SIGN_BINS)
+            },
+            "flux_bins_by_geometric_section": {
+                sign: {
+                    section: {
+                        name: float(section_summed_values[i, sign_idx, section_idx, j])
+                        for j, name in enumerate(COMPONENTS)
+                    }
+                    for section_idx, section in enumerate(GEOMETRIC_SECTIONS)
                 }
                 for sign_idx, sign in enumerate(SIGN_BINS)
             },
@@ -122,6 +179,17 @@ def _flux_rows_and_derived(
                 "mass_flux_msun_per_yr": float(summed_values[i, 0] * YR_S / MSUN_G),
                 "mass_flux_msun_per_yr_bins": {
                     sign: float(sign_summed_values[i, sign_idx, 0] * YR_S / MSUN_G)
+                    for sign_idx, sign in enumerate(SIGN_BINS)
+                },
+                "mass_flux_msun_per_yr_bins_by_geometric_section": {
+                    sign: {
+                        section: float(
+                            section_summed_values[i, sign_idx, section_idx, 0]
+                            * YR_S
+                            / MSUN_G
+                        )
+                        for section_idx, section in enumerate(GEOMETRIC_SECTIONS)
+                    }
                     for sign_idx, sign in enumerate(SIGN_BINS)
                 },
             }
@@ -275,9 +343,9 @@ def main() -> int:
             version=0,
             block=0,
             shape=(
-                (len(heights), 2, len(temperature_bins) - 1, 4)
+                (len(heights), 2, len(temperature_bins) - 1, len(GEOMETRIC_SECTIONS), 4)
                 if temperature_bins is not None
-                else (len(heights), 2, 4)
+                else (len(heights), 2, len(GEOMETRIC_SECTIONS), 4)
             ),
             dtype=np.float64,
             dataset=ds,
@@ -308,6 +376,11 @@ def main() -> int:
             "fields": {role: name for role, (name, _) in fields.items()},
             "fluxes": flux_rows[0]["fluxes"] if len(heights) == 1 else None,
             "flux_bins": flux_rows[0]["flux_bins"] if len(heights) == 1 else None,
+            "flux_bins_by_geometric_section": (
+                flux_rows[0]["flux_bins_by_geometric_section"]
+                if len(heights) == 1
+                else None
+            ),
             "flux_bins_by_temperature": (
                 flux_rows[0]["flux_bins_by_temperature"]
                 if len(heights) == 1 and temperature_bins is not None

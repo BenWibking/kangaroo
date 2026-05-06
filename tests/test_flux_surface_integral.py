@@ -323,6 +323,7 @@ def test_cylindrical_flux_surface_integral_lowering_accepts_height_array() -> No
 
     assert flux.radius == 0.5
     assert flux.heights == (0.5, 1.5)
+    assert flux.geometric_sections == ("endcaps", "walls")
     assert flux.components == (
         "mass_flux_cylinder_negative",
         "hydro_energy_flux_cylinder_negative",
@@ -342,10 +343,10 @@ def test_cylindrical_flux_surface_integral_lowering_accepts_height_array() -> No
     assert len(accum) == 1
     assert accum[0].params["radius"] == 0.5
     assert accum[0].params["heights"] == [0.5, 1.5]
-    assert accum[0].output_bytes == [128]
+    assert accum[0].output_bytes == [256]
     reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
     assert reducers
-    assert all(tmpl.output_bytes == [128] for tmpl in reducers)
+    assert all(tmpl.output_bytes == [256] for tmpl in reducers)
 
 
 def test_flux_surface_integral_rejects_temperature_bins_without_temperature_field() -> None:
@@ -673,6 +674,64 @@ def test_flux_surface_integral_runtime_one_cell_mhd_energy_term() -> None:
     assert np.allclose(raw, np.array([[0.0, 0.0, 0.0, 0.0], [6.0, 87.0, 90.0, 15.0]]))
 
 
+def test_cylindrical_flux_surface_integral_runtime_outputs_endcaps_and_walls() -> None:
+    rt = Runtime()
+    step = 19
+    levels = [
+        LevelMeta(
+            geom=LevelGeom(
+                dx=(1.0, 1.0, 1.0),
+                x0=(0.0, -0.5, -0.5),
+                ref_ratio=1,
+            ),
+            boxes=[BlockBox((0, 0, 0), (0, 0, 0))],
+        )
+    ]
+    runmeta = _runmeta_with_step_index(step, levels)
+    ds = open_dataset(
+        "memory://cylflux-endcaps-walls",
+        runmeta=runmeta,
+        step=step,
+        level=0,
+        runtime=rt,
+    )
+    for fid in range(1, 10):
+        ds.register_field(f"f{fid}", fid)
+
+    state = _one_cell_state(rho=2.0, momx=0.0, energy=21.5, scalar=5.0, bz=0.0)
+    state[4] = np.array([[[4.0]]], dtype=np.float64)
+    for fid, values in state.items():
+        _set_block_double(ds, step=step, level=0, field=fid, block=0, values=values)
+
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    flux = pipe.cylindrical_flux_surface_integral(
+        1,
+        momentum=(2, 3, 4),
+        energy=5,
+        passive_scalar=6,
+        magnetic_field=(7, 8, 9),
+        radius=0.5,
+        height=0.25,
+        out="flux",
+        bytes_per_value=8,
+    )
+    pipe.run()
+
+    raw = rt.get_task_chunk_array(
+        step=step,
+        level=0,
+        field=flux.field,
+        shape=(2, 2, 4),
+        dtype=np.float64,
+        dataset=ds,
+        block=0,
+    )
+    expected = np.zeros((2, 2, 4), dtype=np.float64)
+    expected[0, 0] = np.array([-4.0, -(199.0 / 3.0), -(199.0 / 3.0), -10.0])
+    expected[1, 0] = np.array([4.0, 199.0 / 3.0, 199.0 / 3.0, 10.0])
+    assert np.allclose(raw, expected)
+
+
 def test_flux_surface_integral_runtime_radius_array() -> None:
     rt = Runtime()
     step = 8
@@ -761,12 +820,14 @@ def test_cylindrical_flux_surface_integral_runtime_one_cell_mhd_energy_term() ->
         step=step,
         level=0,
         field=flux.field,
-        shape=(2, 4),
+        shape=(2, 2, 4),
         dtype=np.float64,
         dataset=ds,
         block=0,
     )
-    assert np.allclose(raw, np.array([[0.0, 0.0, 0.0, 0.0], [6.0, 87.0, 90.0, 15.0]]))
+    expected = np.zeros((2, 2, 4), dtype=np.float64)
+    expected[1, 1] = np.array([6.0, 87.0, 90.0, 15.0])
+    assert np.allclose(raw, expected)
 
 
 def test_flux_surface_integral_runtime_sparse_radius_slots() -> None:

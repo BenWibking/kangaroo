@@ -86,6 +86,7 @@ class CylindricalFluxSurfaceIntegralHandle:
     radius: float
     heights: tuple[float, ...] = ()
     temperature_bins: tuple[float, ...] | None = None
+    geometric_sections: tuple[str, ...] = ("endcaps", "walls")
     components: tuple[str, ...] = (
         "mass_flux_cylinder_negative",
         "hydro_energy_flux_cylinder_negative",

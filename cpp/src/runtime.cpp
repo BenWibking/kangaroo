@@ -5569,8 +5569,12 @@ void register_default_kernels(KernelRegistry& registry) {
         const bool use_temperature_bins = params.temperature_bins.size() >= 2;
         const std::size_t num_temperature_bins =
             use_temperature_bins ? params.temperature_bins.size() - 1 : 1;
+        constexpr std::size_t num_geometric_sections = 2;
+        constexpr std::size_t endcaps_section = 0;
+        constexpr std::size_t walls_section = 1;
         const std::size_t out_bytes =
-            params.num_heights * 2 * num_temperature_bins * 4 * sizeof(double);
+            params.num_heights * 2 * num_temperature_bins *
+            num_geometric_sections * 4 * sizeof(double);
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }
@@ -5694,31 +5698,25 @@ void register_default_kernels(KernelRegistry& registry) {
                                               box_hi_axis(axis));
         };
 
-        auto accumulate_cell = [&](std::size_t height_idx,
+        auto accumulate_flux = [&](std::size_t height_idx,
                                    int i,
                                    int j,
                                    int k,
-                                   double x0,
-                                   double x1,
-                                   double y0,
-                                   double y1,
-                                   double z0,
-                                   double z1) {
-          const double height = params.heights[height_idx];
-          if (!cylinder_may_intersect_cell(radius2, height, x0, x1, y0, y1, z0, z1)) {
+                                   double nx,
+                                   double ny,
+                                   double nz,
+                                   double area,
+                                   std::size_t geometric_section) {
+          if (area <= 0.0 || geometric_section >= num_geometric_sections) {
             return;
           }
-
           const auto idx = logical_index(i, j, k);
           if (!covered_mask.empty() && covered_mask[idx] != 0) {
             return;
           }
 
-          const double x = 0.5 * (x0 + x1);
-          const double y = 0.5 * (y0 + y1);
-          const double rxy = std::sqrt(x * x + y * y);
           const double rho = read_value(0, i, j, k);
-          if (rxy <= 0.0 || rho <= 0.0 || !std::isfinite(rho)) {
+          if (rho <= 0.0 || !std::isfinite(rho)) {
             return;
           }
 
@@ -5762,41 +5760,35 @@ void register_default_kernels(KernelRegistry& registry) {
           const double vx = momx / rho;
           const double vy = momy / rho;
           const double vz = momz / rho;
-          const double vcyl = (x * momx + y * momy) / (rho * rxy);
-          const double nhat_x = x / rxy;
-          const double nhat_y = y / rxy;
+          const double vnormal = vx * nx + vy * ny + vz * nz;
 
           const double kinetic =
               0.5 * (momx * momx + momy * momy + momz * momz) / rho;
           const double emag = 0.5 * (bx * bx + by * by + bz * bz);
           const double ehydro = energy_density - emag;
           const double pgas = gamma_minus_one * (ehydro - kinetic);
-          if (!std::isfinite(vcyl) || !std::isfinite(pgas)) {
-            return;
-          }
-
-          const double area = cylindrical_section_area_in_intersecting_cell(
-              params.radius, height, x0, x1, y0, y1, z0, z1);
-          if (area <= 0.0) {
+          if (!std::isfinite(vnormal) || !std::isfinite(pgas)) {
             return;
           }
 
           const double bdotv = vx * bx + vy * by + vz * bz;
-          const double bcyl = nhat_x * bx + nhat_y * by;
-          const double mass_flux = rho * vcyl * area;
-          const double hydro_energy_flux = (ehydro + pgas) * vcyl * area;
+          const double bnormal = nx * bx + ny * by + nz * bz;
+          const double mass_flux = rho * vnormal * area;
+          const double hydro_energy_flux = (ehydro + pgas) * vnormal * area;
           const double mhd_energy_flux =
-              ((energy_density + pgas + emag) * vcyl - bdotv * bcyl) * area;
-          const double scalar_flux = scalar_density * vcyl * area;
+              ((energy_density + pgas + emag) * vnormal - bdotv * bnormal) * area;
+          const double scalar_flux = scalar_density * vnormal * area;
           const std::array<double, 4> fluxes{
               mass_flux, hydro_energy_flux, mhd_energy_flux, scalar_flux};
           const std::size_t height_base =
               static_cast<std::size_t>(params.height_indices[height_idx]) *
-              2 * num_temperature_bins * 4;
+              2 * num_temperature_bins * num_geometric_sections * 4;
           for (std::size_t component = 0; component < fluxes.size(); ++component) {
             const std::size_t sign_bin = fluxes[component] < 0.0 ? 0 : 1;
-            out[height_base + sign_bin * num_temperature_bins * 4 +
-                temperature_bin * 4 + component] += fluxes[component];
+            out[height_base + sign_bin * num_temperature_bins *
+                num_geometric_sections * 4 +
+                temperature_bin * num_geometric_sections * 4 +
+                geometric_section * 4 + component] += fluxes[component];
           }
         };
 
@@ -5824,7 +5816,7 @@ void register_default_kernels(KernelRegistry& registry) {
               const double min_xy = min_x + min_dist_sq_to_interval(y0, y1);
               const double max_xy =
                   max_dist_sq_to_interval(x0, x1) + max_dist_sq_to_interval(y0, y1);
-              if (min_xy > radius2 || max_xy < radius2) {
+              if (min_xy > radius2) {
                 continue;
               }
 
@@ -5838,7 +5830,51 @@ void register_default_kernels(KernelRegistry& registry) {
                   const int gk = box.lo.z + k;
                   const double z0 = cell_edge(2, gk);
                   const double z1 = z0 + level.geom.dx[2];
-                  accumulate_cell(height_idx, i, j, k, x0, x1, y0, y1, z0, z1);
+                  if (max_xy >= radius2 &&
+                      cylinder_may_intersect_cell(radius2, height, x0, x1, y0, y1, z0, z1)) {
+                    const double x = 0.5 * (x0 + x1);
+                    const double y = 0.5 * (y0 + y1);
+                    const double rxy = std::sqrt(x * x + y * y);
+                    if (rxy > 0.0) {
+                      const double area = cylindrical_section_area_in_intersecting_cell(
+                          params.radius, height, x0, x1, y0, y1, z0, z1);
+                      accumulate_flux(height_idx,
+                                      i,
+                                      j,
+                                      k,
+                                      x / rxy,
+                                      y / rxy,
+                                      0.0,
+                                      area,
+                                      walls_section);
+                    }
+                  }
+                  if (z0 <= height && z1 >= height) {
+                    const double area = plane_box_section_area(
+                        x0, x1, y0, y1, z0, z1, 0.0, 0.0, 1.0, height);
+                    accumulate_flux(height_idx,
+                                    i,
+                                    j,
+                                    k,
+                                    0.0,
+                                    0.0,
+                                    1.0,
+                                    area,
+                                    endcaps_section);
+                  }
+                  if (z0 <= -height && z1 >= -height) {
+                    const double area = plane_box_section_area(
+                        x0, x1, y0, y1, z0, z1, 0.0, 0.0, 1.0, -height);
+                    accumulate_flux(height_idx,
+                                    i,
+                                    j,
+                                    k,
+                                    0.0,
+                                    0.0,
+                                    -1.0,
+                                    area,
+                                    endcaps_section);
+                  }
                 }
               }
             }

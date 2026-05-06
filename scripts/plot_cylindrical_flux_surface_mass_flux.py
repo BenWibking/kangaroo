@@ -16,6 +16,7 @@ MSUN_PER_YEAR_LABEL = r"$M_\odot\,yr^{-1}$"
 SECONDS_PER_YEAR = 365.25 * 24.0 * 3600.0
 SECONDS_PER_MYR = 1.0e6 * SECONDS_PER_YEAR
 MSUN_G = 1.98847e33
+GEOMETRIC_SECTIONS = ("walls", "endcaps")
 
 
 class TemperatureMassFlux(NamedTuple):
@@ -49,7 +50,14 @@ def _temperature_label(row: dict[str, Any]) -> str:
 def _load_temperature_mass_flux_from_derived(
     rows: list[dict[str, Any]],
     order: np.ndarray,
+    section: str,
 ) -> TemperatureMassFlux | None:
+    section_bins = rows[0].get("mass_flux_msun_per_yr_bins_by_geometric_section")
+    if section_bins is not None:
+        return None
+    if section != "walls":
+        return None
+
     first_bins = rows[0].get("mass_flux_msun_per_yr_bins_by_temperature")
     if first_bins is None:
         return None
@@ -97,6 +105,7 @@ def _load_temperature_mass_flux_from_derived(
 def _load_temperature_mass_flux_from_flux_rows(
     rows: list[dict[str, Any]],
     order: np.ndarray,
+    section: str,
 ) -> TemperatureMassFlux | None:
     first_bins = rows[0].get("flux_bins_by_temperature")
     if first_bins is None:
@@ -126,13 +135,25 @@ def _load_temperature_mass_flux_from_flux_rows(
             raise ValueError("Temperature-bin counts differ between heights.")
         negative_rows.append(
             [
-                float(item["fluxes"]["mass_flux_cylinder"]) * SECONDS_PER_YEAR / MSUN_G
+                float(
+                    item.get("fluxes_by_geometric_section", {})
+                    .get(section, item["fluxes"] if section == "walls" else {})
+                    .get("mass_flux_cylinder", 0.0)
+                )
+                * SECONDS_PER_YEAR
+                / MSUN_G
                 for item in negative
             ]
         )
         positive_rows.append(
             [
-                float(item["fluxes"]["mass_flux_cylinder"]) * SECONDS_PER_YEAR / MSUN_G
+                float(
+                    item.get("fluxes_by_geometric_section", {})
+                    .get(section, item["fluxes"] if section == "walls" else {})
+                    .get("mass_flux_cylinder", 0.0)
+                )
+                * SECONDS_PER_YEAR
+                / MSUN_G
                 for item in positive
             ]
         )
@@ -152,7 +173,16 @@ def _load_temperature_mass_flux_from_flux_rows(
     )
 
 
-def _load_mass_flux(path: Path) -> MassFluxData:
+def _section_label(section: str) -> str:
+    if section == "walls":
+        return "walls"
+    if section == "endcaps":
+        return "endcaps"
+    raise ValueError(f"unsupported geometric section: {section}")
+
+
+def _load_mass_flux(path: Path, section: str) -> MassFluxData:
+    section = _section_label(section)
     with path.open("r", encoding="utf-8") as handle:
         data = json.load(handle)
 
@@ -164,32 +194,57 @@ def _load_mass_flux(path: Path) -> MassFluxData:
         if not rows:
             raise ValueError("No height samples found.")
         height = np.asarray([row["height_kpc"] for row in rows], dtype=np.float64)
-        mass_flux = np.asarray(
-            [row["mass_flux_msun_per_yr"] for row in rows],
-            dtype=np.float64,
-        )
-        mass_flux_negative = np.asarray(
-            [
-                row.get("mass_flux_msun_per_yr_bins", {}).get(
-                    "negative",
-                    min(row["mass_flux_msun_per_yr"], 0.0),
+        if rows[0].get("mass_flux_msun_per_yr_bins_by_geometric_section") is None:
+            if section != "walls":
+                raise ValueError(
+                    "JSON does not contain geometric-section mass flux for endcaps."
                 )
-                for row in rows
-            ],
-            dtype=np.float64,
-        )
-        mass_flux_positive = np.asarray(
-            [
-                row.get("mass_flux_msun_per_yr_bins", {}).get(
-                    "positive",
-                    max(row["mass_flux_msun_per_yr"], 0.0),
-                )
-                for row in rows
-            ],
-            dtype=np.float64,
-        )
+            mass_flux = np.asarray(
+                [row["mass_flux_msun_per_yr"] for row in rows],
+                dtype=np.float64,
+            )
+            mass_flux_negative = np.asarray(
+                [
+                    row.get("mass_flux_msun_per_yr_bins", {}).get(
+                        "negative",
+                        min(row["mass_flux_msun_per_yr"], 0.0),
+                    )
+                    for row in rows
+                ],
+                dtype=np.float64,
+            )
+            mass_flux_positive = np.asarray(
+                [
+                    row.get("mass_flux_msun_per_yr_bins", {}).get(
+                        "positive",
+                        max(row["mass_flux_msun_per_yr"], 0.0),
+                    )
+                    for row in rows
+                ],
+                dtype=np.float64,
+            )
+        else:
+            mass_flux_negative = np.asarray(
+                [
+                    row["mass_flux_msun_per_yr_bins_by_geometric_section"][
+                        "negative"
+                    ][section]
+                    for row in rows
+                ],
+                dtype=np.float64,
+            )
+            mass_flux_positive = np.asarray(
+                [
+                    row["mass_flux_msun_per_yr_bins_by_geometric_section"][
+                        "positive"
+                    ][section]
+                    for row in rows
+                ],
+                dtype=np.float64,
+            )
+            mass_flux = mass_flux_negative + mass_flux_positive
         order = np.argsort(height)
-        temperature = _load_temperature_mass_flux_from_derived(rows, order)
+        temperature = _load_temperature_mass_flux_from_derived(rows, order, section)
     else:
         heights_kpc = data.get("heights_kpc")
         flux_rows = data.get("fluxes_by_height")
@@ -200,43 +255,70 @@ def _load_mass_flux(path: Path) -> MassFluxData:
             )
 
         height = np.asarray(heights_kpc, dtype=np.float64)
-        mass_flux = np.asarray(
-            [
-                row["fluxes"]["mass_flux_cylinder"] * SECONDS_PER_YEAR / MSUN_G
-                for row in flux_rows
-            ],
-            dtype=np.float64,
-        )
-        mass_flux_negative = np.asarray(
-            [
-                row.get("flux_bins", {})
-                .get("negative", {})
-                .get(
-                    "mass_flux_cylinder",
-                    min(row["fluxes"]["mass_flux_cylinder"], 0.0),
-                )
-                * SECONDS_PER_YEAR
-                / MSUN_G
-                for row in flux_rows
-            ],
-            dtype=np.float64,
-        )
-        mass_flux_positive = np.asarray(
-            [
-                row.get("flux_bins", {})
-                .get("positive", {})
-                .get(
-                    "mass_flux_cylinder",
-                    max(row["fluxes"]["mass_flux_cylinder"], 0.0),
-                )
-                * SECONDS_PER_YEAR
-                / MSUN_G
-                for row in flux_rows
-            ],
-            dtype=np.float64,
-        )
+        if flux_rows[0].get("flux_bins_by_geometric_section") is None:
+            if section != "walls":
+                raise ValueError("JSON does not contain geometric-section flux for endcaps.")
+            mass_flux = np.asarray(
+                [
+                    row["fluxes"]["mass_flux_cylinder"] * SECONDS_PER_YEAR / MSUN_G
+                    for row in flux_rows
+                ],
+                dtype=np.float64,
+            )
+            mass_flux_negative = np.asarray(
+                [
+                    row.get("flux_bins", {})
+                    .get("negative", {})
+                    .get(
+                        "mass_flux_cylinder",
+                        min(row["fluxes"]["mass_flux_cylinder"], 0.0),
+                    )
+                    * SECONDS_PER_YEAR
+                    / MSUN_G
+                    for row in flux_rows
+                ],
+                dtype=np.float64,
+            )
+            mass_flux_positive = np.asarray(
+                [
+                    row.get("flux_bins", {})
+                    .get("positive", {})
+                    .get(
+                        "mass_flux_cylinder",
+                        max(row["fluxes"]["mass_flux_cylinder"], 0.0),
+                    )
+                    * SECONDS_PER_YEAR
+                    / MSUN_G
+                    for row in flux_rows
+                ],
+                dtype=np.float64,
+            )
+        else:
+            mass_flux_negative = np.asarray(
+                [
+                    row["flux_bins_by_geometric_section"]["negative"][section][
+                        "mass_flux_cylinder"
+                    ]
+                    * SECONDS_PER_YEAR
+                    / MSUN_G
+                    for row in flux_rows
+                ],
+                dtype=np.float64,
+            )
+            mass_flux_positive = np.asarray(
+                [
+                    row["flux_bins_by_geometric_section"]["positive"][section][
+                        "mass_flux_cylinder"
+                    ]
+                    * SECONDS_PER_YEAR
+                    / MSUN_G
+                    for row in flux_rows
+                ],
+                dtype=np.float64,
+            )
+            mass_flux = mass_flux_negative + mass_flux_positive
         order = np.argsort(height)
-        temperature = _load_temperature_mass_flux_from_flux_rows(flux_rows, order)
+        temperature = _load_temperature_mass_flux_from_flux_rows(flux_rows, order, section)
 
     if height.size == 0:
         raise ValueError("No height samples found.")
@@ -259,7 +341,9 @@ def _load_mass_flux(path: Path) -> MassFluxData:
     if temperature is None and rows is not None:
         flux_rows = data.get("fluxes_by_height")
         if flux_rows is not None:
-            temperature = _load_temperature_mass_flux_from_flux_rows(flux_rows, order)
+            temperature = _load_temperature_mass_flux_from_flux_rows(
+                flux_rows, order, section
+            )
 
     return MassFluxData(
         height_kpc=height[order],
@@ -273,6 +357,10 @@ def _load_mass_flux(path: Path) -> MassFluxData:
 
 def _output_with_suffix(path: Path, suffix: str) -> Path:
     return path.with_name(f"{path.stem}_{suffix}{path.suffix}")
+
+
+def _section_output(path: Path, section: str) -> Path:
+    return _output_with_suffix(path, section)
 
 
 def _setup_axes(
@@ -349,40 +437,12 @@ def _compute_axis_limits(
     return AxisLimits(xlim=xlim, ylim=ylim)
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(
-        description="Plot mass flux versus half-height from a cylindrical_flux_surface.json file."
-    )
-    parser.add_argument(
-        "input",
-        nargs="?",
-        default="cylindrical_flux_surface.json",
-        help="Input cylindrical flux-surface JSON file (default: cylindrical_flux_surface.json).",
-    )
-    parser.add_argument(
-        "-o",
-        "--output",
-        default="mass_flux_vs_height.png",
-        help="Output image path (default: mass_flux_vs_height.png).",
-    )
-    parser.add_argument(
-        "--title",
-        default="Mass flux through cylindrical surfaces",
-        help="Plot title.",
-    )
-    parser.add_argument(
-        "--linear-y",
-        action="store_true",
-        help="Use a linear y-axis instead of symlog.",
-    )
-    args = parser.parse_args()
-
-    data = _load_mass_flux(Path(args.input))
-    title = args.title
-    if data.time_myr is not None:
-        title = f"{title}, t = {data.time_myr:.3f} Myr"
-
-    output = Path(args.output)
+def _plot_mass_flux_set(
+    data: MassFluxData,
+    output: Path,
+    title: str,
+    linear_y: bool,
+) -> list[Path]:
     if data.temperature is None:
         axis_limits = _compute_axis_limits(
             data.height_kpc,
@@ -397,11 +457,10 @@ def main() -> int:
                 (data.net, "net", "--"),
             ],
             title,
-            args.linear_y,
+            linear_y,
             axis_limits,
         )
-        print(f"wrote {output}")
-        return 0
+        return [output]
 
     temp = data.temperature
     net_by_temperature = temp.negative + temp.positive
@@ -431,7 +490,7 @@ def main() -> int:
             (total_net, "net", "--"),
         ],
         f"{title}: all temperature phases",
-        args.linear_y,
+        linear_y,
         total_axis_limits,
     )
     outputs.append(output)
@@ -442,7 +501,7 @@ def main() -> int:
         data.height_kpc,
         [(temp.negative[i], temp.labels[i], "-") for i in range(len(temp.labels))],
         f"{title}: inflows by temperature",
-        args.linear_y,
+        linear_y,
         axis_limits,
     )
     outputs.append(inflows_output)
@@ -453,7 +512,7 @@ def main() -> int:
         data.height_kpc,
         [(temp.positive[i], temp.labels[i], "-") for i in range(len(temp.labels))],
         f"{title}: outflows by temperature",
-        args.linear_y,
+        linear_y,
         axis_limits,
     )
     outputs.append(outflows_output)
@@ -464,7 +523,7 @@ def main() -> int:
         data.height_kpc,
         [(net_by_temperature[i], temp.labels[i], "-") for i in range(len(temp.labels))],
         f"{title}: net flux by temperature",
-        args.linear_y,
+        linear_y,
         axis_limits,
     )
     outputs.append(net_output)
@@ -480,10 +539,60 @@ def main() -> int:
                 (net_by_temperature[i], "net", "--"),
             ],
             f"{title}: {label}",
-            args.linear_y,
+            linear_y,
             axis_limits,
         )
         outputs.append(bin_output)
+
+    return outputs
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Plot mass flux versus half-height from a cylindrical_flux_surface.json file."
+    )
+    parser.add_argument(
+        "input",
+        nargs="?",
+        default="cylindrical_flux_surface.json",
+        help="Input cylindrical flux-surface JSON file (default: cylindrical_flux_surface.json).",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        default="mass_flux_vs_height.png",
+        help="Output image path (default: mass_flux_vs_height.png).",
+    )
+    parser.add_argument(
+        "--title",
+        default="Mass flux through cylindrical surfaces",
+        help="Plot title.",
+    )
+    parser.add_argument(
+        "--linear-y",
+        action="store_true",
+        help="Use a linear y-axis instead of symlog.",
+    )
+    args = parser.parse_args()
+
+    output = Path(args.output)
+    section_data = [
+        (section, _load_mass_flux(Path(args.input), section))
+        for section in GEOMETRIC_SECTIONS
+    ]
+    outputs: list[Path] = []
+    for section, data in section_data:
+        title = f"{args.title} ({section})"
+        if data.time_myr is not None:
+            title = f"{title}, t = {data.time_myr:.3f} Myr"
+        outputs.extend(
+            _plot_mass_flux_set(
+                data,
+                _section_output(output, section),
+                title,
+                args.linear_y,
+            )
+        )
 
     for path in outputs:
         print(f"wrote {path}")
