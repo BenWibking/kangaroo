@@ -16,6 +16,7 @@ A conforming runtime MUST expose and execute the kernel names listed below, with
 - `vorticity_mag`
 - `histogram1d_accumulate`
 - `histogram2d_accumulate`
+- `flux_surface_integral_accumulate`
 - `particle_load_field_chunk_f64`
 - `particle_cic_grid_accumulate`
 - `particle_cic_projection_accumulate`
@@ -151,22 +152,53 @@ Behavior:
 - CDF from histogram returns cumulative running sum, optionally normalized by total if total is positive.
 - CDF from samples returns sorted values and empirical cumulative fractions.
 
-## 8. Particle Field Access and Conversion
+## 8. Spherical Flux Surface Integration
 
-### 8.1 `particle_load_field_chunk_f64`
+`flux_surface_integral_accumulate` MUST:
+- Accumulate a four-component `float64` vector per requested radius and block:
+  mass flux, hydro energy flux, MHD energy flux, and passive scalar flux.
+- Accept a finite, positive radius or a finite, positive radius array.
+- Use the same spherical section area approximation as Quokka's
+  `sphericalSectionAreaInCell`.
+- Exclude coarse cells covered by finer AMR levels via covered-box masking.
+- Skip cells with non-positive density or zero radius from the coordinate origin.
+- Compute radial velocity from conserved momentum and density.
+- Use cell-centered `Bx`, `By`, and `Bz` magnetic fields directly. This is an
+  intentional deviation from the Quokka DiskGalaxy implementation, which
+  averages face-centered magnetic fields to the cell center before evaluating
+  the same flux formulas.
+- Sum block, level, and final outputs through the standard double-precision
+  graph reduction kernels.
+
+The output is laid out with radius as the outer axis and component as the inner
+axis. For each radius, the component order MUST be:
+1. `mass_flux_sphere`
+2. `hydro_energy_flux_sphere`
+3. `mhd_energy_flux_sphere`
+4. `passive_scalar_flux_sphere`
+
+Validation:
+- Every radius MUST be finite and positive.
+- Every radius MUST intersect at least one mesh block.
+- `gamma` MUST be finite and greater than one for the ideal-gas pressure path.
+- MHD mode MUST receive all three cell-centered magnetic components.
+
+## 9. Particle Field Access and Conversion
+
+### 9.1 `particle_load_field_chunk_f64`
 
 Behavior:
 - Reads one particle field chunk by chunk index.
 - Converts source numeric dtypes (`float32`, `float64`, `int64`) to `float64` output.
 - Errors on unsupported dtype or short payload.
 
-### 8.2 Particle dataset requirements
+### 9.2 Particle dataset requirements
 
 Particle kernels that read backend particle fields directly require plotfile-backed datasets.
 
 If backend does not support required particle access, operator MUST fail explicitly.
 
-## 9. Particle Boolean/Filter Operators
+## 10. Particle Boolean/Filter Operators
 
 Required semantics:
 - `particle_eq_mask`: exact equality against scalar.
@@ -182,7 +214,7 @@ Mask encoding:
 - Non-zero byte means true; zero means false.
 - API-level materialization converts mask bytes to boolean arrays.
 
-## 10. Particle Numeric Operators
+## 11. Particle Numeric Operators
 
 Required semantics:
 - `particle_subtract`: elementwise subtraction.
@@ -195,9 +227,9 @@ Required semantics:
 Reduction semantics:
 - Multi-chunk scalar reductions MUST support graph reduction trees via configured reduce kernels.
 
-## 11. Particle Histogram and Mode Operators
+## 12. Particle Histogram and Mode Operators
 
-### 11.1 `particle_histogram1d`
+### 12.1 `particle_histogram1d`
 
 Behavior:
 - Supports explicit edges.
@@ -205,7 +237,7 @@ Behavior:
 - Supports optional explicit per-sample weights.
 - Ignores non-finite samples and non-finite weights.
 
-### 11.2 `particle_topk_modes`
+### 12.2 `particle_topk_modes`
 
 Behavior:
 - Counts exact value frequencies.
@@ -213,9 +245,9 @@ Behavior:
 - Tie-break by descending value.
 - Output layout contains values and counts vectors of length `k`.
 
-## 12. Particle CIC AMR Deposition Operators
+## 13. Particle CIC AMR Deposition Operators
 
-### 12.1 `particle_cic_grid_accumulate`
+### 13.1 `particle_cic_grid_accumulate`
 
 Behavior:
 - Deposits particle mass on native AMR cell grid for each block.
@@ -224,7 +256,7 @@ Behavior:
 - Converts mass deposition to density-like quantity using cell volume.
 - Excludes cells in covered regions.
 
-### 12.2 `particle_cic_projection_accumulate`
+### 13.2 `particle_cic_projection_accumulate`
 
 Behavior:
 - Performs native deposition then distributes to output pixels by overlap.
@@ -232,24 +264,23 @@ Behavior:
 - Excludes covered regions.
 - Produces 2D accumulated mass map.
 
-## 13. Reduction Helper Kernels
+## 14. Reduction Helper Kernels
 
-### 13.1 `uniform_slice_add` and `uniform_slice_reduce`
+### 14.1 `uniform_slice_add` and `uniform_slice_reduce`
 
 Behavior:
 - Elementwise summation over input buffers.
 - Supports 4-byte and 8-byte floating-point accumulation modes.
 
-### 13.2 `uniform_slice_finalize`
+### 14.2 `uniform_slice_finalize`
 
 Behavior:
 - Combines sum and area buffers.
 - Produces normalized output using provided pixel area.
 - Emits NaN where area is zero.
 
-### 13.3 Particle scalar reductions
+### 14.3 Particle scalar reductions
 
 - `particle_int64_sum_reduce` sums int64 scalars.
 - `particle_scalar_min_reduce` computes finite minimum over scalar inputs.
 - `particle_scalar_max_reduce` computes finite maximum over scalar inputs.
-

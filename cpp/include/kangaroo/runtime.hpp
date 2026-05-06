@@ -13,6 +13,7 @@
 #include "kangaroo/runmeta.hpp"
 
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -21,6 +22,8 @@
 #include <vector>
 
 #include <hpx/include/lcos.hpp>
+#include <hpx/synchronization/mutex.hpp>
+#include <hpx/synchronization/recursive_mutex.hpp>
 
 namespace kangaroo {
 
@@ -37,7 +40,9 @@ struct DatasetHandle {
 
   void set_chunk(const ChunkRef& ref, HostView view);
   std::optional<HostView> get_chunk(const ChunkRef& ref) const;
+  std::vector<std::optional<HostView>> get_chunks(const std::vector<ChunkRef>& refs) const;
   bool has_chunk(const ChunkRef& ref) const;
+  std::size_t estimate_chunk_bytes(const ChunkRef& ref) const;
 
   template <typename Archive>
   void save(Archive& ar, unsigned) const {
@@ -56,6 +61,8 @@ struct DatasetHandle {
       } else if (auto plt = std::dynamic_pointer_cast<PlotfileBackend>(backend)) {
         is_plotfile = true;
         ar& is_memory& is_plotfile& is_openpmd& is_parthenon;
+        auto field_map = plt->field_map();
+        ar& field_map;
 #ifdef KANGAROO_USE_OPENPMD
       } else if (auto opmd = std::dynamic_pointer_cast<OpenPMDBackend>(backend)) {
         is_openpmd = true;
@@ -99,6 +106,9 @@ struct DatasetHandle {
         path = path.substr(7);
       }
       backend = std::make_shared<PlotfileBackend>(path);
+      std::map<int32_t, int32_t> field_map;
+      ar& field_map;
+      std::dynamic_pointer_cast<PlotfileBackend>(backend)->set_field_map(std::move(field_map));
     } else if (is_openpmd) {
 #ifdef KANGAROO_USE_OPENPMD
       backend = std::make_shared<OpenPMDBackend>(uri);
@@ -133,9 +143,12 @@ struct ChunkSlot {
 
 struct ChunkStore {
   using MapT = std::unordered_map<ChunkRef, ChunkSlot, ChunkRefHash, ChunkRefEq>;
+  using ConsumerMapT = std::unordered_map<ChunkRef, std::int64_t, ChunkRefHash, ChunkRefEq>;
+  using Mutex = hpx::recursive_mutex;
 
-  std::mutex mutex;
+  Mutex mutex;
   MapT data;
+  ConsumerMapT consumer_counts;
 };
 
 struct ExecutionContext {
@@ -193,7 +206,6 @@ class Runtime {
 
  private:
   int32_t next_field_id_ = 1000;
-  int32_t next_plan_id_ = 1;
   int32_t retained_output_run_id_ = 0;
   std::vector<int32_t> retained_output_run_ids_;
   int32_t preload_run_id_ = 0;
@@ -237,12 +249,22 @@ struct DataEvent {
   std::string op;
   std::string mode;
   std::string status;
+  std::string file;
   ChunkRef ref;
   int32_t locality = -1;
   int32_t target_locality = -1;
   int32_t worker = -1;
   std::string worker_label;
   std::size_t bytes = 0;
+  std::size_t estimated_bytes = 0;
+  int64_t file_offset = -1;
+  int32_t comp_start = -1;
+  int32_t comp_count = -1;
+  int32_t queue_depth = -1;
+  int32_t in_flight = -1;
+  int32_t concurrency = -1;
+  int64_t in_flight_bytes = -1;
+  int64_t byte_limit = -1;
   double ts = 0.0;
   double start = 0.0;
   double end = 0.0;
