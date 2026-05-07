@@ -17,6 +17,9 @@ from scripts.plotfile_cylindrical_flux_surface import (
     _flux_rows_and_derived as _cylindrical_flux_rows_and_derived,
 )
 from scripts.plot_cylindrical_flux_surface_mass_flux import main as _plot_cylindrical_main
+from scripts.plot_flux_surface_passive_scalar_flux import (
+    main as _plot_scalar_flux_main,
+)
 
 
 @dataclass(frozen=True)
@@ -273,3 +276,86 @@ def test_cylindrical_flux_surface_mass_flux_plot_writes_section_sets(
     assert _plot_cylindrical_main() == 0
     assert (tmp_path / "mass_flux_vs_height_walls.png").exists()
     assert (tmp_path / "mass_flux_vs_height_endcaps.png").exists()
+
+
+def test_flux_surface_passive_scalar_flux_plot_writes_temperature_sets(
+    tmp_path, monkeypatch
+) -> None:
+    input_json = tmp_path / "flux_surface.json"
+    output = tmp_path / "passive_scalar_flux_vs_radius.png"
+    payload = {
+        "time": None,
+        "fields": {"scalar": "scalar_0"},
+        "fluxes_by_radius": [
+            {
+                "radius_kpc": 1.0,
+                "fluxes": {"passive_scalar_flux_sphere": 4.0},
+                "flux_bins": {
+                    "negative": {"passive_scalar_flux_sphere": -1.0},
+                    "positive": {"passive_scalar_flux_sphere": 5.0},
+                },
+                "flux_bins_by_temperature": {
+                    "negative": [
+                        {
+                            "temperature_min": 0.0,
+                            "temperature_max": 10.0,
+                            "fluxes": {"passive_scalar_flux_sphere": -1.0},
+                        }
+                    ],
+                    "positive": [
+                        {
+                            "temperature_min": 0.0,
+                            "temperature_max": 10.0,
+                            "fluxes": {"passive_scalar_flux_sphere": 5.0},
+                        }
+                    ],
+                },
+            },
+            {
+                "radius_kpc": 2.0,
+                "fluxes": {"passive_scalar_flux_sphere": 6.0},
+                "flux_bins": {
+                    "negative": {"passive_scalar_flux_sphere": -3.0},
+                    "positive": {"passive_scalar_flux_sphere": 9.0},
+                },
+                "flux_bins_by_temperature": {
+                    "negative": [
+                        {
+                            "temperature_min": 0.0,
+                            "temperature_max": 10.0,
+                            "fluxes": {"passive_scalar_flux_sphere": -3.0},
+                        }
+                    ],
+                    "positive": [
+                        {
+                            "temperature_min": 0.0,
+                            "temperature_max": 10.0,
+                            "fluxes": {"passive_scalar_flux_sphere": 9.0},
+                        }
+                    ],
+                },
+            },
+        ],
+    }
+    input_json.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "plot_flux_surface_passive_scalar_flux.py",
+            str(input_json),
+            "-o",
+            str(output),
+        ],
+    )
+
+    assert _plot_scalar_flux_main() == 0
+    assert output.exists()
+    assert (
+        tmp_path / "passive_scalar_flux_vs_radius_inflows_by_temperature.png"
+    ).exists()
+    assert (
+        tmp_path / "passive_scalar_flux_vs_radius_outflows_by_temperature.png"
+    ).exists()
+    assert (
+        tmp_path / "passive_scalar_flux_vs_radius_net_by_temperature.png"
+    ).exists()
