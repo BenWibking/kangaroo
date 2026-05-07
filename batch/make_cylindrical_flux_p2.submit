@@ -2,10 +2,10 @@
 #SBATCH -t 00:15:00
 #SBATCH -A ast236
 #SBATCH -N 4
-#SBATCH -p gpu
+#SBATCH -p batch
 #SBATCH -J kangaroo-cylflux-p2
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=28
+#SBATCH --cpus-per-task=32
 
 set -euo pipefail
 
@@ -74,7 +74,7 @@ export SPACK_HPX_PREFIX="$(spack location -i hpx@1.11.0%gcc@14.2.0)"
 export LD_LIBRARY_PATH="$SPACK_HPX_PREFIX/lib64:${LD_LIBRARY_PATH:-}"
 
 NNODES="${SLURM_NNODES:-4}"
-CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-28}"
+CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-32}"
 if [[ "${SLURM_TRES_PER_TASK:-}" =~ (^|,)cpu=([0-9]+)(,|$) ]]; then
   CPUS_PER_TASK="${BASH_REMATCH[2]}"
   if [[ "${SLURM_CPUS_PER_TASK:-}" != "$CPUS_PER_TASK" ]]; then
