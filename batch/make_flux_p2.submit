@@ -10,8 +10,7 @@
 set -euo pipefail
 
 module load gcc/14.2.0
-
-: "${PLOTFILE:=/lustre/orion/ast236/proj-shared/wibking/MW_Gen1_Phase2/plt0426651}"
+: "${PLOTFILE:=/lustre/orion/ast236/proj-shared/wibking/MW_Gen1_Phase2/plt0221965}"
 : "${RMIN_KPC:=5.0}"
 : "${RMAX_KPC:=100.0}"
 : "${KANGAROO_FLUX_PROFILE:=production}"
