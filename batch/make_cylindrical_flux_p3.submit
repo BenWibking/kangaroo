@@ -11,7 +11,8 @@ set -euo pipefail
 
 module load gcc/14.2.0
 
-: "${PLOTFILE:=/lustre/orion/ast236/proj-shared/wibking/MW_Gen1_Phase3/plt0318882}"
+#: "${PLOTFILE:=/lustre/orion/ast236/proj-shared/wibking/MW_Gen1_Phase3/plt0318882}"
+: "${PLOTFILE:=/lustre/orion/ast236/proj-shared/wibking/noCGM/MW_Gen1_Phase3/plt0288007}"
 : "${RADIUS_KPC:=20.0}"
 : "${ZMIN_KPC:=0.1}"
 : "${ZMAX_KPC:=30.0}"
