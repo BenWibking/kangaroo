@@ -13,10 +13,10 @@ module load gcc/14.2.0
 
 : "${PLOTFILE:=/lustre/orion/ast236/proj-shared/wibking/noCGM_0.1uG/Phase0/plt0160060}"
 : "${OUTPUT_DIR:=toomre_q_noCGM_0.1uG_Phase0_plt0160060}"
-: "${R_MIN_KPC:=0.1}"
-: "${R_MAX_KPC:=20.0}"
+: "${R_MIN_KPC:=0.0}"
+: "${R_MAX_KPC:=17.5}"
 : "${DR_KPC:=0.25}"
-: "${Z_MAX_KPC:=4.0}"
+: "${Z_MAX_KPC:=1.0}"
 : "${GAMMA:=1.6666666666666667}"
 : "${OVERWRITE:=1}"
 

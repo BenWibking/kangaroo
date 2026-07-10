@@ -18,6 +18,7 @@ from scripts.plotfile_toomre_q import (
     _pick_field,
     _radial_edges,
     derive_toomre_profiles,
+    plot_annular_profiles,
     plot_toomre_profiles,
     profile_rows,
     write_profile_csv,
@@ -423,6 +424,7 @@ def test_plot_and_csv_contain_all_three_q_profiles(tmp_path: Path) -> None:
     rows = profile_rows(edges, profile)
     csv_path = tmp_path / "profile.csv"
     png_path = tmp_path / "profile.png"
+    annular_png_path = tmp_path / "annular_profile.png"
     write_profile_csv(csv_path, rows)
     plot_toomre_profiles(
         png_path,
@@ -430,8 +432,15 @@ def test_plot_and_csv_contain_all_three_q_profiles(tmp_path: Path) -> None:
         plotfile_name="plt00000",
         time_seconds=0.0,
     )
+    plot_annular_profiles(
+        annular_png_path,
+        profile,
+        plotfile_name="plt00000",
+        time_seconds=0.0,
+    )
 
     assert png_path.stat().st_size > 0
+    assert annular_png_path.stat().st_size > 0
     with csv_path.open(newline="", encoding="utf-8") as stream:
         reader = csv.DictReader(stream)
         assert set(

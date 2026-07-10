@@ -343,6 +343,72 @@ def plot_toomre_profiles(
     plt.close(fig)
 
 
+def plot_annular_profiles(
+    path: Path,
+    profile: dict[str, np.ndarray],
+    *,
+    plotfile_name: str,
+    time_seconds: float | None,
+) -> None:
+    radius_kpc = profile["radius"] / KPC_CM
+    surface_density = profile["surface_density"] * PC_CM**2 / MSUN_G
+    fig, axes = plt.subplots(
+        2,
+        1,
+        figsize=(7.2, 7.0),
+        sharex=True,
+        gridspec_kw={"height_ratios": [1.0, 1.25]},
+    )
+
+    sigma = np.asarray(surface_density, dtype=np.float64)
+    axes[0].plot(
+        radius_kpc,
+        np.ma.masked_where((~np.isfinite(sigma)) | (sigma <= 0.0), sigma),
+        label=r"$\Sigma$",
+        color="#0072B2",
+        marker="o",
+        markersize=3.0,
+        linewidth=1.6,
+    )
+    axes[0].set_ylabel(r"$\Sigma$ [$M_\odot$ pc$^{-2}$]")
+    axes[0].set_yscale("log")
+    axes[0].grid(True, which="both", alpha=0.2)
+    axes[0].legend(loc="best", frameon=False)
+
+    velocity_styles = (
+        ("alfven_speed", r"$v_A$", "#CC79A7", "-", "o"),
+        ("sound_speed", r"$c_s$", "#009E73", "--", "s"),
+        ("circular_speed", r"$v_c$", "#D55E00", "-.", "^"),
+        ("radial_dispersion", r"$\delta v_R$", "#56B4E9", ":", "D"),
+    )
+    for key, label, color, linestyle, marker in velocity_styles:
+        values = np.asarray(profile[key], dtype=np.float64) / 1.0e5
+        axes[1].plot(
+            radius_kpc,
+            np.ma.masked_where((~np.isfinite(values)) | (values <= 0.0), values),
+            label=label,
+            color=color,
+            linestyle=linestyle,
+            marker=marker,
+            markersize=3.0,
+            linewidth=1.6,
+        )
+    axes[1].set_xlabel("Galactocentric radius [kpc]")
+    axes[1].set_ylabel("Velocity [km/s]")
+    axes[1].set_yscale("log")
+    axes[1].set_xlim(float(radius_kpc[0]), float(radius_kpc[-1]))
+    axes[1].grid(True, which="both", alpha=0.2)
+    axes[1].legend(loc="best", frameon=False, ncols=2)
+
+    title = f"Annular Toomre inputs — {plotfile_name}"
+    if time_seconds is not None and math.isfinite(time_seconds):
+        title += f"  (t = {time_seconds / MYR_S:.2f} Myr)"
+    fig.suptitle(title)
+    fig.tight_layout()
+    fig.savefig(path, dpi=180)
+    plt.close(fig)
+
+
 def _domain_center(metadata: dict) -> tuple[float, float, float]:
     prob_lo = metadata.get("prob_lo")
     prob_hi = metadata.get("prob_hi")
@@ -509,8 +575,13 @@ def main(argv: list[str] | None = None) -> int:
             stem = f"{plotfile.name}_toomre_q"
             csv_path = output_dir / f"{stem}.csv"
             png_path = output_dir / f"{stem}.png"
+            annular_png_path = output_dir / f"{stem}_annular_profiles.png"
             if not args.overwrite:
-                existing = [str(path) for path in (csv_path, png_path) if path.exists()]
+                existing = [
+                    str(path)
+                    for path in (csv_path, png_path, annular_png_path)
+                    if path.exists()
+                ]
                 if existing:
                     raise FileExistsError(
                         "Refusing to overwrite existing output(s): " + ", ".join(existing)
@@ -525,7 +596,14 @@ def main(argv: list[str] | None = None) -> int:
                 plotfile_name=plotfile.name,
                 time_seconds=time_seconds,
             )
+            plot_annular_profiles(
+                annular_png_path,
+                profile,
+                plotfile_name=plotfile.name,
+                time_seconds=time_seconds,
+            )
             print(f"wrote {png_path}")
+            print(f"wrote {annular_png_path}")
             print(f"wrote {csv_path}")
         return 0
 
