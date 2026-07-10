@@ -361,10 +361,16 @@ def _radial_edges(args: argparse.Namespace) -> np.ndarray:
         dr = float(args.dr_kpc)
         if not math.isfinite(dr) or dr <= 0.0:
             raise ValueError("dr_kpc must be finite and positive")
-        bins_float = (rmax - rmin) / dr
-        bins = int(round(bins_float))
-        if bins < 3 or not math.isclose(bins_float, bins, rel_tol=1.0e-10, abs_tol=1.0e-10):
-            raise ValueError("dr_kpc must divide the radial interval into at least three bins")
+        span = rmax - rmin
+        full_bins = int(math.floor(span / dr))
+        edges_kpc = rmin + dr * np.arange(full_bins + 1, dtype=np.float64)
+        if math.isclose(edges_kpc[-1], rmax, rel_tol=1.0e-10, abs_tol=1.0e-10):
+            edges_kpc[-1] = rmax
+        else:
+            edges_kpc = np.append(edges_kpc, rmax)
+        if len(edges_kpc) < 4:
+            raise ValueError("dr_kpc must produce at least three radial bins")
+        return edges_kpc * KPC_CM
     if bins < 3:
         raise ValueError("bins must be at least three to compute epicyclic frequency")
     return np.linspace(rmin * KPC_CM, rmax * KPC_CM, bins + 1)

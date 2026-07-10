@@ -469,3 +469,14 @@ def test_cli_discovers_only_immediate_main_plotfiles_and_default_fields(tmp_path
     args = SimpleNamespace(r_min_kpc=0.5, r_max_kpc=16.0, bins=62, dr_kpc=None)
     edges = _radial_edges(args)
     np.testing.assert_allclose(np.diff(edges), 0.25 * 1.0e3 * 3.0856775814913673e18)
+
+
+def test_radial_edges_dr_allows_short_final_bin() -> None:
+    args = SimpleNamespace(r_min_kpc=0.1, r_max_kpc=20.0, bins=62, dr_kpc=0.25)
+    edges = _radial_edges(args) / (1.0e3 * 3.0856775814913673e18)
+
+    assert len(edges) == 81
+    np.testing.assert_allclose(edges[0], 0.1)
+    np.testing.assert_allclose(edges[-1], 20.0)
+    np.testing.assert_allclose(np.diff(edges[:-1]), 0.25)
+    np.testing.assert_allclose(edges[-1] - edges[-2], 0.15)
