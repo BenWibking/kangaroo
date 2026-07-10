@@ -21,6 +21,7 @@
 - Do not wrap Pixi toolchain discovery in a login shell (`bash -lc`): on macOS it can reorder `PATH` so `/opt/homebrew` precedes `$CONDA_PREFIX`. Use a non-login shell when one is required.
 - Before trusting native test failures, inspect `CMakeCache.txt` and linked libraries. `CMAKE_C_COMPILER`, `CMAKE_CXX_COMPILER`, `HPX_DIR`, `Boost_DIR`, HDF5, and hwloc must all resolve inside `.pixi/envs/pixi-hpx`; no Spack or Homebrew paths are acceptable.
 - Never reuse a CMake tree configured with a different HPX/compiler stack. Use a new build directory when changing environments.
+- Exception for HPC cluster batch runs: keep Slurm submit scripts that need the MPI parcelport on the Spack HPX launcher/runtime (for example, Spack `hpxrun.py` and its `LD_LIBRARY_PATH`). Do not rewrite those batch paths to `.pixi/envs/pixi-hpx`; the `pixi-hpx` guidance above is for configuring, building, installing, and testing the Kangaroo extensions.
 
 ## Coding Style & Naming Conventions
 - Python: PEP 8 style, 4-space indentation, type hints used throughout (`analysis/runtime.py` is a good reference).

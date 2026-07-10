@@ -16,12 +16,16 @@ pip = ">=25.3,<26"
 numpy = "*"
 matplotlib = "*"
 hdf5 = ">=1.14,<1.15"
-mpich = ">=4.3.2,<5"
 tqdm = ">=4.67.3,<5"
+
+[feature.mpi-tools.dependencies]
+mpich = ">=4.3.2,<5"
 
 [feature.pixi-hpx.dependencies.hpx]
 version = "==1.11.0"
 build = "system_*"
+
+[feature.spack-hpx]
 
 [pypi-dependencies]
 msgpack = "*"
@@ -30,13 +34,18 @@ scikit-build-core = ">=0.9.10"
 nanobind = ">=1.9"
 
 [environments]
-default = []
-pixi-hpx = ["pixi-hpx"]
+default = ["mpi-tools"]
+pixi-hpx = ["pixi-hpx", "mpi-tools"]
+spack-hpx = ["spack-hpx"]
 
 [tasks]
 configure = "bash -lc 'build_dir=${KANGAROO_BUILD_DIR:-.pixi/build}; cmake -S cpp -B \"$build_dir\" -DCMAKE_BUILD_TYPE=Release -DHPX_DIR=$(scripts/utils/detect_hpx.sh) -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -Dnanobind_DIR=$(python -m nanobind --cmake_dir) -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX -DPython_EXECUTABLE=$CONDA_PREFIX/bin/python'"
 configure-pixi-hpx = "bash -c 'build_dir=${KANGAROO_BUILD_DIR:-.pixi/build}; cmake -S cpp -B \"$build_dir\" -DCMAKE_BUILD_TYPE=Release -DHPX_DIR=$CONDA_PREFIX/lib/cmake/HPX -DCMAKE_PREFIX_PATH=$CONDA_PREFIX -DHDF5_ROOT=$CONDA_PREFIX -DHDF5_C_COMPILER_EXECUTABLE=$CONDA_PREFIX/bin/h5cc -Dnanobind_DIR=$(python -m nanobind --cmake_dir) -DCMAKE_INSTALL_PREFIX=$CONDA_PREFIX -DPython_EXECUTABLE=$CONDA_PREFIX/bin/python'"
+configure-spack-hpx = "scripts/utils/configure_spack_hpx.sh"
 build = "bash -lc 'build_dir=${KANGAROO_BUILD_DIR:-.pixi/build}; cmake --build \"$build_dir\" --parallel'"
+build-spack-hpx = "bash -c 'build_dir=${KANGAROO_BUILD_DIR:-.pixi/build-spack-hpx-mpi}; cmake --build \"$build_dir\" --parallel'"
 install = "bash -lc 'build_dir=${KANGAROO_BUILD_DIR:-.pixi/build}; cmake --install \"$build_dir\" --prefix $CONDA_PREFIX'"
+install-spack-hpx = "bash -c 'build_dir=${KANGAROO_BUILD_DIR:-.pixi/build-spack-hpx-mpi}; cmake --install \"$build_dir\" --prefix $CONDA_PREFIX'"
 test = "pytest -q"
+hpxrun-spack-hpx = "scripts/utils/hpxrun_spack_hpx.sh"
 plotfile_projection = "env LD_PRELOAD=$CONDA_PREFIX/lib/libtcmalloc_minimal.so.4 python scripts/plotfile_projection.py"
