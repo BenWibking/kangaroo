@@ -1,5 +1,5 @@
 #!/bin/bash
-#SBATCH -t 00:05:00
+#SBATCH -t 05:00:00
 #SBATCH -A ast236
 #SBATCH -N 1
 #SBATCH -p batch
@@ -11,8 +11,8 @@ set -euo pipefail
 
 module load gcc/14.2.0
 
-: "${PLOTFILE:=/lustre/orion/ast236/proj-shared/wibking/noCGM_0.1uG/Phase0/plt0160060}"
-: "${OUTPUT_DIR:=toomre_q_noCGM_0.1uG_Phase0_plt0160060}"
+: "${PLOTFILE:=/lustre/orion/ast236/proj-shared/wibking/noCGM_0.1uG/Phase0}"
+: "${OUTPUT_DIR:=toomre_q_noCGM_0.1uG_Phase0}"
 : "${R_MIN_KPC:=0.0}"
 : "${R_MAX_KPC:=17.5}"
 : "${DR_KPC:=0.25}"
