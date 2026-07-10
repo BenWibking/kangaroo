@@ -4798,6 +4798,202 @@ void register_default_kernels(KernelRegistry& registry) {
       });
   {
     struct Params {
+      std::array<double, 2> radial_range{0.0, 1.0};
+      std::array<double, 2> z_bounds{-1.0, 1.0};
+      std::array<double, 3> center{0.0, 0.0, 0.0};
+      int bins = 1;
+      int bytes_per_value = 8;
+      std::shared_ptr<const CoveredBoxListIR> covered_boxes;
+    };
+
+    auto decode_params = [](const msgpack::object& root) {
+      Params params;
+      auto decode_double_array = [](const msgpack::object* obj, auto& values) {
+        if (obj == nullptr || obj->type != msgpack::type::ARRAY ||
+            obj->via.array.size != values.size()) {
+          return;
+        }
+        for (std::size_t i = 0; i < values.size(); ++i) {
+          values[i] = obj->via.array.ptr[i].as<double>();
+        }
+      };
+      decode_double_array(find_msgpack_map_value(root, "radial_range"), params.radial_range);
+      decode_double_array(find_msgpack_map_value(root, "z_bounds"), params.z_bounds);
+      decode_double_array(find_msgpack_map_value(root, "center"), params.center);
+      if (const auto* bins = find_msgpack_map_value(root, "bins");
+          bins && (bins->type == msgpack::type::POSITIVE_INTEGER ||
+                   bins->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.bins = bins->as<int>();
+      }
+      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
+          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
+                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
+        params.bytes_per_value = bpv->as<int>();
+      }
+      params.covered_boxes = parse_covered_boxes_param(root);
+      return params;
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "toomre_profile_accumulate", .n_inputs = 8, .n_outputs = 1,
+                   .needs_neighbors = false},
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
+                        const NeighborViews&, std::span<HostView> outputs,
+                        std::span<const std::uint8_t> params_msgpack) {
+          constexpr std::size_t num_components = 7;
+          const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+          if (outputs.empty() || params.bins <= 0) {
+            return hpx::make_ready_future();
+          }
+          const std::size_t out_bytes =
+              static_cast<std::size_t>(params.bins) * num_components * sizeof(double);
+          if (outputs[0].data.size() != out_bytes) {
+            outputs[0].data.assign(out_bytes, 0);
+          } else {
+            std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
+          }
+
+          const double rmin = params.radial_range[0];
+          const double rmax = params.radial_range[1];
+          const double zmin = params.z_bounds[0];
+          const double zmax = params.z_bounds[1];
+          if (inputs.size() < 8 || block < 0 ||
+              static_cast<std::size_t>(block) >= level.boxes.size() ||
+              (params.bytes_per_value != 4 && params.bytes_per_value != 8) ||
+              !std::isfinite(rmin) || !std::isfinite(rmax) || rmin < 0.0 || rmax <= rmin ||
+              !std::isfinite(zmin) || !std::isfinite(zmax) || zmax <= zmin ||
+              std::any_of(params.center.begin(), params.center.end(),
+                          [](double value) { return !std::isfinite(value); })) {
+            return hpx::make_ready_future();
+          }
+
+          const auto& box = level.boxes.at(static_cast<std::size_t>(block));
+          const int nx = box.hi.x - box.lo.x + 1;
+          const int ny = box.hi.y - box.lo.y + 1;
+          const int nz = box.hi.z - box.lo.z + 1;
+          if (nx <= 0 || ny <= 0 || nz <= 0) {
+            return hpx::make_ready_future();
+          }
+
+          std::vector<HostGridView3D> input_views;
+          input_views.reserve(7);
+          for (std::size_t input_idx = 0; input_idx < 7; ++input_idx) {
+            input_views.emplace_back(
+                inputs[input_idx], nx, ny, nz, params.bytes_per_value);
+          }
+          const std::size_t logical_cells =
+              static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) *
+              static_cast<std::size_t>(nz);
+          if (inputs[7].data.size() < logical_cells * 3 * sizeof(double)) {
+            return hpx::make_ready_future();
+          }
+          auto read_gradient = [&](std::size_t logical_idx, std::size_t component) {
+            double value = std::numeric_limits<double>::quiet_NaN();
+            const std::size_t offset =
+                (logical_idx * 3 + component) * sizeof(double);
+            std::memcpy(&value, inputs[7].data.data() + offset, sizeof(double));
+            return value;
+          };
+          auto covered = [&](int gx, int gy, int gz) -> bool {
+            if (!params.covered_boxes) {
+              return false;
+            }
+            for (const auto& covered_box : *params.covered_boxes) {
+              if (covered_box_contains(covered_box, gx, gy, gz)) {
+                return true;
+              }
+            }
+            return false;
+          };
+          auto cell_edge = [&](int axis, int global_idx) -> double {
+            return level.geom.x0[axis] +
+                   static_cast<double>(global_idx - level.geom.index_origin[axis]) *
+                       level.geom.dx[axis];
+          };
+
+          const double inv_dr = static_cast<double>(params.bins) / (rmax - rmin);
+          const double dx = std::abs(level.geom.dx[0]);
+          const double dy = std::abs(level.geom.dx[1]);
+          auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+
+          for (int i = 0; i < nx; ++i) {
+            const int gi = box.lo.x + i;
+            const double x =
+                0.5 * (cell_edge(0, gi) + cell_edge(0, gi + 1));
+            const double rx = x - params.center[0];
+            for (int j = 0; j < ny; ++j) {
+              const int gj = box.lo.y + j;
+              const double y =
+                  0.5 * (cell_edge(1, gj) + cell_edge(1, gj + 1));
+              const double ry = y - params.center[1];
+              const double radius = std::sqrt(rx * rx + ry * ry);
+              if (radius < rmin || radius > rmax || radius <= 0.0) {
+                continue;
+              }
+              int radial_bin = radius == rmax
+                                   ? params.bins - 1
+                                   : static_cast<int>(std::floor((radius - rmin) * inv_dr));
+              if (radial_bin < 0 || radial_bin >= params.bins) {
+                continue;
+              }
+
+              for (int k = 0; k < nz; ++k) {
+                const int gk = box.lo.z + k;
+                if (covered(gi, gj, gk)) {
+                  continue;
+                }
+                const double cell_z0 = cell_edge(2, gk);
+                const double cell_z1 = cell_edge(2, gk + 1);
+                const double overlap =
+                    std::max(0.0, std::min(cell_z1, zmax) - std::max(cell_z0, zmin));
+                if (overlap <= 0.0) {
+                  continue;
+                }
+
+                const double rho = input_views[0].get_double_or(i, j, k);
+                const double momx = input_views[1].get_double_or(i, j, k);
+                const double momy = input_views[2].get_double_or(i, j, k);
+                const double internal_energy = input_views[3].get_double_or(i, j, k);
+                const double bx = input_views[4].get_double_or(i, j, k);
+                const double by = input_views[5].get_double_or(i, j, k);
+                const double bz = input_views[6].get_double_or(i, j, k);
+                const std::size_t logical_idx = input_views[0].logical_index(i, j, k);
+                const double grad_x = read_gradient(logical_idx, 0);
+                const double grad_y = read_gradient(logical_idx, 1);
+                if (!std::isfinite(rho) || rho <= 0.0 || !std::isfinite(momx) ||
+                    !std::isfinite(momy) || !std::isfinite(internal_energy) ||
+                    !std::isfinite(bx) || !std::isfinite(by) || !std::isfinite(bz) ||
+                    !std::isfinite(grad_x) || !std::isfinite(grad_y)) {
+                  continue;
+                }
+
+                const double volume = dx * dy * overlap;
+                const double mass = rho * volume;
+                const double radial_velocity =
+                    (rx * momx + ry * momy) / (radius * rho);
+                const double radial_gravity =
+                    (rx * grad_x + ry * grad_y) / radius;
+                if (!std::isfinite(radial_velocity) || !std::isfinite(radial_gravity)) {
+                  continue;
+                }
+                const std::size_t base =
+                    static_cast<std::size_t>(radial_bin) * num_components;
+                out[base] += mass;
+                out[base + 1] += internal_energy * volume;
+                out[base + 2] += (bx * bx + by * by + bz * bz) * volume;
+                out[base + 3] += mass * radial_velocity;
+                out[base + 4] += mass * radial_velocity * radial_velocity;
+                out[base + 5] += mass * radial_gravity;
+                out[base + 6] += volume;
+              }
+            }
+          }
+          return hpx::make_ready_future();
+        },
+        make_covered_box_params_preparer<Params>(decode_params));
+  }
+  {
+    struct Params {
       std::array<double, 2> range{0.0, 1.0};
       int bins = 1;
       int bytes_per_value = 4;
