@@ -4894,17 +4894,69 @@ void register_default_kernels(KernelRegistry& registry) {
             std::memcpy(&value, inputs[7].data.data() + offset, sizeof(double));
             return value;
           };
-          auto covered = [&](int gx, int gy, int gz) -> bool {
-            if (!params.covered_boxes) {
-              return false;
-            }
+          const std::size_t mask_nx = static_cast<std::size_t>(nx) + 1;
+          const std::size_t mask_ny = static_cast<std::size_t>(ny) + 1;
+          const std::size_t mask_nz = static_cast<std::size_t>(nz) + 1;
+          std::vector<int32_t> covered_mask;
+          auto mask_index = [=](int i, int j, int k) {
+            return (static_cast<std::size_t>(i) * mask_ny + static_cast<std::size_t>(j)) *
+                       mask_nz +
+                   static_cast<std::size_t>(k);
+          };
+          if (params.covered_boxes && !params.covered_boxes->empty()) {
+            covered_mask.assign(mask_nx * mask_ny * mask_nz, 0);
             for (const auto& covered_box : *params.covered_boxes) {
-              if (covered_box_contains(covered_box, gx, gy, gz)) {
-                return true;
+              const int lo[3] = {
+                  std::max(covered_box.lo[0], box.lo.x) - box.lo.x,
+                  std::max(covered_box.lo[1], box.lo.y) - box.lo.y,
+                  std::max(covered_box.lo[2], box.lo.z) - box.lo.z};
+              const int hi[3] = {
+                  std::min(covered_box.hi[0], box.hi.x) - box.lo.x + 1,
+                  std::min(covered_box.hi[1], box.hi.y) - box.lo.y + 1,
+                  std::min(covered_box.hi[2], box.hi.z) - box.lo.z + 1};
+              if (lo[0] >= hi[0] || lo[1] >= hi[1] || lo[2] >= hi[2]) {
+                continue;
+              }
+              for (int di = 0; di < 2; ++di) {
+                for (int dj = 0; dj < 2; ++dj) {
+                  for (int dk = 0; dk < 2; ++dk) {
+                    const int sign = ((di + dj + dk) % 2 == 0) ? 1 : -1;
+                    covered_mask[mask_index(di ? hi[0] : lo[0],
+                                            dj ? hi[1] : lo[1],
+                                            dk ? hi[2] : lo[2])] += sign;
+                  }
+                }
               }
             }
-            return false;
-          };
+            for (int i = 0; i < nx; ++i) {
+              for (int j = 0; j < ny; ++j) {
+                for (int k = 0; k < nz; ++k) {
+                  const auto idx = mask_index(i, j, k);
+                  if (i > 0) {
+                    covered_mask[idx] += covered_mask[mask_index(i - 1, j, k)];
+                  }
+                  if (j > 0) {
+                    covered_mask[idx] += covered_mask[mask_index(i, j - 1, k)];
+                  }
+                  if (k > 0) {
+                    covered_mask[idx] += covered_mask[mask_index(i, j, k - 1)];
+                  }
+                  if (i > 0 && j > 0) {
+                    covered_mask[idx] -= covered_mask[mask_index(i - 1, j - 1, k)];
+                  }
+                  if (i > 0 && k > 0) {
+                    covered_mask[idx] -= covered_mask[mask_index(i - 1, j, k - 1)];
+                  }
+                  if (j > 0 && k > 0) {
+                    covered_mask[idx] -= covered_mask[mask_index(i, j - 1, k - 1)];
+                  }
+                  if (i > 0 && j > 0 && k > 0) {
+                    covered_mask[idx] += covered_mask[mask_index(i - 1, j - 1, k - 1)];
+                  }
+                }
+              }
+            }
+          }
           auto cell_edge = [&](int axis, int global_idx) -> double {
             return level.geom.x0[axis] +
                    static_cast<double>(global_idx - level.geom.index_origin[axis]) *
@@ -4939,7 +4991,7 @@ void register_default_kernels(KernelRegistry& registry) {
 
               for (int k = 0; k < nz; ++k) {
                 const int gk = box.lo.z + k;
-                if (covered(gi, gj, gk)) {
+                if (!covered_mask.empty() && covered_mask[mask_index(i, j, k)] != 0) {
                   continue;
                 }
                 const double cell_z0 = cell_edge(2, gk);
