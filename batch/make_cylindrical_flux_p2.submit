@@ -2,27 +2,29 @@
 #SBATCH -t 00:15:00
 #SBATCH -A ast236
 #SBATCH -N 4
-#SBATCH -p gpu
-#SBATCH -J kangaroo-flux-p2
+#SBATCH -p batch
+#SBATCH -J kangaroo-cylflux-p2
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=28
+#SBATCH --cpus-per-task=32
 
 set -euo pipefail
 
 module load gcc/14.2.0
+
 : "${PLOTFILE:=/lustre/orion/ast236/proj-shared/wibking/MW_Gen1_Phase2/plt0221965}"
-: "${RMIN_KPC:=5.0}"
-: "${RMAX_KPC:=100.0}"
+: "${RADIUS_KPC:=5.0}"
+: "${ZMIN_KPC:=0.1}"
+: "${ZMAX_KPC:=30.0}"
 : "${KANGAROO_FLUX_PROFILE:=production}"
 
 case "$KANGAROO_FLUX_PROFILE" in
   production)
     : "${NBINS:=50}"
-    : "${OUTPUT_JSON:=flux_surface.json}"
+    : "${OUTPUT_JSON:=cylindrical_flux_surface.json}"
     ;;
   diagnostic)
     : "${NBINS:=8}"
-    : "${OUTPUT_JSON:=flux_surface.diagnostic.json}"
+    : "${OUTPUT_JSON:=cylindrical_flux_surface.diagnostic.json}"
     : "${KANGAROO_EVENT_LOG:=auto}"
     : "${KANGAROO_PROGRESS:=1}"
     ;;
@@ -32,13 +34,6 @@ case "$KANGAROO_FLUX_PROFILE" in
     ;;
 esac
 
-# Tuned for the streaming executor and plotfile loader:
-# - run on 1 TB GPU nodes; batch nodes on this cluster have been unstable here;
-# - one HPX locality per node, so Lustre bandwidth scales with node count;
-# - 16 block-bundle reads per node was the observed single-node saturation point;
-# - executor admission is per-locality and bounded by tasks, storage units, and bytes;
-# - the dedicated HPX I/O pool keeps blocking reads off the default compute pool;
-# - zero-copy plotfile reads avoid the old read-buffer-to-runtime-layout transpose copy.
 : "${KANGAROO_EXECUTOR_MODE:=streaming}"
 : "${KANGAROO_EXECUTOR_MAX_ACTIVE_TASKS_PER_LOCALITY:=128}"
 : "${KANGAROO_PLOTFILE_READ_CONCURRENCY:=16}"
@@ -60,9 +55,6 @@ export KANGAROO_PLOTFILE_IO_POOL
 export KANGAROO_PLOTFILE_IO_POOL_THREADS
 export KANGAROO_PLOTFILE_ZERO_COPY_READS
 
-# Progress is useful for coarse diagnosis and is cheap enough for timing runs.
-# JSON event logging is much heavier; enable it explicitly with
-# KANGAROO_EVENT_LOG=auto or a concrete output path.
 PROGRESS_ARGS=()
 if [[ "${KANGAROO_PROGRESS:-0}" == "1" ]]; then
   PROGRESS_ARGS+=(--progress)
@@ -70,7 +62,7 @@ fi
 if [[ -n "${KANGAROO_EVENT_LOG:-}" ]]; then
   mkdir -p event_logs
   if [[ "$KANGAROO_EVENT_LOG" == "1" || "$KANGAROO_EVENT_LOG" == "auto" ]]; then
-    KANGAROO_EVENT_LOG="$PWD/event_logs/flux_surface.${SLURM_JOB_ID:-manual}.events.jsonl"
+    KANGAROO_EVENT_LOG="$PWD/event_logs/cylindrical_flux_surface.${SLURM_JOB_ID:-manual}.events.jsonl"
   fi
   export KANGAROO_EVENT_LOG
 fi
@@ -82,7 +74,7 @@ export SPACK_HPX_PREFIX="$(spack location -i hpx@1.11.0%gcc@14.2.0)"
 export LD_LIBRARY_PATH="$SPACK_HPX_PREFIX/lib64:${LD_LIBRARY_PATH:-}"
 
 NNODES="${SLURM_NNODES:-4}"
-CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-28}"
+CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-32}"
 if [[ "${SLURM_TRES_PER_TASK:-}" =~ (^|,)cpu=([0-9]+)(,|$) ]]; then
   CPUS_PER_TASK="${BASH_REMATCH[2]}"
   if [[ "${SLURM_CPUS_PER_TASK:-}" != "$CPUS_PER_TASK" ]]; then
@@ -91,7 +83,6 @@ if [[ "${SLURM_TRES_PER_TASK:-}" =~ (^|,)cpu=([0-9]+)(,|$) ]]; then
   export SLURM_CPUS_PER_TASK="$CPUS_PER_TASK"
 fi
 
-# Avoid guard-page overhead and stack reservation pressure in many-task HPX runs.
 HPX_GUARD_PAGE_ARG=--hpx:ini=hpx.stacks.use_guard_pages=0
 export HPXRUN_ARGS="${HPXRUN_ARGS:+${HPXRUN_ARGS} }${HPX_GUARD_PAGE_ARG}"
 
@@ -115,6 +106,7 @@ echo "KANGAROO_PLOTFILE_IO_POOL_THREADS=${KANGAROO_PLOTFILE_IO_POOL_THREADS}"
 echo "KANGAROO_PLOTFILE_ZERO_COPY_READS=${KANGAROO_PLOTFILE_ZERO_COPY_READS}"
 echo "KANGAROO_EVENT_LOG=${KANGAROO_EVENT_LOG:-disabled}"
 echo "plotfile=${PLOTFILE}"
+echo "radius_kpc=${RADIUS_KPC}"
 echo "nbins=${NBINS}"
 echo "output_json=${OUTPUT_JSON}"
 
@@ -124,10 +116,11 @@ echo "output_json=${OUTPUT_JSON}"
   -l "$NNODES" \
   -t "$CPUS_PER_TASK" \
   "$PWD/.pixi/envs/default/bin/python" \
-  "$PWD/scripts/plotfile_flux_surface.py" \
+  "$PWD/scripts/plotfile_cylindrical_flux_surface.py" \
   -- \
   "$PLOTFILE" \
-  --rmin-kpc "$RMIN_KPC" --rmax-kpc "$RMAX_KPC" \
+  --radius-kpc "$RADIUS_KPC" \
+  --zmin-kpc "$ZMIN_KPC" --zmax-kpc "$ZMAX_KPC" \
   --nbins "$NBINS" \
   --temperature-bins 0,980,4126,7105,2.0e4,5.0e5,1.0e9 \
   --density gasDensity \

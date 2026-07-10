@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 
 import numpy as np
@@ -11,6 +12,13 @@ from scripts.plotfile_flux_surface import (
     _parse_temperature_bins,
     _pick_field,
     _validate_selected_fields,
+)
+from scripts.plotfile_cylindrical_flux_surface import (
+    _flux_rows_and_derived as _cylindrical_flux_rows_and_derived,
+)
+from scripts.plot_cylindrical_flux_surface_mass_flux import main as _plot_cylindrical_main
+from scripts.plot_flux_surface_passive_scalar_flux import (
+    main as _plot_scalar_flux_main,
 )
 
 
@@ -183,3 +191,171 @@ def test_flux_surface_json_includes_temperature_bins() -> None:
         "mass_flux_msun_per_yr"
     ] < 0.0
     assert "mass_flux_msun_per_yr_bins_by_temperature" in derived["mass_flux_msun_per_yr_by_radius"][0]
+
+
+def test_cylindrical_flux_surface_json_includes_geometric_sections() -> None:
+    heights = np.array([1.0], dtype=np.float64)
+    temperature_bins = np.array([0.0, 10.0, 20.0], dtype=np.float64)
+    values = np.zeros((1, 2, 2, 2, 4), dtype=np.float64)
+    values[0, 0, 0, 0] = np.array([-2.0, -3.0, -4.0, -5.0])
+    values[0, 0, 1, 1] = np.array([-7.0, -11.0, -13.0, -17.0])
+    values[0, 1, 0, 0] = np.array([19.0, 23.0, 29.0, 31.0])
+    values[0, 1, 1, 1] = np.array([37.0, 41.0, 43.0, 47.0])
+
+    rows, derived = _cylindrical_flux_rows_and_derived(
+        heights,
+        values,
+        pc_cm=1.0,
+        temperature_bins=temperature_bins,
+    )
+
+    assert rows[0]["flux_bins"]["negative"]["mass_flux_cylinder"] == -9.0
+    assert (
+        rows[0]["flux_bins_by_geometric_section"]["negative"]["endcaps"][
+            "mass_flux_cylinder"
+        ]
+        == -2.0
+    )
+    assert (
+        rows[0]["flux_bins_by_geometric_section"]["positive"]["walls"][
+            "mhd_energy_flux_cylinder"
+        ]
+        == 43.0
+    )
+    temp_row = rows[0]["flux_bins_by_temperature"]["positive"][1]
+    assert temp_row["temperature_min"] == 10.0
+    assert temp_row["fluxes"]["mass_flux_cylinder"] == 37.0
+    assert temp_row["fluxes_by_geometric_section"]["walls"]["mass_flux_cylinder"] == 37.0
+    assert derived["mass_flux_msun_per_yr_by_height"][0][
+        "mass_flux_msun_per_yr_bins_by_geometric_section"
+    ]["positive"]["walls"] > 0.0
+
+
+def test_cylindrical_flux_surface_mass_flux_plot_writes_section_sets(
+    tmp_path, monkeypatch
+) -> None:
+    input_json = tmp_path / "cylindrical_flux_surface.json"
+    output = tmp_path / "mass_flux_vs_height.png"
+    payload = {
+        "time": None,
+        "heights_kpc": [1.0, 2.0],
+        "derived": {
+            "mass_flux_msun_per_yr_by_height": [
+                {
+                    "height": 1.0,
+                    "height_kpc": 1.0,
+                    "mass_flux_msun_per_yr": 4.0,
+                    "mass_flux_msun_per_yr_bins_by_geometric_section": {
+                        "negative": {"walls": -1.0, "endcaps": -2.0},
+                        "positive": {"walls": 5.0, "endcaps": 8.0},
+                    },
+                },
+                {
+                    "height": 2.0,
+                    "height_kpc": 2.0,
+                    "mass_flux_msun_per_yr": 6.0,
+                    "mass_flux_msun_per_yr_bins_by_geometric_section": {
+                        "negative": {"walls": -3.0, "endcaps": -4.0},
+                        "positive": {"walls": 9.0, "endcaps": 12.0},
+                    },
+                },
+            ],
+        },
+    }
+    input_json.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "plot_cylindrical_flux_surface_mass_flux.py",
+            str(input_json),
+            "-o",
+            str(output),
+        ],
+    )
+
+    assert _plot_cylindrical_main() == 0
+    assert (tmp_path / "mass_flux_vs_height_walls.png").exists()
+    assert (tmp_path / "mass_flux_vs_height_endcaps.png").exists()
+
+
+def test_flux_surface_passive_scalar_flux_plot_writes_temperature_sets(
+    tmp_path, monkeypatch
+) -> None:
+    input_json = tmp_path / "flux_surface.json"
+    output = tmp_path / "passive_scalar_flux_vs_radius.png"
+    payload = {
+        "time": None,
+        "fields": {"scalar": "scalar_0"},
+        "fluxes_by_radius": [
+            {
+                "radius_kpc": 1.0,
+                "fluxes": {"passive_scalar_flux_sphere": 4.0},
+                "flux_bins": {
+                    "negative": {"passive_scalar_flux_sphere": -1.0},
+                    "positive": {"passive_scalar_flux_sphere": 5.0},
+                },
+                "flux_bins_by_temperature": {
+                    "negative": [
+                        {
+                            "temperature_min": 0.0,
+                            "temperature_max": 10.0,
+                            "fluxes": {"passive_scalar_flux_sphere": -1.0},
+                        }
+                    ],
+                    "positive": [
+                        {
+                            "temperature_min": 0.0,
+                            "temperature_max": 10.0,
+                            "fluxes": {"passive_scalar_flux_sphere": 5.0},
+                        }
+                    ],
+                },
+            },
+            {
+                "radius_kpc": 2.0,
+                "fluxes": {"passive_scalar_flux_sphere": 6.0},
+                "flux_bins": {
+                    "negative": {"passive_scalar_flux_sphere": -3.0},
+                    "positive": {"passive_scalar_flux_sphere": 9.0},
+                },
+                "flux_bins_by_temperature": {
+                    "negative": [
+                        {
+                            "temperature_min": 0.0,
+                            "temperature_max": 10.0,
+                            "fluxes": {"passive_scalar_flux_sphere": -3.0},
+                        }
+                    ],
+                    "positive": [
+                        {
+                            "temperature_min": 0.0,
+                            "temperature_max": 10.0,
+                            "fluxes": {"passive_scalar_flux_sphere": 9.0},
+                        }
+                    ],
+                },
+            },
+        ],
+    }
+    input_json.write_text(json.dumps(payload), encoding="utf-8")
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "plot_flux_surface_passive_scalar_flux.py",
+            str(input_json),
+            "-o",
+            str(output),
+        ],
+    )
+
+    assert _plot_scalar_flux_main() == 0
+    assert output.exists()
+    assert (
+        tmp_path / "passive_scalar_flux_vs_radius_inflows_by_temperature.png"
+    ).exists()
+    assert (
+        tmp_path / "passive_scalar_flux_vs_radius_outflows_by_temperature.png"
+    ).exists()
+    assert (
+        tmp_path / "passive_scalar_flux_vs_radius_net_by_temperature.png"
+    ).exists()
