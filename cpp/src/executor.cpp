@@ -594,6 +594,7 @@ ResolvedBufferSpec resolve_output_spec(const BufferSpecIR& spec,
 
 void finalize_output_buffer(ChunkBuffer& buffer, const BufferSpecIR& spec) {
   if (spec.shape_kind == ShapeRuleKind::kDynamic) {
+    if (!buffer.awaiting_dynamic_extent_commit()) return;
     const auto width = scalar_size(spec.scalar);
     if (width == 0 || buffer.data.size() % width != 0) {
       throw BufferContractError(BufferContractReason::kDescriptorStorageMismatch,

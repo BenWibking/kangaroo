@@ -344,7 +344,6 @@ NB_MODULE(_core, m) {
   });
   m.def("test_chunk_buffer_dynamic_roundtrip", [](std::uint64_t capacity, std::uint64_t extent) {
     auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(kangaroo::ScalarType::kF64, capacity);
-    buffer.data.resize(extent * sizeof(double));
     buffer.commit_dynamic_extent(extent);
 
     std::vector<char> archive_bytes;
@@ -721,7 +720,8 @@ NB_MODULE(_core, m) {
            [](kangaroo::Runtime& self, int32_t step, int16_t level, int32_t field,
               int32_t version, int32_t block, kangaroo::DatasetHandle* dataset) {
              auto view = self.get_task_chunk(step, level, field, version, block, dataset);
-             return nb::bytes(reinterpret_cast<const char*>(view.data.data()), view.data.size());
+             const auto bytes = view.byte_view();
+             return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
            },
            nb::arg("step"),
            nb::arg("level"),

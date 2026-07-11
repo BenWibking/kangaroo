@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import numpy as np
 import pytest
 
 from analysis import _core
@@ -14,6 +15,7 @@ from analysis.buffer import (
     dtype_from_numpy,
     numpy_dtype,
 )
+from analysis.dataset import Dataset
 
 
 @pytest.mark.parametrize(
@@ -73,6 +75,40 @@ def test_committed_dynamic_buffer_roundtrips_by_visible_size(extent: int) -> Non
         visible_bytes,
         visible_bytes,
     )
+
+
+@pytest.mark.parametrize(
+    ("alias", "canonical", "numpy_type"),
+    [
+        ("uint8", "u8", np.uint8),
+        ("int64", "i64", np.int64),
+        ("float32", "f32", np.float32),
+        ("float64", "f64", np.float64),
+    ],
+)
+def test_dataset_set_chunk_accepts_dtype_aliases(
+    alias: str, canonical: str, numpy_type: type[np.generic]
+) -> None:
+    class Handle:
+        calls: list[tuple[object, ...]] = []
+
+        def set_chunk(self, *args: object) -> None:
+            self.calls.append(args)
+
+    dataset = Dataset.__new__(Dataset)
+    dataset._h = Handle()
+    array = np.asarray([1, 2], dtype=numpy_type)
+
+    dataset.set_chunk(field=1, block=2, data=array, dtype=alias)
+    dataset.set_chunk(
+        field=1,
+        block=2,
+        data=array.tobytes(),
+        dtype=alias,
+        shape=array.shape,
+    )
+
+    assert [call[4] for call in dataset._h.calls] == [canonical, canonical]
 
 
 def test_backend_chunk_bounds_follow_particle_records_and_reduce_inputs() -> None:

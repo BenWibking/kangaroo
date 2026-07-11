@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from . import _core  # type: ignore
-from .buffer import DType, dtype_from_numpy, numpy_dtype
+from .buffer import DType, dtype_from_numpy, numpy_dtype, parse_dtype_tag
 
 
 @dataclass(frozen=True)
@@ -358,7 +358,7 @@ class Dataset:
         if isinstance(data, np.ndarray):
             array = np.ascontiguousarray(data)
             inferred_dtype = dtype_from_numpy(array.dtype)
-            if dtype is not None and DType(dtype) is not inferred_dtype:
+            if dtype is not None and parse_dtype_tag(dtype) is not inferred_dtype:
                 raise ValueError("explicit dtype does not match NumPy array dtype")
             if shape is not None and tuple(shape) != tuple(array.shape):
                 raise ValueError("explicit shape does not match NumPy array shape")
@@ -380,7 +380,7 @@ class Dataset:
             return
         if dtype is None or shape is None:
             raise ValueError("raw-byte chunk writes require dtype and shape, or opaque=True")
-        self._h.set_chunk(field, version, block, raw, DType(dtype).value, list(shape))
+        self._h.set_chunk(field, version, block, raw, parse_dtype_tag(dtype).value, list(shape))
 
 
 def _resolve_dataset_uri(path_or_uri: str) -> str:

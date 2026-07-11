@@ -585,6 +585,9 @@ class ChunkBuffer {
     return data.size();
   }
   std::size_t capacity_bytes() const noexcept { return data.size(); }
+  bool awaiting_dynamic_extent_commit() const noexcept {
+    return dynamic_capacity_elements_.has_value() && !dynamic_extent_committed_;
+  }
   std::span<const std::uint8_t> byte_view() const noexcept { return {data.data(), bytes()}; }
   std::span<std::uint8_t> mutable_byte_view() {
     data.detach();
@@ -620,7 +623,7 @@ class ChunkBuffer {
   template <typename T> ArrayView<T> mutable_array() { return mutable_view<T, 1>(); }
 
   void commit_dynamic_extent(std::uint64_t elements) {
-    if (!dynamic_capacity_elements_ || desc_.rank != 1 || desc_.extents[0] != 0) {
+    if (!dynamic_capacity_elements_ || desc_.rank != 1 || dynamic_extent_committed_) {
       throw BufferContractError(BufferContractReason::kInvalidDynamicResize,
                                 "buffer is not awaiting a dynamic extent commit");
     }
@@ -629,16 +632,19 @@ class ChunkBuffer {
                                 "dynamic extent exceeds its declared upper bound");
     }
     desc_.extents[0] = elements;
+    dynamic_extent_committed_ = true;
   }
 
   template <typename Archive>
   void save(Archive& ar, unsigned) const {
-    ar& data& desc_& dynamic_capacity_elements_;
+    const auto serialized_bytes = dynamic_extent_committed_ ? bytes() : data.size();
+    auto visible_data = data.slice(0, serialized_bytes);
+    ar& visible_data& desc_& dynamic_capacity_elements_& dynamic_extent_committed_;
   }
 
   template <typename Archive>
   void load(Archive& ar, unsigned) {
-    ar& data& desc_& dynamic_capacity_elements_;
+    ar& data& desc_& dynamic_capacity_elements_& dynamic_extent_committed_;
     if (dynamic_capacity_elements_) {
       if (desc_.rank != 1) {
         throw BufferContractError(BufferContractReason::kInvalidExtent,
@@ -649,7 +655,7 @@ class ChunkBuffer {
                                   "dynamic extent exceeds capacity after deserialization");
       }
       const auto expected = checked_multiply(desc_.extents[0], scalar_size(desc_.scalar));
-      if (expected != data.size()) {
+      if (dynamic_extent_committed_ && expected != data.size()) {
         throw BufferContractError(BufferContractReason::kDescriptorStorageMismatch,
                                   "dynamic buffer extent/storage mismatch after deserialization");
       }
@@ -679,6 +685,7 @@ class ChunkBuffer {
 
   BufferDesc desc_;
   std::optional<std::uint64_t> dynamic_capacity_elements_;
+  bool dynamic_extent_committed_ = false;
 };
 
 template <typename T>
