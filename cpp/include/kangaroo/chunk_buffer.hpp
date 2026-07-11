@@ -178,6 +178,9 @@ struct BufferDesc {
       std::uint64_t expected = scalar_size(scalar);
       for (std::size_t pos = 0; pos < rank; ++pos) {
         const auto axis = order[pos];
+        if (extents[axis] == 1) {
+          continue;
+        }
         if (strides_bytes[axis] != static_cast<std::int64_t>(expected)) {
           throw BufferContractError(BufferContractReason::kInvalidExtent,
                                     "buffer layout must be a dense stride permutation");

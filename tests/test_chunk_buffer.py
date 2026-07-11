@@ -32,6 +32,15 @@ def test_contiguous_descriptors(dtype: str, size: int) -> None:
     }
 
 
+@pytest.mark.parametrize("extents", [(2, 1, 1), (2, 1, 3)])
+def test_contiguous_descriptors_accept_singleton_axes(
+    extents: tuple[int, ...],
+) -> None:
+    desc = _core.test_chunk_buffer_descriptor("f64", list(extents), "contiguous")
+    assert desc["extents"] == list(extents)
+    assert desc["elements"] == 2 * extents[-1]
+
+
 def test_opaque_descriptor_is_rank_one_bytes() -> None:
     assert _core.test_chunk_buffer_descriptor("opaque", [7], "contiguous")["bytes"] == 7
 

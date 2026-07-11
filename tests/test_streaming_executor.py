@@ -44,6 +44,65 @@ def _set_scalar(ds, *, field: int, block: int, value: float) -> None:
     ds._h.set_chunk_ref(0, 0, field, 0, block, arr.tobytes(order="C"), "f64", [1, 1, 1])
 
 
+def _write_single_fab_plotfile(path) -> None:
+    level = path / "Level_0"
+    level.mkdir(parents=True)
+    (path / "Header").write_text(
+        "\n".join(
+            [
+                "HyperCLaw-V1.1",
+                "1",
+                "density",
+                "3",
+                "0.0",
+                "0",
+                "0 0 0",
+                "2 1 3",
+                "((0,0,0) (1,0,2) (0,0,0))",
+                "0",
+                "1 1 1",
+                "0",
+                "0",
+                "0 1 0.0",
+                "0",
+                "0 2",
+                "0 1",
+                "0 3",
+                "Level_0/Cell",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (level / "Cell_H").write_text(
+        "\n".join(
+            [
+                "1",
+                "1",
+                "1",
+                "0",
+                "(1 0",
+                "((0,0,0) (1,0,2) (0,0,0))",
+                ")",
+                "1",
+                "FabOnDisk: Cell_D_00000 0",
+                "1,1",
+                "0,",
+                "1,1",
+                "0,",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    fab_header = (
+        "FAB ((8, (64 11 52 0 1 12 0 1023)),(8, (8 7 6 5 4 3 2 1)))"
+        "((0,0,0) (1,0,2) (0,0,0)) 1\n"
+    ).encode("ascii")
+    values = np.arange(6, dtype=np.float64)
+    (level / "Cell_D_00000").write_bytes(fab_header + values.tobytes())
+
+
 def _max_base_task_concurrency(events: list[dict]) -> int:
     active: set[str] = set()
     max_active = 0
@@ -264,6 +323,46 @@ def test_streaming_executor_accounts_like_input_output_bytes(tmp_path, monkeypat
     max_active = _max_base_task_concurrency(events)
     assert max_active > 0
     assert max_active <= 2
+
+
+def test_streaming_executor_accounts_plotfile_like_input_output_bytes(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MODE", "streaming")
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MAX_OUTPUT_BYTES_PER_LOCALITY", "48")
+
+    plotfile = tmp_path / "plt00000"
+    _write_single_fab_plotfile(plotfile)
+    rt = Runtime()
+    ds = open_dataset(str(plotfile), runtime=rt, step=0, level=0)
+    runmeta = ds.get_runmeta()
+    source = ds.field_id("density")
+    output = 43512
+
+    stage = Stage(name="plotfile_expr")
+    stage.map_blocks(
+        name="plotfile_identity",
+        kernel="field_expr",
+        domain=Domain(step=0, level=0),
+        inputs=[FieldRef(source)],
+        outputs=[OutputRef(FieldRef(output), BufferSpec(DType.F64, LikeInputShape(0)))],
+        deps={"kind": "None"},
+        params={"expression": "density", "variables": ["density"]},
+    )
+    rt.run(Plan(stages=[stage]), runmeta=runmeta, dataset=ds)
+
+    got = rt.get_task_chunk_array(
+        step=0,
+        level=0,
+        field=output,
+        version=0,
+        block=0,
+        shape=(2, 1, 3),
+        dtype=np.float64,
+        dataset=ds,
+    )
+    expected = np.arange(6, dtype=np.float64).reshape(3, 1, 2).transpose(2, 1, 0)
+    np.testing.assert_array_equal(got, expected)
 
 
 def test_streaming_executor_accounts_dynamic_like_input_capacity(tmp_path, monkeypatch) -> None:
