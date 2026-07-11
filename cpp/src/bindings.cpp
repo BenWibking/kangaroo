@@ -319,12 +319,23 @@ NB_MODULE(_core, m) {
   m.def("test_chunk_buffer_cow", []() {
     const std::array<std::uint64_t, 1> extents{3};
     auto original = kangaroo::ChunkBuffer::allocate(
-        kangaroo::BufferDesc::contiguous(kangaroo::ScalarType::kI64, extents),
-        kangaroo::InitPolicy::kZero);
+        kangaroo::BufferDesc::contiguous(kangaroo::ScalarType::kI64, extents));
     original.mutable_array<std::int64_t>()(1) = 7;
     auto copy = original;
     copy.mutable_array<std::int64_t>()(1) = 11;
     return nb::make_tuple(original.array<std::int64_t>()(1), copy.array<std::int64_t>()(1));
+  });
+  m.def("test_chunk_buffer_init_policy", [](std::uint64_t elements) {
+    const std::array<std::uint64_t, 1> extents{elements};
+    const auto desc = kangaroo::BufferDesc::contiguous(kangaroo::ScalarType::kU8, extents);
+    auto uninitialized = kangaroo::ChunkBuffer::allocate(
+        desc, kangaroo::InitPolicy::kUninitialized);
+    auto zeroed = kangaroo::ChunkBuffer::allocate(desc, kangaroo::InitPolicy::kZero);
+    const bool all_zero = std::all_of(
+        zeroed.data.cbegin(), zeroed.data.cend(),
+        [](std::uint8_t value) { return value == std::uint8_t{0}; });
+    return nb::make_tuple(
+        uninitialized.data.uses_raw_storage(), zeroed.data.uses_raw_storage(), all_zero);
   });
   m.def("test_chunk_buffer_dynamic", [](std::uint64_t capacity, std::uint64_t extent) {
     auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(kangaroo::ScalarType::kF64, capacity);

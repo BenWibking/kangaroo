@@ -252,38 +252,60 @@ struct BufferDesc {
 };
 
 class SharedByteBuffer {
+ private:
+  struct UninitializedStorageTag {};
+  explicit SharedByteBuffer(UninitializedStorageTag) noexcept {}
+
  public:
   using container_type = std::vector<std::uint8_t>;
   using value_type = container_type::value_type;
   using size_type = container_type::size_type;
-  using iterator = container_type::iterator;
-  using const_iterator = container_type::const_iterator;
+  using iterator = value_type*;
+  using const_iterator = const value_type*;
 
-  SharedByteBuffer() : data_(std::make_shared<container_type>()) {}
+  SharedByteBuffer() : vector_data_(std::make_shared<container_type>()) {}
   explicit SharedByteBuffer(container_type data)
-      : data_(std::make_shared<container_type>(std::move(data))) {}
+      : vector_data_(std::make_shared<container_type>(std::move(data))) {}
+
+  static SharedByteBuffer allocate_uninitialized(size_type count) {
+    SharedByteBuffer out(UninitializedStorageTag{});
+    if (count != 0) {
+      out.raw_data_ = std::shared_ptr<std::uint8_t[]>(
+          new std::uint8_t[count], std::default_delete<std::uint8_t[]>());
+    }
+    out.raw_size_ = count;
+    out.raw_capacity_ = count;
+    return out;
+  }
 
   SharedByteBuffer& operator=(container_type data) {
-    data_ = std::make_shared<container_type>(std::move(data));
-    offset_ = 0;
-    size_ = npos;
+    reset_vector(std::move(data));
     return *this;
   }
 
   const std::uint8_t* data() const noexcept {
-    return data_ ? data_->data() + start_offset() : nullptr;
+    const auto* base = storage_data();
+    return base ? base + start_offset() : nullptr;
   }
   std::uint8_t* data() { return mutable_data(); }
-  std::uint8_t* mutable_data() { detach(); return data_->data(); }
+  std::uint8_t* mutable_data() {
+    detach();
+    return vector_data_ ? vector_data_->data() : raw_data_.get();
+  }
   bool empty() const noexcept { return size() == 0; }
   size_type size() const noexcept { return visible_size(); }
+  bool uses_raw_storage() const noexcept { return !vector_data_; }
   bool is_shared_or_sliced() const noexcept {
-    return data_ && (data_.use_count() != 1 || start_offset() != 0 || visible_size() != data_->size());
+    return storage_use_count() != 1 || start_offset() != 0 ||
+           visible_size() != storage_size();
   }
 
   SharedByteBuffer slice(size_type offset, size_type count) const {
     SharedByteBuffer out;
-    out.data_ = data_;
+    out.vector_data_ = vector_data_;
+    out.raw_data_ = raw_data_;
+    out.raw_size_ = raw_size_;
+    out.raw_capacity_ = raw_capacity_;
     const auto visible = size();
     offset = std::min(offset, visible);
     count = std::min(count, visible - offset);
@@ -292,70 +314,137 @@ class SharedByteBuffer {
     return out;
   }
 
-  void clear() { detach(); data_->clear(); }
-  void resize(size_type count) { detach(); data_->resize(count); }
-  void resize(size_type count, value_type value) { detach(); data_->resize(count, value); }
-  void assign(size_type count, value_type value) { detach(); data_->assign(count, value); }
+  void clear() {
+    detach();
+    reset_vector({});
+  }
+  void resize(size_type count) {
+    detach();
+    if (vector_data_) {
+      vector_data_->resize(count);
+    } else {
+      resize_raw(count, value_type{});
+    }
+  }
+  void resize(size_type count, value_type value) {
+    detach();
+    if (vector_data_) {
+      vector_data_->resize(count, value);
+    } else {
+      resize_raw(count, value);
+    }
+  }
+  void assign(size_type count, value_type value) {
+    detach();
+    materialize_vector();
+    vector_data_->assign(count, value);
+  }
   template <class InputIt> void assign(InputIt first, InputIt last) {
     detach();
-    data_->assign(first, last);
+    materialize_vector();
+    vector_data_->assign(first, last);
   }
-  iterator begin() { detach(); return data_->begin(); }
-  iterator end() { detach(); return data_->end(); }
-  const_iterator begin() const {
-    return data_ ? data_->begin() + static_cast<std::ptrdiff_t>(start_offset())
-                 : empty_storage().begin();
+  iterator begin() {
+    detach();
+    return mutable_data();
   }
-  const_iterator end() const { return begin() + static_cast<std::ptrdiff_t>(size()); }
+  iterator end() {
+    auto* first = begin();
+    return size() == 0 ? first : first + size();
+  }
+  const_iterator begin() const { return data(); }
+  const_iterator end() const {
+    const auto* first = begin();
+    return size() == 0 ? first : first + size();
+  }
   const_iterator cbegin() const { return begin(); }
   const_iterator cend() const { return end(); }
-  container_type& mutable_vector() { detach(); return *data_; }
-  const container_type& vector() const { return data_ ? *data_ : empty_storage(); }
+  container_type& mutable_vector() {
+    detach();
+    materialize_vector();
+    return *vector_data_;
+  }
+  const container_type& vector() const {
+    const_cast<SharedByteBuffer*>(this)->materialize_vector();
+    return *vector_data_;
+  }
 
   void detach() {
-    if (!data_) {
-      data_ = std::make_shared<container_type>();
-      offset_ = 0;
-      size_ = npos;
-      return;
-    }
     if (is_shared_or_sliced()) {
       const auto* visible = std::as_const(*this).data();
-      data_ = std::make_shared<container_type>(visible, visible + size());
-      offset_ = 0;
-      size_ = npos;
+      container_type copy;
+      if (size() != 0) copy.assign(visible, visible + size());
+      reset_vector(std::move(copy));
     }
   }
 
   template <typename Archive>
   void save(Archive& ar, unsigned) const {
-    container_type visible(data(), data() + size());
+    container_type visible;
+    if (size() != 0) visible.assign(data(), data() + size());
     ar& visible;
   }
   template <typename Archive>
   void load(Archive& ar, unsigned) {
     container_type visible;
     ar& visible;
-    data_ = std::make_shared<container_type>(std::move(visible));
-    offset_ = 0;
-    size_ = npos;
+    reset_vector(std::move(visible));
   }
   HPX_SERIALIZATION_SPLIT_MEMBER()
 
  private:
-  static const container_type& empty_storage() {
-    static const container_type empty;
-    return empty;
+  void reset_vector(container_type data) {
+    vector_data_ = std::make_shared<container_type>(std::move(data));
+    raw_data_.reset();
+    raw_size_ = 0;
+    raw_capacity_ = 0;
+    offset_ = 0;
+    size_ = npos;
+  }
+  void materialize_vector() {
+    if (vector_data_) return;
+    container_type data;
+    if (raw_size_ != 0) data.assign(raw_data_.get(), raw_data_.get() + raw_size_);
+    vector_data_ = std::make_shared<container_type>(std::move(data));
+    raw_data_.reset();
+    raw_size_ = 0;
+    raw_capacity_ = 0;
+  }
+  void resize_raw(size_type count, value_type value) {
+    const auto old_size = raw_size_;
+    if (count > raw_capacity_) {
+      auto replacement = std::shared_ptr<std::uint8_t[]>(
+          new std::uint8_t[count], std::default_delete<std::uint8_t[]>());
+      if (old_size != 0) std::copy_n(raw_data_.get(), old_size, replacement.get());
+      raw_data_ = std::move(replacement);
+      raw_capacity_ = count;
+    }
+    if (count > old_size) {
+      std::fill(raw_data_.get() + old_size, raw_data_.get() + count, value);
+    }
+    raw_size_ = count;
+  }
+  const std::uint8_t* storage_data() const noexcept {
+    return vector_data_ ? vector_data_->data() : raw_data_.get();
+  }
+  size_type storage_size() const noexcept {
+    return vector_data_ ? vector_data_->size() : raw_size_;
+  }
+  long storage_use_count() const noexcept {
+    if (vector_data_) return vector_data_.use_count();
+    return raw_data_ ? raw_data_.use_count() : 1;
   }
   static constexpr size_type npos = std::numeric_limits<size_type>::max();
-  size_type start_offset() const noexcept { return data_ ? std::min(offset_, data_->size()) : 0; }
+  size_type start_offset() const noexcept { return std::min(offset_, storage_size()); }
   size_type visible_size() const noexcept {
-    if (!data_) return 0;
-    const auto available = data_->size() - start_offset();
+    const auto available = storage_size() - start_offset();
     return size_ == npos ? available : std::min(size_, available);
   }
 
-  std::shared_ptr<container_type> data_;
+  std::shared_ptr<container_type> vector_data_;
+  std::shared_ptr<std::uint8_t[]> raw_data_;
+  size_type raw_size_ = 0;
+  size_type raw_capacity_ = 0;
   size_type offset_ = 0;
   size_type size_ = npos;
 };
@@ -445,10 +534,13 @@ class ChunkBuffer {
       throw BufferContractError(BufferContractReason::kArithmeticOverflow,
                                 "buffer does not fit in host address space");
     }
-    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(bytes64));
-    if (init == InitPolicy::kZero) std::fill(bytes.begin(), bytes.end(), std::uint8_t{0});
     ChunkBuffer out;
-    out.data = SharedByteBuffer(std::move(bytes));
+    const auto bytes = static_cast<std::size_t>(bytes64);
+    if (init == InitPolicy::kZero) {
+      out.data = SharedByteBuffer(std::vector<std::uint8_t>(bytes, std::uint8_t{0}));
+    } else {
+      out.data = SharedByteBuffer::allocate_uninitialized(bytes);
+    }
     out.desc_ = desc;
     out.desc_.validate(out.data.size());
     return out;

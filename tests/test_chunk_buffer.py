@@ -46,6 +46,10 @@ def test_mutating_a_copy_detaches_storage() -> None:
     assert _core.test_chunk_buffer_cow() == (7, 11)
 
 
+def test_init_policy_selects_uninitialized_or_zeroed_storage() -> None:
+    assert _core.test_chunk_buffer_init_policy(4096) == (True, False, True)
+
+
 def test_dynamic_extent_commit() -> None:
     assert _core.test_chunk_buffer_dynamic(10, 3) == (3, 24, 80)
     with pytest.raises(RuntimeError, match="upper bound"):
