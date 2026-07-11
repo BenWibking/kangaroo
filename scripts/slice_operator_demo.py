@@ -105,7 +105,13 @@ def main() -> int:
             )
             data = make_synthetic_field(bx, by, bz, dx, x0_block)
             block_data.append(data)
-            ds.set_chunk(field=field, block=block_id, data=data.astype(np.float32).tobytes(order="C"))
+            ds.set_chunk(
+                field=field,
+                block=block_id,
+                data=data.astype(np.float32).tobytes(order="C"),
+                dtype="f32",
+                shape=data.shape,
+            )
 
         axis = "z"
         k = nz // 2

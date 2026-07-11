@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
 import pytest
@@ -7,11 +8,20 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DESCRIPTOR_MIGRATED_CLIS = (
+    "scripts/plotfile_slice.py",
     "scripts/plotfile_projection.py",
     "scripts/plotfile_flux_surface.py",
     "scripts/plotfile_cylindrical_flux_surface.py",
     "scripts/plotfile_projection_cic_stellar.py",
 )
+
+IMAGE_DESCRIPTOR_CLIS = (
+    "scripts/plotfile_slice.py",
+    "scripts/plotfile_projection.py",
+    "scripts/plotfile_projection_cic_stellar.py",
+)
+
+RAW_CHUNK_DEMOS = ("scripts/slice_operator_demo.py",)
 
 
 @pytest.mark.parametrize("relative_path", DESCRIPTOR_MIGRATED_CLIS)
@@ -20,3 +30,40 @@ def test_plotting_cli_uses_descriptor_api(relative_path: str) -> None:
     assert "infer_bytes_per_value" not in source
     assert "bytes_per_value" not in source
     assert "--bytes-per-value" not in source
+
+
+@pytest.mark.parametrize("relative_path", IMAGE_DESCRIPTOR_CLIS)
+def test_image_cli_uses_resolved_output_shape(relative_path: str) -> None:
+    source = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    chunk_reads = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "get_task_chunk_array"
+    ]
+    assert chunk_reads
+    assert all(
+        keyword.arg != "shape" for call in chunk_reads for keyword in call.keywords
+    )
+
+
+@pytest.mark.parametrize("relative_path", RAW_CHUNK_DEMOS)
+def test_demo_raw_chunk_writes_include_descriptors(relative_path: str) -> None:
+    source = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+    tree = ast.parse(source)
+
+    chunk_writes = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "set_chunk"
+    ]
+    assert chunk_writes
+    assert all(
+        {"dtype", "shape"} <= {keyword.arg for keyword in call.keywords}
+        for call in chunk_writes
+    )

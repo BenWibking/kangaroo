@@ -97,7 +97,6 @@ def main() -> int:
             field=out.field,
             version=0,
             block=0,
-            shape=res,
             dataset=ds,
         )
 
