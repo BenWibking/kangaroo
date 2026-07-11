@@ -2248,7 +2248,8 @@ void register_default_kernels(KernelRegistry& registry) {
                 packed_patches.push_back(std::move(pp));
               }
 
-              outputs[0] = pack_patches(packed_patches);
+              const auto packed = pack_patches(packed_patches);
+              outputs[0].data.assign(packed.data.cbegin(), packed.data.cend());
               return;
             });
         },

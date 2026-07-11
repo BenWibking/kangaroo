@@ -35,6 +35,53 @@ def _set_f64_grid(ds, step, level, field, lo, hi, payload: bytes) -> None:
     ds._h.set_chunk_ref(step, level, field, 0, 0, payload, "f64", shape)
 
 
+def test_vorticity_mag_single_block_without_amr_neighbors() -> None:
+    rt = Runtime()
+    lo = (0, 0, 0)
+    hi = (3, 3, 3)
+    runmeta = RunMeta(
+        steps=[
+            StepMeta(
+                step=0,
+                levels=[
+                    LevelMeta(
+                        geom=LevelGeom(
+                            dx=(1.0, 1.0, 1.0),
+                            x0=(0.0, 0.0, 0.0),
+                            ref_ratio=1,
+                        ),
+                        boxes=[BlockBox(lo, hi)],
+                    )
+                ],
+            )
+        ]
+    )
+    ds = open_dataset("memory://local", runmeta=runmeta, step=0, level=0, runtime=rt)
+    geom = {
+        "dx": (1.0, 1.0, 1.0),
+        "x0": (0.0, 0.0, 0.0),
+        "index_origin": (0, 0, 0),
+    }
+
+    # u=y, v=z, w=x gives curl=(-1,-1,-1) without needing neighbor patches.
+    fu = ds.field_id("vel_x")
+    fv = ds.field_id("vel_y")
+    fw = ds.field_id("vel_z")
+    _set_f64_grid(ds, 0, 0, fu, lo, hi, _pack_linear_field_double(lo, hi, geom, ay=1.0))
+    _set_f64_grid(ds, 0, 0, fv, lo, hi, _pack_linear_field_double(lo, hi, geom, az=1.0))
+    _set_f64_grid(ds, 0, 0, fw, lo, hi, _pack_linear_field_double(lo, hi, geom, ax=1.0))
+
+    op = VorticityMag((fu, fv, fw), out_name="vort")
+    ctx = LoweringContext(runtime=rt._rt, runmeta=runmeta, dataset=ds)
+    plan = Plan(stages=op.lower(ctx))
+    rt.run(plan, runmeta=runmeta, dataset=ds)
+
+    vort_field = plan.stages[-1].templates[0].outputs[0].field.field
+    raw = rt.get_task_chunk(step=0, level=0, field=vort_field, version=0, block=0)
+    vals = np.frombuffer(raw, dtype=np.float64)
+    assert np.allclose(vals, math.sqrt(3.0), rtol=0.0, atol=1.0e-8)
+
+
 def test_vorticity_mag_from_three_component_gradients_amr() -> None:
     rt = Runtime()
     runmeta = RunMeta(
