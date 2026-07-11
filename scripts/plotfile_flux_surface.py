@@ -476,13 +476,13 @@ def main() -> int:
             field=flux.field,
             version=0,
             block=0,
-            shape=(
-                (len(radii), 2, len(temperature_bins) - 1, 4)
-                if temperature_bins is not None
-                else (len(radii), 2, 4)
-            ),
             dtype=np.float64,
             dataset=ds,
+        )
+        values = values.reshape(
+            (len(radii), 2, len(temperature_bins) - 1, 4)
+            if temperature_bins is not None
+            else (len(radii), 2, 4)
         )
         flux_rows, derived = _flux_rows_and_derived(
             radii,

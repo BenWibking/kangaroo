@@ -15,13 +15,20 @@ DESCRIPTOR_MIGRATED_CLIS = (
     "scripts/plotfile_projection_cic_stellar.py",
 )
 
-IMAGE_DESCRIPTOR_CLIS = (
+RESHAPED_DESCRIPTOR_CLIS = (
     "scripts/plotfile_slice.py",
     "scripts/plotfile_projection.py",
+    "scripts/plotfile_flux_surface.py",
+    "scripts/plotfile_cylindrical_flux_surface.py",
     "scripts/plotfile_projection_cic_stellar.py",
 )
 
 RAW_CHUNK_DEMOS = ("scripts/slice_operator_demo.py",)
+
+FLUX_SURFACE_CLIS = (
+    "scripts/plotfile_flux_surface.py",
+    "scripts/plotfile_cylindrical_flux_surface.py",
+)
 
 
 @pytest.mark.parametrize("relative_path", DESCRIPTOR_MIGRATED_CLIS)
@@ -32,8 +39,8 @@ def test_plotting_cli_uses_descriptor_api(relative_path: str) -> None:
     assert "--bytes-per-value" not in source
 
 
-@pytest.mark.parametrize("relative_path", IMAGE_DESCRIPTOR_CLIS)
-def test_image_cli_uses_resolved_output_shape(relative_path: str) -> None:
+@pytest.mark.parametrize("relative_path", RESHAPED_DESCRIPTOR_CLIS)
+def test_cli_uses_resolved_output_shape(relative_path: str) -> None:
     source = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
     tree = ast.parse(source)
 
@@ -48,6 +55,12 @@ def test_image_cli_uses_resolved_output_shape(relative_path: str) -> None:
     assert all(
         keyword.arg != "shape" for call in chunk_reads for keyword in call.keywords
     )
+
+
+@pytest.mark.parametrize("relative_path", FLUX_SURFACE_CLIS)
+def test_flux_surface_cli_reshapes_descriptor_array(relative_path: str) -> None:
+    source = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+    assert "values = values.reshape(" in source
 
 
 @pytest.mark.parametrize("relative_path", RAW_CHUNK_DEMOS)

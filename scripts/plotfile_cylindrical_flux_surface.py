@@ -340,13 +340,19 @@ def main() -> int:
             field=flux.field,
             version=0,
             block=0,
-            shape=(
-                (len(heights), 2, len(temperature_bins) - 1, len(GEOMETRIC_SECTIONS), 4)
-                if temperature_bins is not None
-                else (len(heights), 2, len(GEOMETRIC_SECTIONS), 4)
-            ),
             dtype=np.float64,
             dataset=ds,
+        )
+        values = values.reshape(
+            (
+                len(heights),
+                2,
+                len(temperature_bins) - 1,
+                len(GEOMETRIC_SECTIONS),
+                4,
+            )
+            if temperature_bins is not None
+            else (len(heights), 2, len(GEOMETRIC_SECTIONS), 4)
         )
         flux_rows, derived = _flux_rows_and_derived(
             heights,
