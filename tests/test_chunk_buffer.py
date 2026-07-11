@@ -52,6 +52,16 @@ def test_dynamic_extent_commit() -> None:
         _core.test_chunk_buffer_dynamic(2, 3)
 
 
+@pytest.mark.parametrize("extent", [0, 3])
+def test_committed_dynamic_buffer_roundtrips_by_visible_size(extent: int) -> None:
+    visible_bytes = extent * 8
+    assert _core.test_chunk_buffer_dynamic_roundtrip(10, extent) == (
+        extent,
+        visible_bytes,
+        visible_bytes,
+    )
+
+
 def test_buffer_specs_encode_closed_shape_language() -> None:
     assert BufferSpec(DType.F64, BlockShape(3)).to_dict() == {
         "dtype": "f64",

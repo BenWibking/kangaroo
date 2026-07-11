@@ -545,14 +545,18 @@ class ChunkBuffer {
   void load(Archive& ar, unsigned) {
     ar& data& desc_& dynamic_capacity_elements_;
     if (dynamic_capacity_elements_) {
-      const auto expected = checked_multiply(*dynamic_capacity_elements_, scalar_size(desc_.scalar));
-      if (expected != data.size()) {
-        throw BufferContractError(BufferContractReason::kDescriptorStorageMismatch,
-                                  "dynamic buffer capacity/storage mismatch after deserialization");
+      if (desc_.rank != 1) {
+        throw BufferContractError(BufferContractReason::kInvalidExtent,
+                                  "dynamic buffer must be rank one after deserialization");
       }
       if (desc_.extents[0] > *dynamic_capacity_elements_) {
         throw BufferContractError(BufferContractReason::kDynamicUpperBoundViolation,
                                   "dynamic extent exceeds capacity after deserialization");
+      }
+      const auto expected = checked_multiply(desc_.extents[0], scalar_size(desc_.scalar));
+      if (expected != data.size()) {
+        throw BufferContractError(BufferContractReason::kDescriptorStorageMismatch,
+                                  "dynamic buffer extent/storage mismatch after deserialization");
       }
     } else {
       desc_.validate(data.size());

@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 
+#include <hpx/serialization/serialize.hpp>
 #include <hpx/version.hpp>
 
 namespace nb = nanobind;
@@ -277,6 +278,21 @@ NB_MODULE(_core, m) {
     auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(kangaroo::ScalarType::kF64, capacity);
     buffer.commit_dynamic_extent(extent);
     return nb::make_tuple(buffer.desc().extents[0], buffer.bytes(), buffer.capacity_bytes());
+  });
+  m.def("test_chunk_buffer_dynamic_roundtrip", [](std::uint64_t capacity, std::uint64_t extent) {
+    auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(kangaroo::ScalarType::kF64, capacity);
+    buffer.data.resize(extent * sizeof(double));
+    buffer.commit_dynamic_extent(extent);
+
+    std::vector<char> archive_bytes;
+    hpx::serialization::output_archive output_archive(archive_bytes);
+    output_archive << buffer;
+
+    kangaroo::ChunkBuffer restored;
+    hpx::serialization::input_archive input_archive(archive_bytes, archive_bytes.size());
+    input_archive >> restored;
+    return nb::make_tuple(
+        restored.desc().extents[0], restored.bytes(), restored.capacity_bytes());
   });
   m.def("hpx_configuration_string", []() { return hpx::configuration_string(); });
   m.def("set_event_log_path", &kangaroo::set_event_log_path);
