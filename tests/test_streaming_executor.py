@@ -3,7 +3,14 @@ from __future__ import annotations
 import json
 import struct
 
-from analysis.buffer import BufferSpec, DType, FixedShape
+from analysis.buffer import (
+    BufferSpec,
+    DType,
+    DynamicShape,
+    DynamicUpperBound,
+    FixedShape,
+    LikeInputShape,
+)
 from analysis.plan import OutputRef
 
 import numpy as np
@@ -194,6 +201,122 @@ def test_streaming_executor_bounds_active_output_bytes(tmp_path, monkeypatch) ->
             dataset=ds,
         )
         assert struct.unpack("<q", raw)[0] == block + 3
+
+    events = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    max_active = _max_base_task_concurrency(events)
+    assert max_active > 0
+    assert max_active <= 2
+
+
+def test_streaming_executor_accounts_like_input_output_bytes(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MODE", "streaming")
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MAX_ACTIVE_TASKS_PER_LOCALITY", "16")
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MAX_ACTIVE_STORAGE_UNITS_PER_LOCALITY", "16")
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MAX_OUTPUT_BYTES_PER_LOCALITY", "16")
+
+    nblocks = 12
+    rt = Runtime()
+    runmeta = _runmeta(nblocks)
+    ds = open_dataset(
+        "memory://streaming-like-input-output-bytes",
+        runmeta=runmeta,
+        step=0,
+        level=0,
+        runtime=rt,
+    )
+    source = 43501
+    output = 43502
+    values = np.arange(8, dtype=np.float64)
+    for block in range(nblocks):
+        ds._h.set_chunk_ref(0, 0, source, 0, block, values.tobytes(), "f64", [8])
+
+    log_path = tmp_path / "streaming-like-input-output-bytes.events.jsonl"
+    rt.set_event_log_path(str(log_path))
+    try:
+        stage = Stage(name="particle_mask")
+        stage.map_blocks(
+            name="particle_eq_mask",
+            kernel="particle_eq_mask",
+            domain=Domain(step=0, level=0),
+            inputs=[FieldRef(source)],
+            outputs=[
+                OutputRef(
+                    FieldRef(output),
+                    BufferSpec(DType.U8, LikeInputShape(0)),
+                )
+            ],
+            deps={"kind": "None"},
+            params={"scalar": -1.0},
+        )
+        rt.run(Plan(stages=[stage]), runmeta=runmeta, dataset=ds)
+    finally:
+        rt.set_event_log_path("")
+
+    events = [
+        json.loads(line)
+        for line in log_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    max_active = _max_base_task_concurrency(events)
+    assert max_active > 0
+    assert max_active <= 2
+
+
+def test_streaming_executor_accounts_dynamic_like_input_capacity(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MODE", "streaming")
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MAX_ACTIVE_TASKS_PER_LOCALITY", "16")
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MAX_ACTIVE_STORAGE_UNITS_PER_LOCALITY", "16")
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MAX_OUTPUT_BYTES_PER_LOCALITY", "128")
+
+    nblocks = 12
+    rt = Runtime()
+    runmeta = _runmeta(nblocks)
+    ds = open_dataset(
+        "memory://streaming-dynamic-output-bytes",
+        runmeta=runmeta,
+        step=0,
+        level=0,
+        runtime=rt,
+    )
+    values_field = 43601
+    mask_field = 43602
+    output = 43603
+    values = np.arange(8, dtype=np.float64)
+    mask = np.ones(8, dtype=np.uint8)
+    for block in range(nblocks):
+        ds._h.set_chunk_ref(
+            0, 0, values_field, 0, block, values.tobytes(), "f64", [8]
+        )
+        ds._h.set_chunk_ref(0, 0, mask_field, 0, block, mask.tobytes(), "u8", [8])
+
+    log_path = tmp_path / "streaming-dynamic-output-bytes.events.jsonl"
+    rt.set_event_log_path(str(log_path))
+    try:
+        stage = Stage(name="particle_filter")
+        stage.map_blocks(
+            name="particle_filter",
+            kernel="particle_filter",
+            domain=Domain(step=0, level=0),
+            inputs=[FieldRef(values_field), FieldRef(mask_field)],
+            outputs=[
+                OutputRef(
+                    FieldRef(output),
+                    BufferSpec(
+                        DType.F64,
+                        DynamicShape(DynamicUpperBound.like_input(0)),
+                    ),
+                )
+            ],
+            deps={"kind": "None"},
+            params={},
+        )
+        rt.run(Plan(stages=[stage]), runmeta=runmeta, dataset=ds)
+    finally:
+        rt.set_event_log_path("")
 
     events = [
         json.loads(line)

@@ -3,6 +3,8 @@
 #include "kangaroo/kernel.hpp"
 
 #include <cstdint>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include <hpx/future.hpp>
@@ -91,6 +93,13 @@ class DataService {
   virtual ~DataService() = default;
   virtual int home_rank(const ChunkRef&) const = 0;
   virtual std::size_t estimate_host_bytes(const ChunkRef&) const = 0;
+  virtual std::optional<BufferDesc> describe_host(const ChunkRef&) const {
+    return std::nullopt;
+  }
+  virtual std::optional<std::uint64_t> estimate_particle_chunk_records(
+      const std::string&, std::int64_t) const {
+    return std::nullopt;
+  }
   virtual ChunkBuffer alloc_host(const ChunkRef&, const ResolvedBufferSpec&) = 0;
   virtual hpx::future<ChunkBuffer> get_host(const ChunkRef&) = 0;
   virtual std::vector<hpx::future<ChunkBuffer>> get_hosts(const std::vector<ChunkRef>& refs) {

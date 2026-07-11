@@ -948,6 +948,25 @@ std::size_t DataServiceLocal::estimate_host_bytes(const ChunkRef& ref) const {
   return dataset == nullptr ? 0 : dataset->estimate_chunk_bytes(ref);
 }
 
+std::optional<BufferDesc> DataServiceLocal::describe_host(const ChunkRef& ref) const {
+  const DatasetHandle* dataset = dataset_;
+  if (run_id_ != 0) {
+    if (auto ctx = execution_context_shared(run_id_)) dataset = &ctx->dataset;
+  }
+  if (dataset == nullptr || !dataset->backend) return std::nullopt;
+  return dataset->backend->describe_chunk(ref);
+}
+
+std::optional<std::uint64_t> DataServiceLocal::estimate_particle_chunk_records(
+    const std::string& particle_type, std::int64_t chunk_index) const {
+  const DatasetHandle* dataset = dataset_;
+  if (run_id_ != 0) {
+    if (auto ctx = execution_context_shared(run_id_)) dataset = &ctx->dataset;
+  }
+  if (dataset == nullptr || !dataset->backend) return std::nullopt;
+  return dataset->backend->estimate_particle_chunk_records(particle_type, chunk_index);
+}
+
 ChunkBuffer DataServiceLocal::alloc_host(const ChunkRef&, const ResolvedBufferSpec& spec) {
   if (spec.dynamic_capacity_elements.has_value()) {
     return ChunkBuffer::allocate_dynamic(

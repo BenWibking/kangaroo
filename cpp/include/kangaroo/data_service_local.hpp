@@ -42,6 +42,9 @@ class DataServiceLocal : public DataService {
 
   int home_rank(const ChunkRef& ref) const override;
   std::size_t estimate_host_bytes(const ChunkRef& ref) const override;
+  std::optional<BufferDesc> describe_host(const ChunkRef& ref) const override;
+  std::optional<std::uint64_t> estimate_particle_chunk_records(
+      const std::string& particle_type, std::int64_t chunk_index) const override;
   ChunkBuffer alloc_host(const ChunkRef& ref, const ResolvedBufferSpec& spec) override;
   hpx::shared_future<std::shared_ptr<ChunkBuffer>> get_host_shared(const ChunkRef& ref);
   std::vector<hpx::shared_future<std::shared_ptr<ChunkBuffer>>> get_hosts_shared(
