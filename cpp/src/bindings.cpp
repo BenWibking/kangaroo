@@ -14,6 +14,7 @@
 
 #include <hpx/serialization/serialize.hpp>
 #include <hpx/version.hpp>
+#include <msgpack.hpp>
 
 namespace nb = nanobind;
 
@@ -201,6 +202,57 @@ nb::dict subbox_view_dict(const kangaroo::SubboxView& view) {
   return d;
 }
 
+class DynamicBoundTestBackend final : public kangaroo::DatasetBackend {
+ public:
+  DynamicBoundTestBackend(std::uint64_t particle_records, std::size_t chunk_bytes)
+      : particle_records_(particle_records), chunk_bytes_(chunk_bytes) {}
+
+  std::optional<kangaroo::ChunkBuffer> get_chunk(const kangaroo::ChunkRef&) override {
+    return std::nullopt;
+  }
+  bool has_chunk(const kangaroo::ChunkRef&) const override { return true; }
+  std::size_t estimate_chunk_bytes(const kangaroo::ChunkRef& ref) const override {
+    return ref.block == 1 ? chunk_bytes_ : sizeof(double);
+  }
+  std::optional<std::uint64_t> estimate_particle_chunk_records(
+      const std::string&, std::int64_t) const override {
+    return particle_records_;
+  }
+  kangaroo::DatasetMetadata get_metadata() const override { return {}; }
+
+ private:
+  std::uint64_t particle_records_ = 0;
+  std::size_t chunk_bytes_ = 0;
+};
+
+std::vector<std::uint8_t> pack_particle_bound_params() {
+  msgpack::sbuffer packed;
+  msgpack::packer<msgpack::sbuffer> pk(&packed);
+  pk.pack_map(2);
+  pk.pack(std::string("particle_type"));
+  pk.pack(std::string("particles"));
+  pk.pack(std::string("field_name"));
+  pk.pack(std::string("value"));
+  return {packed.data(), packed.data() + packed.size()};
+}
+
+std::vector<std::uint8_t> pack_amr_bound_params() {
+  msgpack::sbuffer packed;
+  msgpack::packer<msgpack::sbuffer> pk(&packed);
+  pk.pack_map(5);
+  pk.pack(std::string("input_field"));
+  pk.pack_int32(11);
+  pk.pack(std::string("input_version"));
+  pk.pack_int32(0);
+  pk.pack(std::string("input_step"));
+  pk.pack_int32(0);
+  pk.pack(std::string("input_level"));
+  pk.pack_int16(0);
+  pk.pack(std::string("halo_cells"));
+  pk.pack_int32(1);
+  return {packed.data(), packed.data() + packed.size()};
+}
+
 }  // namespace
 
 NB_MODULE(_core, m) {
@@ -293,6 +345,55 @@ NB_MODULE(_core, m) {
     input_archive >> restored;
     return nb::make_tuple(
         restored.desc().extents[0], restored.bytes(), restored.capacity_bytes());
+  });
+  m.def("test_backend_chunk_dynamic_capacity",
+        [](const std::string& dtype, const std::string& kernel,
+           std::uint64_t particle_records, const std::vector<std::uint64_t>& input_bytes) {
+          kangaroo::DatasetHandle dataset;
+          dataset.backend = std::make_shared<DynamicBoundTestBackend>(particle_records, 0);
+          kangaroo::RunMeta meta;
+          kangaroo::LevelMeta level;
+          level.geom.dx[0] = level.geom.dx[1] = level.geom.dx[2] = 1.0;
+          level.boxes.push_back(kangaroo::BlockBox{{0, 0, 0}, {0, 0, 0}});
+          meta.steps.push_back(kangaroo::StepMeta{0, {level}});
+
+          kangaroo::TaskTemplateIR task;
+          task.kernel = kernel;
+          task.params_msgpack = pack_particle_bound_params();
+          kangaroo::BufferSpecIR spec;
+          spec.scalar = parse_scalar_type(dtype);
+          spec.shape_kind = kangaroo::ShapeRuleKind::kDynamic;
+          spec.dynamic_upper_bound.kind = kangaroo::DynamicUpperBoundKind::kBackendChunk;
+          std::vector<kangaroo::ChunkBuffer> inputs;
+          inputs.reserve(input_bytes.size());
+          for (const auto bytes : input_bytes) {
+            inputs.push_back(kangaroo::ChunkBuffer::opaque(
+                std::vector<std::uint8_t>(static_cast<std::size_t>(bytes))));
+          }
+          const auto resolved = kangaroo::resolve_output_spec_for_task(
+              spec, task, dataset, meta, 0, 0, 0, inputs);
+          return *resolved.dynamic_capacity_elements;
+        });
+  m.def("test_amr_subbox_dynamic_capacity", [](std::uint64_t source_chunk_bytes) {
+    kangaroo::DatasetHandle dataset;
+    dataset.backend = std::make_shared<DynamicBoundTestBackend>(0, source_chunk_bytes);
+    kangaroo::RunMeta meta;
+    kangaroo::LevelMeta level;
+    level.geom.dx[0] = level.geom.dx[1] = level.geom.dx[2] = 1.0;
+    level.boxes.push_back(kangaroo::BlockBox{{0, 0, 0}, {0, 0, 0}});
+    level.boxes.push_back(kangaroo::BlockBox{{1, 0, 0}, {1, 0, 0}});
+    meta.steps.push_back(kangaroo::StepMeta{0, {level}});
+
+    kangaroo::TaskTemplateIR task;
+    task.kernel = "amr_subbox_fetch_pack";
+    task.params_msgpack = pack_amr_bound_params();
+    kangaroo::BufferSpecIR spec;
+    spec.scalar = kangaroo::ScalarType::kOpaque;
+    spec.shape_kind = kangaroo::ShapeRuleKind::kDynamic;
+    spec.dynamic_upper_bound.kind = kangaroo::DynamicUpperBoundKind::kAmrSubboxPack;
+    const auto resolved = kangaroo::resolve_output_spec_for_task(
+        spec, task, dataset, meta, 0, 0, 0, {});
+    return *resolved.dynamic_capacity_elements;
   });
   m.def("hpx_configuration_string", []() { return hpx::configuration_string(); });
   m.def("set_event_log_path", &kangaroo::set_event_log_path);

@@ -62,6 +62,28 @@ def test_committed_dynamic_buffer_roundtrips_by_visible_size(extent: int) -> Non
     )
 
 
+def test_backend_chunk_bounds_follow_particle_records_and_reduce_inputs() -> None:
+    records = 1_048_577
+    assert _core.test_backend_chunk_dynamic_capacity(
+        "f64", "particle_load_field_chunk_f64", records, []
+    ) == records
+    assert _core.test_backend_chunk_dynamic_capacity(
+        "opaque", "particle_topk_modes_map", records, []
+    ) == 8 + 16 * records
+
+    input_bytes = [6 << 20, 4 << 20]
+    assert _core.test_backend_chunk_dynamic_capacity(
+        "opaque", "particle_value_counts_reduce", 0, input_bytes
+    ) == sum(input_bytes)
+
+
+def test_amr_subbox_bound_follows_requested_source_payload() -> None:
+    source_bytes = 65 << 20
+    capacity = _core.test_amr_subbox_dynamic_capacity(source_bytes)
+    assert capacity > source_bytes
+    assert capacity > 64 << 20
+
+
 def test_buffer_specs_encode_closed_shape_language() -> None:
     assert BufferSpec(DType.F64, BlockShape(3)).to_dict() == {
         "dtype": "f64",

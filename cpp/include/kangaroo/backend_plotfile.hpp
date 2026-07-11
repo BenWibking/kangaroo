@@ -17,6 +17,8 @@ class PlotfileBackend : public DatasetBackend {
   std::vector<std::optional<ChunkBuffer>> get_chunks(const std::vector<ChunkRef>& refs) override;
   bool has_chunk(const ChunkRef& ref) const override;
   std::size_t estimate_chunk_bytes(const ChunkRef& ref) const override;
+  std::optional<std::uint64_t> estimate_particle_chunk_records(
+      const std::string& particle_type, std::int64_t chunk_index) const override;
   DatasetMetadata get_metadata() const override;
 
   // Helpers for field mapping

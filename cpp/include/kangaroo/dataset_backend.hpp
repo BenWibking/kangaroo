@@ -48,6 +48,12 @@ class DatasetBackend {
     (void)ref;
     return 0;
   }
+  virtual std::optional<std::uint64_t> estimate_particle_chunk_records(
+      const std::string& particle_type, std::int64_t chunk_index) const {
+    (void)particle_type;
+    (void)chunk_index;
+    return std::nullopt;
+  }
   virtual DatasetMetadata get_metadata() const = 0;
 
   // Pragmatic access for metadata discovery

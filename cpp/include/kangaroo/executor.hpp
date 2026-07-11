@@ -9,12 +9,25 @@
 #include <cstddef>
 #include <cstdint>
 #include <hpx/future.hpp>
+#include <span>
 #include <string>
 #include <vector>
 
 namespace kangaroo {
 
+struct DatasetHandle;
+
 void prepare_plan(PlanIR& plan, KernelRegistry& kernels);
+
+ResolvedBufferSpec resolve_output_spec_for_task(
+    const BufferSpecIR& spec,
+    const TaskTemplateIR& task,
+    const DatasetHandle& dataset,
+    const RunMeta& meta,
+    int32_t step,
+    int16_t level,
+    int32_t block,
+    std::span<const ChunkBuffer> inputs);
 
 struct ExecutorOptions {
   std::string mode = "eager";

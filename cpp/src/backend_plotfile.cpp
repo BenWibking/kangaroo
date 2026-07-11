@@ -291,6 +291,12 @@ std::size_t PlotfileBackend::estimate_chunk_bytes(const ChunkRef& ref) const {
   return static_cast<std::size_t>(points) * sizeof(double);
 }
 
+std::optional<std::uint64_t> PlotfileBackend::estimate_particle_chunk_records(
+    const std::string& particle_type, std::int64_t chunk_index) const {
+  const auto records = reader_.particle_chunk_records(particle_type, chunk_index);
+  return static_cast<std::uint64_t>(std::max<std::int64_t>(0, records));
+}
+
 DatasetMetadata PlotfileBackend::get_metadata() const {
   DatasetMetadata meta;
   const auto& h = reader_.header();
