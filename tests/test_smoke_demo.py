@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
@@ -17,6 +18,32 @@ def test_smoke_demo_script() -> None:
         pytest.xfail("Runtime ran but kernels are not registered yet")
 
     assert result.returncode == 0
+
+
+def test_slice_operator_demo_script(tmp_path) -> None:
+    output = tmp_path / "slice.png"
+    env = os.environ.copy()
+    env["MPLBACKEND"] = "Agg"
+    env["MPLCONFIGDIR"] = str(tmp_path / "matplotlib")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/slice_operator_demo.py",
+            "--output",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    if "Runtime init failed" in result.stdout:
+        pytest.skip("Runtime init failed (likely missing built module)")
+
+    assert result.returncode == 0, result.stderr
+    assert "Slice comparison: allclose = True" in result.stdout
+    assert output.is_file()
 
 
 def _make_runtime_handles():
