@@ -26,9 +26,9 @@ def test_cross_level_subbox_fetch_memory_backend() -> None:
     ds = _core.DatasetHandle("memory://local", 0, 0)
 
     # Level 0 chunk: [0:3]x[0:1]x[0:1]
-    ds.set_chunk_ref(0, 0, 7, 0, 0, _pack_f32_chunk(4, 2, 2, 0.0))
+    ds.set_chunk_ref(0, 0, 7, 0, 0, _pack_f32_chunk(4, 2, 2, 0.0), "f32", [4, 2, 2])
     # Level 1 chunk: [0:7]x[0:3]x[0:3]
-    ds.set_chunk_ref(0, 1, 7, 0, 0, _pack_f32_chunk(8, 4, 4, 1000.0))
+    ds.set_chunk_ref(0, 1, 7, 0, 0, _pack_f32_chunk(8, 4, 4, 1000.0), "f32", [8, 4, 4])
 
     # Fetch a level-0 subbox.
     out0 = _core.test_get_subbox(
@@ -42,7 +42,6 @@ def test_cross_level_subbox_fetch_memory_backend() -> None:
         chunk_hi=(3, 1, 1),
         request_lo=(1, 0, 0),
         request_hi=(2, 1, 1),
-        bytes_per_value=4,
     )
     assert tuple(out0["lo"]) == (1, 0, 0)
     assert tuple(out0["hi"]) == (2, 1, 1)
@@ -61,10 +60,8 @@ def test_cross_level_subbox_fetch_memory_backend() -> None:
         chunk_hi=(7, 3, 3),
         request_lo=(2, 1, 1),
         request_hi=(3, 2, 2),
-        bytes_per_value=4,
     )
     assert tuple(out1["lo"]) == (2, 1, 1)
     assert tuple(out1["hi"]) == (3, 2, 2)
     vals1 = _unpack_f32(out1["data"])
     assert vals1 == [1211.0, 1212.0, 1221.0, 1222.0, 1311.0, 1312.0, 1321.0, 1322.0]
-

@@ -239,12 +239,12 @@ void log_dataset_load_event(const char* op,
   log_data_event(event);
 }
 
-SubboxView build_subbox_view(const HostView& chunk, const ChunkSubboxRef& ref) {
+SubboxView build_subbox_view(const ChunkBuffer& chunk, const ChunkSubboxRef& ref) {
   SubboxView out;
-  out.bytes_per_value = ref.bytes_per_value;
   out.box = ref.request_box;
 
-  if (chunk.data.empty() || ref.bytes_per_value <= 0) {
+  if (chunk.data.empty() || chunk.desc().rank != 3 ||
+      chunk.desc().scalar == ScalarType::kOpaque) {
     return out;
   }
 
@@ -276,7 +276,7 @@ SubboxView build_subbox_view(const HostView& chunk, const ChunkSubboxRef& ref) {
   out.box.hi[1] = oy1;
   out.box.hi[2] = oz1;
 
-  const std::size_t bytes_per = static_cast<std::size_t>(ref.bytes_per_value);
+  const std::size_t bytes_per = scalar_size(chunk.desc().scalar);
   const std::size_t elems_total =
       static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
   const std::size_t needed = elems_total * bytes_per;
@@ -287,9 +287,11 @@ SubboxView build_subbox_view(const HostView& chunk, const ChunkSubboxRef& ref) {
   const int32_t onx = ox1 - ox0 + 1;
   const int32_t ony = oy1 - oy0 + 1;
   const int32_t onz = oz1 - oz0 + 1;
-  const std::size_t out_bytes = static_cast<std::size_t>(onx) * static_cast<std::size_t>(ony) *
-                                static_cast<std::size_t>(onz) * bytes_per;
-  out.data.data.resize(out_bytes, 0);
+  const std::array<std::uint64_t, 3> out_extents{
+      static_cast<std::uint64_t>(onx), static_cast<std::uint64_t>(ony),
+      static_cast<std::uint64_t>(onz)};
+  out.data = ChunkBuffer::allocate(
+      BufferDesc::runtime_grid(chunk.desc().scalar, out_extents), InitPolicy::kZero);
 
   auto out_index = [&](int32_t i, int32_t j, int32_t k) -> std::size_t {
     return (static_cast<std::size_t>(i) * static_cast<std::size_t>(ony) +
@@ -298,8 +300,9 @@ SubboxView build_subbox_view(const HostView& chunk, const ChunkSubboxRef& ref) {
            static_cast<std::size_t>(k);
   };
 
-  HostGridView3D input(chunk, nx, ny, nz, ref.bytes_per_value);
   auto* dst = out.data.data.data();
+  const auto& source_desc = chunk.desc();
+  const auto* source = chunk.byte_view().data();
   for (int32_t i = 0; i < onx; ++i) {
     const int32_t gi = ox0 + i;
     const int32_t li = gi - ref.chunk_box.lo[0];
@@ -310,7 +313,11 @@ SubboxView build_subbox_view(const HostView& chunk, const ChunkSubboxRef& ref) {
         const int32_t gk = oz0 + k;
         const int32_t lk = gk - ref.chunk_box.lo[2];
         const std::size_t dst_byte = out_index(i, j, k) * bytes_per;
-        (void)input.copy_value_bytes(li, lj, lk, dst + dst_byte);
+        const auto source_byte =
+            static_cast<std::uint64_t>(li) * source_desc.strides_bytes[0] +
+            static_cast<std::uint64_t>(lj) * source_desc.strides_bytes[1] +
+            static_cast<std::uint64_t>(lk) * source_desc.strides_bytes[2];
+        std::memcpy(dst + dst_byte, source + source_byte, bytes_per);
       }
     }
   }
@@ -320,16 +327,16 @@ SubboxView build_subbox_view(const HostView& chunk, const ChunkSubboxRef& ref) {
 
 ChunkSlot make_pending_slot() {
   ChunkSlot slot;
-  slot.promise = std::make_shared<hpx::promise<std::shared_ptr<HostView>>>();
+  slot.promise = std::make_shared<hpx::promise<std::shared_ptr<ChunkBuffer>>>();
   slot.future = slot.promise->get_future().share();
   return slot;
 }
 
 void fulfill_dataset_load(const std::shared_ptr<ChunkStore>& chunk_store,
                           const ChunkRef& ref,
-                          HostView view) {
-  auto shared_view = std::make_shared<HostView>(std::move(view));
-  std::shared_ptr<hpx::promise<std::shared_ptr<HostView>>> promise;
+                          ChunkBuffer view) {
+  auto shared_view = std::make_shared<ChunkBuffer>(std::move(view));
+  std::shared_ptr<hpx::promise<std::shared_ptr<ChunkBuffer>>> promise;
   {
     std::lock_guard<ChunkStore::Mutex> lock(chunk_store->mutex);
     auto [it, inserted] = chunk_store->data.try_emplace(ref, make_pending_slot());
@@ -351,7 +358,7 @@ void fulfill_dataset_load(const std::shared_ptr<ChunkStore>& chunk_store,
 void fail_dataset_load(const std::shared_ptr<ChunkStore>& chunk_store,
                        const ChunkRef& ref,
                        std::exception_ptr error) {
-  std::shared_ptr<hpx::promise<std::shared_ptr<HostView>>> promise;
+  std::shared_ptr<hpx::promise<std::shared_ptr<ChunkBuffer>>> promise;
   {
     std::lock_guard<ChunkStore::Mutex> lock(chunk_store->mutex);
     auto [it, inserted] = chunk_store->data.try_emplace(ref, make_pending_slot());
@@ -933,13 +940,23 @@ int DataServiceLocal::home_rank(const ChunkRef& ref) const {
   return static_cast<int>(h % cached_locality_count());
 }
 
-HostView DataServiceLocal::alloc_host(const ChunkRef&, std::size_t bytes) {
-  HostView view;
-  view.data.resize(bytes);
-  return view;
+std::size_t DataServiceLocal::estimate_host_bytes(const ChunkRef& ref) const {
+  const DatasetHandle* dataset = dataset_;
+  if (run_id_ != 0) {
+    if (auto ctx = execution_context_shared(run_id_)) dataset = &ctx->dataset;
+  }
+  return dataset == nullptr ? 0 : dataset->estimate_chunk_bytes(ref);
 }
 
-hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_local_shared_impl(
+ChunkBuffer DataServiceLocal::alloc_host(const ChunkRef&, const ResolvedBufferSpec& spec) {
+  if (spec.dynamic_capacity_elements.has_value()) {
+    return ChunkBuffer::allocate_dynamic(
+        spec.desc.scalar, *spec.dynamic_capacity_elements, spec.init);
+  }
+  return ChunkBuffer::allocate(spec.desc, spec.init);
+}
+
+hpx::shared_future<std::shared_ptr<ChunkBuffer>> DataServiceLocal::get_local_shared_impl(
     const ChunkRef& ref) {
   std::shared_ptr<ExecutionContext> ctx;
   const DatasetHandle* dataset = dataset_;
@@ -957,7 +974,7 @@ hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_local_shared
     throw std::runtime_error("chunk store not initialized");
   }
 
-  hpx::shared_future<std::shared_ptr<HostView>> future;
+  hpx::shared_future<std::shared_ptr<ChunkBuffer>> future;
   {
     std::lock_guard<ChunkStore::Mutex> lock(chunk_store->mutex);
     auto it = chunk_store->data.find(ref);
@@ -969,7 +986,7 @@ hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_local_shared
 
   const bool dataset_has_chunk = dataset != nullptr && dataset->has_chunk(ref);
   if (!dataset_has_chunk && run_id_ != 0 && !execution_context_may_produce_chunk(run_id_, ref)) {
-    return hpx::make_exceptional_future<std::shared_ptr<HostView>>(
+    return hpx::make_exceptional_future<std::shared_ptr<ChunkBuffer>>(
                std::runtime_error("chunk is not available from run dataset or planned outputs"))
         .share();
   }
@@ -988,13 +1005,13 @@ hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_local_shared
   }
 
   if (run_id_ == 0 && dataset != nullptr) {
-    std::shared_ptr<hpx::promise<std::shared_ptr<HostView>>> promise;
+    std::shared_ptr<hpx::promise<std::shared_ptr<ChunkBuffer>>> promise;
     try {
       auto view = dataset->get_chunk(ref);
       if (!view.has_value()) {
         throw std::runtime_error("dataset chunk disappeared during load");
       }
-      auto shared_view = std::make_shared<HostView>(std::move(*view));
+      auto shared_view = std::make_shared<ChunkBuffer>(std::move(*view));
       {
         std::lock_guard<ChunkStore::Mutex> lock(chunk_store->mutex);
         auto [it, inserted] = chunk_store->data.try_emplace(ref, make_pending_slot());
@@ -1058,7 +1075,7 @@ hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_local_shared
   return future;
 }
 
-std::vector<hpx::shared_future<std::shared_ptr<HostView>>>
+std::vector<hpx::shared_future<std::shared_ptr<ChunkBuffer>>>
 DataServiceLocal::get_local_shared_batch_impl(const std::vector<ChunkRef>& refs) {
   auto log_batch_issue_phase = [&](const char* op,
                                    double start,
@@ -1101,7 +1118,7 @@ DataServiceLocal::get_local_shared_batch_impl(const std::vector<ChunkRef>& refs)
     throw std::runtime_error("chunk store not initialized");
   }
 
-  std::vector<hpx::shared_future<std::shared_ptr<HostView>>> futures(refs.size());
+  std::vector<hpx::shared_future<std::shared_ptr<ChunkBuffer>>> futures(refs.size());
   std::vector<std::size_t> unresolved;
   unresolved.reserve(refs.size());
   double phase_start = now_seconds();
@@ -1132,7 +1149,7 @@ DataServiceLocal::get_local_shared_batch_impl(const std::vector<ChunkRef>& refs)
     const auto& ref = refs[idx];
     const bool dataset_has_chunk = dataset != nullptr && dataset->has_chunk(ref);
     if (!dataset_has_chunk && run_id_ != 0 && !execution_context_may_produce_chunk(run_id_, ref)) {
-      futures[idx] = hpx::make_exceptional_future<std::shared_ptr<HostView>>(
+      futures[idx] = hpx::make_exceptional_future<std::shared_ptr<ChunkBuffer>>(
                          std::runtime_error(
                              "chunk is not available from run dataset or planned outputs"))
                          .share();
@@ -1200,7 +1217,7 @@ DataServiceLocal::get_local_shared_batch_impl(const std::vector<ChunkRef>& refs)
   return futures;
 }
 
-hpx::future<HostView> DataServiceLocal::get_local_impl(const ChunkRef& ref) {
+hpx::future<ChunkBuffer> DataServiceLocal::get_local_impl(const ChunkRef& ref) {
   auto ready = get_local_shared_impl(ref);
   if (ready.is_ready()) {
     auto view = ready.get();
@@ -1212,7 +1229,7 @@ hpx::future<HostView> DataServiceLocal::get_local_impl(const ChunkRef& ref) {
   });
 }
 
-hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_host_shared(
+hpx::shared_future<std::shared_ptr<ChunkBuffer>> DataServiceLocal::get_host_shared(
     const ChunkRef& ref) {
   const int target = home_rank(ref);
   const int here = hpx::get_locality_id();
@@ -1221,13 +1238,13 @@ hpx::shared_future<std::shared_ptr<HostView>> DataServiceLocal::get_host_shared(
   }
 
   return get_host(ref).then([](auto&& result) {
-    return std::make_shared<HostView>(result.get());
+    return std::make_shared<ChunkBuffer>(result.get());
   }).share();
 }
 
-std::vector<hpx::shared_future<std::shared_ptr<HostView>>> DataServiceLocal::get_hosts_shared(
+std::vector<hpx::shared_future<std::shared_ptr<ChunkBuffer>>> DataServiceLocal::get_hosts_shared(
     const std::vector<ChunkRef>& refs) {
-  std::vector<hpx::shared_future<std::shared_ptr<HostView>>> out(refs.size());
+  std::vector<hpx::shared_future<std::shared_ptr<ChunkBuffer>>> out(refs.size());
   if (refs.empty()) {
     return out;
   }
@@ -1257,12 +1274,12 @@ std::vector<hpx::shared_future<std::shared_ptr<HostView>>> DataServiceLocal::get
   return out;
 }
 
-hpx::future<HostView> data_get_local_impl(int32_t run_id, const ChunkRef& ref) {
+hpx::future<ChunkBuffer> data_get_local_impl(int32_t run_id, const ChunkRef& ref) {
   DataServiceLocal data_service(run_id);
   return data_service.get_local_impl(ref);
 }
 
-void data_put_local_impl(int32_t run_id, const ChunkRef& ref, HostView view) {
+void data_put_local_impl(int32_t run_id, const ChunkRef& ref, ChunkBuffer view) {
   DataServiceLocal data_service(run_id);
   data_service.put_local_impl(ref, std::move(view));
 }
@@ -1437,7 +1454,7 @@ hpx::future<void> DataServiceLocal::release_consumed_inputs(const std::vector<Ch
   });
 }
 
-void DataServiceLocal::put_local_impl(const ChunkRef& ref, HostView view) {
+void DataServiceLocal::put_local_impl(const ChunkRef& ref, ChunkBuffer view) {
   const int here = hpx::get_locality_id();
   const std::size_t bytes = view.data.size();
   log_dataflow_marker("put_local_enter", ref, here, here, bytes);
@@ -1446,8 +1463,8 @@ void DataServiceLocal::put_local_impl(const ChunkRef& ref, HostView view) {
   if (chunk_store == nullptr) {
     throw std::runtime_error("chunk store not initialized");
   }
-  auto shared_view = std::make_shared<HostView>(std::move(view));
-  std::shared_ptr<hpx::promise<std::shared_ptr<HostView>>> promise;
+  auto shared_view = std::make_shared<ChunkBuffer>(std::move(view));
+  std::shared_ptr<hpx::promise<std::shared_ptr<ChunkBuffer>>> promise;
   log_dataflow_marker("put_local_before_lock", ref, here, here, bytes);
   const double lock_wait_start = now_seconds();
   double lock_hold_start = 0.0;
@@ -1478,21 +1495,21 @@ void DataServiceLocal::put_local_impl(const ChunkRef& ref, HostView view) {
   log_dataflow_marker("put_local_promise_set_end", ref, here, here, bytes);
 }
 
-hpx::future<HostView> DataServiceLocal::get_host(const ChunkRef& ref) {
+hpx::future<ChunkBuffer> DataServiceLocal::get_host(const ChunkRef& ref) {
   int target = home_rank(ref);
   int here = hpx::get_locality_id();
   const double start = now_seconds();
   if (target == here) {
     auto local = get_local_impl(ref);
     if (local.is_ready()) {
-      HostView view = local.get();
+      ChunkBuffer view = local.get();
       log_dataflow_fetch("get_host_local", ref, here, target, view.data.size());
       log_dataflow_event("get_host", "end", ref, here, target, view.data.size(), start);
       return hpx::make_ready_future(std::move(view));
     }
     return local.then([ref, here, target, start](auto&& result) mutable {
       try {
-        HostView view = result.get();
+        ChunkBuffer view = result.get();
         log_dataflow_fetch("get_host_local", ref, here, target, view.data.size());
         log_dataflow_event("get_host", "end", ref, here, target, view.data.size(), start);
         return view;
@@ -1506,7 +1523,7 @@ hpx::future<HostView> DataServiceLocal::get_host(const ChunkRef& ref) {
              hpx::async<::kangaroo_data_get_local_action>(locality_for_rank(target), run_id_, ref))
       .then([ref, here, target, start](auto&& result) mutable {
         try {
-          HostView view = result.get();
+          ChunkBuffer view = result.get();
           log_dataflow_fetch("get_host_remote", ref, here, target, view.data.size());
           log_dataflow_event("get_host", "end", ref, here, target, view.data.size(), start);
           return view;
@@ -1517,7 +1534,7 @@ hpx::future<HostView> DataServiceLocal::get_host(const ChunkRef& ref) {
       });
 }
 
-std::vector<hpx::future<HostView>> DataServiceLocal::get_hosts(
+std::vector<hpx::future<ChunkBuffer>> DataServiceLocal::get_hosts(
     const std::vector<ChunkRef>& refs) {
   auto log_get_hosts_phase = [&](const char* op,
                                  double start,
@@ -1544,7 +1561,7 @@ std::vector<hpx::future<HostView>> DataServiceLocal::get_hosts(
   };
 
   const double total_start = now_seconds();
-  std::vector<hpx::future<HostView>> out(refs.size());
+  std::vector<hpx::future<ChunkBuffer>> out(refs.size());
   if (refs.empty()) {
     log_get_hosts_phase("get_hosts_total", total_start, 0);
     return out;
@@ -1586,14 +1603,14 @@ std::vector<hpx::future<HostView>> DataServiceLocal::get_hosts(
       auto ready = std::move(shared_futures[j]);
       if (ready.is_ready()) {
         ++ready_count;
-        HostView view = *ready.get();
+        ChunkBuffer view = *ready.get();
         log_dataflow_fetch("get_host_local", ref, here, target, view.data.size());
         log_dataflow_event("get_host", "end", ref, here, target, view.data.size(), start);
         out[local_indices[j]] = hpx::make_ready_future(std::move(view));
       } else {
         out[local_indices[j]] = ready.then([ref, here, target, start](auto&& result) mutable {
           try {
-            HostView view = *result.get();
+            ChunkBuffer view = *result.get();
             log_dataflow_fetch("get_host_local", ref, here, target, view.data.size());
             log_dataflow_event("get_host", "end", ref, here, target, view.data.size(), start);
             return view;
@@ -1613,12 +1630,12 @@ std::vector<hpx::future<HostView>> DataServiceLocal::get_hosts(
 
 hpx::future<SubboxView> DataServiceLocal::get_subbox(const ChunkSubboxRef& ref) {
   return get_host(ref.chunk).then([ref](auto&& result) {
-    HostView chunk = result.get();
+    ChunkBuffer chunk = result.get();
     return build_subbox_view(chunk, ref);
   });
 }
 
-hpx::future<void> DataServiceLocal::put_host(const ChunkRef& ref, HostView view) {
+hpx::future<void> DataServiceLocal::put_host(const ChunkRef& ref, ChunkBuffer view) {
   int target = home_rank(ref);
   int here = hpx::get_locality_id();
   const double start = now_seconds();

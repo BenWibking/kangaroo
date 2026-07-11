@@ -1,4 +1,5 @@
 #include "kangaroo/runtime.hpp"
+#include "kangaroo/chunk_buffer.hpp"
 #include "kangaroo/data_service_local.hpp"
 
 #ifdef KANGAROO_USE_NANOBIND
@@ -139,15 +140,51 @@ kangaroo::IndexBox3 parse_index_box(nb::tuple lo, nb::tuple hi) {
   return b;
 }
 
-kangaroo::HostView host_view_from_bytes(nb::bytes payload) {
-  kangaroo::HostView view;
-  const auto* raw = reinterpret_cast<const std::uint8_t*>(payload.data());
-  view.data.assign(raw, raw + payload.size());
-  return view;
+kangaroo::ScalarType parse_scalar_type(const std::string& dtype) {
+  if (dtype == "opaque") return kangaroo::ScalarType::kOpaque;
+  if (dtype == "u8") return kangaroo::ScalarType::kU8;
+  if (dtype == "i64") return kangaroo::ScalarType::kI64;
+  if (dtype == "f32") return kangaroo::ScalarType::kF32;
+  if (dtype == "f64") return kangaroo::ScalarType::kF64;
+  throw std::runtime_error("unsupported chunk dtype: " + dtype);
 }
 
-nb::bytes host_view_bytes(const kangaroo::HostView& view) {
+kangaroo::ChunkBuffer host_view_from_bytes(
+    nb::bytes payload,
+    const std::string& dtype = "opaque",
+    const std::vector<std::uint64_t>& shape = {}) {
+  const auto* raw = reinterpret_cast<const std::uint8_t*>(payload.data());
+  std::vector<std::uint8_t> bytes(raw, raw + payload.size());
+  const auto scalar = parse_scalar_type(dtype);
+  if (scalar == kangaroo::ScalarType::kOpaque) {
+    if (!shape.empty() && (shape.size() != 1 || shape[0] != bytes.size())) {
+      throw std::runtime_error("opaque chunk shape must equal its byte count");
+    }
+    return kangaroo::ChunkBuffer::opaque(std::move(bytes));
+  }
+  if (shape.empty()) {
+    throw std::runtime_error("numeric chunk writes require an explicit shape");
+  }
+  return kangaroo::ChunkBuffer::wrap(
+      kangaroo::SharedByteBuffer(std::move(bytes)),
+      kangaroo::BufferDesc::contiguous(scalar, shape));
+}
+
+nb::bytes host_view_bytes(const kangaroo::ChunkBuffer& view) {
   return nb::bytes(reinterpret_cast<const char*>(view.data.data()), view.data.size());
+}
+
+nb::dict chunk_buffer_dict(const kangaroo::ChunkBuffer& buffer) {
+  const auto& desc = buffer.desc();
+  nb::dict out;
+  out["data"] = nb::bytes(
+      reinterpret_cast<const char*>(buffer.byte_view().data()), buffer.byte_view().size());
+  out["dtype"] = kangaroo::scalar_type_name(desc.scalar);
+  out["shape"] = std::vector<std::uint64_t>(
+      desc.extents.begin(), desc.extents.begin() + desc.rank);
+  out["strides_bytes"] = std::vector<std::int64_t>(
+      desc.strides_bytes.begin(), desc.strides_bytes.begin() + desc.rank);
+  return out;
 }
 
 nb::dict subbox_view_dict(const kangaroo::SubboxView& view) {
@@ -157,7 +194,7 @@ nb::dict subbox_view_dict(const kangaroo::SubboxView& view) {
   nb::dict d;
   d["data"] = nb::bytes(reinterpret_cast<const char*>(view.data.data.data()),
                         view.data.data.size());
-  d["bytes_per_value"] = view.bytes_per_value;
+  d["dtype"] = kangaroo::scalar_type_name(view.data.desc().scalar);
   d["lo"] = to_tuple(view.box.lo);
   d["hi"] = to_tuple(view.box.hi);
   return d;
@@ -166,6 +203,81 @@ nb::dict subbox_view_dict(const kangaroo::SubboxView& view) {
 }  // namespace
 
 NB_MODULE(_core, m) {
+  m.def("test_chunk_buffer_descriptor",
+        [](const std::string& dtype,
+           const std::vector<std::uint64_t>& extents,
+           const std::string& layout) {
+          kangaroo::ScalarType scalar = kangaroo::ScalarType::kOpaque;
+          if (dtype == "u8") scalar = kangaroo::ScalarType::kU8;
+          else if (dtype == "i64") scalar = kangaroo::ScalarType::kI64;
+          else if (dtype == "f32") scalar = kangaroo::ScalarType::kF32;
+          else if (dtype == "f64") scalar = kangaroo::ScalarType::kF64;
+          else if (dtype != "opaque") throw std::runtime_error("unknown scalar type: " + dtype);
+
+          kangaroo::BufferDesc desc;
+          if (layout == "contiguous") {
+            desc = kangaroo::BufferDesc::contiguous(scalar, extents);
+          } else if (layout == "plotfile") {
+            if (extents.size() != 3) throw std::runtime_error("plotfile layout requires rank 3");
+            desc = kangaroo::BufferDesc::plotfile_grid(
+                scalar, {extents[0], extents[1], extents[2]});
+          } else {
+            throw std::runtime_error("unknown layout: " + layout);
+          }
+          auto buffer = kangaroo::ChunkBuffer::allocate(desc, kangaroo::InitPolicy::kZero);
+          nb::dict out;
+          out["dtype"] = kangaroo::scalar_type_name(desc.scalar);
+          out["rank"] = desc.rank;
+          out["extents"] = std::vector<std::uint64_t>(
+              desc.extents.begin(), desc.extents.begin() + desc.rank);
+          out["strides_bytes"] = std::vector<std::int64_t>(
+              desc.strides_bytes.begin(), desc.strides_bytes.begin() + desc.rank);
+          out["elements"] = desc.element_count();
+          out["bytes"] = buffer.bytes();
+          return out;
+        },
+        nb::arg("dtype"), nb::arg("extents"), nb::arg("layout") = "contiguous");
+  m.def("test_chunk_buffer_layout_values", []() {
+    const std::array<std::uint64_t, 3> extents{2, 3, 4};
+    auto runtime = kangaroo::ChunkBuffer::allocate(
+        kangaroo::BufferDesc::runtime_grid(kangaroo::ScalarType::kF64, extents));
+    auto plotfile = kangaroo::ChunkBuffer::allocate(
+        kangaroo::BufferDesc::plotfile_grid(kangaroo::ScalarType::kF64, extents));
+    auto runtime_view = runtime.mutable_view<double, 3>();
+    auto plotfile_view = plotfile.mutable_view<double, 3>();
+    for (std::uint64_t i = 0; i < extents[0]; ++i) {
+      for (std::uint64_t j = 0; j < extents[1]; ++j) {
+        for (std::uint64_t k = 0; k < extents[2]; ++k) {
+          const double value = static_cast<double>(100 * i + 10 * j + k);
+          runtime_view(i, j, k) = value;
+          plotfile_view(i, j, k) = value;
+        }
+      }
+    }
+    const auto runtime_const = std::as_const(runtime).view<double, 3>();
+    const auto plotfile_const = std::as_const(plotfile).view<double, 3>();
+    nb::list values;
+    for (std::uint64_t i = 0; i < extents[0]; ++i)
+      for (std::uint64_t j = 0; j < extents[1]; ++j)
+        for (std::uint64_t k = 0; k < extents[2]; ++k)
+          values.append(nb::make_tuple(runtime_const(i, j, k), plotfile_const(i, j, k)));
+    return values;
+  });
+  m.def("test_chunk_buffer_cow", []() {
+    const std::array<std::uint64_t, 1> extents{3};
+    auto original = kangaroo::ChunkBuffer::allocate(
+        kangaroo::BufferDesc::contiguous(kangaroo::ScalarType::kI64, extents),
+        kangaroo::InitPolicy::kZero);
+    original.mutable_array<std::int64_t>()(1) = 7;
+    auto copy = original;
+    copy.mutable_array<std::int64_t>()(1) = 11;
+    return nb::make_tuple(original.array<std::int64_t>()(1), copy.array<std::int64_t>()(1));
+  });
+  m.def("test_chunk_buffer_dynamic", [](std::uint64_t capacity, std::uint64_t extent) {
+    auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(kangaroo::ScalarType::kF64, capacity);
+    buffer.commit_dynamic_extent(extent);
+    return nb::make_tuple(buffer.desc().extents[0], buffer.bytes(), buffer.capacity_bytes());
+  });
   m.def("hpx_configuration_string", []() { return hpx::configuration_string(); });
   m.def("set_event_log_path", &kangaroo::set_event_log_path);
   m.def("set_perfetto_trace_path", &kangaroo::set_perfetto_trace_path);
@@ -179,15 +291,13 @@ NB_MODULE(_core, m) {
            nb::tuple chunk_lo,
            nb::tuple chunk_hi,
            nb::tuple request_lo,
-           nb::tuple request_hi,
-           int32_t bytes_per_value) -> nb::dict {
+           nb::tuple request_hi) -> nb::dict {
           (void)binding_runtime().locality_id();
 
           kangaroo::ChunkSubboxRef ref;
           ref.chunk = kangaroo::ChunkRef{step, level, field, version, block};
           ref.chunk_box = parse_index_box(chunk_lo, chunk_hi);
           ref.request_box = parse_index_box(request_lo, request_hi);
-          ref.bytes_per_value = bytes_per_value;
 
           kangaroo::DataServiceLocal data_service(0, &dataset);
           auto out = data_service.get_subbox(ref).get();
@@ -202,8 +312,7 @@ NB_MODULE(_core, m) {
         nb::arg("chunk_lo"),
         nb::arg("chunk_hi"),
         nb::arg("request_lo"),
-        nb::arg("request_hi"),
-        nb::arg("bytes_per_value"));
+        nb::arg("request_hi"));
   m.def("test_data_service_pending_then_put",
         [](kangaroo::DatasetHandle& dataset,
            int32_t step,
@@ -223,10 +332,10 @@ NB_MODULE(_core, m) {
           const bool returned_before_put = true;
           const bool future_ready_before_put = host_future.is_ready();
 
-          kangaroo::HostView payload_view = host_view_from_bytes(payload);
+          kangaroo::ChunkBuffer payload_view = host_view_from_bytes(payload);
           data_service.put_host(ref, std::move(payload_view)).get();
           const bool ready_before_get = host_future.is_ready();
-          kangaroo::HostView out = host_future.get();
+          kangaroo::ChunkBuffer out = host_future.get();
 
           nb::dict d;
           d["returned_before_put"] = returned_before_put;
@@ -259,7 +368,7 @@ NB_MODULE(_core, m) {
 
           auto host_future = data_service.get_host(ref);
           const bool ready_before_get = host_future.is_ready();
-          kangaroo::HostView out = host_future.get();
+          kangaroo::ChunkBuffer out = host_future.get();
 
           nb::dict d;
           d["ready_before_get"] = ready_before_get;
@@ -286,7 +395,7 @@ NB_MODULE(_core, m) {
 
           kangaroo::DataServiceLocal data_service(0, &dataset);
           kangaroo::ChunkRef ref{step, level, field, version, block};
-          std::vector<hpx::future<kangaroo::HostView>> futures;
+          std::vector<hpx::future<kangaroo::ChunkBuffer>> futures;
           futures.reserve(static_cast<std::size_t>(consumers));
           nb::list ready_before_put;
           for (int32_t i = 0; i < consumers; ++i) {
@@ -328,7 +437,7 @@ NB_MODULE(_core, m) {
            nb::tuple chunk_hi,
            nb::tuple request_lo,
            nb::tuple request_hi,
-           int32_t bytes_per_value,
+           const std::string& dtype,
            nb::bytes payload) -> nb::dict {
           (void)binding_runtime().locality_id();
 
@@ -336,12 +445,19 @@ NB_MODULE(_core, m) {
           subbox_ref.chunk = kangaroo::ChunkRef{step, level, field, version, block};
           subbox_ref.chunk_box = parse_index_box(chunk_lo, chunk_hi);
           subbox_ref.request_box = parse_index_box(request_lo, request_hi);
-          subbox_ref.bytes_per_value = bytes_per_value;
+          const auto shape = std::vector<std::uint64_t>{
+              static_cast<std::uint64_t>(subbox_ref.chunk_box.hi[0] -
+                                         subbox_ref.chunk_box.lo[0] + 1),
+              static_cast<std::uint64_t>(subbox_ref.chunk_box.hi[1] -
+                                         subbox_ref.chunk_box.lo[1] + 1),
+              static_cast<std::uint64_t>(subbox_ref.chunk_box.hi[2] -
+                                         subbox_ref.chunk_box.lo[2] + 1)};
 
           kangaroo::DataServiceLocal data_service(0, &dataset);
           auto subbox_future = data_service.get_subbox(subbox_ref);
           const bool future_ready_before_put = subbox_future.is_ready();
-          data_service.put_host(subbox_ref.chunk, host_view_from_bytes(payload)).get();
+          data_service.put_host(
+              subbox_ref.chunk, host_view_from_bytes(payload, dtype, shape)).get();
           const bool ready_before_get = subbox_future.is_ready();
           auto out = subbox_future.get();
 
@@ -360,7 +476,7 @@ NB_MODULE(_core, m) {
         nb::arg("chunk_hi"),
         nb::arg("request_lo"),
         nb::arg("request_hi"),
-        nb::arg("bytes_per_value"),
+        nb::arg("dtype"),
         nb::arg("payload"));
   m.def("log_task_event",
         [](const std::string& name,
@@ -485,6 +601,14 @@ NB_MODULE(_core, m) {
            nb::arg("version") = 0,
            nb::arg("block"),
            nb::arg("dataset") = nb::none())
+      .def("get_task_chunk_info",
+           [](kangaroo::Runtime& self, int32_t step, int16_t level, int32_t field,
+              int32_t version, int32_t block, kangaroo::DatasetHandle* dataset) {
+             return chunk_buffer_dict(
+                 self.get_task_chunk(step, level, field, version, block, dataset));
+           },
+           nb::arg("step"), nb::arg("level"), nb::arg("field"),
+           nb::arg("version") = 0, nb::arg("block"), nb::arg("dataset") = nb::none())
       .def("preload_dataset", &kangaroo::Runtime::preload_dataset)
       .def("run_packed_plan",
            &kangaroo::Runtime::run_packed_plan,
@@ -806,14 +930,14 @@ NB_MODULE(_core, m) {
       })
       .def("set_chunk",
            [](kangaroo::DatasetHandle& self, int32_t field, int32_t version, int32_t block,
-              nb::bytes payload) {
-             const auto* data = static_cast<const std::uint8_t*>(payload.data());
-             std::vector<std::uint8_t> buffer(data, data + payload.size());
-             kangaroo::HostView view;
-             view.data = std::move(buffer);
+              nb::bytes payload, const std::string& dtype,
+              const std::vector<std::uint64_t>& shape) {
+             auto view = host_view_from_bytes(payload, dtype, shape);
              kangaroo::ChunkRef ref{self.step, self.level, field, version, block};
              self.set_chunk(ref, std::move(view));
-           })
+           },
+           nb::arg("field"), nb::arg("version"), nb::arg("block"), nb::arg("payload"),
+           nb::arg("dtype") = "opaque", nb::arg("shape") = std::vector<std::uint64_t>{})
       .def("set_chunk_ref",
            [](kangaroo::DatasetHandle& self,
               int32_t step,
@@ -821,14 +945,16 @@ NB_MODULE(_core, m) {
               int32_t field,
               int32_t version,
               int32_t block,
-              nb::bytes payload) {
-             const auto* data = static_cast<const std::uint8_t*>(payload.data());
-             std::vector<std::uint8_t> buffer(data, data + payload.size());
-             kangaroo::HostView view;
-             view.data = std::move(buffer);
+              nb::bytes payload,
+              const std::string& dtype,
+              const std::vector<std::uint64_t>& shape) {
+             auto view = host_view_from_bytes(payload, dtype, shape);
              kangaroo::ChunkRef ref{step, level, field, version, block};
              self.set_chunk(ref, std::move(view));
-           })
+           },
+           nb::arg("step"), nb::arg("level"), nb::arg("field"), nb::arg("version"),
+           nb::arg("block"), nb::arg("payload"), nb::arg("dtype") = "opaque",
+           nb::arg("shape") = std::vector<std::uint64_t>{})
       .def("read_chunk_ref",
            [](kangaroo::DatasetHandle& self,
               int32_t step,
@@ -837,7 +963,7 @@ NB_MODULE(_core, m) {
               int32_t version,
               int32_t block) -> nb::object {
              kangaroo::ChunkRef ref{step, level, field, version, block};
-             std::optional<kangaroo::HostView> view;
+             std::optional<kangaroo::ChunkBuffer> view;
              {
                nb::gil_scoped_release release;
                view = self.get_chunk(ref);
@@ -871,7 +997,7 @@ NB_MODULE(_core, m) {
                });
              }
 
-             std::vector<std::optional<kangaroo::HostView>> views;
+             std::vector<std::optional<kangaroo::ChunkBuffer>> views;
              {
                nb::gil_scoped_release release;
                views = self.get_chunks(refs);
@@ -907,7 +1033,7 @@ NB_MODULE(_core, m) {
                });
              }
 
-             std::vector<std::optional<kangaroo::HostView>> views;
+             std::vector<std::optional<kangaroo::ChunkBuffer>> views;
              {
                nb::gil_scoped_release release;
                views = self.get_chunks(refs);

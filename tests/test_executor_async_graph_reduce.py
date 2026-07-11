@@ -15,7 +15,8 @@ def test_many_graph_reduce_consumers_wait_for_later_producer_without_deadlock() 
 
         from analysis import Runtime
         from analysis.dataset import open_dataset
-        from analysis.plan import Domain, FieldRef, Plan, Stage
+        from analysis.buffer import BufferSpec, DType, FixedShape
+        from analysis.plan import Domain, FieldRef, OutputRef, Plan, Stage
         from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
 
         rt = Runtime()
@@ -44,7 +45,7 @@ def test_many_graph_reduce_consumers_wait_for_later_producer_without_deadlock() 
         consumer_count = 96
         value = 123456789
 
-        ds._h.set_chunk_ref(0, 0, source_field, 0, 0, struct.pack("<q", value))
+        ds._h.set_chunk_ref(0, 0, source_field, 0, 0, struct.pack("<q", value), "i64", [1])
 
         # This stage is deliberately independent and first in the plan. It creates
         # many consumers of the same not-yet-produced chunk before the producer
@@ -55,8 +56,7 @@ def test_many_graph_reduce_consumers_wait_for_later_producer_without_deadlock() 
             kernel="particle_int64_sum_reduce",
             domain=Domain(step=0, level=0),
             inputs=[FieldRef(produced_field)],
-            outputs=[FieldRef(reduced_field)],
-            output_bytes=[8],
+            outputs=[OutputRef(FieldRef(reduced_field), BufferSpec(DType.I64, FixedShape((1,))))],
             deps={"kind": "None"},
             params={
                 "graph_kind": "reduce",
@@ -73,8 +73,7 @@ def test_many_graph_reduce_consumers_wait_for_later_producer_without_deadlock() 
             kernel="particle_int64_sum_reduce",
             domain=Domain(step=0, level=0, blocks=[0]),
             inputs=[FieldRef(source_field)],
-            outputs=[FieldRef(produced_field)],
-            output_bytes=[8],
+            outputs=[OutputRef(FieldRef(produced_field), BufferSpec(DType.I64, FixedShape((1,))))],
             deps={"kind": "None"},
             params={},
         )
@@ -115,7 +114,8 @@ def test_graph_reduce_group_offsets_select_variable_input_groups() -> None:
 
         from analysis import Runtime
         from analysis.dataset import open_dataset
-        from analysis.plan import Domain, FieldRef, Plan, Stage
+        from analysis.buffer import BufferSpec, DType, FixedShape
+        from analysis.plan import Domain, FieldRef, OutputRef, Plan, Stage
         from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
 
         rt = Runtime()
@@ -146,7 +146,7 @@ def test_graph_reduce_group_offsets_select_variable_input_groups() -> None:
         source_field = 32001
         reduced_field = 32002
         for block, value in enumerate([1, 2, 3, 4]):
-            ds._h.set_chunk_ref(0, 0, source_field, 0, block, struct.pack("<q", value))
+            ds._h.set_chunk_ref(0, 0, source_field, 0, block, struct.pack("<q", value), "i64", [1])
 
         graph = Stage(name="offset_reduce", plane="graph")
         graph.map_blocks(
@@ -154,8 +154,7 @@ def test_graph_reduce_group_offsets_select_variable_input_groups() -> None:
             kernel="particle_int64_sum_reduce",
             domain=Domain(step=0, level=0),
             inputs=[FieldRef(source_field)],
-            outputs=[FieldRef(reduced_field)],
-            output_bytes=[8],
+            outputs=[OutputRef(FieldRef(reduced_field), BufferSpec(DType.I64, FixedShape((1,))))],
             deps={"kind": "None"},
             params={
                 "graph_kind": "reduce",

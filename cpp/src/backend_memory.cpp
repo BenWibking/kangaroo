@@ -2,7 +2,7 @@
 
 namespace kangaroo {
 
-std::optional<HostView> MemoryBackend::get_chunk(const ChunkRef& ref) {
+std::optional<ChunkBuffer> MemoryBackend::get_chunk(const ChunkRef& ref) {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = data_.find(ref);
   if (it != data_.end()) {
@@ -16,13 +16,19 @@ bool MemoryBackend::has_chunk(const ChunkRef& ref) const {
   return data_.find(ref) != data_.end();
 }
 
+std::optional<BufferDesc> MemoryBackend::describe_chunk(const ChunkRef& ref) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto it = data_.find(ref);
+  return it == data_.end() ? std::nullopt : std::optional<BufferDesc>(it->second.desc());
+}
+
 std::size_t MemoryBackend::estimate_chunk_bytes(const ChunkRef& ref) const {
   std::lock_guard<std::mutex> lock(mutex_);
   auto it = data_.find(ref);
   if (it == data_.end()) {
     return 0;
   }
-  return it->second.data.size();
+  return it->second.bytes();
 }
 
 DatasetMetadata MemoryBackend::get_metadata() const {
@@ -30,7 +36,7 @@ DatasetMetadata MemoryBackend::get_metadata() const {
   return DatasetMetadata{};
 }
 
-void MemoryBackend::set_chunk(const ChunkRef& ref, HostView view) {
+void MemoryBackend::set_chunk(const ChunkRef& ref, ChunkBuffer view) {
   std::lock_guard<std::mutex> lock(mutex_);
   data_[ref] = std::move(view);
 }

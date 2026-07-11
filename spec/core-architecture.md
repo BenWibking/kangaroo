@@ -35,8 +35,8 @@ A plan is a list of stages. Each stage contains:
 Each template contains:
 - Identity: `name`, `plane`, `kernel`
 - Domain: `step`, `level`, optional `blocks`
-- `inputs` and `outputs` as field references
-- `output_bytes` (optional per-output size hints)
+- `inputs` as field references
+- `outputs` as field references paired with buffer specifications
 - `deps` dependency rule
 - `params` payload
 
@@ -81,14 +81,14 @@ Scheduling behavior:
 ## 7. Data Service Contract
 
 The runtime data service MUST support:
-- Output buffer allocation by chunk identity and requested size.
+- Output buffer allocation by chunk identity and resolved descriptor/allocation policy.
 - Asynchronous get by chunk identity.
 - Asynchronous put by chunk identity.
 - Subbox fetch by chunk identity plus request bounds.
 
 Subbox contract:
 - Returned box MUST be the geometric intersection of requested box and source chunk box.
-- Returned payload MUST correspond exactly to returned box extents and bytes-per-value.
+- Returned chunk buffer MUST retain the source scalar type and describe the returned extents.
 - No-overlap requests MUST return empty payload and invalid/empty bounds representation.
 
 ## 8. Neighbor Dependency Semantics
@@ -141,13 +141,13 @@ Kernel name compatibility requirements are defined in `spec/operators.md`.
 
 ## 12. Output Allocation Semantics
 
-If `output_bytes` is provided on a template:
-- Its length MUST equal number of outputs.
-- Each output buffer MUST be allocated with corresponding size.
+Every output MUST have a buffer specification. Block, fixed, and like-input shapes are
+allocated by the executor from a resolved descriptor. Dynamic rank-one outputs MUST
+declare a conservative upper-bound rule and may commit one final extent within that
+capacity. Kernels MUST NOT resize statically specified outputs.
 
-If omitted:
-- Runtime MAY allocate zero-sized output buffers initially.
-- Kernel is then responsible for resizing output payload appropriately.
+Kernel parameters contain scientific configuration only; storage dtype, shape, layout,
+and allocation policy belong to chunk descriptors and buffer specifications.
 
 ## 13. Event Logging
 

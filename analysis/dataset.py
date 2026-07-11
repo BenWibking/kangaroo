@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from . import _core  # type: ignore
+from .buffer import DType, dtype_from_numpy, numpy_dtype
 
 
 @dataclass(frozen=True)
@@ -121,14 +122,7 @@ class Dataset:
         payload = self._h.read_particle_field_chunk(particle_type, field, int(chunk_index))
         dtype = payload["dtype"]
         raw = payload["data"]
-        if dtype == "float32":
-            np_dtype = np.float32
-        elif dtype == "float64":
-            np_dtype = np.float64
-        elif dtype == "int64":
-            np_dtype = np.int64
-        else:
-            raise RuntimeError(f"unsupported particle dtype '{dtype}'")
+        np_dtype = numpy_dtype(dtype)
         return np.frombuffer(raw, dtype=np_dtype)
 
     def register_field(self, name: str, fid: int) -> None:
@@ -350,40 +344,43 @@ class Dataset:
             "axis_bounds": axis_bounds,
         }
 
-    def infer_bytes_per_value(
+    def set_chunk(
         self,
-        runtime: Any,
         *,
         field: int,
-        level: int,
-        step: int = 0,
         version: int = 0,
-        block: int = 0,
-    ) -> int:
-        level_boxes = self.metadata["level_boxes"][level]
-        if not level_boxes:
-            raise RuntimeError(f"No boxes found for level {level}")
-        b0_lo, b0_hi = level_boxes[0]
-        b0_elems = (
-            (b0_hi[0] - b0_lo[0] + 1)
-            * (b0_hi[1] - b0_lo[1] + 1)
-            * (b0_hi[2] - b0_lo[2] + 1)
-        )
-        raw = runtime.get_task_chunk(
-            step=step,
-            level=level,
-            field=field,
-            version=version,
-            block=block,
-            dataset=self,
-        )
-        bpv = len(raw) // b0_elems
-        if bpv <= 0:
-            raise RuntimeError("Unable to infer bytes-per-value from dataset chunk")
-        return bpv
+        block: int,
+        data: bytes | bytearray | memoryview | np.ndarray,
+        dtype: DType | str | None = None,
+        shape: tuple[int, ...] | None = None,
+        opaque: bool = False,
+    ) -> None:
+        if isinstance(data, np.ndarray):
+            array = np.ascontiguousarray(data)
+            inferred_dtype = dtype_from_numpy(array.dtype)
+            if dtype is not None and DType(dtype) is not inferred_dtype:
+                raise ValueError("explicit dtype does not match NumPy array dtype")
+            if shape is not None and tuple(shape) != tuple(array.shape):
+                raise ValueError("explicit shape does not match NumPy array shape")
+            self._h.set_chunk(
+                field,
+                version,
+                block,
+                array.tobytes(order="C"),
+                inferred_dtype.value,
+                list(array.shape),
+            )
+            return
 
-    def set_chunk(self, *, field: int, version: int = 0, block: int, data: bytes) -> None:
-        self._h.set_chunk(field, version, block, data)
+        raw = bytes(data)
+        if opaque:
+            if dtype is not None or shape is not None:
+                raise ValueError("opaque writes cannot also specify numeric dtype or shape")
+            self._h.set_chunk(field, version, block, raw, DType.OPAQUE.value, [len(raw)])
+            return
+        if dtype is None or shape is None:
+            raise ValueError("raw-byte chunk writes require dtype and shape, or opaque=True")
+        self._h.set_chunk(field, version, block, raw, DType(dtype).value, list(shape))
 
 
 def _resolve_dataset_uri(path_or_uri: str) -> str:

@@ -10,7 +10,9 @@ from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
 
 def _set_block_double(ds, *, step: int, level: int, field: int, block: int, values: np.ndarray) -> None:
     arr = np.asarray(values, dtype=np.float64)
-    ds._h.set_chunk_ref(step, level, field, 0, block, arr.tobytes(order="C"))
+    ds._h.set_chunk_ref(
+        step, level, field, 0, block, arr.tobytes(order="C"), "f64", list(arr.shape)
+    )
 
 
 def _runmeta(step: int) -> RunMeta:

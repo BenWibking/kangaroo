@@ -15,8 +15,8 @@
 
 namespace kangaroo {
 
-hpx::future<HostView> data_get_local_impl(int32_t run_id, const ChunkRef& ref);
-void data_put_local_impl(int32_t run_id, const ChunkRef& ref, HostView view);
+hpx::future<ChunkBuffer> data_get_local_impl(int32_t run_id, const ChunkRef& ref);
+void data_put_local_impl(int32_t run_id, const ChunkRef& ref, ChunkBuffer view);
 struct ChunkConsumerCount {
   ChunkRef ref;
   std::int64_t count = 0;
@@ -41,14 +41,15 @@ class DataServiceLocal : public DataService {
                             std::shared_ptr<ChunkStore> chunk_store = nullptr);
 
   int home_rank(const ChunkRef& ref) const override;
-  HostView alloc_host(const ChunkRef& ref, std::size_t bytes) override;
-  hpx::shared_future<std::shared_ptr<HostView>> get_host_shared(const ChunkRef& ref);
-  std::vector<hpx::shared_future<std::shared_ptr<HostView>>> get_hosts_shared(
+  std::size_t estimate_host_bytes(const ChunkRef& ref) const override;
+  ChunkBuffer alloc_host(const ChunkRef& ref, const ResolvedBufferSpec& spec) override;
+  hpx::shared_future<std::shared_ptr<ChunkBuffer>> get_host_shared(const ChunkRef& ref);
+  std::vector<hpx::shared_future<std::shared_ptr<ChunkBuffer>>> get_hosts_shared(
       const std::vector<ChunkRef>& refs);
-  hpx::future<HostView> get_host(const ChunkRef& ref) override;
-  std::vector<hpx::future<HostView>> get_hosts(const std::vector<ChunkRef>& refs) override;
+  hpx::future<ChunkBuffer> get_host(const ChunkRef& ref) override;
+  std::vector<hpx::future<ChunkBuffer>> get_hosts(const std::vector<ChunkRef>& refs) override;
   hpx::future<SubboxView> get_subbox(const ChunkSubboxRef& ref) override;
-  hpx::future<void> put_host(const ChunkRef& ref, HostView view) override;
+  hpx::future<void> put_host(const ChunkRef& ref, ChunkBuffer view) override;
   hpx::future<void> register_input_consumers(const std::vector<ChunkConsumerCount>& counts);
   hpx::future<void> release_consumed_inputs(const std::vector<ChunkRef>& refs);
   static void preload(const RunMeta& meta,
@@ -57,8 +58,8 @@ class DataServiceLocal : public DataService {
                       const std::vector<int32_t>& fields);
 
  private:
-  friend hpx::future<HostView> data_get_local_impl(int32_t run_id, const ChunkRef& ref);
-  friend void data_put_local_impl(int32_t run_id, const ChunkRef& ref, HostView view);
+  friend hpx::future<ChunkBuffer> data_get_local_impl(int32_t run_id, const ChunkRef& ref);
+  friend void data_put_local_impl(int32_t run_id, const ChunkRef& ref, ChunkBuffer view);
   friend void data_register_input_consumers_local_impl(
       int32_t run_id,
       const std::vector<ChunkConsumerCount>& counts);
@@ -68,11 +69,11 @@ class DataServiceLocal : public DataService {
 
   const DatasetHandle* resolve_dataset() const;
   std::shared_ptr<ChunkStore> resolve_chunk_store() const;
-  hpx::shared_future<std::shared_ptr<HostView>> get_local_shared_impl(const ChunkRef& ref);
-  std::vector<hpx::shared_future<std::shared_ptr<HostView>>> get_local_shared_batch_impl(
+  hpx::shared_future<std::shared_ptr<ChunkBuffer>> get_local_shared_impl(const ChunkRef& ref);
+  std::vector<hpx::shared_future<std::shared_ptr<ChunkBuffer>>> get_local_shared_batch_impl(
       const std::vector<ChunkRef>& refs);
-  hpx::future<HostView> get_local_impl(const ChunkRef& ref);
-  void put_local_impl(const ChunkRef& ref, HostView view);
+  hpx::future<ChunkBuffer> get_local_impl(const ChunkRef& ref);
+  void put_local_impl(const ChunkRef& ref, ChunkBuffer view);
 
   int32_t run_id_ = 0;
   const DatasetHandle* dataset_ = nullptr;

@@ -14,6 +14,8 @@ from pathlib import Path
 import msgpack
 import numpy as np
 
+from .buffer import DType, numpy_dtype
+
 from .plan import Plan
 
 try:
@@ -255,24 +257,18 @@ class Runtime:
         dataset_h = dataset._h if dataset is not None and hasattr(dataset, "_h") else None
         return self._rt.get_task_chunk(step, level, field, version, block, dataset_h)
 
-    def get_task_chunk_array(
+    def get_task_chunk_bytes(
         self,
         *,
         step: int,
         level: int,
         field: int,
-        shape: tuple[int, ...],
         version: int = 0,
         block: int,
-        dtype: Any | None = None,
-        bytes_per_value: int | None = None,
         dataset: Any | None = None,
-    ) -> np.ndarray:
-        count = int(np.prod(shape))
-        if count <= 0:
-            raise ValueError("shape must have a positive number of elements")
-
-        raw = self.get_task_chunk(
+    ) -> bytes:
+        """Return the raw visible bytes for a numeric chunk or opaque payload."""
+        return self.get_task_chunk(
             step=step,
             level=level,
             field=field,
@@ -280,16 +276,43 @@ class Runtime:
             block=block,
             dataset=dataset,
         )
-        if dtype is None:
-            if bytes_per_value is None:
-                bytes_per_value = len(raw) // count
-            if bytes_per_value == 8:
-                dtype = np.float64
-            elif bytes_per_value == 4:
-                dtype = np.float32
-            else:
-                raise ValueError(f"unsupported bytes_per_value: {bytes_per_value}")
-        return np.frombuffer(raw, dtype=dtype, count=count).reshape(shape)
+
+    def get_task_chunk_array(
+        self,
+        *,
+        step: int,
+        level: int,
+        field: int,
+        shape: tuple[int, ...] | None = None,
+        version: int = 0,
+        block: int,
+        dtype: Any | None = None,
+        dataset: Any | None = None,
+    ) -> np.ndarray:
+        if self._run_in_progress:
+            raise RuntimeError("output retrieval is not allowed while a plan run is in progress")
+        dataset_h = dataset._h if dataset is not None and hasattr(dataset, "_h") else None
+        info = self._rt.get_task_chunk_info(
+            step, level, field, version, block, dataset_h
+        )
+        descriptor_dtype = DType(info["dtype"])
+        resolved_dtype = numpy_dtype(descriptor_dtype)
+        resolved_shape = tuple(int(value) for value in info["shape"])
+        strides = tuple(int(value) for value in info["strides_bytes"])
+        if dtype is not None and np.dtype(dtype) != resolved_dtype:
+            raise ValueError(
+                f"requested dtype {np.dtype(dtype)} does not match chunk dtype {resolved_dtype}"
+            )
+        if shape is not None and tuple(shape) != resolved_shape:
+            raise ValueError(
+                f"requested shape {tuple(shape)} does not match chunk shape {resolved_shape}"
+            )
+        return np.ndarray(
+            shape=resolved_shape,
+            dtype=resolved_dtype,
+            buffer=info["data"],
+            strides=strides,
+        )
 
 
 def plan_to_dict(plan: Plan) -> dict:
@@ -348,10 +371,13 @@ def plan_to_dict(plan: Plan) -> dict:
                             for ref in tmpl.inputs
                         ],
                         "outputs": [
-                            {"field": ref.field, "version": ref.version}
+                            {
+                                "field": ref.field.field,
+                                "version": ref.field.version,
+                                "buffer": ref.buffer.to_dict(),
+                            }
                             for ref in tmpl.outputs
                         ],
-                        "output_bytes": list(tmpl.output_bytes),
                         "deps": tmpl.deps,
                         "params": params_to_dict(tmpl.params),
                     }

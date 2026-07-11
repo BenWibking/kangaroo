@@ -27,6 +27,7 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <tuple>
 #include <variant>
 #include <unordered_map>
 #include <vector>
@@ -189,6 +190,12 @@ void log_projection_kernel_summary(const char* kernel,
             << std::endl;
 }
 
+template <typename T>
+T load_buffer_scalar(const std::uint8_t* data, std::size_t index);
+
+template <typename T>
+void store_buffer_scalar(std::uint8_t* data, std::size_t index, T value);
+
 void append_particle_values_as_f64(const plotfile::ParticleArrayData& data, const std::string& name,
                                    const std::string& context, std::vector<double>& out_vals) {
   const std::size_t n = static_cast<std::size_t>(std::max<int64_t>(0, data.count));
@@ -198,23 +205,22 @@ void append_particle_values_as_f64(const plotfile::ParticleArrayData& data, cons
     if (data.bytes.size() < n * sizeof(double)) {
       throw std::runtime_error(context + ": short float64 payload for " + name);
     }
-    const auto* in = reinterpret_cast<const double*>(data.bytes.data());
-    std::copy(in, in + n, out_vals.begin() + static_cast<std::ptrdiff_t>(start));
+    for (std::size_t i = 0; i < n; ++i) {
+      out_vals[start + i] = load_buffer_scalar<double>(data.bytes.data(), i);
+    }
   } else if (data.dtype == "float32") {
     if (data.bytes.size() < n * sizeof(float)) {
       throw std::runtime_error(context + ": short float32 payload for " + name);
     }
-    const auto* in = reinterpret_cast<const float*>(data.bytes.data());
     for (std::size_t i = 0; i < n; ++i) {
-      out_vals[start + i] = static_cast<double>(in[i]);
+      out_vals[start + i] = static_cast<double>(load_buffer_scalar<float>(data.bytes.data(), i));
     }
   } else if (data.dtype == "int64") {
     if (data.bytes.size() < n * sizeof(int64_t)) {
       throw std::runtime_error(context + ": short int64 payload for " + name);
     }
-    const auto* in = reinterpret_cast<const int64_t*>(data.bytes.data());
     for (std::size_t i = 0; i < n; ++i) {
-      out_vals[start + i] = static_cast<double>(in[i]);
+      out_vals[start + i] = static_cast<double>(load_buffer_scalar<int64_t>(data.bytes.data(), i));
     }
   } else {
     throw std::runtime_error(context + ": unsupported dtype '" + data.dtype + "' for " + name);
@@ -245,6 +251,89 @@ std::unordered_map<double, int64_t> decode_particle_value_counts(std::span<const
     counts[value] += count;
   }
   return counts;
+}
+
+template <typename T>
+T load_buffer_scalar(const std::uint8_t* data, std::size_t index) {
+  T value;
+  std::memcpy(&value, data + index * sizeof(T), sizeof(T));
+  return value;
+}
+
+template <typename T>
+void store_buffer_scalar(std::uint8_t* data, std::size_t index, T value) {
+  std::memcpy(data + index * sizeof(T), &value, sizeof(T));
+}
+
+bool descriptors_match(const BufferDesc& lhs, const BufferDesc& rhs) {
+  if (lhs.scalar != rhs.scalar || lhs.rank != rhs.rank) return false;
+  for (std::size_t axis = 0; axis < lhs.rank; ++axis) {
+    if (lhs.extents[axis] != rhs.extents[axis] ||
+        lhs.strides_bytes[axis] != rhs.strides_bytes[axis]) return false;
+  }
+  return true;
+}
+
+template <typename T>
+void reduce_matching_buffers(std::span<const ChunkBuffer> inputs, ChunkBuffer& output) {
+  const auto count = static_cast<std::size_t>(output.desc().element_count());
+  auto out = output.mutable_byte_view();
+  std::fill(out.begin(), out.end(), std::uint8_t{0});
+  for (const auto& input : inputs) {
+    if (!descriptors_match(input.desc(), output.desc())) {
+      throw BufferContractError(BufferContractReason::kDescriptorStorageMismatch,
+                                "generic reduction requires identical descriptors");
+    }
+    const auto in = input.byte_view();
+    for (std::size_t index = 0; index < count; ++index) {
+      const T sum = load_buffer_scalar<T>(out.data(), index) +
+                    load_buffer_scalar<T>(in.data(), index);
+      store_buffer_scalar(out.data(), index, sum);
+    }
+  }
+}
+
+void reduce_matching_real_buffers(std::span<const ChunkBuffer> inputs, ChunkBuffer& output) {
+  if (output.desc().scalar == ScalarType::kF32) {
+    reduce_matching_buffers<float>(inputs, output);
+  } else if (output.desc().scalar == ScalarType::kF64) {
+    reduce_matching_buffers<double>(inputs, output);
+  } else {
+    throw BufferContractError(BufferContractReason::kScalarMismatch,
+                              "generic real reduction requires f32 or f64 buffers");
+  }
+}
+
+struct RealGridAccessor {
+  const std::uint8_t* data = nullptr;
+  std::array<std::int64_t, 3> strides{};
+  double (*load)(const RealGridAccessor&, int, int, int) = nullptr;
+
+  double operator()(int i, int j, int k) const { return load(*this, i, j, k); }
+};
+
+template <typename T>
+RealGridAccessor make_real_grid_accessor(const TensorView<const T, 3>& grid) {
+  RealGridAccessor accessor;
+  accessor.data = grid.byte_data();
+  accessor.strides = grid.strides_bytes();
+  accessor.load = [](const RealGridAccessor& self, int i, int j, int k) {
+    const auto offset = static_cast<std::uint64_t>(i) * self.strides[0] +
+                        static_cast<std::uint64_t>(j) * self.strides[1] +
+                        static_cast<std::uint64_t>(k) * self.strides[2];
+    T value;
+    std::memcpy(&value, self.data + offset, sizeof(T));
+    return static_cast<double>(value);
+  };
+  return accessor;
+}
+
+RealGridAccessor make_real_grid_accessor(const ChunkBuffer& buffer) {
+  RealGridAccessor accessor;
+  visit_real_buffers_exact<1>(std::span<const ChunkBuffer>(&buffer, 1), [&](auto view) {
+    accessor = make_real_grid_accessor(view.template tensor<3>());
+  });
+  return accessor;
 }
 
 void encode_particle_value_counts(const std::unordered_map<double, int64_t>& counts,
@@ -1321,25 +1410,12 @@ std::shared_ptr<plotfile::PlotfileReader> get_plotfile_reader(const std::string&
   return shared;
 }
 
-template <typename InT, typename OutT>
-void transpose_plotfile_axes(const InT* in, OutT* out, int nx, int ny, int nz) {
-  for (int k = 0; k < nz; ++k) {
-    for (int j = 0; j < ny; ++j) {
-      for (int i = 0; i < nx; ++i) {
-        const std::size_t in_idx = (static_cast<std::size_t>(k) * ny + j) * nx + i;
-        const std::size_t out_idx = (static_cast<std::size_t>(i) * ny + j) * nz + k;
-        out[out_idx] = static_cast<OutT>(in[in_idx]);
-      }
-    }
-  }
-}
-
 struct SamplePatch {
   int16_t level = 0;
   IndexBox3 box;
   LevelGeom geom;
-  HostView view;
-  int32_t bytes_per_value = 4;
+  ChunkBuffer view;
+  RealGridAccessor values;
 };
 
 double cell_edge(const LevelGeom& geom, int axis, int idx) {
@@ -1420,21 +1496,10 @@ std::optional<double> patch_value_at(const SamplePatch& p, int32_t i, int32_t j,
       k < p.box.lo[2] || k > p.box.hi[2]) {
     return std::nullopt;
   }
-  const int32_t nx = p.box.hi[0] - p.box.lo[0] + 1;
-  const int32_t ny = p.box.hi[1] - p.box.lo[1] + 1;
-  const int32_t nz = p.box.hi[2] - p.box.lo[2] + 1;
-  if (nx <= 0 || ny <= 0 || nz <= 0 || p.bytes_per_value <= 0) {
-    return std::nullopt;
-  }
   const int32_t li = i - p.box.lo[0];
   const int32_t lj = j - p.box.lo[1];
   const int32_t lk = k - p.box.lo[2];
-  HostGridView3D view(p.view, nx, ny, nz, p.bytes_per_value);
-  double value = 0.0;
-  if (view.get_double(li, lj, lk, value)) {
-    return value;
-  }
-  return std::nullopt;
+  return p.values(li, lj, lk);
 }
 
 struct SamplePoint {
@@ -1518,6 +1583,8 @@ std::vector<SamplePatch> unpack_sample_patches(std::span<const std::uint8_t> pac
       continue;
     }
     SamplePatch patch;
+    BufferDesc desc;
+    std::vector<std::uint8_t> payload;
     for (uint32_t j = 0; j < p.via.map.size; ++j) {
       const auto& key = p.via.map.ptr[j].key;
       const auto& val = p.via.map.ptr[j].val;
@@ -1551,13 +1618,26 @@ std::vector<SamplePatch> unpack_sample_patches(std::span<const std::uint8_t> pac
         patch.geom.is_periodic[0] = val.via.array.ptr[0].as<bool>();
         patch.geom.is_periodic[1] = val.via.array.ptr[1].as<bool>();
         patch.geom.is_periodic[2] = val.via.array.ptr[2].as<bool>();
-      } else if (ks == "bytes_per_value") {
-        patch.bytes_per_value = val.as<int32_t>();
+      } else if (ks == "scalar") {
+        desc.scalar = static_cast<ScalarType>(val.as<std::uint8_t>());
+      } else if (ks == "extents" && val.type == msgpack::type::ARRAY &&
+                 val.via.array.size >= 1 && val.via.array.size <= kMaxBufferRank) {
+        desc.rank = static_cast<std::uint8_t>(val.via.array.size);
+        for (std::size_t axis = 0; axis < desc.rank; ++axis) {
+          desc.extents[axis] = val.via.array.ptr[axis].as<std::uint64_t>();
+        }
+      } else if (ks == "strides_bytes" && val.type == msgpack::type::ARRAY &&
+                 val.via.array.size >= 1 && val.via.array.size <= kMaxBufferRank) {
+        for (std::size_t axis = 0; axis < val.via.array.size; ++axis) {
+          desc.strides_bytes[axis] = val.via.array.ptr[axis].as<std::int64_t>();
+        }
       } else if (ks == "data" && val.type == msgpack::type::BIN) {
-        patch.view.data.assign(val.via.bin.ptr, val.via.bin.ptr + val.via.bin.size);
+        payload.assign(val.via.bin.ptr, val.via.bin.ptr + val.via.bin.size);
       }
     }
-    if (!patch.view.data.empty()) {
+    if (!payload.empty()) {
+      patch.view = ChunkBuffer::wrap(SharedByteBuffer(std::move(payload)), desc);
+      patch.values = make_real_grid_accessor(patch.view);
       patches.push_back(std::move(patch));
     }
   }
@@ -1969,7 +2049,6 @@ void register_default_kernels(KernelRegistry& registry) {
       int32_t input_version = 0;
       int32_t input_step = 0;
       int16_t input_level = 0;
-      int32_t bytes_per_value = 8;
       int32_t halo_cells = 1;
     };
 
@@ -1988,9 +2067,6 @@ void register_default_kernels(KernelRegistry& registry) {
         if (const auto* lev = find_msgpack_map_value(root, "input_level")) {
           params.input_level = lev->as<int16_t>();
         }
-        if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value")) {
-          params.bytes_per_value = bpv->as<int32_t>();
-        }
         if (const auto* halo = find_msgpack_map_value(root, "halo_cells")) {
           params.halo_cells = halo->as<int32_t>();
         }
@@ -2000,8 +2076,8 @@ void register_default_kernels(KernelRegistry& registry) {
 
     registry.register_kernel(
         KernelDesc{.name = "amr_subbox_fetch_pack", .n_inputs = 0, .n_outputs = 1, .needs_neighbors = false},
-        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView>,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const ChunkBuffer>,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
         if (outputs.empty() || block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
           return hpx::make_ready_future();
@@ -2011,9 +2087,6 @@ void register_default_kernels(KernelRegistry& registry) {
 
         outputs[0].data.clear();
         if (params.input_field < 0) {
-          return hpx::make_ready_future();
-        }
-        if (params.bytes_per_value != 4 && params.bytes_per_value != 8) {
           return hpx::make_ready_future();
         }
 
@@ -2042,18 +2115,17 @@ void register_default_kernels(KernelRegistry& registry) {
           int16_t level = 0;
           IndexBox3 box;
           LevelGeom geom;
-          int32_t bytes_per_value = 4;
-          HostView data;
+          ChunkBuffer data;
         };
         auto pack_patches = [](const std::vector<PackedPatch>& packed_patches) {
-          HostView packed;
+          ChunkBuffer packed;
           msgpack::sbuffer sbuf;
           msgpack::packer<msgpack::sbuffer> pk(&sbuf);
           pk.pack_map(1);
           pk.pack(std::string("patches"));
           pk.pack_array(packed_patches.size());
           for (const auto& p : packed_patches) {
-            pk.pack_map(9);
+            pk.pack_map(11);
             pk.pack(std::string("level"));
             pk.pack_int16(p.level);
             pk.pack(std::string("lo"));
@@ -2086,16 +2158,25 @@ void register_default_kernels(KernelRegistry& registry) {
             pk.pack(static_cast<bool>(p.geom.is_periodic[0]));
             pk.pack(static_cast<bool>(p.geom.is_periodic[1]));
             pk.pack(static_cast<bool>(p.geom.is_periodic[2]));
-            pk.pack(std::string("bytes_per_value"));
-            pk.pack_int32(p.bytes_per_value);
+            pk.pack(std::string("scalar"));
+            pk.pack_uint8(static_cast<std::uint8_t>(p.data.desc().scalar));
+            pk.pack(std::string("extents"));
+            pk.pack_array(p.data.desc().rank);
+            for (std::size_t axis = 0; axis < p.data.desc().rank; ++axis) {
+              pk.pack_uint64(p.data.desc().extents[axis]);
+            }
+            pk.pack(std::string("strides_bytes"));
+            pk.pack_array(p.data.desc().rank);
+            for (std::size_t axis = 0; axis < p.data.desc().rank; ++axis) {
+              pk.pack_int64(p.data.desc().strides_bytes[axis]);
+            }
             pk.pack(std::string("data"));
             pk.pack_bin(p.data.data.size());
             if (!p.data.data.empty()) {
               pk.pack_bin_body(reinterpret_cast<const char*>(p.data.data.data()), p.data.data.size());
             }
           }
-          packed.data.assign(sbuf.data(), sbuf.data() + sbuf.size());
-          return packed;
+          return ChunkBuffer::opaque(std::vector<std::uint8_t>(sbuf.data(), sbuf.data() + sbuf.size()));
         };
 
         struct PendingPatch {
@@ -2140,7 +2221,6 @@ void register_default_kernels(KernelRegistry& registry) {
             ref.chunk_box.hi[1] = ob.hi.y;
             ref.chunk_box.hi[2] = ob.hi.z;
             ref.request_box = request_box;
-            ref.bytes_per_value = params.bytes_per_value;
             pending_patches.push_back(PendingPatch{.level = lev, .geom = lev_meta.geom});
             pending_subboxes.push_back(data_service.get_subbox(ref));
           }
@@ -2149,8 +2229,7 @@ void register_default_kernels(KernelRegistry& registry) {
         return hpx::when_all(std::move(pending_subboxes))
             .then([pending_patches = std::move(pending_patches),
                    pack_patches = std::move(pack_patches),
-                   outputs,
-                   bytes_per_value = params.bytes_per_value](auto&& all) mutable {
+                   outputs](auto&& all) mutable {
               auto ready_subboxes = all.get();
               std::vector<PackedPatch> packed_patches;
               packed_patches.reserve(ready_subboxes.size());
@@ -2165,7 +2244,6 @@ void register_default_kernels(KernelRegistry& registry) {
                 pp.level = pending_patches[i].level;
                 pp.box = sub.box;
                 pp.geom = pending_patches[i].geom;
-                pp.bytes_per_value = bytes_per_value;
                 pp.data = std::move(sub.data);
                 packed_patches.push_back(std::move(pp));
               }
@@ -2182,7 +2260,6 @@ void register_default_kernels(KernelRegistry& registry) {
       int32_t input_version = 0;
       int32_t input_step = 0;
       int16_t input_level = 0;
-      int32_t bytes_per_value = 0;
       int32_t stencil_radius = 1;
     };
 
@@ -2209,11 +2286,6 @@ void register_default_kernels(KernelRegistry& registry) {
                     lev->type == msgpack::type::NEGATIVE_INTEGER)) {
           params.input_level = lev->as<int16_t>();
         }
-        if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-            bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                    bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-          params.bytes_per_value = bpv->as<int32_t>();
-        }
         if (const auto* sr = find_msgpack_map_value(root, "stencil_radius");
             sr && (sr->type == msgpack::type::POSITIVE_INTEGER ||
                    sr->type == msgpack::type::NEGATIVE_INTEGER)) {
@@ -2225,10 +2297,10 @@ void register_default_kernels(KernelRegistry& registry) {
 
     registry.register_kernel(
         KernelDesc{.name = "gradU_stencil", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
-        if (inputs.size() < 2 || outputs.empty() || block < 0 ||
+        if (inputs.size() < 2 || inputs[0].data.empty() || outputs.empty() || block < 0 ||
             static_cast<std::size_t>(block) >= level.boxes.size()) {
           return hpx::make_ready_future();
         }
@@ -2242,29 +2314,8 @@ void register_default_kernels(KernelRegistry& registry) {
         if (nx <= 0 || ny <= 0 || nz <= 0) {
           return hpx::make_ready_future();
         }
-
-        const auto& in = inputs[0].data;
-        int32_t bytes_per_value = params.bytes_per_value;
-        if (bytes_per_value <= 0) {
-          const std::size_t npts = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) *
-                                   static_cast<std::size_t>(nz);
-          if (npts > 0) {
-            const std::size_t guess = in.size() / npts;
-            if (guess == 4 || guess == 8) {
-              bytes_per_value = static_cast<int32_t>(guess);
-            }
-          }
-        }
-        if (bytes_per_value != 4 && bytes_per_value != 8) {
-          return hpx::make_ready_future();
-        }
         const int32_t stencil_radius = std::max(1, params.stencil_radius);
-
-        const std::size_t out_bytes =
-            static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz) *
-            3 * sizeof(double);
-        outputs[0].data.assign(out_bytes, 0);
-        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+        auto out = outputs[0].mutable_view<double, 4>();
 
         SamplePatch self;
         self.level = 0;
@@ -2276,7 +2327,7 @@ void register_default_kernels(KernelRegistry& registry) {
         self.box.hi[2] = box.hi.z;
         self.geom = level.geom;
         self.view = inputs[0];
-        self.bytes_per_value = bytes_per_value;
+        self.values = make_real_grid_accessor(self.view);
 
         const RunMeta& meta = current_runmeta();
         if (params.input_step < 0 || static_cast<std::size_t>(params.input_step) >= meta.steps.size()) {
@@ -2348,7 +2399,7 @@ void register_default_kernels(KernelRegistry& registry) {
                      static_cast<std::size_t>(nz) +
                  static_cast<std::size_t>(k);
         };
-        HostGridView3D self_input(inputs[0], nx, ny, nz, bytes_per_value);
+        const auto self_input = make_real_grid_accessor(inputs[0]);
 
         for (int i = 0; i < nx; ++i) {
           const int32_t gi = box.lo.x + i;
@@ -2359,8 +2410,7 @@ void register_default_kernels(KernelRegistry& registry) {
             for (int k = 0; k < nz; ++k) {
               const int32_t gk = box.lo.z + k;
               const double zc = cell_center(target_geom, 2, gk);
-              const std::size_t idx = self_index(i, j, k);
-              const double f0 = self_input.get_double_or(i, j, k);
+              const double f0 = self_input(i, j, k);
 
               std::vector<SamplePoint> samples;
               const int32_t width = 2 * stencil_radius + 1;
@@ -2425,9 +2475,9 @@ void register_default_kernels(KernelRegistry& registry) {
                 solve_3x3(a, bvec, grad);
               }
 
-              out[3 * idx + 0] = grad[0];
-              out[3 * idx + 1] = grad[1];
-              out[3 * idx + 2] = grad[2];
+              out(i, j, k, 0) = grad[0];
+              out(i, j, k, 1) = grad[1];
+              out(i, j, k, 2) = grad[2];
             }
           }
         }
@@ -2440,7 +2490,6 @@ void register_default_kernels(KernelRegistry& registry) {
       std::string plotfile;
       int level = 0;
       int comp = 0;
-      int bytes_per_value = 4;
     };
 
     auto decode_params = [](const msgpack::object& root) {
@@ -2459,18 +2508,13 @@ void register_default_kernels(KernelRegistry& registry) {
                    comp->type == msgpack::type::NEGATIVE_INTEGER)) {
         params.comp = comp->as<int>();
       }
-      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.bytes_per_value = bpv->as<int>();
-      }
       return params;
     };
 
     registry.register_kernel(
         KernelDesc{.name = "plotfile_load", .n_inputs = 0, .n_outputs = 1, .needs_neighbors = false},
-        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView>,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const ChunkBuffer>,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
         if (outputs.empty()) {
           return hpx::make_ready_future();
@@ -2494,20 +2538,6 @@ void register_default_kernels(KernelRegistry& registry) {
           return hpx::make_ready_future();
         }
 
-        std::size_t out_bytes = 0;
-        if (params.bytes_per_value > 0) {
-          out_bytes = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) *
-                      static_cast<std::size_t>(nz) *
-                      static_cast<std::size_t>(params.bytes_per_value);
-        }
-        if (out_bytes == 0) {
-          return hpx::make_ready_future();
-        }
-
-        if (outputs[0].data.size() != out_bytes) {
-          outputs[0].data.assign(out_bytes, 0);
-        }
-
         auto reader = get_plotfile_reader(params.plotfile);
         if (!reader || params.level < 0 || params.level >= reader->num_levels()) {
           return hpx::make_ready_future();
@@ -2521,33 +2551,31 @@ void register_default_kernels(KernelRegistry& registry) {
           return hpx::make_ready_future();
         }
 
-        const int file_bytes_per_value = data.type == plotfile::RealType::kFloat32 ? 4 : 8;
-        if (plotfile_zero_copy_reads_enabled() &&
-            params.bytes_per_value == file_bytes_per_value) {
-          outputs[0].data = std::move(data.bytes);
-          outputs[0].layout = HostViewLayout::kPlotfileKJI;
+        const ScalarType file_scalar =
+            data.type == plotfile::RealType::kFloat32 ? ScalarType::kF32 : ScalarType::kF64;
+        if (plotfile_zero_copy_reads_enabled() && outputs[0].desc().scalar == file_scalar) {
+          outputs[0] = ChunkBuffer::wrap(
+              SharedByteBuffer(std::move(data.bytes)),
+              BufferDesc::plotfile_grid(file_scalar,
+                                        {static_cast<std::uint64_t>(nx),
+                                         static_cast<std::uint64_t>(ny),
+                                         static_cast<std::uint64_t>(nz)}));
           return hpx::make_ready_future();
         }
 
-        if (data.type == plotfile::RealType::kFloat32) {
-          const auto* in = reinterpret_cast<const float*>(data.bytes.data());
-          if (params.bytes_per_value == 4) {
-            auto* out = reinterpret_cast<float*>(outputs[0].data.data());
-            transpose_plotfile_axes(in, out, nx, ny, nz);
-          } else if (params.bytes_per_value == 8) {
-            auto* out = reinterpret_cast<double*>(outputs[0].data.data());
-            transpose_plotfile_axes(in, out, nx, ny, nz);
+        auto transpose_into = [&]<typename OutT>() {
+          auto out = outputs[0].mutable_view<OutT, 3>();
+          for (int i = 0; i < nx; ++i) for (int j = 0; j < ny; ++j) for (int k = 0; k < nz; ++k) {
+            const auto source = (static_cast<std::size_t>(k) * ny + j) * nx + i;
+            out(i, j, k) = data.type == plotfile::RealType::kFloat32
+                               ? static_cast<OutT>(load_buffer_scalar<float>(data.bytes.data(), source))
+                               : static_cast<OutT>(load_buffer_scalar<double>(data.bytes.data(), source));
           }
-        } else if (data.type == plotfile::RealType::kFloat64) {
-          const auto* in = reinterpret_cast<const double*>(data.bytes.data());
-          if (params.bytes_per_value == 8) {
-            auto* out = reinterpret_cast<double*>(outputs[0].data.data());
-            transpose_plotfile_axes(in, out, nx, ny, nz);
-          } else if (params.bytes_per_value == 4) {
-            auto* out = reinterpret_cast<float*>(outputs[0].data.data());
-            transpose_plotfile_axes(in, out, nx, ny, nz);
-          }
-        }
+        };
+        if (outputs[0].desc().scalar == ScalarType::kF32) transpose_into.template operator()<float>();
+        else if (outputs[0].desc().scalar == ScalarType::kF64) transpose_into.template operator()<double>();
+        else throw BufferContractError(BufferContractReason::kScalarMismatch,
+                                       "plotfile_load output must be f32 or f64");
 
         return hpx::make_ready_future();
         },
@@ -2561,7 +2589,6 @@ void register_default_kernels(KernelRegistry& registry) {
       bool has_plane_index = false;
       std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
       std::array<int, 2> resolution{1, 1};
-      int bytes_per_value = 4;
       std::shared_ptr<const CoveredBoxListIR> covered_boxes;
     };
 
@@ -2595,11 +2622,6 @@ void register_default_kernels(KernelRegistry& registry) {
         params.resolution[0] = res->via.array.ptr[0].as<int>();
         params.resolution[1] = res->via.array.ptr[1].as<int>();
       }
-      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.bytes_per_value = bpv->as<int>();
-      }
       params.covered_boxes = parse_covered_boxes_param(root);
       return params;
     };
@@ -2607,8 +2629,8 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "uniform_slice_cellavg_accumulate", .n_inputs = 1, .n_outputs = 2,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
           const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
@@ -2618,18 +2640,10 @@ void register_default_kernels(KernelRegistry& registry) {
             return hpx::make_ready_future();
           }
 
-          const std::size_t bytes = static_cast<std::size_t>(out_nx) *
-                                    static_cast<std::size_t>(out_ny) * sizeof(double);
-          if (outputs[0].data.size() != bytes) {
-            outputs[0].data.assign(bytes, 0);
-          } else {
-            std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
-          }
-          if (outputs[1].data.size() != bytes) {
-            outputs[1].data.assign(bytes, 0);
-          } else {
-            std::fill(outputs[1].data.begin(), outputs[1].data.end(), 0);
-          }
+          auto out_sum = outputs[0].mutable_byte_view();
+          auto out_area = outputs[1].mutable_byte_view();
+          std::fill(out_sum.begin(), out_sum.end(), std::uint8_t{0});
+          std::fill(out_area.begin(), out_area.end(), std::uint8_t{0});
 
           if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
             return hpx::make_ready_future();
@@ -2704,14 +2718,12 @@ void register_default_kernels(KernelRegistry& registry) {
             return false;
           };
 
-          HostGridView3D input(inputs[0], nx, ny, nz, params.bytes_per_value);
-          auto* out_sum = reinterpret_cast<double*>(outputs[0].data.data());
-          auto* out_area = reinterpret_cast<double*>(outputs[1].data.data());
-
           auto cell_edge = [&](int ax, int idx) -> double {
             return level.geom.x0[ax] + (idx - level.geom.index_origin[ax]) * level.geom.dx[ax];
           };
 
+          visit_real_buffers_exact<1>(inputs.first(1), [&](auto input_buffer) {
+          const auto input = input_buffer.grid();
           for (int v_local = 0; v_local < (v_axis == 0 ? nx : (v_axis == 1 ? ny : nz)); ++v_local) {
             const int v_global = (v_axis == 0 ? v_local + box.lo.x
                                               : (v_axis == 1 ? v_local + box.lo.y
@@ -2732,7 +2744,8 @@ void register_default_kernels(KernelRegistry& registry) {
               idx_local[axis] = k_local;
               idx_local[u_axis] = u_local;
               idx_local[v_axis] = v_local;
-              const double value = input.get_double_or(idx_local[0], idx_local[1], idx_local[2]);
+              const double value = static_cast<double>(
+                  input(idx_local[0], idx_local[1], idx_local[2]));
 
               const double u_cell_lo = cell_edge(u_axis, u_global);
               const double u_cell_hi = u_cell_lo + level.geom.dx[u_axis];
@@ -2769,12 +2782,17 @@ void register_default_kernels(KernelRegistry& registry) {
                   }
                   const double area = ou * ov;
                   const std::size_t out_idx = static_cast<std::size_t>(j) * out_nx + i;
-                  out_sum[out_idx] += value * area;
-                  out_area[out_idx] += area;
+                  store_buffer_scalar(
+                      out_sum.data(), out_idx,
+                      load_buffer_scalar<double>(out_sum.data(), out_idx) + value * area);
+                  store_buffer_scalar(
+                      out_area.data(), out_idx,
+                      load_buffer_scalar<double>(out_area.data(), out_idx) + area);
                 }
               }
             }
           }
+          });
 
           return hpx::make_ready_future();
         },
@@ -2786,7 +2804,6 @@ void register_default_kernels(KernelRegistry& registry) {
       std::array<double, 2> axis_bounds{0.0, 1.0};
       std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
       std::array<int, 2> resolution{1, 1};
-      int bytes_per_value = 4;
       std::shared_ptr<const CoveredBoxListIR> covered_boxes;
     };
 
@@ -2813,11 +2830,6 @@ void register_default_kernels(KernelRegistry& registry) {
         params.resolution[0] = res->via.array.ptr[0].as<int>();
         params.resolution[1] = res->via.array.ptr[1].as<int>();
       }
-      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.bytes_per_value = bpv->as<int>();
-      }
       params.covered_boxes = parse_covered_boxes_param(root);
       return params;
     };
@@ -2825,8 +2837,8 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "uniform_projection_accumulate", .n_inputs = 1, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
           const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
@@ -2836,13 +2848,8 @@ void register_default_kernels(KernelRegistry& registry) {
             return hpx::make_ready_future();
           }
 
-          const std::size_t bytes = static_cast<std::size_t>(out_nx) *
-                                    static_cast<std::size_t>(out_ny) * sizeof(double);
-          if (outputs[0].data.size() != bytes) {
-            outputs[0].data.assign(bytes, 0);
-          } else {
-            std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
-          }
+          auto out_sum = outputs[0].mutable_byte_view();
+          std::fill(out_sum.begin(), out_sum.end(), std::uint8_t{0});
 
           if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
             return hpx::make_ready_future();
@@ -2892,9 +2899,10 @@ void register_default_kernels(KernelRegistry& registry) {
             return hpx::make_ready_future();
           }
 
-          HostGridView3D input(inputs[0], nx, ny, nz, params.bytes_per_value);
           auto logical_index = [&](int i, int j, int k) -> std::size_t {
-            return input.logical_index(i, j, k);
+            return (static_cast<std::size_t>(i) * static_cast<std::size_t>(ny) +
+                    static_cast<std::size_t>(j)) * static_cast<std::size_t>(nz) +
+                   static_cast<std::size_t>(k);
           };
 
           std::vector<std::uint8_t> covered_mask;
@@ -2930,12 +2938,13 @@ void register_default_kernels(KernelRegistry& registry) {
             return level.geom.x0[ax] + (idx - level.geom.index_origin[ax]) * level.geom.dx[ax];
           };
 
-          auto* out_sum = reinterpret_cast<double*>(outputs[0].data.data());
           std::size_t candidate_cells = 0;
           std::size_t covered_skips = 0;
           std::size_t bounds_skips = 0;
           std::size_t deposited_cells = 0;
 
+          visit_real_buffers_exact<1>(inputs.first(1), [&](auto input_buffer) {
+          const auto input = input_buffer.grid();
           for (int i = 0; i < nx; ++i) {
             const int gx = box.lo.x + i;
             for (int j = 0; j < ny; ++j) {
@@ -2979,7 +2988,7 @@ void register_default_kernels(KernelRegistry& registry) {
                 i1 = std::min(i1, out_nx - 1);
                 j1 = std::min(j1, out_ny - 1);
 
-                const double value = input.get_double_or(i, j, k);
+                const double value = static_cast<double>(input(i, j, k));
 
                 for (int jj = j0; jj <= j1; ++jj) {
                   const double pv0 = vmin + static_cast<double>(jj) * dv;
@@ -2999,18 +3008,21 @@ void register_default_kernels(KernelRegistry& registry) {
                     }
                     const double volume = ou * ov * oa;
                     const std::size_t out_idx = static_cast<std::size_t>(jj) * out_nx + ii;
-                    out_sum[out_idx] += value * volume;
+                    store_buffer_scalar(
+                        out_sum.data(), out_idx,
+                        load_buffer_scalar<double>(out_sum.data(), out_idx) + value * volume);
                     ++deposited_cells;
                   }
                 }
               }
             }
           }
+          });
 
           double total_sum = 0.0;
           for (std::size_t idx = 0;
                idx < static_cast<std::size_t>(out_nx) * static_cast<std::size_t>(out_ny); ++idx) {
-            total_sum += out_sum[idx];
+            total_sum += load_buffer_scalar<double>(out_sum.data(), idx);
           }
           log_projection_kernel_summary("uniform_projection_accumulate",
                                         -1,
@@ -3030,8 +3042,6 @@ void register_default_kernels(KernelRegistry& registry) {
     struct Params {
       std::string expression;
       std::vector<std::string> variables;
-      std::vector<int> input_bytes_per_value;
-      int out_bytes_per_value = 8;
     };
 
     auto decode_params = [](const msgpack::object& root) {
@@ -3050,29 +3060,13 @@ void register_default_kernels(KernelRegistry& registry) {
           }
         }
       }
-      if (const auto* in_bpv = find_msgpack_map_value(root, "input_bytes_per_value");
-          in_bpv && in_bpv->type == msgpack::type::ARRAY) {
-        params.input_bytes_per_value.reserve(in_bpv->via.array.size);
-        for (uint32_t i = 0; i < in_bpv->via.array.size; ++i) {
-          const auto& v = in_bpv->via.array.ptr[i];
-          if (v.type == msgpack::type::POSITIVE_INTEGER ||
-              v.type == msgpack::type::NEGATIVE_INTEGER) {
-            params.input_bytes_per_value.push_back(v.as<int>());
-          }
-        }
-      }
-      if (const auto* out_bpv = find_msgpack_map_value(root, "out_bytes_per_value");
-          out_bpv && (out_bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                      out_bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.out_bytes_per_value = out_bpv->as<int>();
-      }
       return params;
     };
 
     registry.register_kernel(
         KernelDesc{.name = "field_expr", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
         const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
@@ -3091,15 +3085,6 @@ void register_default_kernels(KernelRegistry& registry) {
         if (params.variables.size() > 8) {
           throw std::runtime_error("field_expr currently supports at most 8 variables");
         }
-        if (params.out_bytes_per_value != 4 && params.out_bytes_per_value != 8) {
-          throw std::runtime_error("field_expr out_bytes_per_value must be 4 or 8");
-        }
-
-        auto input_bytes_per_value = params.input_bytes_per_value;
-        if (input_bytes_per_value.size() < inputs.size()) {
-          input_bytes_per_value.resize(inputs.size(), 8);
-        }
-
         int nx = 0;
         int ny = 0;
         int nz = 0;
@@ -3110,38 +3095,6 @@ void register_default_kernels(KernelRegistry& registry) {
           nz = box.hi.z - box.lo.z + 1;
         }
 
-        std::vector<HostGridView3D> input_views;
-        input_views.reserve(inputs.size());
-        for (std::size_t iv = 0; iv < inputs.size(); ++iv) {
-          input_views.emplace_back(inputs[iv], nx, ny, nz, input_bytes_per_value[iv]);
-        }
-
-        auto read_value = [&](int iv, std::size_t idx) -> double {
-          return input_views[static_cast<std::size_t>(iv)].get_logical_or(idx);
-        };
-
-        std::size_t n = std::numeric_limits<std::size_t>::max();
-        for (std::size_t iv = 0; iv < inputs.size(); ++iv) {
-          const int bpv = input_bytes_per_value[iv];
-          if (bpv != 4 && bpv != 8) {
-            throw std::runtime_error("field_expr input_bytes_per_value must be 4 or 8");
-          }
-          n = std::min(n, input_views[iv].logical_cell_count());
-        }
-        if (n == std::numeric_limits<std::size_t>::max()) {
-          n = 0;
-        }
-
-        const std::size_t out_bytes = n * static_cast<std::size_t>(params.out_bytes_per_value);
-        outputs[0].data.assign(out_bytes, 0);
-        auto write_value = [&](std::size_t idx, double value) {
-          if (params.out_bytes_per_value == 8) {
-            reinterpret_cast<double*>(outputs[0].data.data())[idx] = value;
-          } else {
-            reinterpret_cast<float*>(outputs[0].data.data())[idx] = static_cast<float>(value);
-          }
-        };
-
         amrexpr::Parser parser;
         try {
           parser.define(params.expression);
@@ -3150,20 +3103,56 @@ void register_default_kernels(KernelRegistry& registry) {
           throw std::runtime_error(std::string("field_expr parse failed: ") + e.what());
         }
 
-#define KANGAROO_FIELD_EXPR_CASE(N)                                                      \
-        case N: {                                                                        \
-          auto exe = parser.compileHost<N>();                                            \
-          for (std::size_t idx = 0; idx < n; ++idx) {                                   \
-            double vars[N];                                                              \
-            for (int iv = 0; iv < N; ++iv) {                                             \
-              vars[iv] = read_value(iv, idx);                                            \
-            }                                                                            \
-            write_value(idx, exe(vars));                                                 \
-          }                                                                              \
-          break;                                                                         \
+        std::array<RealGridAccessor, 8> input_views{};
+        auto bind_inputs = [&](auto... typed_inputs) {
+          std::size_t input_index = 0;
+          ((input_views[input_index++] = make_real_grid_accessor(typed_inputs.grid())), ...);
+        };
+
+        switch (inputs.size()) {
+          case 1: visit_real_buffers_exact<1>(inputs, bind_inputs); break;
+          case 2: visit_real_buffers_exact<2>(inputs, bind_inputs); break;
+          case 3: visit_real_buffers_exact<3>(inputs, bind_inputs); break;
+          case 4: visit_real_buffers_exact<4>(inputs, bind_inputs); break;
+          case 5: visit_real_buffers_exact<5>(inputs, bind_inputs); break;
+          case 6: visit_real_buffers_exact<6>(inputs, bind_inputs); break;
+          case 7: visit_real_buffers_exact<7>(inputs, bind_inputs); break;
+          case 8: visit_real_buffers_exact<8>(inputs, bind_inputs); break;
+          default:
+            throw std::runtime_error("field_expr variable count is out of range");
         }
 
-        switch (static_cast<int>(params.variables.size())) {
+        auto out = outputs[0].mutable_byte_view();
+        const bool output_f64 = outputs[0].desc().scalar == ScalarType::kF64;
+        if (!output_f64 && outputs[0].desc().scalar != ScalarType::kF32) {
+          throw BufferContractError(BufferContractReason::kScalarMismatch,
+                                    "field expression output must be f32 or f64");
+        }
+        const std::size_t cell_count = static_cast<std::size_t>(nx) * ny * nz;
+        auto read_value = [&](int variable, std::size_t index) {
+          const int i = static_cast<int>(index / (static_cast<std::size_t>(ny) * nz));
+          const auto remainder = index % (static_cast<std::size_t>(ny) * nz);
+          const int j = static_cast<int>(remainder / nz);
+          const int k = static_cast<int>(remainder % nz);
+          return input_views[static_cast<std::size_t>(variable)](i, j, k);
+        };
+        auto write_value = [&](std::size_t index, double value) {
+          if (output_f64) store_buffer_scalar(out.data(), index, value);
+          else store_buffer_scalar(out.data(), index, static_cast<float>(value));
+        };
+
+#define KANGAROO_FIELD_EXPR_CASE(N)                                                   \
+        case N: {                                                                     \
+          auto executable = parser.compileHost<N>();                                  \
+          for (std::size_t index = 0; index < cell_count; ++index) {                  \
+            double vars[N];                                                           \
+            for (int variable = 0; variable < N; ++variable)                         \
+              vars[variable] = read_value(variable, index);                           \
+            write_value(index, executable(vars));                                     \
+          }                                                                           \
+          break;                                                                      \
+        }
+        switch (inputs.size()) {
           KANGAROO_FIELD_EXPR_CASE(1)
           KANGAROO_FIELD_EXPR_CASE(2)
           KANGAROO_FIELD_EXPR_CASE(3)
@@ -3172,10 +3161,8 @@ void register_default_kernels(KernelRegistry& registry) {
           KANGAROO_FIELD_EXPR_CASE(6)
           KANGAROO_FIELD_EXPR_CASE(7)
           KANGAROO_FIELD_EXPR_CASE(8)
-          default:
-            throw std::runtime_error("field_expr variable count is out of range");
+          default: throw std::runtime_error("field_expr variable count is out of range");
         }
-
 #undef KANGAROO_FIELD_EXPR_CASE
         return hpx::make_ready_future();
         },
@@ -3183,8 +3170,8 @@ void register_default_kernels(KernelRegistry& registry) {
   }
   registry.register_kernel(
       KernelDesc{.name = "vorticity_mag", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta& level, int32_t block, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+      [](const LevelMeta& level, int32_t block, std::span<const ChunkBuffer> inputs, const NeighborViews&,
+         std::span<ChunkBuffer> outputs, std::span<const std::uint8_t>) {
         if (outputs.empty() || block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
           return hpx::make_ready_future();
         }
@@ -3195,49 +3182,39 @@ void register_default_kernels(KernelRegistry& registry) {
         if (nx <= 0 || ny <= 0 || nz <= 0) {
           return hpx::make_ready_future();
         }
-        const std::size_t ncell =
-            static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
-        outputs[0].data.assign(ncell * sizeof(double), 0);
-        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+        auto out = outputs[0].mutable_view<double, 3>();
 
         // Preferred path: three scalar gradient inputs [grad(vx), grad(vy), grad(vz)].
         if (inputs.size() >= 3) {
-          const auto& gx = inputs[0].data;
-          const auto& gy = inputs[1].data;
-          const auto& gz = inputs[2].data;
-          if (gx.size() >= ncell * 3 * sizeof(double) && gy.size() >= ncell * 3 * sizeof(double) &&
-              gz.size() >= ncell * 3 * sizeof(double)) {
-            const auto* du = reinterpret_cast<const double*>(gx.data());
-            const auto* dv = reinterpret_cast<const double*>(gy.data());
-            const auto* dw = reinterpret_cast<const double*>(gz.data());
-            for (std::size_t idx = 0; idx < ncell; ++idx) {
-              const double dudy = du[3 * idx + 1];
-              const double dudz = du[3 * idx + 2];
-              const double dvdx = dv[3 * idx + 0];
-              const double dvdz = dv[3 * idx + 2];
-              const double dwdx = dw[3 * idx + 0];
-              const double dwdy = dw[3 * idx + 1];
-              const double wx = dwdy - dvdz;
-              const double wy = dudz - dwdx;
-              const double wz = dvdx - dudy;
-              out[idx] = std::sqrt(wx * wx + wy * wy + wz * wz);
+          visit_real_buffers_exact<3>(inputs.first(3), [&](auto du_buffer, auto dv_buffer,
+                                                           auto dw_buffer) {
+            const auto du = du_buffer.template tensor<4>();
+            const auto dv = dv_buffer.template tensor<4>();
+            const auto dw = dw_buffer.template tensor<4>();
+            for (int i = 0; i < nx; ++i) for (int j = 0; j < ny; ++j) for (int k = 0; k < nz; ++k) {
+              const double wx = static_cast<double>(dw(i, j, k, 1)) -
+                                static_cast<double>(dv(i, j, k, 2));
+              const double wy = static_cast<double>(du(i, j, k, 2)) -
+                                static_cast<double>(dw(i, j, k, 0));
+              const double wz = static_cast<double>(dv(i, j, k, 0)) -
+                                static_cast<double>(du(i, j, k, 1));
+              out(i, j, k) = std::sqrt(wx * wx + wy * wy + wz * wz);
             }
-            return hpx::make_ready_future();
-          }
+          });
+          return hpx::make_ready_future();
         }
 
-        // Backward-compatible fallback: one scalar gradient input -> |grad(S)|.
+        // One scalar gradient input -> |grad(S)|.
         if (!inputs.empty()) {
-          const auto& g = inputs[0].data;
-          if (g.size() >= ncell * 3 * sizeof(double)) {
-            const auto* grad = reinterpret_cast<const double*>(g.data());
-            for (std::size_t idx = 0; idx < ncell; ++idx) {
-              const double gx = grad[3 * idx + 0];
-              const double gy = grad[3 * idx + 1];
-              const double gz = grad[3 * idx + 2];
-              out[idx] = std::sqrt(gx * gx + gy * gy + gz * gz);
+          visit_real_buffers_exact<1>(inputs.first(1), [&](auto gradient_buffer) {
+            const auto gradient = gradient_buffer.template tensor<4>();
+            for (int i = 0; i < nx; ++i) for (int j = 0; j < ny; ++j) for (int k = 0; k < nz; ++k) {
+              const double gx = static_cast<double>(gradient(i, j, k, 0));
+              const double gy = static_cast<double>(gradient(i, j, k, 1));
+              const double gz = static_cast<double>(gradient(i, j, k, 2));
+              out(i, j, k) = std::sqrt(gx * gx + gy * gy + gz * gz);
             }
-          }
+          });
         }
         return hpx::make_ready_future();
       });
@@ -3247,7 +3224,6 @@ void register_default_kernels(KernelRegistry& registry) {
       double coord = 0.0;
       std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
       std::array<int, 2> resolution{1, 1};
-      int bytes_per_value = 4;
     };
 
     auto decode_params = [](const msgpack::object& root) {
@@ -3274,18 +3250,13 @@ void register_default_kernels(KernelRegistry& registry) {
         params.resolution[0] = res->via.array.ptr[0].as<int>();
         params.resolution[1] = res->via.array.ptr[1].as<int>();
       }
-      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.bytes_per_value = bpv->as<int>();
-      }
       return params;
     };
 
     registry.register_kernel(
         KernelDesc{.name = "uniform_slice", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
           if (log_locality) {
             std::cout << "[kangaroo] uniform_slice block=" << block
@@ -3295,21 +3266,11 @@ void register_default_kernels(KernelRegistry& registry) {
 
           const auto out_nx = params.resolution[0];
           const auto out_ny = params.resolution[1];
-          std::size_t bytes = 0;
-          if (out_nx > 0 && out_ny > 0 && params.bytes_per_value > 0) {
-            bytes = static_cast<std::size_t>(out_nx) * static_cast<std::size_t>(out_ny) *
-                    static_cast<std::size_t>(params.bytes_per_value);
-          }
-
-          if (outputs.empty() || inputs.empty() || bytes == 0) {
+          if (outputs.empty() || inputs.empty() || out_nx <= 0 || out_ny <= 0) {
             return hpx::make_ready_future();
           }
-
-          if (outputs[0].data.size() != bytes) {
-            outputs[0].data.assign(bytes, 0);
-          } else {
-            std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
-          }
+          auto output_storage = outputs[0].mutable_byte_view();
+          std::fill(output_storage.begin(), output_storage.end(), std::uint8_t{0});
 
           if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
             return hpx::make_ready_future();
@@ -3364,7 +3325,7 @@ void register_default_kernels(KernelRegistry& registry) {
           const double du = (out_nx > 0) ? (u1 - u0) / static_cast<double>(out_nx) : 0.0;
           const double dv = (out_ny > 0) ? (v1 - v0) / static_cast<double>(out_ny) : 0.0;
 
-          HostGridView3D input(inputs[0], nx, ny, nz, params.bytes_per_value);
+          const auto input = make_real_grid_accessor(inputs[0]);
           auto sample_input = [&](int u_local, int v_local) -> double {
             if (u_local < 0 || v_local < 0) {
               return 0.0;
@@ -3394,11 +3355,11 @@ void register_default_kernels(KernelRegistry& registry) {
               jj = u_axis == 1 ? u_local : v_local;
               kk = k_local;
             }
-            return input.get_double_or(ii, jj, kk);
+            return input(ii, jj, kk);
           };
 
-          if (params.bytes_per_value == 4) {
-            auto* out_f = reinterpret_cast<float*>(outputs[0].data.data());
+          auto fill_output = [&]<typename T>() {
+            auto out = outputs[0].mutable_view<T, 2>();
             for (int j = 0; j < out_ny; ++j) {
               const double v = v0 + (static_cast<double>(j) + 0.5) * dv;
               const int v_global = cell_index(v_axis, v);
@@ -3411,29 +3372,14 @@ void register_default_kernels(KernelRegistry& registry) {
                 const int u_local = u_axis == 0 ? u_global - box.lo.x
                                                 : (u_axis == 1 ? u_global - box.lo.y
                                                                : u_global - box.lo.z);
-                out_f[static_cast<std::size_t>(j) * out_nx + i] =
-                    static_cast<float>(sample_input(u_local, v_local));
+                out(j, i) = static_cast<T>(sample_input(u_local, v_local));
               }
             }
-          } else if (params.bytes_per_value == 8) {
-            auto* out_d = reinterpret_cast<double*>(outputs[0].data.data());
-            for (int j = 0; j < out_ny; ++j) {
-              const double v = v0 + (static_cast<double>(j) + 0.5) * dv;
-              const int v_global = cell_index(v_axis, v);
-              const int v_local = v_axis == 0 ? v_global - box.lo.x
-                                              : (v_axis == 1 ? v_global - box.lo.y
-                                                             : v_global - box.lo.z);
-              for (int i = 0; i < out_nx; ++i) {
-                const double u = u0 + (static_cast<double>(i) + 0.5) * du;
-                const int u_global = cell_index(u_axis, u);
-                const int u_local = u_axis == 0 ? u_global - box.lo.x
-                                                : (u_axis == 1 ? u_global - box.lo.y
-                                                               : u_global - box.lo.z);
-                out_d[static_cast<std::size_t>(j) * out_nx + i] =
-                    sample_input(u_local, v_local);
-              }
-            }
-          }
+          };
+          if (outputs[0].desc().scalar == ScalarType::kF32) fill_output.template operator()<float>();
+          else if (outputs[0].desc().scalar == ScalarType::kF64) fill_output.template operator()<double>();
+          else throw BufferContractError(BufferContractReason::kScalarMismatch,
+                                         "uniform_slice output must be f32 or f64");
           return hpx::make_ready_future();
         },
         make_kernel_params_preparer<Params>(decode_params));
@@ -3460,8 +3406,8 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "particle_load_field_chunk_f64", .n_inputs = 0, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta&, int32_t block, std::span<const HostView>,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta&, int32_t block, std::span<const ChunkBuffer>,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
           if (outputs.empty()) {
             return hpx::make_ready_future();
@@ -3485,7 +3431,7 @@ void register_default_kernels(KernelRegistry& registry) {
               reader->read_particle_field_chunk(params.particle_type, params.field_name, block);
           const std::size_t n = static_cast<std::size_t>(std::max<int64_t>(0, data.count));
           outputs[0].data.resize(n * sizeof(double));
-          auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+          auto* out = outputs[0].data.mutable_data();
 
           if (data.dtype == "float64") {
             if (data.bytes.size() < n * sizeof(double)) {
@@ -3496,17 +3442,17 @@ void register_default_kernels(KernelRegistry& registry) {
             if (data.bytes.size() < n * sizeof(float)) {
               throw std::runtime_error("particle_load_field_chunk_f64: short float32 payload");
             }
-            const auto* in = reinterpret_cast<const float*>(data.bytes.data());
             for (std::size_t i = 0; i < n; ++i) {
-              out[i] = static_cast<double>(in[i]);
+              store_buffer_scalar<double>(
+                  out, i, static_cast<double>(load_buffer_scalar<float>(data.bytes.data(), i)));
             }
           } else if (data.dtype == "int64") {
             if (data.bytes.size() < n * sizeof(int64_t)) {
               throw std::runtime_error("particle_load_field_chunk_f64: short int64 payload");
             }
-            const auto* in = reinterpret_cast<const int64_t*>(data.bytes.data());
             for (std::size_t i = 0; i < n; ++i) {
-              out[i] = static_cast<double>(in[i]);
+              store_buffer_scalar<double>(
+                  out, i, static_cast<double>(load_buffer_scalar<int64_t>(data.bytes.data(), i)));
             }
           } else {
             throw std::runtime_error("particle_load_field_chunk_f64: unsupported particle dtype '" +
@@ -3561,8 +3507,8 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "particle_cic_grid_accumulate", .n_inputs = 0, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView>,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const ChunkBuffer>,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
           const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
@@ -3641,9 +3587,8 @@ void register_default_kernels(KernelRegistry& registry) {
 
           const std::size_t out_elems = static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) *
                                         static_cast<std::size_t>(nz);
-          outputs[0].data.resize(out_elems * sizeof(double));
-          auto* out = reinterpret_cast<double*>(outputs[0].data.data());
-          std::fill(out, out + out_elems, 0.0);
+          auto out = outputs[0].mutable_byte_view();
+          std::fill(out.begin(), out.end(), std::uint8_t{0});
 
           const double cell_volume = dx[0] * dx[1] * dx[2];
           if (!(cell_volume > 0.0)) {
@@ -3711,7 +3656,10 @@ void register_default_kernels(KernelRegistry& registry) {
                 k_local < 0 || k_local >= nz) {
               return;
             }
-            out[out_index(i_local, j_local, k_local)] += wmass / cell_volume;
+            const auto index = out_index(i_local, j_local, k_local);
+            store_buffer_scalar<double>(
+                out.data(), index,
+                load_buffer_scalar<double>(out.data(), index) + wmass / cell_volume);
           };
 
           for (std::size_t p = 0; p < n; ++p) {
@@ -3812,8 +3760,8 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "particle_cic_projection_accumulate", .n_inputs = 0, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView>,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const ChunkBuffer>,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
           const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
@@ -3825,11 +3773,8 @@ void register_default_kernels(KernelRegistry& registry) {
           if (out_nx <= 0 || out_ny <= 0) {
             throw std::runtime_error("particle_cic_projection_accumulate: invalid resolution");
           }
-          outputs[0].data.resize(
-              static_cast<std::size_t>(out_nx) * static_cast<std::size_t>(out_ny) * sizeof(double));
-          auto* out = reinterpret_cast<double*>(outputs[0].data.data());
-          std::fill(out, out + static_cast<std::size_t>(out_nx) * static_cast<std::size_t>(out_ny),
-                    0.0);
+          auto out = outputs[0].mutable_byte_view();
+          std::fill(out.begin(), out.end(), std::uint8_t{0});
 
           if (params.particle_type.empty()) {
             throw std::runtime_error("particle_cic_projection_accumulate: missing particle_type");
@@ -4092,7 +4037,10 @@ void register_default_kernels(KernelRegistry& registry) {
                     continue;
                   }
                   const double w = (ou * ov) / cell_area;
-                  out[row + static_cast<std::size_t>(ix)] += mass * w;
+                  const auto index = row + static_cast<std::size_t>(ix);
+                  store_buffer_scalar<double>(
+                      out.data(), index,
+                      load_buffer_scalar<double>(out.data(), index) + mass * w);
                 }
               }
             }
@@ -4131,20 +4079,18 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "particle_eq_mask", .n_inputs = 1, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
           const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
           if (inputs.empty() || outputs.empty()) {
             return hpx::make_ready_future();
           }
-          const auto& in = inputs[0].data;
-          const std::size_t n = in.size() / sizeof(double);
-          outputs[0].data.resize(n);
-          const auto* in_d = reinterpret_cast<const double*>(in.data());
-          auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+          const auto in = inputs[0].array<double>();
+          auto out = outputs[0].mutable_array<std::uint8_t>();
+          const std::size_t n = in.extent(0);
           for (std::size_t i = 0; i < n; ++i) {
-            out[i] = (in_d[i] == params.scalar) ? 1 : 0;
+            out(i) = (in(i) == params.scalar) ? 1 : 0;
           }
           return hpx::make_ready_future();
         },
@@ -4153,20 +4099,18 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "particle_abs_lt_mask", .n_inputs = 1, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
           const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
           if (inputs.empty() || outputs.empty()) {
             return hpx::make_ready_future();
           }
-          const auto& in = inputs[0].data;
-          const std::size_t n = in.size() / sizeof(double);
-          outputs[0].data.resize(n);
-          const auto* in_d = reinterpret_cast<const double*>(in.data());
-          auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+          const auto in = inputs[0].array<double>();
+          auto out = outputs[0].mutable_array<std::uint8_t>();
+          const std::size_t n = in.extent(0);
           for (std::size_t i = 0; i < n; ++i) {
-            out[i] = (std::abs(in_d[i]) < params.scalar) ? 1 : 0;
+            out(i) = (std::abs(in(i)) < params.scalar) ? 1 : 0;
           }
           return hpx::make_ready_future();
         },
@@ -4175,20 +4119,18 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "particle_le_mask", .n_inputs = 1, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
           const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
           if (inputs.empty() || outputs.empty()) {
             return hpx::make_ready_future();
           }
-          const auto& in = inputs[0].data;
-          const std::size_t n = in.size() / sizeof(double);
-          outputs[0].data.resize(n);
-          const auto* in_d = reinterpret_cast<const double*>(in.data());
-          auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+          const auto in = inputs[0].array<double>();
+          auto out = outputs[0].mutable_array<std::uint8_t>();
+          const std::size_t n = in.extent(0);
           for (std::size_t i = 0; i < n; ++i) {
-            out[i] = (in_d[i] <= params.scalar) ? 1 : 0;
+            out(i) = (in(i) <= params.scalar) ? 1 : 0;
           }
           return hpx::make_ready_future();
         },
@@ -4197,20 +4139,18 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "particle_gt_mask", .n_inputs = 1, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
           const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
           if (inputs.empty() || outputs.empty()) {
             return hpx::make_ready_future();
           }
-          const auto& in = inputs[0].data;
-          const std::size_t n = in.size() / sizeof(double);
-          outputs[0].data.resize(n);
-          const auto* in_d = reinterpret_cast<const double*>(in.data());
-          auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+          const auto in = inputs[0].array<double>();
+          auto out = outputs[0].mutable_array<std::uint8_t>();
+          const std::size_t n = in.extent(0);
           for (std::size_t i = 0; i < n; ++i) {
-            out[i] = (in_d[i] > params.scalar) ? 1 : 0;
+            out(i) = (in(i) > params.scalar) ? 1 : 0;
           }
           return hpx::make_ready_future();
         },
@@ -4236,27 +4176,25 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "particle_isin_mask", .n_inputs = 1, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
           const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
           if (inputs.empty() || outputs.empty()) {
             return hpx::make_ready_future();
           }
-          const auto& in = inputs[0].data;
-          const std::size_t n = in.size() / sizeof(double);
-          outputs[0].data.resize(n);
-          const auto* in_d = reinterpret_cast<const double*>(in.data());
-          auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+          const auto in = inputs[0].array<double>();
+          auto out = outputs[0].mutable_array<std::uint8_t>();
+          const std::size_t n = in.extent(0);
           for (std::size_t i = 0; i < n; ++i) {
             bool found = false;
             for (double x : params.values) {
-              if (in_d[i] == x) {
+              if (in(i) == x) {
                 found = true;
                 break;
               }
             }
-            out[i] = found ? 1 : 0;
+            out(i) = found ? 1 : 0;
           }
           return hpx::make_ready_future();
         },
@@ -4264,162 +4202,142 @@ void register_default_kernels(KernelRegistry& registry) {
   }
   registry.register_kernel(
       KernelDesc{.name = "particle_isfinite_mask", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+      [](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs, const NeighborViews&,
+         std::span<ChunkBuffer> outputs, std::span<const std::uint8_t>) {
         if (inputs.empty() || outputs.empty()) {
           return hpx::make_ready_future();
         }
-        const auto& in = inputs[0].data;
-        const std::size_t n = in.size() / sizeof(double);
-        outputs[0].data.resize(n);
-        const auto* in_d = reinterpret_cast<const double*>(in.data());
-        auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
+        const auto in = inputs[0].array<double>();
+        auto out = outputs[0].mutable_array<std::uint8_t>();
+        const std::size_t n = in.extent(0);
         for (std::size_t i = 0; i < n; ++i) {
-          out[i] = std::isfinite(in_d[i]) ? 1 : 0;
+          out(i) = std::isfinite(in(i)) ? 1 : 0;
         }
         return hpx::make_ready_future();
       });
   registry.register_kernel(
       KernelDesc{.name = "particle_and_mask", .n_inputs = 2, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+      [](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs, const NeighborViews&,
+         std::span<ChunkBuffer> outputs, std::span<const std::uint8_t>) {
         if (inputs.size() < 2 || outputs.empty()) {
           return hpx::make_ready_future();
         }
-        const auto& a = inputs[0].data;
-        const auto& b = inputs[1].data;
-        const std::size_t n = std::min(a.size(), b.size());
-        outputs[0].data.resize(n);
-        auto* out = reinterpret_cast<std::uint8_t*>(outputs[0].data.data());
-        const auto* a_u = reinterpret_cast<const std::uint8_t*>(a.data());
-        const auto* b_u = reinterpret_cast<const std::uint8_t*>(b.data());
+        const auto a = inputs[0].array<std::uint8_t>();
+        const auto b = inputs[1].array<std::uint8_t>();
+        auto out = outputs[0].mutable_array<std::uint8_t>();
+        const std::size_t n = std::min(a.extent(0), b.extent(0));
         for (std::size_t i = 0; i < n; ++i) {
-          out[i] = (a_u[i] != 0 && b_u[i] != 0) ? 1 : 0;
+          out(i) = (a(i) != 0 && b(i) != 0) ? 1 : 0;
         }
         return hpx::make_ready_future();
       });
   registry.register_kernel(
       KernelDesc{.name = "particle_filter", .n_inputs = 2, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+      [](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs, const NeighborViews&,
+         std::span<ChunkBuffer> outputs, std::span<const std::uint8_t>) {
         if (inputs.size() < 2 || outputs.empty()) {
           return hpx::make_ready_future();
         }
-        const auto& values = inputs[0].data;
-        const auto& mask = inputs[1].data;
-        const std::size_t n = std::min(values.size() / sizeof(double), mask.size());
-        const auto* in_d = reinterpret_cast<const double*>(values.data());
-        const auto* m_u = reinterpret_cast<const std::uint8_t*>(mask.data());
+        const auto values = inputs[0].array<double>();
+        const auto mask = inputs[1].array<std::uint8_t>();
+        const std::size_t n = std::min(values.extent(0), mask.extent(0));
         std::size_t count = 0;
         for (std::size_t i = 0; i < n; ++i) {
-          if (m_u[i] != 0) {
+          if (mask(i) != 0) {
             ++count;
           }
         }
         outputs[0].data.resize(count * sizeof(double));
-        auto* out_d = reinterpret_cast<double*>(outputs[0].data.data());
+        auto* out_data = outputs[0].data.mutable_data();
         std::size_t out_idx = 0;
         for (std::size_t i = 0; i < n; ++i) {
-          if (m_u[i] != 0) {
-            out_d[out_idx++] = in_d[i];
+          if (mask(i) != 0) {
+            store_buffer_scalar<double>(out_data, out_idx++, values(i));
           }
         }
         return hpx::make_ready_future();
       });
   registry.register_kernel(
       KernelDesc{.name = "particle_subtract", .n_inputs = 2, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+      [](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs, const NeighborViews&,
+         std::span<ChunkBuffer> outputs, std::span<const std::uint8_t>) {
         if (inputs.size() < 2 || outputs.empty()) {
           return hpx::make_ready_future();
         }
-        const auto& a = inputs[0].data;
-        const auto& b = inputs[1].data;
-        const std::size_t n = std::min(a.size(), b.size()) / sizeof(double);
-        outputs[0].data.resize(n * sizeof(double));
-        const auto* a_d = reinterpret_cast<const double*>(a.data());
-        const auto* b_d = reinterpret_cast<const double*>(b.data());
-        auto* out_d = reinterpret_cast<double*>(outputs[0].data.data());
+        const auto a = inputs[0].array<double>();
+        const auto b = inputs[1].array<double>();
+        auto out = outputs[0].mutable_array<double>();
+        const std::size_t n = std::min(a.extent(0), b.extent(0));
         for (std::size_t i = 0; i < n; ++i) {
-          out_d[i] = a_d[i] - b_d[i];
+          out(i) = a(i) - b(i);
         }
         return hpx::make_ready_future();
       });
   registry.register_kernel(
       KernelDesc{.name = "particle_distance3", .n_inputs = 6, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+      [](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs, const NeighborViews&,
+         std::span<ChunkBuffer> outputs, std::span<const std::uint8_t>) {
         if (inputs.size() < 6 || outputs.empty()) {
           return hpx::make_ready_future();
         }
+        std::array<ArrayView<const double>, 6> values{
+            inputs[0].array<double>(), inputs[1].array<double>(), inputs[2].array<double>(),
+            inputs[3].array<double>(), inputs[4].array<double>(), inputs[5].array<double>()};
         const std::size_t n = std::min(
-            {inputs[0].data.size(), inputs[1].data.size(), inputs[2].data.size(),
-             inputs[3].data.size(), inputs[4].data.size(), inputs[5].data.size()}) /
-            sizeof(double);
-        outputs[0].data.resize(n * sizeof(double));
-        const auto* ax = reinterpret_cast<const double*>(inputs[0].data.data());
-        const auto* ay = reinterpret_cast<const double*>(inputs[1].data.data());
-        const auto* az = reinterpret_cast<const double*>(inputs[2].data.data());
-        const auto* bx = reinterpret_cast<const double*>(inputs[3].data.data());
-        const auto* by = reinterpret_cast<const double*>(inputs[4].data.data());
-        const auto* bz = reinterpret_cast<const double*>(inputs[5].data.data());
-        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+            {values[0].extent(0), values[1].extent(0), values[2].extent(0),
+             values[3].extent(0), values[4].extent(0), values[5].extent(0)});
+        auto out = outputs[0].mutable_array<double>();
         for (std::size_t i = 0; i < n; ++i) {
-          const double dx = ax[i] - bx[i];
-          const double dy = ay[i] - by[i];
-          const double dz = az[i] - bz[i];
-          out[i] = std::sqrt(dx * dx + dy * dy + dz * dz);
+          const double dx = values[0](i) - values[3](i);
+          const double dy = values[1](i) - values[4](i);
+          const double dz = values[2](i) - values[5](i);
+          out(i) = std::sqrt(dx * dx + dy * dy + dz * dz);
         }
         return hpx::make_ready_future();
       });
   registry.register_kernel(
       KernelDesc{.name = "particle_sum", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+      [](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs, const NeighborViews&,
+         std::span<ChunkBuffer> outputs, std::span<const std::uint8_t>) {
         if (inputs.empty() || outputs.empty()) {
           return hpx::make_ready_future();
         }
-        const auto& in = inputs[0].data;
-        const std::size_t n = in.size() / sizeof(double);
-        const auto* in_d = reinterpret_cast<const double*>(in.data());
+        const auto in = inputs[0].array<double>();
+        const std::size_t n = in.extent(0);
         double sum = 0.0;
         for (std::size_t i = 0; i < n; ++i) {
-          sum += in_d[i];
+          sum += in(i);
         }
-        outputs[0].data.resize(sizeof(double));
-        *reinterpret_cast<double*>(outputs[0].data.data()) = sum;
+        outputs[0].mutable_array<double>()(0) = sum;
         return hpx::make_ready_future();
       });
   registry.register_kernel(
       KernelDesc{.name = "particle_count", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+      [](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs, const NeighborViews&,
+         std::span<ChunkBuffer> outputs, std::span<const std::uint8_t>) {
         if (inputs.empty() || outputs.empty()) {
           return hpx::make_ready_future();
         }
-        const auto& in = inputs[0].data;
-        const std::size_t n = in.size();
-        const auto* in_u = reinterpret_cast<const std::uint8_t*>(in.data());
+        const auto in = inputs[0].array<std::uint8_t>();
+        const std::size_t n = in.extent(0);
         int64_t count = 0;
         for (std::size_t i = 0; i < n; ++i) {
-          if (in_u[i] != 0) {
+          if (in(i) != 0) {
             ++count;
           }
         }
-        outputs[0].data.resize(sizeof(int64_t));
-        *reinterpret_cast<int64_t*>(outputs[0].data.data()) = count;
+        outputs[0].mutable_array<std::int64_t>()(0) = count;
         return hpx::make_ready_future();
       });
   registry.register_kernel(
       KernelDesc{.name = "particle_len_f64", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+      [](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs, const NeighborViews&,
+         std::span<ChunkBuffer> outputs, std::span<const std::uint8_t>) {
         if (inputs.empty() || outputs.empty()) {
           return hpx::make_ready_future();
         }
-        const int64_t n = static_cast<int64_t>(inputs[0].data.size() / sizeof(double));
-        outputs[0].data.resize(sizeof(int64_t));
-        *reinterpret_cast<int64_t*>(outputs[0].data.data()) = n;
+        const auto n = static_cast<int64_t>(inputs[0].array<double>().extent(0));
+        outputs[0].mutable_array<std::int64_t>()(0) = n;
         return hpx::make_ready_future();
       });
   {
@@ -4438,20 +4356,19 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "particle_min", .n_inputs = 1, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
           const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
           if (inputs.empty() || outputs.empty()) {
             return hpx::make_ready_future();
           }
-          const auto& in = inputs[0].data;
-          const std::size_t n = in.size() / sizeof(double);
-          const auto* in_d = reinterpret_cast<const double*>(in.data());
+          const auto in = inputs[0].array<double>();
+          const std::size_t n = in.extent(0);
           double out_v = std::numeric_limits<double>::infinity();
           bool any = false;
           for (std::size_t i = 0; i < n; ++i) {
-            const double v = in_d[i];
+            const double v = in(i);
             if (params.finite_only && !std::isfinite(v)) {
               continue;
             }
@@ -4460,8 +4377,7 @@ void register_default_kernels(KernelRegistry& registry) {
               any = true;
             }
           }
-          outputs[0].data.resize(sizeof(double));
-          *reinterpret_cast<double*>(outputs[0].data.data()) =
+          outputs[0].mutable_array<double>()(0) =
               any ? out_v : std::numeric_limits<double>::infinity();
           return hpx::make_ready_future();
         },
@@ -4470,20 +4386,19 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "particle_max", .n_inputs = 1, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
           const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
           if (inputs.empty() || outputs.empty()) {
             return hpx::make_ready_future();
           }
-          const auto& in = inputs[0].data;
-          const std::size_t n = in.size() / sizeof(double);
-          const auto* in_d = reinterpret_cast<const double*>(in.data());
+          const auto in = inputs[0].array<double>();
+          const std::size_t n = in.extent(0);
           double out_v = -std::numeric_limits<double>::infinity();
           bool any = false;
           for (std::size_t i = 0; i < n; ++i) {
-            const double v = in_d[i];
+            const double v = in(i);
             if (params.finite_only && !std::isfinite(v)) {
               continue;
             }
@@ -4492,8 +4407,7 @@ void register_default_kernels(KernelRegistry& registry) {
               any = true;
             }
           }
-          outputs[0].data.resize(sizeof(double));
-          *reinterpret_cast<double*>(outputs[0].data.data()) =
+          outputs[0].mutable_array<double>()(0) =
               any ? out_v : -std::numeric_limits<double>::infinity();
           return hpx::make_ready_future();
         },
@@ -4523,26 +4437,24 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "particle_histogram1d", .n_inputs = 1, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
           const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
           if (inputs.empty() || outputs.empty() || params.edges.size() < 2) {
             return hpx::make_ready_future();
           }
           const std::size_t bins = params.edges.size() - 1;
-          outputs[0].data.resize(bins * sizeof(double));
-          auto* out = reinterpret_cast<double*>(outputs[0].data.data());
-          std::fill(out, out + bins, 0.0);
-          const auto& values = inputs[0].data;
-          const std::size_t n = values.size() / sizeof(double);
-          const auto* in_d = reinterpret_cast<const double*>(values.data());
+          auto out = outputs[0].mutable_array<double>();
+          for (std::size_t i = 0; i < bins; ++i) out(i) = 0.0;
+          const auto values = inputs[0].array<double>();
+          const std::size_t n = values.extent(0);
           const bool weighted = inputs.size() >= 2;
-          const auto* w_d =
-              weighted ? reinterpret_cast<const double*>(inputs[1].data.data()) : nullptr;
-          const std::size_t nw = weighted ? (inputs[1].data.size() / sizeof(double)) : 0;
+          const std::optional<ArrayView<const double>> weights =
+              weighted ? std::optional(inputs[1].array<double>()) : std::nullopt;
+          const std::size_t nw = weights ? weights->extent(0) : 0;
           for (std::size_t i = 0; i < n; ++i) {
-            const double x = in_d[i];
+            const double x = values(i);
             if (!std::isfinite(x) || x < params.edges.front() || x > params.edges.back()) {
               continue;
             }
@@ -4556,23 +4468,23 @@ void register_default_kernels(KernelRegistry& registry) {
             }
             double w = 1.0;
             if (weighted && i < nw) {
-              w = w_d[i];
+              w = (*weights)(i);
               if (!std::isfinite(w)) {
                 continue;
               }
             }
-            out[idx] += w;
+            out(idx) = static_cast<double>(out(idx)) + w;
           }
           if (params.density) {
             double total = 0.0;
             for (std::size_t i = 0; i < bins; ++i) {
-              total += out[i];
+              total += out(i);
             }
             if (total > 0.0) {
               for (std::size_t i = 0; i < bins; ++i) {
                 const double width = params.edges[i + 1] - params.edges[i];
                 if (width > 0.0) {
-                  out[i] /= (total * width);
+                  out(i) = static_cast<double>(out(i)) / (total * width);
                 }
               }
             }
@@ -4603,8 +4515,8 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "particle_topk_modes_map", .n_inputs = 0, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta&, int32_t block, std::span<const HostView>,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta&, int32_t block, std::span<const ChunkBuffer>,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
           if (outputs.empty()) {
             return hpx::make_ready_future();
@@ -4643,8 +4555,8 @@ void register_default_kernels(KernelRegistry& registry) {
   registry.register_kernel(
       KernelDesc{.name = "particle_value_counts_reduce", .n_inputs = 1, .n_outputs = 1,
                  .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+      [](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs, const NeighborViews&,
+         std::span<ChunkBuffer> outputs, std::span<const std::uint8_t>) {
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }
@@ -4680,8 +4592,8 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "particle_topk_modes_finalize", .n_inputs = 1, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
           if (outputs.empty()) {
             return hpx::make_ready_future();
@@ -4706,15 +4618,14 @@ void register_default_kernels(KernelRegistry& registry) {
                     });
 
           const std::size_t out_len = static_cast<std::size_t>(params.k);
-          outputs[0].data.resize(out_len * 2 * sizeof(double));
-          auto* out = reinterpret_cast<double*>(outputs[0].data.data());
+          auto out = outputs[0].mutable_array<double>();
           for (std::size_t i = 0; i < out_len; ++i) {
             if (i < modes.size()) {
-              out[i] = modes[i].first;
-              out[out_len + i] = static_cast<double>(modes[i].second);
+              out(i) = modes[i].first;
+              out(out_len + i) = static_cast<double>(modes[i].second);
             } else {
-              out[i] = std::numeric_limits<double>::quiet_NaN();
-              out[out_len + i] = 0.0;
+              out(i) = std::numeric_limits<double>::quiet_NaN();
+              out(out_len + i) = 0.0;
             }
           }
           return hpx::make_ready_future();
@@ -4723,38 +4634,35 @@ void register_default_kernels(KernelRegistry& registry) {
   }
   registry.register_kernel(
       KernelDesc{.name = "particle_int64_sum_reduce", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+      [](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs, const NeighborViews&,
+         std::span<ChunkBuffer> outputs, std::span<const std::uint8_t>) {
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }
         int64_t total = 0;
         for (const auto& in_view : inputs) {
-          const auto& in = in_view.data;
-          if (in.size() < sizeof(int64_t)) {
+          if (in_view.bytes() < sizeof(int64_t)) {
             continue;
           }
-          total += *reinterpret_cast<const int64_t*>(in.data());
+          total += in_view.array<std::int64_t>()(0);
         }
-        outputs[0].data.resize(sizeof(int64_t));
-        *reinterpret_cast<int64_t*>(outputs[0].data.data()) = total;
+        outputs[0].mutable_array<std::int64_t>()(0) = total;
         return hpx::make_ready_future();
       });
   registry.register_kernel(
       KernelDesc{.name = "particle_scalar_min_reduce", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+      [](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs, const NeighborViews&,
+         std::span<ChunkBuffer> outputs, std::span<const std::uint8_t>) {
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }
         double out_v = std::numeric_limits<double>::infinity();
         bool any = false;
         for (const auto& in_view : inputs) {
-          const auto& in = in_view.data;
-          if (in.size() < sizeof(double)) {
+          if (in_view.bytes() < sizeof(double)) {
             continue;
           }
-          const double v = *reinterpret_cast<const double*>(in.data());
+          const double v = in_view.array<double>()(0);
           if (!std::isfinite(v)) {
             continue;
           }
@@ -4763,26 +4671,24 @@ void register_default_kernels(KernelRegistry& registry) {
             any = true;
           }
         }
-        outputs[0].data.resize(sizeof(double));
-        *reinterpret_cast<double*>(outputs[0].data.data()) =
+        outputs[0].mutable_array<double>()(0) =
             any ? out_v : std::numeric_limits<double>::infinity();
         return hpx::make_ready_future();
       });
   registry.register_kernel(
       KernelDesc{.name = "particle_scalar_max_reduce", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-      [](const LevelMeta&, int32_t, std::span<const HostView> inputs, const NeighborViews&,
-         std::span<HostView> outputs, std::span<const std::uint8_t>) {
+      [](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs, const NeighborViews&,
+         std::span<ChunkBuffer> outputs, std::span<const std::uint8_t>) {
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }
         double out_v = -std::numeric_limits<double>::infinity();
         bool any = false;
         for (const auto& in_view : inputs) {
-          const auto& in = in_view.data;
-          if (in.size() < sizeof(double)) {
+          if (in_view.bytes() < sizeof(double)) {
             continue;
           }
-          const double v = *reinterpret_cast<const double*>(in.data());
+          const double v = in_view.array<double>()(0);
           if (!std::isfinite(v)) {
             continue;
           }
@@ -4791,8 +4697,7 @@ void register_default_kernels(KernelRegistry& registry) {
             any = true;
           }
         }
-        outputs[0].data.resize(sizeof(double));
-        *reinterpret_cast<double*>(outputs[0].data.data()) =
+        outputs[0].mutable_array<double>()(0) =
             any ? out_v : -std::numeric_limits<double>::infinity();
         return hpx::make_ready_future();
       });
@@ -4800,7 +4705,6 @@ void register_default_kernels(KernelRegistry& registry) {
     struct Params {
       std::array<double, 2> range{0.0, 1.0};
       int bins = 1;
-      int bytes_per_value = 4;
       std::shared_ptr<const CoveredBoxListIR> covered_boxes;
     };
 
@@ -4816,11 +4720,6 @@ void register_default_kernels(KernelRegistry& registry) {
                    bins->type == msgpack::type::NEGATIVE_INTEGER)) {
         params.bins = bins->as<int>();
       }
-      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.bytes_per_value = bpv->as<int>();
-      }
       params.covered_boxes = parse_covered_boxes_param(root);
       return params;
     };
@@ -4828,8 +4727,8 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "histogram1d_accumulate", .n_inputs = 1, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
         const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
@@ -4842,12 +4741,8 @@ void register_default_kernels(KernelRegistry& registry) {
           return hpx::make_ready_future();
         }
 
-        const std::size_t out_bytes = static_cast<std::size_t>(params.bins) * sizeof(double);
-        if (outputs[0].data.size() != out_bytes) {
-          outputs[0].data.assign(out_bytes, 0);
-        } else {
-          std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
-        }
+        auto out = outputs[0].mutable_array<double>();
+        for (int bin = 0; bin < params.bins; ++bin) out(bin) = 0.0;
 
         if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
           return hpx::make_ready_future();
@@ -4871,44 +4766,38 @@ void register_default_kernels(KernelRegistry& registry) {
           }
           return false;
         };
-        const bool weighted = inputs.size() >= 2;
-        HostGridView3D value_input(inputs[0], nx, ny, nz, params.bytes_per_value);
-        HostGridView3D weight_input(inputs[weighted ? 1 : 0], nx, ny, nz, params.bytes_per_value);
         const double inv_dx = static_cast<double>(params.bins) / (hi - lo);
-        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
-
-        for (int i = 0; i < nx; ++i) {
-          const int gi = box.lo.x + i;
-          for (int j = 0; j < ny; ++j) {
-            const int gj = box.lo.y + j;
-            for (int k = 0; k < nz; ++k) {
-              const int gk = box.lo.z + k;
-              if (covered(gi, gj, gk)) {
-                continue;
-              }
-              const double value = value_input.get_double_or(i, j, k);
-              if (!std::isfinite(value) || value < lo || value > hi) {
-                continue;
-              }
-              int bin = 0;
-              if (value == hi) {
-                bin = params.bins - 1;
-              } else {
-                bin = static_cast<int>(std::floor((value - lo) * inv_dx));
-              }
-              if (bin < 0 || bin >= params.bins) {
-                continue;
-              }
-              double weight = 1.0;
-              if (weighted) {
-                weight = weight_input.get_double_or(i, j, k);
-                if (!std::isfinite(weight)) {
-                  continue;
+        auto accumulate = [&](auto... typed_inputs) {
+          static_assert(sizeof...(typed_inputs) == 1 || sizeof...(typed_inputs) == 2);
+          const auto typed = std::tuple{typed_inputs...};
+          const auto values = std::get<0>(typed).grid();
+          for (int i = 0; i < nx; ++i) {
+            const int gi = box.lo.x + i;
+            for (int j = 0; j < ny; ++j) {
+              const int gj = box.lo.y + j;
+              for (int k = 0; k < nz; ++k) {
+                const int gk = box.lo.z + k;
+                if (covered(gi, gj, gk)) continue;
+                const double value = static_cast<double>(values(i, j, k));
+                if (!std::isfinite(value) || value < lo || value > hi) continue;
+                const int bin = value == hi
+                                    ? params.bins - 1
+                                    : static_cast<int>(std::floor((value - lo) * inv_dx));
+                if (bin < 0 || bin >= params.bins) continue;
+                double weight = 1.0;
+                if constexpr (sizeof...(typed_inputs) == 2) {
+                  weight = static_cast<double>(std::get<1>(typed).grid()(i, j, k));
+                  if (!std::isfinite(weight)) continue;
                 }
+                out(bin) = static_cast<double>(out(bin)) + weight;
               }
-              out[static_cast<std::size_t>(bin)] += weight;
             }
           }
+        };
+        if (inputs.size() == 1) {
+          visit_real_buffers_exact<1>(inputs, accumulate);
+        } else {
+          visit_real_buffers_exact<2>(inputs, accumulate);
         }
         return hpx::make_ready_future();
         },
@@ -4919,7 +4808,6 @@ void register_default_kernels(KernelRegistry& registry) {
       std::array<double, 2> x_range{0.0, 1.0};
       std::array<double, 2> y_range{0.0, 1.0};
       std::array<int, 2> bins{1, 1};
-      int bytes_per_value = 4;
       std::string weight_mode{"input"};
       std::shared_ptr<const CoveredBoxListIR> covered_boxes;
     };
@@ -4942,11 +4830,6 @@ void register_default_kernels(KernelRegistry& registry) {
           params.bins[0] = bins->via.array.ptr[0].as<int>();
           params.bins[1] = bins->via.array.ptr[1].as<int>();
         }
-        if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-            bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                    bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-          params.bytes_per_value = bpv->as<int>();
-        }
         if (const auto* mode = find_msgpack_map_value(root, "weight_mode");
             mode && mode->type == msgpack::type::STR) {
           params.weight_mode = mode->as<std::string>();
@@ -4959,8 +4842,8 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "histogram2d_accumulate", .n_inputs = 2, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
         const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
@@ -4978,13 +4861,9 @@ void register_default_kernels(KernelRegistry& registry) {
           return hpx::make_ready_future();
         }
 
-        const std::size_t out_bytes = static_cast<std::size_t>(nx_bins) *
-                                      static_cast<std::size_t>(ny_bins) * sizeof(double);
-        if (outputs[0].data.size() != out_bytes) {
-          outputs[0].data.assign(out_bytes, 0);
-        } else {
-          std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
-        }
+        auto out = outputs[0].mutable_view<double, 2>();
+        for (int ix = 0; ix < nx_bins; ++ix)
+          for (int iy = 0; iy < ny_bins; ++iy) out(ix, iy) = 0.0;
 
         if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size()) {
           return hpx::make_ready_future();
@@ -5008,52 +4887,51 @@ void register_default_kernels(KernelRegistry& registry) {
           }
           return false;
         };
-        const bool weighted = inputs.size() >= 3;
-        HostGridView3D x_input(inputs[0], nx, ny, nz, params.bytes_per_value);
-        HostGridView3D y_input(inputs[1], nx, ny, nz, params.bytes_per_value);
-        HostGridView3D weight_input(inputs[weighted ? 2 : 0], nx, ny, nz, params.bytes_per_value);
         const double cell_volume = level.geom.dx[0] * level.geom.dx[1] * level.geom.dx[2];
         const double inv_dx = static_cast<double>(nx_bins) / (xhi - xlo);
         const double inv_dy = static_cast<double>(ny_bins) / (yhi - ylo);
-        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
-
-        for (int i = 0; i < nx; ++i) {
-          const int gi = box.lo.x + i;
-          for (int j = 0; j < ny; ++j) {
-            const int gj = box.lo.y + j;
-            for (int k = 0; k < nz; ++k) {
-              const int gk = box.lo.z + k;
-              if (covered(gi, gj, gk)) {
-                continue;
-              }
-              const double x = x_input.get_double_or(i, j, k);
-              const double y = y_input.get_double_or(i, j, k);
-              if (!std::isfinite(x) || !std::isfinite(y) || x < xlo || x > xhi || y < ylo || y > yhi) {
-                continue;
-              }
-              int ix = (x == xhi) ? (nx_bins - 1) : static_cast<int>(std::floor((x - xlo) * inv_dx));
-              int iy = (y == yhi) ? (ny_bins - 1) : static_cast<int>(std::floor((y - ylo) * inv_dy));
-              if (ix < 0 || ix >= nx_bins || iy < 0 || iy >= ny_bins) {
-                continue;
-              }
-              double weight = 1.0;
-              if (weighted) {
-                weight = weight_input.get_double_or(i, j, k);
-                if (!std::isfinite(weight)) {
-                  continue;
+        auto accumulate = [&](auto... typed_inputs) {
+          static_assert(sizeof...(typed_inputs) == 2 || sizeof...(typed_inputs) == 3);
+          const auto typed = std::tuple{typed_inputs...};
+          const auto x_values = std::get<0>(typed).grid();
+          const auto y_values = std::get<1>(typed).grid();
+          for (int i = 0; i < nx; ++i) {
+            const int gi = box.lo.x + i;
+            for (int j = 0; j < ny; ++j) {
+              const int gj = box.lo.y + j;
+              for (int k = 0; k < nz; ++k) {
+                const int gk = box.lo.z + k;
+                if (covered(gi, gj, gk)) continue;
+                const double x = static_cast<double>(x_values(i, j, k));
+                const double y = static_cast<double>(y_values(i, j, k));
+                if (!std::isfinite(x) || !std::isfinite(y) || x < xlo || x > xhi ||
+                    y < ylo || y > yhi) continue;
+                const int ix = x == xhi
+                                   ? nx_bins - 1
+                                   : static_cast<int>(std::floor((x - xlo) * inv_dx));
+                const int iy = y == yhi
+                                   ? ny_bins - 1
+                                   : static_cast<int>(std::floor((y - ylo) * inv_dy));
+                if (ix < 0 || ix >= nx_bins || iy < 0 || iy >= ny_bins) continue;
+                double weight = 1.0;
+                if constexpr (sizeof...(typed_inputs) == 3) {
+                  weight = static_cast<double>(std::get<2>(typed).grid()(i, j, k));
+                  if (!std::isfinite(weight)) continue;
+                } else if (params.weight_mode == "cell_mass") {
+                  weight = x * cell_volume;
+                  if (!std::isfinite(weight)) continue;
+                } else if (params.weight_mode == "cell_volume") {
+                  weight = cell_volume;
                 }
-              } else if (params.weight_mode == "cell_mass") {
-                weight = x * cell_volume;
-                if (!std::isfinite(weight)) {
-                  continue;
-                }
-              } else if (params.weight_mode == "cell_volume") {
-                weight = cell_volume;
+                out(ix, iy) = static_cast<double>(out(ix, iy)) + weight;
               }
-              out[static_cast<std::size_t>(iy) * static_cast<std::size_t>(nx_bins) +
-                  static_cast<std::size_t>(ix)] += weight;
             }
           }
+        };
+        if (inputs.size() == 2) {
+          visit_real_buffers_exact<2>(inputs, accumulate);
+        } else {
+          visit_real_buffers_exact<3>(inputs, accumulate);
         }
         return hpx::make_ready_future();
         },
@@ -5066,7 +4944,6 @@ void register_default_kernels(KernelRegistry& registry) {
       std::vector<double> temperature_bins;
       std::size_t num_radii = 0;
       double gamma = 5.0 / 3.0;
-      int bytes_per_value = 8;
       std::shared_ptr<const CoveredBoxListIR> covered_boxes;
     };
 
@@ -5140,11 +5017,6 @@ void register_default_kernels(KernelRegistry& registry) {
                     gamma->type == msgpack::type::NEGATIVE_INTEGER)) {
         params.gamma = gamma->as<double>();
       }
-      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.bytes_per_value = bpv->as<int>();
-      }
       params.covered_boxes = parse_covered_boxes_param(root);
       return params;
     };
@@ -5152,24 +5024,19 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "flux_surface_integral_accumulate", .n_inputs = 9, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
         const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
         const bool use_temperature_bins = params.temperature_bins.size() >= 2;
         const std::size_t num_temperature_bins =
             use_temperature_bins ? params.temperature_bins.size() - 1 : 1;
-        const std::size_t out_bytes =
-            params.num_radii * 2 * num_temperature_bins * 4 * sizeof(double);
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }
-        if (outputs[0].data.size() != out_bytes) {
-          outputs[0].data.assign(out_bytes, 0);
-        } else {
-          std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
-        }
+        auto output_storage_bytes = outputs[0].mutable_byte_view();
+        std::fill(output_storage_bytes.begin(), output_storage_bytes.end(), std::uint8_t{0});
         if (inputs.size() < 9 || (use_temperature_bins && inputs.size() < 10) ||
             params.radii.empty() ||
             params.radius_indices.size() != params.radii.size() ||
@@ -5214,9 +5081,10 @@ void register_default_kernels(KernelRegistry& registry) {
           return hpx::make_ready_future();
         }
 
-        HostGridView3D first_input(inputs[0], nx, ny, nz, params.bytes_per_value);
         auto logical_index = [&](int i, int j, int k) -> std::size_t {
-          return first_input.logical_index(i, j, k);
+          return (static_cast<std::size_t>(i) * static_cast<std::size_t>(ny) +
+                  static_cast<std::size_t>(j)) * static_cast<std::size_t>(nz) +
+                 static_cast<std::size_t>(k);
         };
         std::vector<std::uint8_t> covered_mask;
         if (params.covered_boxes && !params.covered_boxes->empty()) {
@@ -5248,21 +5116,22 @@ void register_default_kernels(KernelRegistry& registry) {
             }
           }
         }
-        std::vector<HostGridView3D> input_views;
-        input_views.reserve(inputs.size());
-        for (const auto& input : inputs) {
-          input_views.emplace_back(input, nx, ny, nz, params.bytes_per_value);
-        }
-        auto read_value = [&](std::size_t input_idx, int i, int j, int k) -> double {
-          return input_views[input_idx].get_double_or(i, j, k);
+        std::array<RealGridAccessor, 10> input_views{};
+        auto bind_inputs = [&](auto... typed_inputs) {
+          std::size_t input_index = 0;
+          ((input_views[input_index++] = make_real_grid_accessor(typed_inputs.grid())), ...);
         };
+        if (use_temperature_bins) {
+          visit_real_buffers_exact<10>(inputs.first(10), bind_inputs);
+        } else {
+          visit_real_buffers_exact<9>(inputs.first(9), bind_inputs);
+        }
         auto cell_edge = [&](int axis, int global_idx) -> double {
           return level.geom.x0[axis] +
                  (static_cast<double>(global_idx - level.geom.index_origin[axis]) *
                   level.geom.dx[axis]);
         };
 
-        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
         const double gamma_minus_one = params.gamma - 1.0;
         auto box_lo_axis = [&](int axis) -> int32_t {
           if (axis == 0) {
@@ -5310,21 +5179,23 @@ void register_default_kernels(KernelRegistry& registry) {
           const double z = 0.5 * (z0 + z1);
           const double r = std::sqrt(x * x + y * y + z * z);
 
-          const double rho = read_value(0, i, j, k);
+          const double rho = static_cast<double>(input_views[0](i, j, k));
           if (r <= 0.0 || rho <= 0.0 || !std::isfinite(rho)) {
             return;
           }
 
-          const double momx = read_value(1, i, j, k);
-          const double momy = read_value(2, i, j, k);
-          const double momz = read_value(3, i, j, k);
-          const double energy_density = read_value(4, i, j, k);
-          const double scalar_density = read_value(5, i, j, k);
-          const double bx = read_value(6, i, j, k);
-          const double by = read_value(7, i, j, k);
-          const double bz = read_value(8, i, j, k);
-          const double temperature =
-              use_temperature_bins ? read_value(9, i, j, k) : 0.0;
+          const double momx = static_cast<double>(input_views[1](i, j, k));
+          const double momy = static_cast<double>(input_views[2](i, j, k));
+          const double momz = static_cast<double>(input_views[3](i, j, k));
+          const double energy_density = static_cast<double>(input_views[4](i, j, k));
+          const double scalar_density = static_cast<double>(input_views[5](i, j, k));
+          const double bx = static_cast<double>(input_views[6](i, j, k));
+          const double by = static_cast<double>(input_views[7](i, j, k));
+          const double bz = static_cast<double>(input_views[8](i, j, k));
+          double temperature = 0.0;
+          if (use_temperature_bins) {
+            temperature = static_cast<double>(input_views[9](i, j, k));
+          }
           if (!std::isfinite(momx) || !std::isfinite(momy) || !std::isfinite(momz) ||
               !std::isfinite(energy_density) || !std::isfinite(scalar_density) ||
               !std::isfinite(bx) || !std::isfinite(by) || !std::isfinite(bz) ||
@@ -5389,8 +5260,12 @@ void register_default_kernels(KernelRegistry& registry) {
               2 * num_temperature_bins * 4;
           for (std::size_t component = 0; component < fluxes.size(); ++component) {
             const std::size_t sign_bin = fluxes[component] < 0.0 ? 0 : 1;
-            out[radius_base + sign_bin * num_temperature_bins * 4 +
-                temperature_bin * 4 + component] += fluxes[component];
+            const auto output_index = radius_base + sign_bin * num_temperature_bins * 4 +
+                                      temperature_bin * 4 + component;
+            store_buffer_scalar(
+                output_storage_bytes.data(), output_index,
+                load_buffer_scalar<double>(output_storage_bytes.data(), output_index) +
+                    fluxes[component]);
           }
         };
 
@@ -5476,7 +5351,6 @@ void register_default_kernels(KernelRegistry& registry) {
       std::vector<double> temperature_bins;
       std::size_t num_heights = 0;
       double gamma = 5.0 / 3.0;
-      int bytes_per_value = 8;
       std::shared_ptr<const CoveredBoxListIR> covered_boxes;
     };
 
@@ -5549,11 +5423,6 @@ void register_default_kernels(KernelRegistry& registry) {
                     gamma->type == msgpack::type::NEGATIVE_INTEGER)) {
         params.gamma = gamma->as<double>();
       }
-      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.bytes_per_value = bpv->as<int>();
-      }
       params.covered_boxes = parse_covered_boxes_param(root);
       return params;
     };
@@ -5561,8 +5430,8 @@ void register_default_kernels(KernelRegistry& registry) {
     registry.register_kernel(
         KernelDesc{.name = "cylindrical_flux_surface_integral_accumulate", .n_inputs = 9, .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta& level, int32_t block, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta& level, int32_t block, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
         const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
@@ -5572,17 +5441,11 @@ void register_default_kernels(KernelRegistry& registry) {
         constexpr std::size_t num_geometric_sections = 2;
         constexpr std::size_t endcaps_section = 0;
         constexpr std::size_t walls_section = 1;
-        const std::size_t out_bytes =
-            params.num_heights * 2 * num_temperature_bins *
-            num_geometric_sections * 4 * sizeof(double);
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }
-        if (outputs[0].data.size() != out_bytes) {
-          outputs[0].data.assign(out_bytes, 0);
-        } else {
-          std::fill(outputs[0].data.begin(), outputs[0].data.end(), 0);
-        }
+        auto output_storage_bytes = outputs[0].mutable_byte_view();
+        std::fill(output_storage_bytes.begin(), output_storage_bytes.end(), std::uint8_t{0});
         if (inputs.size() < 9 || (use_temperature_bins && inputs.size() < 10) ||
             params.heights.empty() ||
             params.height_indices.size() != params.heights.size() ||
@@ -5625,9 +5488,10 @@ void register_default_kernels(KernelRegistry& registry) {
           return hpx::make_ready_future();
         }
 
-        HostGridView3D first_input(inputs[0], nx, ny, nz, params.bytes_per_value);
         auto logical_index = [&](int i, int j, int k) -> std::size_t {
-          return first_input.logical_index(i, j, k);
+          return (static_cast<std::size_t>(i) * static_cast<std::size_t>(ny) +
+                  static_cast<std::size_t>(j)) * static_cast<std::size_t>(nz) +
+                 static_cast<std::size_t>(k);
         };
         std::vector<std::uint8_t> covered_mask;
         if (params.covered_boxes && !params.covered_boxes->empty()) {
@@ -5659,21 +5523,22 @@ void register_default_kernels(KernelRegistry& registry) {
             }
           }
         }
-        std::vector<HostGridView3D> input_views;
-        input_views.reserve(inputs.size());
-        for (const auto& input : inputs) {
-          input_views.emplace_back(input, nx, ny, nz, params.bytes_per_value);
-        }
-        auto read_value = [&](std::size_t input_idx, int i, int j, int k) -> double {
-          return input_views[input_idx].get_double_or(i, j, k);
+        std::array<RealGridAccessor, 10> input_views{};
+        auto bind_inputs = [&](auto... typed_inputs) {
+          std::size_t input_index = 0;
+          ((input_views[input_index++] = make_real_grid_accessor(typed_inputs.grid())), ...);
         };
+        if (use_temperature_bins) {
+          visit_real_buffers_exact<10>(inputs.first(10), bind_inputs);
+        } else {
+          visit_real_buffers_exact<9>(inputs.first(9), bind_inputs);
+        }
         auto cell_edge = [&](int axis, int global_idx) -> double {
           return level.geom.x0[axis] +
                  (static_cast<double>(global_idx - level.geom.index_origin[axis]) *
                   level.geom.dx[axis]);
         };
 
-        auto* out = reinterpret_cast<double*>(outputs[0].data.data());
         const double radius2 = params.radius * params.radius;
         const double gamma_minus_one = params.gamma - 1.0;
         auto box_lo_axis = [&](int axis) -> int32_t {
@@ -5715,21 +5580,23 @@ void register_default_kernels(KernelRegistry& registry) {
             return;
           }
 
-          const double rho = read_value(0, i, j, k);
+          const double rho = static_cast<double>(input_views[0](i, j, k));
           if (rho <= 0.0 || !std::isfinite(rho)) {
             return;
           }
 
-          const double momx = read_value(1, i, j, k);
-          const double momy = read_value(2, i, j, k);
-          const double momz = read_value(3, i, j, k);
-          const double energy_density = read_value(4, i, j, k);
-          const double scalar_density = read_value(5, i, j, k);
-          const double bx = read_value(6, i, j, k);
-          const double by = read_value(7, i, j, k);
-          const double bz = read_value(8, i, j, k);
-          const double temperature =
-              use_temperature_bins ? read_value(9, i, j, k) : 0.0;
+          const double momx = static_cast<double>(input_views[1](i, j, k));
+          const double momy = static_cast<double>(input_views[2](i, j, k));
+          const double momz = static_cast<double>(input_views[3](i, j, k));
+          const double energy_density = static_cast<double>(input_views[4](i, j, k));
+          const double scalar_density = static_cast<double>(input_views[5](i, j, k));
+          const double bx = static_cast<double>(input_views[6](i, j, k));
+          const double by = static_cast<double>(input_views[7](i, j, k));
+          const double bz = static_cast<double>(input_views[8](i, j, k));
+          double temperature = 0.0;
+          if (use_temperature_bins) {
+            temperature = static_cast<double>(input_views[9](i, j, k));
+          }
           if (!std::isfinite(momx) || !std::isfinite(momy) || !std::isfinite(momz) ||
               !std::isfinite(energy_density) || !std::isfinite(scalar_density) ||
               !std::isfinite(bx) || !std::isfinite(by) || !std::isfinite(bz) ||
@@ -5785,10 +5652,14 @@ void register_default_kernels(KernelRegistry& registry) {
               2 * num_temperature_bins * num_geometric_sections * 4;
           for (std::size_t component = 0; component < fluxes.size(); ++component) {
             const std::size_t sign_bin = fluxes[component] < 0.0 ? 0 : 1;
-            out[height_base + sign_bin * num_temperature_bins *
-                num_geometric_sections * 4 +
-                temperature_bin * num_geometric_sections * 4 +
-                geometric_section * 4 + component] += fluxes[component];
+            const auto output_index = height_base + sign_bin * num_temperature_bins *
+                                      num_geometric_sections * 4 +
+                                      temperature_bin * num_geometric_sections * 4 +
+                                      geometric_section * 4 + component;
+            store_buffer_scalar(
+                output_storage_bytes.data(), output_index,
+                load_buffer_scalar<double>(output_storage_bytes.data(), output_index) +
+                    fluxes[component]);
           }
         };
 
@@ -5885,81 +5756,25 @@ void register_default_kernels(KernelRegistry& registry) {
         make_covered_box_params_preparer<Params>(decode_params));
   }
   {
-    struct Params {
-      int bytes_per_value = 8;
-    };
-    auto decode_params = [](const msgpack::object& root) {
-      Params params;
-      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.bytes_per_value = bpv->as<int>();
-      }
-      return params;
-    };
     registry.register_kernel(
         KernelDesc{.name = "uniform_slice_add", .n_inputs = 2, .n_outputs = 1, .needs_neighbors = false},
-        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
-        const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
-
+        [](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
+                        std::span<const std::uint8_t>) {
         if (outputs.empty() || inputs.size() < 2) {
           return hpx::make_ready_future();
         }
-        auto& out = outputs[0].data;
-        if (out.empty()) {
-          return hpx::make_ready_future();
-        }
-
-        if (params.bytes_per_value == 8) {
-          const std::size_t n = out.size() / sizeof(double);
-          auto* out_d = reinterpret_cast<double*>(out.data());
-          std::fill(out_d, out_d + n, 0.0);
-          for (const auto& in_view : inputs) {
-            const auto& in = in_view.data;
-            if (in.empty()) {
-              continue;
-            }
-            const std::size_t n_in = std::min(n, in.size() / sizeof(double));
-            const auto* in_d = reinterpret_cast<const double*>(in.data());
-            for (std::size_t i = 0; i < n_in; ++i) {
-              out_d[i] += in_d[i];
-            }
-          }
-        } else if (params.bytes_per_value == 4) {
-          const std::size_t n = out.size() / sizeof(float);
-          auto* out_f = reinterpret_cast<float*>(out.data());
-          std::fill(out_f, out_f + n, 0.0f);
-          for (const auto& in_view : inputs) {
-            const auto& in = in_view.data;
-            if (in.empty()) {
-              continue;
-            }
-            const std::size_t n_in = std::min(n, in.size() / sizeof(float));
-            const auto* in_f = reinterpret_cast<const float*>(in.data());
-            for (std::size_t i = 0; i < n_in; ++i) {
-              out_f[i] += in_f[i];
-            }
-          }
-        }
+        reduce_matching_real_buffers(inputs, outputs[0]);
         return hpx::make_ready_future();
-        },
-        make_kernel_params_preparer<Params>(decode_params));
+        });
   }
   {
     struct Params {
-      int bytes_per_value = 4;
       double pixel_area = 1.0;
     };
 
     auto decode_params = [](const msgpack::object& root) {
       Params params;
-      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.bytes_per_value = bpv->as<int>();
-      }
       if (const auto* area = find_msgpack_map_value(root, "pixel_area");
           area && (area->type == msgpack::type::FLOAT ||
                    area->type == msgpack::type::POSITIVE_INTEGER ||
@@ -5970,8 +5785,8 @@ void register_default_kernels(KernelRegistry& registry) {
     };
     registry.register_kernel(
         KernelDesc{.name = "uniform_slice_finalize", .n_inputs = 2, .n_outputs = 1, .needs_neighbors = false},
-        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
+        [decode_params](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
         const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
@@ -5979,104 +5794,49 @@ void register_default_kernels(KernelRegistry& registry) {
           return hpx::make_ready_future();
         }
 
-        const auto& sum = inputs[0].data;
-        const auto& area = inputs[1].data;
-        auto& out = outputs[0].data;
-        if (out.empty()) {
-          return hpx::make_ready_future();
+        if (inputs[0].desc().scalar != ScalarType::kF64 ||
+            inputs[1].desc().scalar != ScalarType::kF64 ||
+            inputs[0].desc().element_count() != outputs[0].desc().element_count() ||
+            inputs[1].desc().element_count() != outputs[0].desc().element_count()) {
+          throw BufferContractError(BufferContractReason::kDescriptorStorageMismatch,
+                                    "slice finalize descriptor mismatch");
         }
-        const std::size_t n = std::min(sum.size(), area.size()) / sizeof(double);
-        const auto* sum_d = reinterpret_cast<const double*>(sum.data());
-        const auto* area_d = reinterpret_cast<const double*>(area.data());
-
-        if (params.bytes_per_value == 8) {
-          auto* out_d = reinterpret_cast<double*>(out.data());
-          for (std::size_t i = 0; i < n; ++i) {
-            if (area_d[i] == 0.0) {
-              out_d[i] = std::numeric_limits<double>::quiet_NaN();
-            } else {
-              out_d[i] = sum_d[i] / params.pixel_area;
-            }
-          }
-        } else if (params.bytes_per_value == 4) {
-          auto* out_f = reinterpret_cast<float*>(out.data());
-          for (std::size_t i = 0; i < n; ++i) {
-            if (area_d[i] == 0.0) {
-              out_f[i] = std::numeric_limits<float>::quiet_NaN();
-            } else {
-              out_f[i] = static_cast<float>(sum_d[i] / params.pixel_area);
-            }
-          }
+        const auto count = static_cast<std::size_t>(outputs[0].desc().element_count());
+        const auto sum = inputs[0].byte_view();
+        const auto area = inputs[1].byte_view();
+        auto out = outputs[0].mutable_byte_view();
+        auto evaluate = [&](std::size_t index) {
+          const double denominator = load_buffer_scalar<double>(area.data(), index);
+          return denominator == 0.0
+                     ? std::numeric_limits<double>::quiet_NaN()
+                     : load_buffer_scalar<double>(sum.data(), index) / params.pixel_area;
+        };
+        if (outputs[0].desc().scalar == ScalarType::kF64) {
+          for (std::size_t index = 0; index < count; ++index)
+            store_buffer_scalar(out.data(), index, evaluate(index));
+        } else if (outputs[0].desc().scalar == ScalarType::kF32) {
+          for (std::size_t index = 0; index < count; ++index)
+            store_buffer_scalar(out.data(), index, static_cast<float>(evaluate(index)));
+        } else {
+          throw BufferContractError(BufferContractReason::kScalarMismatch,
+                                    "slice finalize output must be f32 or f64");
         }
         return hpx::make_ready_future();
         },
         make_kernel_params_preparer<Params>(decode_params));
   }
   {
-    struct Params {
-      int bytes_per_value = 4;
-    };
-
-    auto decode_params = [](const msgpack::object& root) {
-      Params params;
-      if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-          bpv && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                  bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.bytes_per_value = bpv->as<int>();
-      }
-      return params;
-    };
     registry.register_kernel(
         KernelDesc{.name = "uniform_slice_reduce", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-        [decode_params](const LevelMeta&, int32_t, std::span<const HostView> inputs,
-                        const NeighborViews&, std::span<HostView> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
-        const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
-
+        [](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs,
+                        const NeighborViews&, std::span<ChunkBuffer> outputs,
+                        std::span<const std::uint8_t>) {
         if (outputs.empty() || inputs.empty()) {
           return hpx::make_ready_future();
         }
-
-        auto& out = outputs[0].data;
-        if (out.empty()) {
-          return hpx::make_ready_future();
-        }
-        std::fill(out.begin(), out.end(), 0);
-
-        if (params.bytes_per_value == 4) {
-          const std::size_t n = out.size() / sizeof(float);
-          auto* out_f = reinterpret_cast<float*>(out.data());
-
-          for (const auto& in_view : inputs) {
-            const auto& in = in_view.data;
-            if (in.empty()) {
-              continue;
-            }
-            const std::size_t n_in = std::min(n, in.size() / sizeof(float));
-            const auto* in_f = reinterpret_cast<const float*>(in.data());
-            for (std::size_t i = 0; i < n_in; ++i) {
-              out_f[i] += in_f[i];
-            }
-          }
-        } else if (params.bytes_per_value == 8) {
-          const std::size_t n = out.size() / sizeof(double);
-          auto* out_d = reinterpret_cast<double*>(out.data());
-
-          for (const auto& in_view : inputs) {
-            const auto& in = in_view.data;
-            if (in.empty()) {
-              continue;
-            }
-            const std::size_t n_in = std::min(n, in.size() / sizeof(double));
-            const auto* in_d = reinterpret_cast<const double*>(in.data());
-            for (std::size_t i = 0; i < n_in; ++i) {
-              out_d[i] += in_d[i];
-            }
-          }
-        }
+        reduce_matching_real_buffers(inputs, outputs[0]);
         return hpx::make_ready_future();
-        },
-        make_kernel_params_preparer<Params>(decode_params));
+        });
   }
 }
 
@@ -6168,7 +5928,7 @@ bool template_may_produce_chunk(const TaskTemplateIR& tmpl,
     return false;
   }
   for (const auto& output : tmpl.outputs) {
-    if (output.field == ref.field && output.version == ref.version) {
+    if (output.field.field == ref.field && output.field.version == ref.version) {
       return true;
     }
   }
@@ -6394,7 +6154,7 @@ Runtime::Runtime(const std::vector<std::string>& hpx_config,
   register_default_kernels(kernel_registry_);
 }
 
-void DatasetHandle::set_chunk(const ChunkRef& ref, HostView view) {
+void DatasetHandle::set_chunk(const ChunkRef& ref, ChunkBuffer view) {
   if (!backend) {
     backend = std::make_shared<MemoryBackend>();
   }
@@ -6405,19 +6165,19 @@ void DatasetHandle::set_chunk(const ChunkRef& ref, HostView view) {
   }
 }
 
-std::optional<HostView> DatasetHandle::get_chunk(const ChunkRef& ref) const {
+std::optional<ChunkBuffer> DatasetHandle::get_chunk(const ChunkRef& ref) const {
   if (backend) {
     return backend->get_chunk(ref);
   }
   return std::nullopt;
 }
 
-std::vector<std::optional<HostView>> DatasetHandle::get_chunks(
+std::vector<std::optional<ChunkBuffer>> DatasetHandle::get_chunks(
     const std::vector<ChunkRef>& refs) const {
   if (backend) {
     return backend->get_chunks(refs);
   }
-  return std::vector<std::optional<HostView>>(refs.size());
+  return std::vector<std::optional<ChunkBuffer>>(refs.size());
 }
 
 bool DatasetHandle::has_chunk(const ChunkRef& ref) const {
@@ -6659,7 +6419,7 @@ void Runtime::preload_dataset(const RunMetaHandle& runmeta,
   hpx::lcos::broadcast<::kangaroo_preload_action>(localities, preload_run_id_, fields).get();
 }
 
-HostView Runtime::get_task_chunk(int32_t step,
+ChunkBuffer Runtime::get_task_chunk(int32_t step,
                                  int16_t level,
                                  int32_t field,
                                  int32_t version,

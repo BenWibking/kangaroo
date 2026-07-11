@@ -48,7 +48,7 @@ OpenPMDBackend::OpenPMDBackend(std::string uri) : uri_(std::move(uri)) {
   std::sort(iteration_indices_.begin(), iteration_indices_.end());
 }
 
-std::optional<HostView> OpenPMDBackend::get_chunk(const ChunkRef& ref) {
+std::optional<ChunkBuffer> OpenPMDBackend::get_chunk(const ChunkRef& ref) {
   const auto& cache = get_cache(ref.step);
   if (ref.level < 0 || ref.level >= static_cast<int32_t>(cache.levels.size())) {
     return std::nullopt;
@@ -98,9 +98,9 @@ std::optional<HostView> OpenPMDBackend::get_chunk(const ChunkRef& ref) {
       return std::nullopt;
     }
 
-    HostView view;
+    const std::array<std::uint64_t, 3> extents{nx, ny, nz};
     if (component.getDatatype() == openPMD::Datatype::DOUBLE) {
-      view.data.resize(static_cast<size_t>(elem_count * sizeof(double)));
+      auto view = ChunkBuffer::allocate(BufferDesc::runtime_grid(ScalarType::kF64, extents));
       auto* data = reinterpret_cast<double*>(view.data.data());
       component.loadChunkRaw(data, patch.storage_offset, patch.storage_extent);
       series_->flush();
@@ -109,7 +109,7 @@ std::optional<HostView> OpenPMDBackend::get_chunk(const ChunkRef& ref) {
       return view;
     }
     if (component.getDatatype() == openPMD::Datatype::FLOAT) {
-      view.data.resize(static_cast<size_t>(elem_count * sizeof(float)));
+      auto view = ChunkBuffer::allocate(BufferDesc::runtime_grid(ScalarType::kF32, extents));
       auto* data = reinterpret_cast<float*>(view.data.data());
       component.loadChunkRaw(data, patch.storage_offset, patch.storage_extent);
       series_->flush();

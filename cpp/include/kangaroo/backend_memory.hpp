@@ -11,24 +11,25 @@ class MemoryBackend : public DatasetBackend {
  public:
   MemoryBackend() = default;
 
-  std::optional<HostView> get_chunk(const ChunkRef& ref) override;
+  std::optional<ChunkBuffer> get_chunk(const ChunkRef& ref) override;
   bool has_chunk(const ChunkRef& ref) const override;
+  std::optional<BufferDesc> describe_chunk(const ChunkRef& ref) const override;
   std::size_t estimate_chunk_bytes(const ChunkRef& ref) const override;
   DatasetMetadata get_metadata() const override;
 
-  void set_chunk(const ChunkRef& ref, HostView view);
+  void set_chunk(const ChunkRef& ref, ChunkBuffer view);
 
-  const std::unordered_map<ChunkRef, HostView, ChunkRefHash, ChunkRefEq>& data() const {
+  const std::unordered_map<ChunkRef, ChunkBuffer, ChunkRefHash, ChunkRefEq>& data() const {
     return data_;
   }
   
-  void set_data(std::unordered_map<ChunkRef, HostView, ChunkRefHash, ChunkRefEq> data) {
+  void set_data(std::unordered_map<ChunkRef, ChunkBuffer, ChunkRefHash, ChunkRefEq> data) {
     data_ = std::move(data);
   }
 
  private:
   mutable std::mutex mutex_;
-  std::unordered_map<ChunkRef, HostView, ChunkRefHash, ChunkRefEq> data_;
+  std::unordered_map<ChunkRef, ChunkBuffer, ChunkRefHash, ChunkRefEq> data_;
 };
 
 }  // namespace kangaroo

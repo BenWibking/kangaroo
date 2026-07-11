@@ -13,8 +13,8 @@ class PlotfileBackend : public DatasetBackend {
  public:
   explicit PlotfileBackend(std::string plotfile_dir);
 
-  std::optional<HostView> get_chunk(const ChunkRef& ref) override;
-  std::vector<std::optional<HostView>> get_chunks(const std::vector<ChunkRef>& refs) override;
+  std::optional<ChunkBuffer> get_chunk(const ChunkRef& ref) override;
+  std::vector<std::optional<ChunkBuffer>> get_chunks(const std::vector<ChunkRef>& refs) override;
   bool has_chunk(const ChunkRef& ref) const override;
   std::size_t estimate_chunk_bytes(const ChunkRef& ref) const override;
   DatasetMetadata get_metadata() const override;

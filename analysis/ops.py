@@ -3,8 +3,53 @@ from __future__ import annotations
 import math
 from typing import Iterable, Optional, Sequence
 
+from .buffer import (
+    BlockShape,
+    BufferSpec,
+    DType,
+    DynamicShape,
+    DynamicUpperBound,
+    FixedShape,
+    InitPolicy,
+)
 from .ctx import LoweringContext
-from .plan import FieldRef
+from .plan import FieldRef, OutputRef
+
+
+def _fixed_f64(field: FieldRef, elements: int | float) -> OutputRef:
+    return OutputRef(
+        field,
+        BufferSpec(DType.F64, FixedShape((int(elements),)), InitPolicy.ZERO),
+    )
+
+
+def _fixed_f64_shape(field: FieldRef, extents: tuple[int, ...]) -> OutputRef:
+    return OutputRef(
+        field,
+        BufferSpec(DType.F64, FixedShape(extents), InitPolicy.ZERO),
+    )
+
+
+def _fixed_real(field: FieldRef, elements: int, dtype: DType) -> OutputRef:
+    return OutputRef(field, BufferSpec(dtype, FixedShape((int(elements),))))
+
+
+def _fixed_real_shape(field: FieldRef, extents: tuple[int, ...], dtype: DType) -> OutputRef:
+    return OutputRef(field, BufferSpec(dtype, FixedShape(extents)))
+
+
+def _block_f64(field: FieldRef, components: int = 1) -> OutputRef:
+    return OutputRef(field, BufferSpec(DType.F64, BlockShape(components), InitPolicy.ZERO))
+
+
+def _amr_patch_payload(field: FieldRef) -> OutputRef:
+    return OutputRef(
+        field,
+        BufferSpec(
+            DType.OPAQUE,
+            DynamicShape(DynamicUpperBound.amr_subbox_pack()),
+        ),
+    )
 
 
 def _default_reduce_fan_in(num_inputs: int) -> int:
@@ -163,7 +208,7 @@ class VorticityMag:
                 kernel="amr_subbox_fetch_pack",
                 domain=dom,
                 inputs=[],
-                outputs=[fetch_f],
+                outputs=[_amr_patch_payload(fetch_f)],
                 deps={"kind": "None"},
                 params={
                     "input_field": field_id,
@@ -180,7 +225,7 @@ class VorticityMag:
                 kernel="gradU_stencil",
                 domain=dom,
                 inputs=[FieldRef(field_id), fetch_f],
-                outputs=[grad_f],
+                outputs=[_block_f64(grad_f, 3)],
                 deps={"kind": "None"},
                 params={
                     "order": 2,
@@ -198,7 +243,7 @@ class VorticityMag:
             kernel="vorticity_mag",
             domain=dom,
             inputs=grad_fields,
-            outputs=[vort],
+            outputs=[_block_f64(vort)],
             deps={"kind": "None"},
             params={},
         )
@@ -231,29 +276,11 @@ def _overlaps_1d(a0: float, a1: float, b0: float, b1: float) -> bool:
     return not (a1 < b0 or b1 < a0)
 
 
-def _resolve_bytes_per_value(
-    ctx: LoweringContext,
-    *,
-    field: int,
-    bytes_per_value: int | None,
-    level: int = 0,
-) -> int:
-    if bytes_per_value is not None:
-        return int(bytes_per_value)
-
-    ds = ctx.dataset
-    runtime = getattr(ds, "runtime", None)
-    if runtime is None:
-        raise RuntimeError(
-            "bytes_per_value was not provided and could not be inferred: dataset runtime is missing"
-        )
-    infer = getattr(ds, "infer_bytes_per_value", None)
-    if callable(infer):
-        try:
-            return int(infer(runtime, field=field, level=level, step=ds.step))
-        except Exception:
-            pass
-    return 8
+def _resolve_real_dtype(dtype: DType | str) -> DType:
+    resolved = DType(dtype)
+    if resolved not in (DType.F32, DType.F64):
+        raise ValueError("numeric grid outputs require dtype='f32' or dtype='f64'")
+    return resolved
 
 
 def _coarsen_box(
@@ -282,7 +309,7 @@ class UniformSlice:
         rect: tuple[float, float, float, float],
         resolution: tuple[int, int],
         out_name: str = "slice",
-        bytes_per_value: int | None = None,
+        dtype: DType | str = DType.F64,
         reduce_fan_in: Optional[int] = None,
     ) -> None:
         self.field = field
@@ -291,7 +318,7 @@ class UniformSlice:
         self.rect = rect
         self.resolution = resolution
         self.out_name = out_name
-        self.bytes_per_value = bytes_per_value
+        self.dtype = _resolve_real_dtype(dtype)
         self.reduce_fan_in = reduce_fan_in
 
     def _intersecting_blocks_level(self, level_meta, *, plane_index: int | None = None) -> Iterable[int]:
@@ -421,7 +448,7 @@ class UniformSlice:
         axis_idx = _axis_index(self.axis)
         u_axis, v_axis = [i for i in range(3) if i != axis_idx]
         nx, ny = self.resolution
-        bpv = _resolve_bytes_per_value(ctx, field=self.field, bytes_per_value=self.bytes_per_value)
+        dtype = self.dtype
         if nx <= 0 or ny <= 0:
             raise ValueError("resolution must be positive")
 
@@ -439,7 +466,7 @@ class UniformSlice:
         stages: list = []
         producer_stage: dict[int, object] = {}
 
-        out_sum_bytes = nx * ny * 8
+        out_shape = (ny, nx)
         for level_idx in range(len(levels) - 1, -1, -1):
             level_meta = levels[level_idx]
             blocks = list(
@@ -469,8 +496,7 @@ class UniformSlice:
                     kernel="uniform_slice_cellavg_accumulate",
                     domain=dom,
                     inputs=[FieldRef(self.field)],
-                    outputs=[sum_field, area_field],
-                    output_bytes=[out_sum_bytes, out_sum_bytes],
+                    outputs=[_fixed_f64_shape(sum_field, out_shape), _fixed_f64_shape(area_field, out_shape)],
                     deps={"kind": "None"},
                     params={
                         "axis": axis_idx,
@@ -479,7 +505,6 @@ class UniformSlice:
                         "rect": list(self.rect),
                         "resolution": [nx, ny],
                         "plane_axes": [u_axis, v_axis],
-                        "bytes_per_value": bpv,
                         "covered_boxes": covered_payload,
                     },
                 )
@@ -518,7 +543,6 @@ class UniformSlice:
                     "input_blocks": list(input_blocks),
                     "output_blocks": list(output_blocks),
                     "group_offsets": list(group_offsets),
-                    "bytes_per_value": 8,
                 }
                 area_params = {
                     "graph_kind": "reduce",
@@ -529,15 +553,13 @@ class UniformSlice:
                     "input_blocks": list(input_blocks),
                     "output_blocks": list(output_blocks),
                     "group_offsets": list(group_offsets),
-                    "bytes_per_value": 8,
                 }
                 reduce_stage.map_blocks(
                     name=f"uniform_slice_sum_reduce_s{reduce_idx}",
                     kernel="uniform_slice_reduce",
                     domain=ctx.domain(step=ds.step, level=level_idx),
                     inputs=[input_sum],
-                    outputs=[out_sum],
-                    output_bytes=[out_sum_bytes],
+                    outputs=[_fixed_f64_shape(out_sum, out_shape)],
                     deps={"kind": "None"},
                     params=sum_params,
                 )
@@ -547,8 +569,7 @@ class UniformSlice:
                     kernel="uniform_slice_reduce",
                     domain=ctx.domain(step=ds.step, level=level_idx),
                     inputs=[input_area],
-                    outputs=[out_area],
-                    output_bytes=[out_sum_bytes],
+                    outputs=[_fixed_f64_shape(out_area, out_shape)],
                     deps={"kind": "None"},
                     params=area_params,
                 )
@@ -598,8 +619,7 @@ class UniformSlice:
                         kernel="uniform_slice_add",
                         domain=ctx.domain(step=ds.step, level=ds.level),
                         inputs=[left_ref, right_ref],
-                        outputs=[out_field],
-                        output_bytes=[out_sum_bytes],
+                        outputs=[_fixed_f64_shape(out_field, out_shape)],
                         deps={"kind": "None"},
                         params={
                             "graph_kind": "reduce",
@@ -607,7 +627,6 @@ class UniformSlice:
                             "num_inputs": 1,
                             "input_base": 0,
                             "output_base": 0,
-                            "bytes_per_value": 8,
                         },
                     )
                     stages.append(add_stage)
@@ -638,8 +657,7 @@ class UniformSlice:
                 FieldRef(total_sum.field, version=total_sum.version, domain=ctx.domain(step=ds.step, level=total_sum_level)),
                 FieldRef(total_area.field, version=total_area.version, domain=ctx.domain(step=ds.step, level=total_area_level)),
             ],
-            outputs=[out_field],
-            output_bytes=[nx * ny * bpv],
+            outputs=[_fixed_real_shape(out_field, out_shape, dtype)],
             deps={"kind": "None"},
             params={
                 "graph_kind": "reduce",
@@ -647,7 +665,6 @@ class UniformSlice:
                 "num_inputs": 1,
                 "input_base": 0,
                 "output_base": 0,
-                "bytes_per_value": bpv,
                 "pixel_area": abs((self.rect[2] - self.rect[0]) / nx) * abs((self.rect[3] - self.rect[1]) / ny),
             },
         )
@@ -669,7 +686,6 @@ class UniformProjection:
         rect: tuple[float, float, float, float],
         resolution: tuple[int, int],
         out_name: str = "projection",
-        bytes_per_value: int | None = None,
         reduce_fan_in: Optional[int] = None,
         amr_cell_average: bool = True,
     ) -> None:
@@ -679,7 +695,6 @@ class UniformProjection:
         self.rect = rect
         self.resolution = resolution
         self.out_name = out_name
-        self.bytes_per_value = bytes_per_value
         self.reduce_fan_in = reduce_fan_in
         self.amr_cell_average = amr_cell_average
 
@@ -808,7 +823,6 @@ class UniformProjection:
         ds = ctx.dataset
         axis_idx = _axis_index(self.axis)
         nx, ny = self.resolution
-        bpv = _resolve_bytes_per_value(ctx, field=self.field, bytes_per_value=self.bytes_per_value)
         if nx <= 0 or ny <= 0:
             raise ValueError("resolution must be positive")
 
@@ -823,7 +837,7 @@ class UniformProjection:
         sum_fields: list[tuple[FieldRef, int]] = []
         stages: list = []
         producer_stage: dict[int, object] = {}
-        out_sum_bytes = nx * ny * 8
+        out_shape = (ny, nx)
 
         for level_idx in range(len(levels) - 1, -1, -1):
             level_meta = levels[level_idx]
@@ -850,15 +864,13 @@ class UniformProjection:
                     kernel="uniform_projection_accumulate",
                     domain=dom,
                     inputs=[FieldRef(self.field)],
-                    outputs=[sum_field],
-                    output_bytes=[out_sum_bytes],
+                    outputs=[_fixed_f64_shape(sum_field, out_shape)],
                     deps={"kind": "None"},
                     params={
                         "axis": axis_idx,
                         "axis_bounds": [float(self.axis_bounds[0]), float(self.axis_bounds[1])],
                         "rect": list(self.rect),
                         "resolution": [nx, ny],
-                        "bytes_per_value": bpv,
                         "covered_boxes": covered_payload,
                     },
                 )
@@ -892,15 +904,13 @@ class UniformProjection:
                     "input_blocks": list(input_blocks),
                     "output_blocks": list(output_blocks),
                     "group_offsets": list(group_offsets),
-                    "bytes_per_value": 8,
                 }
                 reduce_stage.map_blocks(
                     name=f"uniform_projection_sum_reduce_s{reduce_idx}",
                     kernel="uniform_slice_reduce",
                     domain=ctx.domain(step=ds.step, level=level_idx),
                     inputs=[input_sum],
-                    outputs=[out_sum],
-                    output_bytes=[out_sum_bytes],
+                    outputs=[_fixed_f64_shape(out_sum, out_shape)],
                     deps={"kind": "None"},
                     params=sum_params,
                 )
@@ -958,8 +968,7 @@ class UniformProjection:
                         kernel="uniform_slice_add",
                         domain=ctx.domain(step=ds.step, level=out_level, blocks=[out_block]),
                         inputs=[left_ref, right_ref],
-                        outputs=[out_field],
-                        output_bytes=[out_sum_bytes],
+                        outputs=[_fixed_f64_shape(out_field, out_shape)],
                         deps={"kind": "None"},
                         params={
                             "graph_kind": "reduce",
@@ -968,7 +977,6 @@ class UniformProjection:
                             "input_base": 0,
                             "output_base": out_block,
                             "output_blocks": [out_block],
-                            "bytes_per_value": 8,
                         },
                     )
                     stages.append(add_stage)
@@ -993,8 +1001,7 @@ class UniformProjection:
                     domain=ctx.domain(step=ds.step, level=total_sum_level, blocks=[total_sum_block]),
                 )
             ],
-            outputs=[out_field],
-            output_bytes=[out_sum_bytes],
+            outputs=[_fixed_f64_shape(out_field, out_shape)],
             deps={"kind": "None"},
             params={
                 "graph_kind": "reduce",
@@ -1002,7 +1009,6 @@ class UniformProjection:
                 "num_inputs": 1,
                 "input_base": 0,
                 "output_base": 0,
-                "bytes_per_value": 8,
             },
         )
         stages.append(finalize)
@@ -1161,6 +1167,7 @@ class ParticleCICProjection:
         stages: list = []
         producer_stage: dict[int, object] = {}
         out_sum_bytes = nx * ny * 8
+        out_shape = (ny, nx)
         previous_level_tail = None
 
         for level_idx in range(len(levels) - 1, -1, -1):
@@ -1201,8 +1208,7 @@ class ParticleCICProjection:
                 kernel="particle_cic_projection_accumulate",
                 domain=dom,
                 inputs=[],
-                outputs=[sum_field],
-                output_bytes=[out_sum_bytes],
+                outputs=[_fixed_f64_shape(sum_field, out_shape)],
                 deps={"kind": "None"},
                 params=params,
             )
@@ -1236,15 +1242,13 @@ class ParticleCICProjection:
                     "input_blocks": list(input_blocks),
                     "output_blocks": list(output_blocks),
                     "group_offsets": list(group_offsets),
-                    "bytes_per_value": 8,
                 }
                 reduce_stage.map_blocks(
                     name=f"particle_cic_projection_sum_reduce_s{reduce_idx}",
                     kernel="uniform_slice_reduce",
                     domain=ctx.domain(step=ds.step, level=level_idx),
                     inputs=[input_sum],
-                    outputs=[out_sum],
-                    output_bytes=[out_sum_bytes],
+                    outputs=[_fixed_f64_shape(out_sum, out_shape)],
                     deps={"kind": "None"},
                     params=sum_params,
                 )
@@ -1303,8 +1307,7 @@ class ParticleCICProjection:
                         kernel="uniform_slice_add",
                         domain=ctx.domain(step=ds.step, level=out_level, blocks=[out_block]),
                         inputs=[left_ref, right_ref],
-                        outputs=[out_field],
-                        output_bytes=[out_sum_bytes],
+                        outputs=[_fixed_f64_shape(out_field, out_shape)],
                         deps={"kind": "None"},
                         params={
                             "graph_kind": "reduce",
@@ -1313,7 +1316,6 @@ class ParticleCICProjection:
                             "input_base": 0,
                             "output_base": out_block,
                             "output_blocks": [out_block],
-                            "bytes_per_value": 8,
                         },
                     )
                     stages.append(add_stage)
@@ -1338,8 +1340,7 @@ class ParticleCICProjection:
                     domain=ctx.domain(step=ds.step, level=total_sum_level, blocks=[total_sum_block]),
                 )
             ],
-            outputs=[out_field],
-            output_bytes=[out_sum_bytes],
+            outputs=[_fixed_f64_shape(out_field, out_shape)],
             deps={"kind": "None"},
             params={
                 "graph_kind": "reduce",
@@ -1347,7 +1348,6 @@ class ParticleCICProjection:
                 "num_inputs": 1,
                 "input_base": 0,
                 "output_base": 0,
-                "bytes_per_value": 8,
             },
         )
         stages.append(finalize)
@@ -1519,8 +1519,7 @@ class ParticleCICGrid:
                     kernel="particle_cic_grid_accumulate",
                     domain=dom,
                     inputs=[],
-                    outputs=[grid_field],
-                    output_bytes=[0],
+                    outputs=[_block_f64(grid_field)],
                     deps={"kind": "None"},
                     params=params,
                 )
@@ -1546,7 +1545,6 @@ class FluxSurfaceIntegral:
         temperature_bins: Sequence[float] | None = None,
         out_name: str = "flux_surface_integral",
         gamma: float = 5.0 / 3.0,
-        bytes_per_value: int | None = None,
         reduce_fan_in: Optional[int] = None,
     ) -> None:
         self.density = int(density)
@@ -1559,7 +1557,6 @@ class FluxSurfaceIntegral:
         self.temperature_bins = self._coerce_temperature_bins(temperature_bins)
         self.out_name = out_name
         self.gamma = float(gamma)
-        self.bytes_per_value = bytes_per_value
         self.reduce_fan_in = reduce_fan_in
 
     def _coerce_radii(self, radius: float | Sequence[float]) -> tuple[float, ...]:
@@ -1661,11 +1658,6 @@ class FluxSurfaceIntegral:
         if len(self.magnetic_field) != 3:
             raise ValueError("magnetic_field must contain three cell-centered fields")
 
-        bpv = _resolve_bytes_per_value(
-            ctx,
-            field=self.density,
-            bytes_per_value=self.bytes_per_value,
-        )
         input_fields = [
             self.density,
             *self.momentum,
@@ -1680,6 +1672,14 @@ class FluxSurfaceIntegral:
             len(self.temperature_bins) - 1 if self.temperature_bins is not None else 1
         )
         out_bytes = len(self.radii) * 2 * num_temperature_bins * 4 * 8
+        out_shape_parts: list[int] = []
+        if len(self.radii) > 1:
+            out_shape_parts.append(len(self.radii))
+        out_shape_parts.append(2)
+        if num_temperature_bins > 1:
+            out_shape_parts.append(num_temperature_bins)
+        out_shape_parts.append(4)
+        out_shape = tuple(out_shape_parts)
         radii2 = [radius * radius for radius in self.radii]
         radius_intersects = [False] * len(self.radii)
 
@@ -1716,8 +1716,7 @@ class FluxSurfaceIntegral:
                     kernel="flux_surface_integral_accumulate",
                     domain=dom,
                     inputs=[FieldRef(fid) for fid in input_fields],
-                    outputs=[flux_field],
-                    output_bytes=[out_bytes],
+                    outputs=[_fixed_f64_shape(flux_field, out_shape)],
                     deps={"kind": "None"},
                     params={
                         "radii": list(active_radii),
@@ -1729,7 +1728,6 @@ class FluxSurfaceIntegral:
                             else []
                         ),
                         "gamma": self.gamma,
-                        "bytes_per_value": int(bpv),
                         "covered_boxes": covered_payload,
                     },
                 )
@@ -1752,8 +1750,7 @@ class FluxSurfaceIntegral:
                     kernel="uniform_slice_reduce",
                     domain=ctx.domain(step=ds.step, level=level_idx),
                     inputs=[input_flux],
-                    outputs=[flux_field],
-                    output_bytes=[out_bytes],
+                    outputs=[_fixed_f64_shape(flux_field, out_shape)],
                     deps={"kind": "None"},
                     params={
                         "graph_kind": "reduce",
@@ -1764,7 +1761,6 @@ class FluxSurfaceIntegral:
                         "input_blocks": [current_blocks[0]],
                         "output_blocks": [0],
                         "group_offsets": [0, 1],
-                        "bytes_per_value": 8,
                     },
                 )
                 stages.append(reduce_stage)
@@ -1794,8 +1790,7 @@ class FluxSurfaceIntegral:
                     kernel="uniform_slice_reduce",
                     domain=ctx.domain(step=ds.step, level=level_idx),
                     inputs=[input_flux],
-                    outputs=[out_flux],
-                    output_bytes=[out_bytes],
+                    outputs=[_fixed_f64_shape(out_flux, out_shape)],
                     deps={"kind": "None"},
                     params={
                         "graph_kind": "reduce",
@@ -1806,7 +1801,6 @@ class FluxSurfaceIntegral:
                         "input_blocks": list(input_blocks),
                         "output_blocks": list(output_blocks),
                         "group_offsets": list(group_offsets),
-                        "bytes_per_value": 8,
                     },
                 )
                 stages.append(reduce_stage)
@@ -1871,8 +1865,7 @@ class FluxSurfaceIntegral:
                         kernel="uniform_slice_add",
                         domain=ctx.domain(step=ds.step, level=ds.level),
                         inputs=[left_ref, right_ref],
-                        outputs=[out_field],
-                        output_bytes=[out_bytes],
+                        outputs=[_fixed_f64_shape(out_field, out_shape)],
                         deps={"kind": "None"},
                         params={
                             "graph_kind": "reduce",
@@ -1880,7 +1873,6 @@ class FluxSurfaceIntegral:
                             "num_inputs": 1,
                             "input_base": 0,
                             "output_base": 0,
-                            "bytes_per_value": 8,
                         },
                     )
                     stages.append(add_stage)
@@ -1905,8 +1897,7 @@ class FluxSurfaceIntegral:
                     domain=ctx.domain(step=ds.step, level=total_flux_level),
                 )
             ],
-            outputs=[out_field],
-            output_bytes=[out_bytes],
+            outputs=[_fixed_f64_shape(out_field, out_shape)],
             deps={"kind": "None"},
             params={
                 "graph_kind": "reduce",
@@ -1914,7 +1905,6 @@ class FluxSurfaceIntegral:
                 "num_inputs": 1,
                 "input_base": 0,
                 "output_base": 0,
-                "bytes_per_value": 8,
             },
         )
         stages.append(finalize)
@@ -1936,7 +1926,6 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
         temperature_bins: Sequence[float] | None = None,
         out_name: str = "cylindrical_flux_surface_integral",
         gamma: float = 5.0 / 3.0,
-        bytes_per_value: int | None = None,
         reduce_fan_in: Optional[int] = None,
     ) -> None:
         super().__init__(
@@ -1950,7 +1939,6 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
             temperature_bins=temperature_bins,
             out_name=out_name,
             gamma=gamma,
-            bytes_per_value=bytes_per_value,
             reduce_fan_in=reduce_fan_in,
         )
         self.radius = self.radii[0]
@@ -2031,11 +2019,6 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
         if len(self.magnetic_field) != 3:
             raise ValueError("magnetic_field must contain three cell-centered fields")
 
-        bpv = _resolve_bytes_per_value(
-            ctx,
-            field=self.density,
-            bytes_per_value=self.bytes_per_value,
-        )
         input_fields = [
             self.density,
             *self.momentum,
@@ -2053,6 +2036,17 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
         out_bytes = (
             len(self.heights) * 2 * num_temperature_bins * num_geometric_sections * 4 * 8
         )
+        out_shape_parts: list[int] = []
+        if len(self.heights) > 1:
+            out_shape_parts.append(len(self.heights))
+        out_shape_parts.append(2)
+        if num_temperature_bins > 1:
+            out_shape_parts.append(num_temperature_bins)
+        if len(out_shape_parts) < 3:
+            out_shape_parts.extend((num_geometric_sections, 4))
+        else:
+            out_shape_parts.append(num_geometric_sections * 4)
+        out_shape = tuple(out_shape_parts)
         radius2 = self.radius * self.radius
         height_intersects = [False] * len(self.heights)
 
@@ -2091,8 +2085,7 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
                     kernel="cylindrical_flux_surface_integral_accumulate",
                     domain=dom,
                     inputs=[FieldRef(fid) for fid in input_fields],
-                    outputs=[flux_field],
-                    output_bytes=[out_bytes],
+                    outputs=[_fixed_f64_shape(flux_field, out_shape)],
                     deps={"kind": "None"},
                     params={
                         "radius": self.radius,
@@ -2105,7 +2098,6 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
                             else []
                         ),
                         "gamma": self.gamma,
-                        "bytes_per_value": int(bpv),
                         "covered_boxes": covered_payload,
                     },
                 )
@@ -2128,8 +2120,7 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
                     kernel="uniform_slice_reduce",
                     domain=ctx.domain(step=ds.step, level=level_idx),
                     inputs=[input_flux],
-                    outputs=[flux_field],
-                    output_bytes=[out_bytes],
+                    outputs=[_fixed_f64_shape(flux_field, out_shape)],
                     deps={"kind": "None"},
                     params={
                         "graph_kind": "reduce",
@@ -2140,7 +2131,6 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
                         "input_blocks": [current_blocks[0]],
                         "output_blocks": [0],
                         "group_offsets": [0, 1],
-                        "bytes_per_value": 8,
                     },
                 )
                 stages.append(reduce_stage)
@@ -2170,8 +2160,7 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
                     kernel="uniform_slice_reduce",
                     domain=ctx.domain(step=ds.step, level=level_idx),
                     inputs=[input_flux],
-                    outputs=[out_flux],
-                    output_bytes=[out_bytes],
+                    outputs=[_fixed_f64_shape(out_flux, out_shape)],
                     deps={"kind": "None"},
                     params={
                         "graph_kind": "reduce",
@@ -2182,7 +2171,6 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
                         "input_blocks": list(input_blocks),
                         "output_blocks": list(output_blocks),
                         "group_offsets": list(group_offsets),
-                        "bytes_per_value": 8,
                     },
                 )
                 stages.append(reduce_stage)
@@ -2251,8 +2239,7 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
                         kernel="uniform_slice_add",
                         domain=ctx.domain(step=ds.step, level=ds.level),
                         inputs=[left_ref, right_ref],
-                        outputs=[out_field],
-                        output_bytes=[out_bytes],
+                        outputs=[_fixed_f64_shape(out_field, out_shape)],
                         deps={"kind": "None"},
                         params={
                             "graph_kind": "reduce",
@@ -2260,7 +2247,6 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
                             "num_inputs": 1,
                             "input_base": 0,
                             "output_base": 0,
-                            "bytes_per_value": 8,
                         },
                     )
                     stages.append(add_stage)
@@ -2289,8 +2275,7 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
                     domain=ctx.domain(step=ds.step, level=total_flux_level),
                 )
             ],
-            outputs=[out_field],
-            output_bytes=[out_bytes],
+            outputs=[_fixed_f64_shape(out_field, out_shape)],
             deps={"kind": "None"},
             params={
                 "graph_kind": "reduce",
@@ -2298,7 +2283,6 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
                 "num_inputs": 1,
                 "input_base": 0,
                 "output_base": 0,
-                "bytes_per_value": 8,
             },
         )
         stages.append(finalize)
@@ -2314,7 +2298,6 @@ class Histogram1D:
         bins: int,
         out_name: str = "histogram1d",
         weight_field: int | None = None,
-        bytes_per_value: int | None = None,
         reduce_fan_in: Optional[int] = None,
     ) -> None:
         self.field = field
@@ -2322,7 +2305,6 @@ class Histogram1D:
         self.bins = bins
         self.out_name = out_name
         self.weight_field = weight_field
-        self.bytes_per_value = bytes_per_value
         self.reduce_fan_in = reduce_fan_in
 
     def _reduce_fan_in(self, num_inputs: int) -> int:
@@ -2369,9 +2351,9 @@ class Histogram1D:
         if not math.isfinite(lo) or not math.isfinite(hi) or hi <= lo:
             raise ValueError("hist_range must be finite and increasing")
 
-        bpv = _resolve_bytes_per_value(ctx, field=self.field, bytes_per_value=self.bytes_per_value)
         levels = ctx.runmeta.steps[ds.step].levels
         out_bytes = self.bins * 8
+        out_shape = (self.bins,)
 
         hist_fields: list[tuple[FieldRef, int]] = []
         stages: list = []
@@ -2398,13 +2380,11 @@ class Histogram1D:
                     kernel="histogram1d_accumulate",
                     domain=dom,
                     inputs=inputs,
-                    outputs=[hist_field],
-                    output_bytes=[out_bytes],
+                    outputs=[_fixed_f64_shape(hist_field, out_shape)],
                     deps={"kind": "None"},
                     params={
                         "range": [float(lo), float(hi)],
                         "bins": int(self.bins),
-                        "bytes_per_value": int(bpv),
                         "covered_boxes": covered_payload,
                     },
                 )
@@ -2438,15 +2418,13 @@ class Histogram1D:
                     "input_blocks": list(input_blocks),
                     "output_blocks": list(output_blocks),
                     "group_offsets": list(group_offsets),
-                    "bytes_per_value": 8,
                 }
                 reduce_stage.map_blocks(
                     name=f"histogram1d_reduce_s{reduce_idx}",
                     kernel="uniform_slice_reduce",
                     domain=ctx.domain(step=ds.step, level=level_idx),
                     inputs=[input_hist],
-                    outputs=[out_hist],
-                    output_bytes=[out_bytes],
+                    outputs=[_fixed_f64_shape(out_hist, out_shape)],
                     deps={"kind": "None"},
                     params=reduce_params,
                 )
@@ -2500,8 +2478,7 @@ class Histogram1D:
                         kernel="uniform_slice_add",
                         domain=ctx.domain(step=ds.step, level=ds.level),
                         inputs=[left_ref, right_ref],
-                        outputs=[out_field],
-                        output_bytes=[out_bytes],
+                        outputs=[_fixed_f64_shape(out_field, out_shape)],
                         deps={"kind": "None"},
                         params={
                             "graph_kind": "reduce",
@@ -2509,7 +2486,6 @@ class Histogram1D:
                             "num_inputs": 1,
                             "input_base": 0,
                             "output_base": 0,
-                            "bytes_per_value": 8,
                         },
                     )
                     stages.append(add_stage)
@@ -2534,8 +2510,7 @@ class Histogram1D:
                     domain=ctx.domain(step=ds.step, level=total_hist_level),
                 )
             ],
-            outputs=[out_field],
-            output_bytes=[out_bytes],
+            outputs=[_fixed_f64_shape(out_field, out_shape)],
             deps={"kind": "None"},
             params={
                 "graph_kind": "reduce",
@@ -2543,7 +2518,6 @@ class Histogram1D:
                 "num_inputs": 1,
                 "input_base": 0,
                 "output_base": 0,
-                "bytes_per_value": 8,
             },
         )
         stages.append(finalize)
@@ -2562,7 +2536,6 @@ class Histogram2D:
         out_name: str = "histogram2d",
         weight_field: int | None = None,
         weight_mode: str = "input",
-        bytes_per_value: int | None = None,
         reduce_fan_in: Optional[int] = None,
     ) -> None:
         self.x_field = x_field
@@ -2573,7 +2546,6 @@ class Histogram2D:
         self.out_name = out_name
         self.weight_field = weight_field
         self.weight_mode = weight_mode
-        self.bytes_per_value = bytes_per_value
         self.reduce_fan_in = reduce_fan_in
 
     def _reduce_fan_in(self, num_inputs: int) -> int:
@@ -2624,7 +2596,6 @@ class Histogram2D:
         if x1 <= x0 or y1 <= y0:
             raise ValueError("histogram ranges must be increasing")
 
-        bpv = _resolve_bytes_per_value(ctx, field=self.x_field, bytes_per_value=self.bytes_per_value)
         levels = ctx.runmeta.steps[ds.step].levels
         out_bytes = nx * ny * 8
 
@@ -2653,14 +2624,12 @@ class Histogram2D:
                     kernel="histogram2d_accumulate",
                     domain=dom,
                     inputs=inputs,
-                    outputs=[hist_field],
-                    output_bytes=[out_bytes],
+                    outputs=[_fixed_f64_shape(hist_field, (nx, ny))],
                     deps={"kind": "None"},
                     params={
                         "x_range": [float(x0), float(x1)],
                         "y_range": [float(y0), float(y1)],
                         "bins": [int(nx), int(ny)],
-                        "bytes_per_value": int(bpv),
                         "weight_mode": self.weight_mode,
                         "covered_boxes": covered_payload,
                     },
@@ -2695,15 +2664,13 @@ class Histogram2D:
                     "input_blocks": list(input_blocks),
                     "output_blocks": list(output_blocks),
                     "group_offsets": list(group_offsets),
-                    "bytes_per_value": 8,
                 }
                 reduce_stage.map_blocks(
                     name=f"histogram2d_reduce_s{reduce_idx}",
                     kernel="uniform_slice_reduce",
                     domain=ctx.domain(step=ds.step, level=level_idx),
                     inputs=[input_hist],
-                    outputs=[out_hist],
-                    output_bytes=[out_bytes],
+                    outputs=[_fixed_f64_shape(out_hist, (nx, ny))],
                     deps={"kind": "None"},
                     params=reduce_params,
                 )
@@ -2757,8 +2724,7 @@ class Histogram2D:
                         kernel="uniform_slice_add",
                         domain=ctx.domain(step=ds.step, level=ds.level),
                         inputs=[left_ref, right_ref],
-                        outputs=[out_field],
-                        output_bytes=[out_bytes],
+                        outputs=[_fixed_f64_shape(out_field, (nx, ny))],
                         deps={"kind": "None"},
                         params={
                             "graph_kind": "reduce",
@@ -2766,7 +2732,6 @@ class Histogram2D:
                             "num_inputs": 1,
                             "input_base": 0,
                             "output_base": 0,
-                            "bytes_per_value": 8,
                         },
                     )
                     stages.append(add_stage)
@@ -2791,8 +2756,7 @@ class Histogram2D:
                     domain=ctx.domain(step=ds.step, level=total_hist_level),
                 )
             ],
-            outputs=[out_field],
-            output_bytes=[out_bytes],
+            outputs=[_fixed_f64_shape(out_field, (nx, ny))],
             deps={"kind": "None"},
             params={
                 "graph_kind": "reduce",
@@ -2800,7 +2764,6 @@ class Histogram2D:
                 "num_inputs": 1,
                 "input_base": 0,
                 "output_base": 0,
-                "bytes_per_value": 8,
             },
         )
         stages.append(finalize)

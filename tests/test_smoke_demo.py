@@ -40,8 +40,8 @@ def _make_runtime_handles():
     )
     ds = open_dataset("memory://example", runmeta=runmeta, step=0, level=0, runtime=rt)
     payload = bytes(8 * 8 * 8 * 8)
-    ds._h.set_chunk_ref(0, 0, 1, 0, 0, payload)
-    ds._h.set_chunk_ref(0, 0, 2, 0, 0, payload)
+    ds._h.set_chunk_ref(0, 0, 1, 0, 0, payload, "f64", [8, 8, 8])
+    ds._h.set_chunk_ref(0, 0, 2, 0, 0, payload, "f64", [8, 8, 8])
     return rt, runmeta, ds
 
 
@@ -93,8 +93,15 @@ def test_neighbor_dep_faces_and_width() -> None:
         "kernel": "gradU_stencil",
         "domain": {"step": 0, "level": 0, "blocks": None},
         "inputs": [{"field": 1, "version": 0}],
-        "outputs": [{"field": 2, "version": 0}],
-        "output_bytes": [0],
+        "outputs": [{
+            "field": 2,
+            "version": 0,
+            "buffer": {
+                "dtype": "f64",
+                "shape": {"kind": "block", "components": 3},
+                "init": "uninitialized",
+            },
+        }],
         "deps": {"kind": "FaceNeighbors", "width": 1, "faces": [1, 1, 1, 1, 1, 1]},
         "params": {},
     }
@@ -127,8 +134,15 @@ def test_neighbor_halo_inputs_indices() -> None:
         "kernel": "gradU_stencil",
         "domain": {"step": 0, "level": 0, "blocks": None},
         "inputs": [{"field": 1, "version": 0}, {"field": 2, "version": 0}],
-        "outputs": [{"field": 3, "version": 0}],
-        "output_bytes": [0],
+        "outputs": [{
+            "field": 3,
+            "version": 0,
+            "buffer": {
+                "dtype": "f64",
+                "shape": {"kind": "block", "components": 3},
+                "init": "uninitialized",
+            },
+        }],
         "deps": {
             "kind": "FaceNeighbors",
             "width": 1,

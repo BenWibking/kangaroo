@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import struct
 
+from analysis.buffer import BufferSpec, DType, FixedShape
+from analysis.plan import OutputRef
+
 import numpy as np
 
 from analysis import Runtime
@@ -31,7 +34,7 @@ def _runmeta(nblocks: int) -> RunMeta:
 
 def _set_scalar(ds, *, field: int, block: int, value: float) -> None:
     arr = np.asarray([[[value]]], dtype=np.float64)
-    ds._h.set_chunk_ref(0, 0, field, 0, block, arr.tobytes(order="C"))
+    ds._h.set_chunk_ref(0, 0, field, 0, block, arr.tobytes(order="C"), "f64", [1, 1, 1])
 
 
 def _max_base_task_concurrency(events: list[dict]) -> int:
@@ -72,7 +75,7 @@ def test_streaming_executor_bounds_active_stage_tasks(tmp_path, monkeypatch) -> 
     rt.set_event_log_path(str(log_path))
     try:
         pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
-        summed = pipe.field_add(pipe.field(left), pipe.field(right), out="sum", bytes_per_value=8)
+        summed = pipe.field_add(pipe.field(left), pipe.field(right), out="sum", dtype="f64")
         pipe.run()
     finally:
         rt.set_event_log_path("")
@@ -121,7 +124,7 @@ def test_streaming_executor_bounds_active_storage_units(tmp_path, monkeypatch) -
     rt.set_event_log_path(str(log_path))
     try:
         pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
-        summed = pipe.field_add(pipe.field(left), pipe.field(right), out="sum", bytes_per_value=8)
+        summed = pipe.field_add(pipe.field(left), pipe.field(right), out="sum", dtype="f64")
         pipe.run()
     finally:
         rt.set_event_log_path("")
@@ -162,7 +165,7 @@ def test_streaming_executor_bounds_active_output_bytes(tmp_path, monkeypatch) ->
     source = 43001
     output = 43002
     for block in range(nblocks):
-        ds._h.set_chunk_ref(0, 0, source, 0, block, struct.pack("<q", block + 3))
+        ds._h.set_chunk_ref(0, 0, source, 0, block, struct.pack("<q", block + 3), "i64", [1])
 
     log_path = tmp_path / "streaming-output-bytes.events.jsonl"
     rt.set_event_log_path(str(log_path))
@@ -173,8 +176,7 @@ def test_streaming_executor_bounds_active_output_bytes(tmp_path, monkeypatch) ->
             kernel="particle_int64_sum_reduce",
             domain=Domain(step=0, level=0),
             inputs=[FieldRef(source)],
-            outputs=[FieldRef(output)],
-            output_bytes=[8],
+            outputs=[OutputRef(FieldRef(output), BufferSpec(DType.I64, FixedShape((1,))))],
             deps={"kind": "None"},
             params={},
         )
@@ -225,7 +227,7 @@ def test_streaming_executor_bounds_active_input_bytes(tmp_path, monkeypatch) -> 
     rt.set_event_log_path(str(log_path))
     try:
         pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
-        summed = pipe.field_add(pipe.field(left), pipe.field(right), out="sum", bytes_per_value=8)
+        summed = pipe.field_add(pipe.field(left), pipe.field(right), out="sum", dtype="f64")
         pipe.run()
     finally:
         rt.set_event_log_path("")
@@ -273,7 +275,7 @@ def test_streaming_executor_evicts_dataset_inputs_after_last_consumer(tmp_path, 
     rt.set_event_log_path(str(log_path))
     try:
         pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
-        summed = pipe.field_add(pipe.field(left), pipe.field(right), out="sum", bytes_per_value=8)
+        summed = pipe.field_add(pipe.field(left), pipe.field(right), out="sum", dtype="f64")
         pipe.run()
     finally:
         rt.set_event_log_path("")

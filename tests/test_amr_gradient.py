@@ -55,8 +55,8 @@ def test_gradU_stencil_amr_remote_fetch_linear_field() -> None:
 
     coarse_payload = _pack_linear_field_double((0, 0, 0), (3, 3, 3), coarse_geom)
     fine_payload = _pack_linear_field_double((2, 0, 0), (7, 7, 7), fine_geom)
-    ds._h.set_chunk_ref(0, 0, field, 0, 0, coarse_payload)
-    ds._h.set_chunk_ref(0, 1, field, 0, 0, fine_payload)
+    ds._h.set_chunk_ref(0, 0, field, 0, 0, coarse_payload, "f64", [4, 4, 4])
+    ds._h.set_chunk_ref(0, 1, field, 0, 0, fine_payload, "f64", [6, 8, 8])
 
     nx = ny = nz = 4
     out_bytes = nx * ny * nz * 3 * 8
@@ -74,15 +74,24 @@ def test_gradU_stencil_amr_remote_fetch_linear_field() -> None:
                         "kernel": "amr_subbox_fetch_pack",
                         "domain": {"step": 0, "level": 0, "blocks": [0]},
                         "inputs": [],
-                        "outputs": [{"field": fetch_field, "version": 0}],
-                        "output_bytes": [0],
+                        "outputs": [{
+                            "field": fetch_field,
+                            "version": 0,
+                            "buffer": {
+                                "dtype": "opaque",
+                                "shape": {
+                                    "kind": "dynamic",
+                                    "upper_bound": {"kind": "amr_subbox_pack"},
+                                },
+                                "init": "uninitialized",
+                            },
+                        }],
                         "deps": {"kind": "None"},
                         "params": {
                             "input_field": field,
                             "input_version": 0,
                             "input_step": 0,
                             "input_level": 0,
-                            "bytes_per_value": 8,
                             "halo_cells": 1,
                         },
                     }
@@ -99,15 +108,21 @@ def test_gradU_stencil_amr_remote_fetch_linear_field() -> None:
                         "kernel": "gradU_stencil",
                         "domain": {"step": 0, "level": 0, "blocks": [0]},
                         "inputs": [{"field": field, "version": 0}, {"field": fetch_field, "version": 0}],
-                        "outputs": [{"field": out_field, "version": 0}],
-                        "output_bytes": [out_bytes],
+                        "outputs": [{
+                            "field": out_field,
+                            "version": 0,
+                            "buffer": {
+                                "dtype": "f64",
+                                "shape": {"kind": "block", "components": 3},
+                                "init": "uninitialized",
+                            },
+                        }],
                         "deps": {"kind": "None"},
                         "params": {
                             "input_field": field,
                             "input_version": 0,
                             "input_step": 0,
                             "input_level": 0,
-                            "bytes_per_value": 8,
                         },
                     }
                 ],

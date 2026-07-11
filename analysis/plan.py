@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence
 
+from .buffer import BufferSpec
+
 Plane = str  # "chunk" | "graph" | "mixed" (v0 supports only "chunk")
 
 
@@ -20,6 +22,12 @@ class Domain:
     blocks: Optional[Sequence[int]] = None  # None means "all blocks on level"
 
 
+@dataclass(frozen=True)
+class OutputRef:
+    field: FieldRef
+    buffer: BufferSpec
+
+
 @dataclass
 class TaskTemplate:
     name: str
@@ -27,8 +35,7 @@ class TaskTemplate:
     kernel: str
     domain: Domain
     inputs: List[FieldRef]
-    outputs: List[FieldRef]
-    output_bytes: List[int] = field(default_factory=list)
+    outputs: List[OutputRef]
     deps: Dict[str, Any] = field(default_factory=lambda: {"kind": "None"})
     params: Dict[str, Any] = field(default_factory=dict)
 
@@ -47,8 +54,7 @@ class Stage:
         kernel: str,
         domain: Domain,
         inputs: List[FieldRef],
-        outputs: List[FieldRef],
-        output_bytes: List[int] | None = None,
+        outputs: List[OutputRef],
         deps: Dict[str, Any],
         params: Dict[str, Any],
     ) -> None:
@@ -60,7 +66,6 @@ class Stage:
                 domain=domain,
                 inputs=inputs,
                 outputs=outputs,
-                output_bytes=list(output_bytes) if output_bytes is not None else [],
                 deps=deps,
                 params=params,
             )

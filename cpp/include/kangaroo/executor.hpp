@@ -22,7 +22,7 @@ struct ExecutorOptions {
   int32_t max_active_storage_units_per_locality = 0;
   int32_t max_active_tasks_per_stage = 0;
   std::size_t max_input_bytes_per_locality = 0;
-  std::size_t max_output_bytes_per_locality = 0;
+  std::size_t max_output_storage_bytes_per_locality = 0;
   bool enable_task_level_stage_overlap = false;
   bool enable_early_release = false;
 };
@@ -43,12 +43,12 @@ struct TaskInstance {
   std::vector<ChunkRef> input_refs;
   std::vector<ChunkRef> output_refs;
   std::size_t estimated_input_bytes = 0;
-  std::size_t estimated_output_bytes = 0;
+  std::size_t estimated_output_storage_bytes = 0;
 
   template <typename Archive>
   void serialize(Archive& ar, unsigned) {
     ar& kind& stage_idx& tmpl_idx& block_or_group& target_locality& input_refs& output_refs&
-        estimated_input_bytes& estimated_output_bytes;
+        estimated_input_bytes& estimated_output_storage_bytes;
   }
 };
 

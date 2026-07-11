@@ -397,7 +397,7 @@ void ParthenonBackend::register_field(int32_t field_id, const std::string& name)
   field_map_[field_id] = std::move(spec);
 }
 
-std::optional<HostView> ParthenonBackend::get_chunk(const ChunkRef& ref) {
+std::optional<ChunkBuffer> ParthenonBackend::get_chunk(const ChunkRef& ref) {
   if (ref.level < 0) {
     return std::nullopt;
   }
@@ -517,16 +517,22 @@ std::optional<HostView> ParthenonBackend::get_chunk(const ChunkRef& ref) {
     return std::nullopt;
   }
 
-  HostView out;
   const std::size_t comp_bytes = spatial_elems * bytes_per;
-  out.data.resize(static_cast<std::size_t>(spec.comp_count) * comp_bytes);
+  std::vector<std::uint8_t> selected(static_cast<std::size_t>(spec.comp_count) * comp_bytes);
   for (int c = 0; c < spec.comp_count; ++c) {
     const std::size_t src = static_cast<std::size_t>(spec.comp_start + c) * comp_bytes;
     const std::size_t dst = static_cast<std::size_t>(c) * comp_bytes;
-    std::memcpy(out.data.data() + dst, block_raw.data() + src, comp_bytes);
+    std::memcpy(selected.data() + dst, block_raw.data() + src, comp_bytes);
   }
-
-  return out;
+  const auto scalar = bytes_per == 4 ? ScalarType::kF32 : ScalarType::kF64;
+  const std::array<std::uint64_t, 3> extents{
+      static_cast<std::uint64_t>(mem_dims[mem_dims.size() - 1]),
+      static_cast<std::uint64_t>(mem_dims[mem_dims.size() - 2]),
+      static_cast<std::uint64_t>(mem_dims[mem_dims.size() - 3])};
+  return ChunkBuffer::wrap(
+      SharedByteBuffer(std::move(selected)),
+      BufferDesc::component_major_grid(
+          scalar, extents, static_cast<std::uint64_t>(spec.comp_count)));
 }
 
 bool ParthenonBackend::has_chunk(const ChunkRef& ref) const {
