@@ -365,13 +365,6 @@ def main() -> int:
         ),
     )
     p.add_argument("--gamma", type=float, default=5.0 / 3.0)
-    p.add_argument(
-        "--bytes-per-value",
-        type=int,
-        choices=(4, 8),
-        default=8,
-        help="Input field precision in bytes; defaults to 8 for double-precision plotfiles.",
-    )
     p.add_argument("--output-json", help="Write flux values and field bindings to this JSON file.")
     p.add_argument("--list-fields", action="store_true", help="Print plotfile field names and exit.")
     p.add_argument("--progress", action="store_true", help="Show Kangaroo task progress.")
@@ -449,7 +442,6 @@ def main() -> int:
             flush=True,
         )
         _validate_selected_fields(ds, runmeta, fields, radii=radii)
-        bytes_per_value = int(a.bytes_per_value)
 
         pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
         flux = pipe.flux_surface_integral(
@@ -474,7 +466,6 @@ def main() -> int:
             ),
             temperature_bins=temperature_bins,
             gamma=float(a.gamma),
-            bytes_per_value=bytes_per_value,
             out="flux_surface_integral",
         )
         pipe.run(progress_bar=bool(a.progress))
@@ -513,7 +504,6 @@ def main() -> int:
                 else None
             ),
             "gamma": float(a.gamma),
-            "bytes_per_value": int(bytes_per_value),
             "fields": {role: name for role, (name, _) in fields.items()},
             "fluxes": flux_rows[0]["fluxes"] if len(radii) == 1 else None,
             "flux_bins": flux_rows[0]["flux_bins"] if len(radii) == 1 else None,
