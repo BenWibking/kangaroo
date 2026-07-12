@@ -15,6 +15,13 @@
 - `pixi run test`: run tests (`pytest -q`).
 - `KANGAROO_PERFETTO_TRACE=run.pftrace pixi run python <script>`: emit a Perfetto trace and inspect it in Perfetto UI.
 
+## HPX Toolchain Consistency
+- Always build and test HPX-dependent code in the dedicated `pixi-hpx` environment. Do not combine the default Pixi compiler with HPX or Boost from Spack, and do not allow Homebrew HDF5 or hwloc into a `pixi-hpx` build.
+- Configure a fresh build tree with `KANGAROO_BUILD_DIR=.pixi/build-pixi-hpx pixi run -e pixi-hpx configure-pixi-hpx`. Build and install with the same environment and `KANGAROO_BUILD_DIR`, then run tests with `pixi run -e pixi-hpx pytest ...`.
+- Do not wrap Pixi toolchain discovery in a login shell (`bash -lc`): on macOS it can reorder `PATH` so `/opt/homebrew` precedes `$CONDA_PREFIX`. Use a non-login shell when one is required.
+- Before trusting native test failures, inspect `CMakeCache.txt` and linked libraries. `CMAKE_C_COMPILER`, `CMAKE_CXX_COMPILER`, `HPX_DIR`, `Boost_DIR`, HDF5, and hwloc must all resolve inside `.pixi/envs/pixi-hpx`; no Spack or Homebrew paths are acceptable.
+- Never reuse a CMake tree configured with a different HPX/compiler stack. Use a new build directory when changing environments.
+
 ## Coding Style & Naming Conventions
 - Python: PEP 8 style, 4-space indentation, type hints used throughout (`analysis/runtime.py` is a good reference).
 - C++: C++20, 2-space indentation, braces on the same line, `snake_case` for functions/variables.

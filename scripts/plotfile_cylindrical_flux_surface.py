@@ -223,7 +223,6 @@ def main() -> int:
     p.add_argument("--temperature")
     p.add_argument("--temperature-bins", nargs="+")
     p.add_argument("--gamma", type=float, default=5.0 / 3.0)
-    p.add_argument("--bytes-per-value", type=int, choices=(4, 8), default=8)
     p.add_argument("--output-json")
     p.add_argument("--list-fields", action="store_true")
     p.add_argument("--progress", action="store_true")
@@ -331,7 +330,6 @@ def main() -> int:
             ),
             temperature_bins=temperature_bins,
             gamma=float(a.gamma),
-            bytes_per_value=int(a.bytes_per_value),
             out="cylindrical_flux_surface_integral",
         )
         pipe.run(progress_bar=bool(a.progress))
@@ -342,13 +340,19 @@ def main() -> int:
             field=flux.field,
             version=0,
             block=0,
-            shape=(
-                (len(heights), 2, len(temperature_bins) - 1, len(GEOMETRIC_SECTIONS), 4)
-                if temperature_bins is not None
-                else (len(heights), 2, len(GEOMETRIC_SECTIONS), 4)
-            ),
             dtype=np.float64,
             dataset=ds,
+        )
+        values = values.reshape(
+            (
+                len(heights),
+                2,
+                len(temperature_bins) - 1,
+                len(GEOMETRIC_SECTIONS),
+                4,
+            )
+            if temperature_bins is not None
+            else (len(heights), 2, len(GEOMETRIC_SECTIONS), 4)
         )
         flux_rows, derived = _flux_rows_and_derived(
             heights,
@@ -372,7 +376,6 @@ def main() -> int:
                 else None
             ),
             "gamma": float(a.gamma),
-            "bytes_per_value": int(a.bytes_per_value),
             "fields": {role: name for role, (name, _) in fields.items()},
             "fluxes": flux_rows[0]["fluxes"] if len(heights) == 1 else None,
             "flux_bins": flux_rows[0]["flux_bins"] if len(heights) == 1 else None,

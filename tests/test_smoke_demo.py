@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 
@@ -17,6 +18,32 @@ def test_smoke_demo_script() -> None:
         pytest.xfail("Runtime ran but kernels are not registered yet")
 
     assert result.returncode == 0
+
+
+def test_slice_operator_demo_script(tmp_path) -> None:
+    output = tmp_path / "slice.png"
+    env = os.environ.copy()
+    env["MPLBACKEND"] = "Agg"
+    env["MPLCONFIGDIR"] = str(tmp_path / "matplotlib")
+    result = subprocess.run(
+        [
+            sys.executable,
+            "scripts/slice_operator_demo.py",
+            "--output",
+            str(output),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+    )
+
+    if "Runtime init failed" in result.stdout:
+        pytest.skip("Runtime init failed (likely missing built module)")
+
+    assert result.returncode == 0, result.stderr
+    assert "Slice comparison: allclose = True" in result.stdout
+    assert output.is_file()
 
 
 def _make_runtime_handles():
@@ -40,8 +67,8 @@ def _make_runtime_handles():
     )
     ds = open_dataset("memory://example", runmeta=runmeta, step=0, level=0, runtime=rt)
     payload = bytes(8 * 8 * 8 * 8)
-    ds._h.set_chunk_ref(0, 0, 1, 0, 0, payload)
-    ds._h.set_chunk_ref(0, 0, 2, 0, 0, payload)
+    ds._h.set_chunk_ref(0, 0, 1, 0, 0, payload, "f64", [8, 8, 8])
+    ds._h.set_chunk_ref(0, 0, 2, 0, 0, payload, "f64", [8, 8, 8])
     return rt, runmeta, ds
 
 
@@ -93,8 +120,15 @@ def test_neighbor_dep_faces_and_width() -> None:
         "kernel": "gradU_stencil",
         "domain": {"step": 0, "level": 0, "blocks": None},
         "inputs": [{"field": 1, "version": 0}],
-        "outputs": [{"field": 2, "version": 0}],
-        "output_bytes": [0],
+        "outputs": [{
+            "field": 2,
+            "version": 0,
+            "buffer": {
+                "dtype": "f64",
+                "shape": {"kind": "block", "components": 3},
+                "init": "uninitialized",
+            },
+        }],
         "deps": {"kind": "FaceNeighbors", "width": 1, "faces": [1, 1, 1, 1, 1, 1]},
         "params": {},
     }
@@ -127,8 +161,15 @@ def test_neighbor_halo_inputs_indices() -> None:
         "kernel": "gradU_stencil",
         "domain": {"step": 0, "level": 0, "blocks": None},
         "inputs": [{"field": 1, "version": 0}, {"field": 2, "version": 0}],
-        "outputs": [{"field": 3, "version": 0}],
-        "output_bytes": [0],
+        "outputs": [{
+            "field": 3,
+            "version": 0,
+            "buffer": {
+                "dtype": "f64",
+                "shape": {"kind": "block", "components": 3},
+                "init": "uninitialized",
+            },
+        }],
         "deps": {
             "kind": "FaceNeighbors",
             "width": 1,

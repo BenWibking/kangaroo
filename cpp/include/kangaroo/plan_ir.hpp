@@ -80,14 +80,58 @@ struct CoveredBoxIR {
 
 using CoveredBoxListIR = std::vector<CoveredBoxIR>;
 
+enum class ShapeRuleKind : std::uint8_t { kBlock = 0, kFixed = 1, kLikeInput = 2, kDynamic = 3 };
+enum class DynamicUpperBoundKind : std::uint8_t {
+  kLiteral = 0,
+  kLikeInput = 1,
+  kBackendChunk = 2,
+  kAmrSubboxPack = 3,
+};
+
+struct DynamicUpperBoundIR {
+  DynamicUpperBoundKind kind = DynamicUpperBoundKind::kLiteral;
+  std::uint64_t value = 0;
+  std::int32_t input_index = -1;
+
+  template <typename Archive>
+  void serialize(Archive& ar, unsigned) {
+    ar& kind& value& input_index;
+  }
+};
+
+struct BufferSpecIR {
+  ScalarType scalar = ScalarType::kOpaque;
+  ShapeRuleKind shape_kind = ShapeRuleKind::kFixed;
+  std::vector<std::uint64_t> fixed_extents;
+  std::uint32_t block_components = 1;
+  std::int32_t like_input_index = -1;
+  DynamicUpperBoundIR dynamic_upper_bound;
+  InitPolicy init = InitPolicy::kUninitialized;
+
+  template <typename Archive>
+  void serialize(Archive& ar, unsigned) {
+    ar& scalar& shape_kind& fixed_extents& block_components& like_input_index&
+        dynamic_upper_bound& init;
+  }
+};
+
+struct OutputRefIR {
+  FieldRefIR field;
+  BufferSpecIR buffer;
+
+  template <typename Archive>
+  void serialize(Archive& ar, unsigned) {
+    ar& field& buffer;
+  }
+};
+
 struct TaskTemplateIR {
   std::string name;
   ExecPlane plane = ExecPlane::Chunk;
   std::string kernel;
   DomainIR domain;
   std::vector<FieldRefIR> inputs;
-  std::vector<FieldRefIR> outputs;
-  std::vector<int32_t> output_bytes;
+  std::vector<OutputRefIR> outputs;
   DepRuleIR deps;
   int32_t covered_boxes_ref = -1;
   std::vector<std::uint8_t> params_msgpack;
@@ -98,7 +142,7 @@ struct TaskTemplateIR {
 
   template <typename Archive>
   void serialize(Archive& ar, unsigned) {
-    ar& name& plane& kernel& domain& inputs& outputs& output_bytes& deps& covered_boxes_ref&
+    ar& name& plane& kernel& domain& inputs& outputs& deps& covered_boxes_ref&
         params_msgpack;
   }
 };

@@ -30,9 +30,9 @@ class DatasetBackend {
  public:
   virtual ~DatasetBackend() = default;
 
-  virtual std::optional<HostView> get_chunk(const ChunkRef& ref) = 0;
-  virtual std::vector<std::optional<HostView>> get_chunks(const std::vector<ChunkRef>& refs) {
-    std::vector<std::optional<HostView>> out;
+  virtual std::optional<ChunkBuffer> get_chunk(const ChunkRef& ref) = 0;
+  virtual std::vector<std::optional<ChunkBuffer>> get_chunks(const std::vector<ChunkRef>& refs) {
+    std::vector<std::optional<ChunkBuffer>> out;
     out.reserve(refs.size());
     for (const auto& ref : refs) {
       out.push_back(get_chunk(ref));
@@ -40,9 +40,19 @@ class DatasetBackend {
     return out;
   }
   virtual bool has_chunk(const ChunkRef& ref) const = 0;
+  virtual std::optional<BufferDesc> describe_chunk(const ChunkRef& ref) const {
+    (void)ref;
+    return std::nullopt;
+  }
   virtual std::size_t estimate_chunk_bytes(const ChunkRef& ref) const {
     (void)ref;
     return 0;
+  }
+  virtual std::optional<std::uint64_t> estimate_particle_chunk_records(
+      const std::string& particle_type, std::int64_t chunk_index) const {
+    (void)particle_type;
+    (void)chunk_index;
+    return std::nullopt;
   }
   virtual DatasetMetadata get_metadata() const = 0;
 

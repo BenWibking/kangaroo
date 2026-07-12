@@ -20,8 +20,9 @@ Observed behavior requirement:
 ## 3. Common Backend Interface Requirements
 
 Each backend MUST provide:
-- `get_chunk(chunk_ref)` returning optional raw payload.
+- `get_chunk(chunk_ref)` returning an optional self-described Chunk Buffer.
 - `has_chunk(chunk_ref)`.
+- descriptor/byte-estimate queries suitable for memory admission where available.
 - `get_metadata()` with backend-appropriate geometry/domain descriptors.
 
 Backends MAY expose additional capabilities (mesh selection, particle readers) through dataset/reader APIs.
@@ -36,9 +37,10 @@ Backends MAY expose additional capabilities (mesh selection, particle readers) t
 
 ### 4.2 FAB Data Layout
 
-On read:
-- Source FAB payload is read from plotfile storage.
-- Returned chunk payload MUST be transposed to runtime canonical axis order expected by operators.
+On read, a component slice MUST attach logical `(nx, ny, nz)` extents and actual physical
+strides. Zero-copy FAB component slices retain KJI physical storage and shared ownership;
+Block Grid access supplies logical `(i, j, k)` indexing without eager transposition. A
+configured copied path MAY transpose and attach contiguous runtime strides.
 
 ### 4.3 Metadata Exposure
 
@@ -60,8 +62,10 @@ Plotfile backend MUST expose:
 Memory backend is mutable key-value chunk storage for tests/synthetic workflows.
 
 Requirements:
-- `set_chunk` writes payload by full chunk identity.
-- `get_chunk` returns exact written bytes for same key.
+- NumPy writes derive dtype and shape automatically.
+- Raw byte writes require explicit dtype/shape or an explicit opaque designation.
+- `set_chunk` writes a validated Chunk Buffer by full chunk identity.
+- `get_chunk` returns the exact descriptor and bytes written for the same key.
 - Missing keys return no chunk.
 - Multiple levels/steps/fields/versions MAY coexist independently.
 
@@ -118,7 +122,7 @@ Subbox fetch MUST:
 - Intersect requested index box with source chunk index box.
 - Return only overlapping extents and corresponding payload.
 - Preserve contiguous memory packing in overlap-local index order.
-- Respect requested bytes-per-value when slicing payload.
+- Preserve the source scalar type and use its descriptor strides when slicing payload.
 
 No-overlap behavior MUST return empty payload and invalid/empty overlap bounds.
 

@@ -6,7 +6,8 @@ import time
 
 import pytest
 
-from analysis.plan import Domain, FieldRef, Plan, Stage
+from analysis.buffer import BufferSpec, DType, FixedShape
+from analysis.plan import Domain, FieldRef, OutputRef, Plan, Stage
 from analysis import runtime as runtime_mod
 from analysis.runtime import (
     Runtime,
@@ -160,8 +161,7 @@ def test_plan_to_dict_hoists_shared_covered_boxes() -> None:
             kernel="uniform_projection_accumulate",
             domain=Domain(step=0, level=0, blocks=[block]),
             inputs=[FieldRef(1, domain=domain)],
-            outputs=[FieldRef(2)],
-            output_bytes=[128],
+            outputs=[OutputRef(FieldRef(2), BufferSpec(DType.F64, FixedShape((16,))))],
             deps={"kind": "None"},
             params={
                 "axis": 2,
@@ -211,8 +211,7 @@ def test_count_plan_tasks_counts_graph_reduce_groups_not_level_blocks() -> None:
         kernel="deposit",
         domain=Domain(step=0, level=0, blocks=[0, 1, 2, 3]),
         inputs=[FieldRef(1)],
-        outputs=[FieldRef(2)],
-        output_bytes=[8],
+        outputs=[OutputRef(FieldRef(2), BufferSpec(DType.F64, FixedShape((1,))))],
         deps={"kind": "None"},
         params={},
     )
@@ -223,8 +222,7 @@ def test_count_plan_tasks_counts_graph_reduce_groups_not_level_blocks() -> None:
         kernel="reduce",
         domain=Domain(step=0, level=0),
         inputs=[FieldRef(2)],
-        outputs=[FieldRef(3)],
-        output_bytes=[8],
+        outputs=[OutputRef(FieldRef(3), BufferSpec(DType.F64, FixedShape((1,))))],
         deps={"kind": "None"},
         params={"graph_kind": "reduce", "fan_in": 2, "num_inputs": 4, "output_base": 0},
     )

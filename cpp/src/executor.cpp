@@ -202,7 +202,7 @@ struct ViewSummary {
   std::size_t nonzero = 0;
 };
 
-ViewSummary summarize_view_f64(const HostView& view) {
+ViewSummary summarize_view_f64(const ChunkBuffer& view) {
   ViewSummary summary;
   summary.bytes = view.data.size();
   if (view.data.empty() || (view.data.size() % sizeof(double)) != 0) {
@@ -234,7 +234,7 @@ ViewSummary summarize_view_f64(const HostView& view) {
 void log_projection_output_summary(const TaskTemplateIR& tmpl,
                                    int32_t block,
                                    std::size_t output_idx,
-                                   const HostView& view) {
+                                   const ChunkBuffer& view) {
   if (!debug_dataflow_enabled()) {
     return;
   }
@@ -314,71 +314,453 @@ std::size_t block_cell_count(const RunMeta& meta, int32_t step, int16_t level, i
   return nx * ny * nz;
 }
 
-std::size_t estimate_block_bytes(const RunMeta& meta, const ChunkRef& ref, int32_t bytes_per_value) {
-  if (bytes_per_value <= 0) {
+std::array<std::uint64_t, 3> block_extents(const RunMeta& meta,
+                                           int32_t step,
+                                           int16_t level,
+                                           int32_t block) {
+  const auto& box = meta.steps.at(static_cast<std::size_t>(step))
+                        .levels.at(static_cast<std::size_t>(level))
+                        .boxes.at(static_cast<std::size_t>(block));
+  return {checked_positive_extent(box.lo.x, box.hi.x),
+          checked_positive_extent(box.lo.y, box.hi.y),
+          checked_positive_extent(box.lo.z, box.hi.z)};
+}
+
+std::optional<BufferDesc> resolve_static_output_desc(const BufferSpecIR& spec,
+                                                     const RunMeta& meta,
+                                                     int32_t step,
+                                                     int16_t level,
+                                                     int32_t block) {
+  if (spec.shape_kind == ShapeRuleKind::kFixed) {
+    return BufferDesc::contiguous(spec.scalar, spec.fixed_extents);
+  }
+  if (spec.shape_kind == ShapeRuleKind::kBlock) {
+    const auto xyz = block_extents(meta, step, level, block);
+    if (spec.block_components == 1) return BufferDesc::runtime_grid(spec.scalar, xyz);
+    const std::array<std::uint64_t, 4> extents{
+        xyz[0], xyz[1], xyz[2], spec.block_components};
+    return BufferDesc::contiguous(spec.scalar, extents);
+  }
+  if (spec.shape_kind == ShapeRuleKind::kDynamic &&
+      spec.dynamic_upper_bound.kind == DynamicUpperBoundKind::kLiteral) {
+    const std::array<std::uint64_t, 1> extents{spec.dynamic_upper_bound.value};
+    return BufferDesc::contiguous(spec.scalar, extents);
+  }
+  return std::nullopt;
+}
+
+ResolvedBufferSpec make_dynamic_output_spec(const BufferSpecIR& spec, std::uint64_t capacity) {
+  ResolvedBufferSpec resolved;
+  resolved.init = spec.init;
+  const std::array<std::uint64_t, 1> capacity_extent{capacity};
+  resolved.desc = BufferDesc::contiguous(spec.scalar, capacity_extent);
+  resolved.desc.extents[0] = 0;
+  resolved.dynamic_capacity_elements = capacity;
+  return resolved;
+}
+
+std::uint64_t derive_backend_chunk_capacity(const BufferSpecIR& spec,
+                                            const TaskTemplateIR& task,
+                                            const DatasetHandle& dataset,
+                                            int32_t block,
+                                            std::span<const ChunkBuffer> inputs) {
+  if (task.kernel == "particle_value_counts_reduce") {
+    std::uint64_t input_bytes = 0;
+    for (const auto& input : inputs) {
+      input_bytes = checked_add(input_bytes, input.bytes());
+    }
+    const auto output_bytes = std::max<std::uint64_t>(sizeof(std::uint64_t), input_bytes);
+    const auto width = scalar_size(spec.scalar);
+    return output_bytes / width + static_cast<std::uint64_t>(output_bytes % width != 0);
+  }
+
+  if (task.kernel != "particle_load_field_chunk_f64" &&
+      task.kernel != "particle_topk_modes_map") {
+    throw BufferContractError(BufferContractReason::kInvalidExtent,
+                              "backend-chunk bound is not defined for kernel " + task.kernel);
+  }
+  if (!dataset.backend) {
+    throw BufferContractError(BufferContractReason::kInvalidExtent,
+                              "backend-chunk bound requires an initialized dataset backend");
+  }
+  const auto& root = cached_params_root(task.params_msgpack);
+  const auto* particle_type = find_msgpack_map_value(root, "particle_type");
+  if (!particle_type || particle_type->type != msgpack::type::STR) {
+    throw BufferContractError(BufferContractReason::kInvalidExtent,
+                              "backend-chunk bound requires particle_type");
+  }
+  const auto records = dataset.backend->estimate_particle_chunk_records(
+      particle_type->as<std::string>(), block);
+  if (!records.has_value()) {
+    throw BufferContractError(BufferContractReason::kInvalidExtent,
+                              "dataset backend cannot estimate particle chunk records");
+  }
+  if (task.kernel == "particle_load_field_chunk_f64") {
+    return *records;
+  }
+  return checked_add(
+      sizeof(std::uint64_t),
+      checked_multiply(*records, sizeof(double) + sizeof(std::int64_t)));
+}
+
+struct AmrSubboxPackParams {
+  int32_t input_field = -1;
+  int32_t input_version = 0;
+  int32_t input_step = 0;
+  int16_t input_level = 0;
+  int32_t halo_cells = 1;
+};
+
+AmrSubboxPackParams parse_amr_subbox_pack_params(const TaskTemplateIR& task) {
+  const auto& root = cached_params_root(task.params_msgpack);
+  AmrSubboxPackParams params;
+  if (const auto* value = find_msgpack_map_value(root, "input_field")) {
+    params.input_field = value->as<int32_t>();
+  }
+  if (const auto* value = find_msgpack_map_value(root, "input_version")) {
+    params.input_version = value->as<int32_t>();
+  }
+  if (const auto* value = find_msgpack_map_value(root, "input_step")) {
+    params.input_step = value->as<int32_t>();
+  }
+  if (const auto* value = find_msgpack_map_value(root, "input_level")) {
+    params.input_level = value->as<int16_t>();
+  }
+  if (const auto* value = find_msgpack_map_value(root, "halo_cells")) {
+    params.halo_cells = value->as<int32_t>();
+  }
+  return params;
+}
+
+template <typename EstimateChunkBytes>
+std::uint64_t derive_amr_subbox_pack_capacity(const TaskTemplateIR& task,
+                                              const RunMeta& meta,
+                                              int32_t step,
+                                              int16_t level,
+                                              int32_t block,
+                                              EstimateChunkBytes&& estimate_chunk_bytes) {
+  // Covers the fixed MessagePack map, keys, rank-four descriptor metadata,
+  // and container headers used by amr_subbox_fetch_pack; payload bytes are
+  // added separately from the intersecting source chunks below.
+  constexpr std::uint64_t kPackedRootMetadataMaxBytes = 64;
+  constexpr std::uint64_t kPackedPatchMetadataMaxBytes = 512;
+  const auto params = parse_amr_subbox_pack_params(task);
+  if (params.input_field < 0) {
     return 0;
   }
-  return block_cell_count(meta, ref.step, ref.level, ref.block) *
-         static_cast<std::size_t>(bytes_per_value);
-}
 
-std::vector<int32_t> input_bytes_per_value_from_params(const TaskTemplateIR& tmpl) {
-  std::vector<int32_t> values;
-  try {
-    const auto& root = cached_params_root(std::span<const std::uint8_t>(
-        tmpl.params_msgpack.data(), tmpl.params_msgpack.size()));
-    if (const auto* input_bpvs = find_msgpack_map_value(root, "input_bytes_per_value");
-        input_bpvs != nullptr && input_bpvs->type == msgpack::type::ARRAY) {
-      values.reserve(input_bpvs->via.array.size);
-      for (uint32_t i = 0; i < input_bpvs->via.array.size; ++i) {
-        const auto& value = input_bpvs->via.array.ptr[i];
-        if (value.type == msgpack::type::POSITIVE_INTEGER ||
-            value.type == msgpack::type::NEGATIVE_INTEGER) {
-          values.push_back(value.as<int32_t>());
-        } else {
-          values.push_back(0);
-        }
-      }
-      return values;
+  const auto& target_level = meta.steps.at(static_cast<std::size_t>(step))
+                                 .levels.at(static_cast<std::size_t>(level));
+  const auto& target_box = target_level.boxes.at(static_cast<std::size_t>(block));
+  const auto box_lo = [](const BlockBox& box, int axis) {
+    return axis == 0 ? box.lo.x : (axis == 1 ? box.lo.y : box.lo.z);
+  };
+  const auto box_hi = [](const BlockBox& box, int axis) {
+    return axis == 0 ? box.hi.x : (axis == 1 ? box.hi.y : box.hi.z);
+  };
+  const auto cell_edge_at = [](const LevelGeom& geom, int axis, int32_t index) {
+    return geom.x0[axis] +
+        static_cast<double>(index - geom.index_origin[axis]) * geom.dx[axis];
+  };
+  const auto coord_to_index_at = [](const LevelGeom& geom, int axis, double coordinate) {
+    if (!(geom.dx[axis] > 0.0)) {
+      throw BufferContractError(BufferContractReason::kInvalidExtent,
+                                "AMR subbox bound requires positive cell spacing");
     }
-    if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-        bpv != nullptr && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                           bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-      values.assign(tmpl.inputs.size(), bpv->as<int32_t>());
-    }
-  } catch (...) {
-    values.clear();
+    return static_cast<int32_t>(std::floor(
+               (coordinate - geom.x0[axis]) / geom.dx[axis])) +
+        geom.index_origin[axis];
+  };
+
+  const int halo = std::max(1, params.halo_cells);
+  double query_lo[3] = {0.0, 0.0, 0.0};
+  double query_hi[3] = {0.0, 0.0, 0.0};
+  for (int axis = 0; axis < 3; ++axis) {
+    query_lo[axis] = cell_edge_at(target_level.geom, axis, box_lo(target_box, axis)) -
+        static_cast<double>(halo) * target_level.geom.dx[axis];
+    query_hi[axis] = cell_edge_at(target_level.geom, axis, box_hi(target_box, axis) + 1) +
+        static_cast<double>(halo) * target_level.geom.dx[axis];
   }
-  return values;
+
+  const auto& source_step = meta.steps.at(static_cast<std::size_t>(params.input_step));
+  std::uint64_t capacity = kPackedRootMetadataMaxBytes;
+  for (int16_t source_level_index = 0;
+       source_level_index < static_cast<int16_t>(source_step.levels.size());
+       ++source_level_index) {
+    const auto& source_level = source_step.levels.at(
+        static_cast<std::size_t>(source_level_index));
+    int32_t request_lo[3] = {0, 0, 0};
+    int32_t request_hi[3] = {-1, -1, -1};
+    for (int axis = 0; axis < 3; ++axis) {
+      request_lo[axis] = coord_to_index_at(source_level.geom, axis, query_lo[axis]);
+      request_hi[axis] = coord_to_index_at(source_level.geom, axis, query_hi[axis]);
+    }
+    for (int32_t source_block = 0;
+         source_block < static_cast<int32_t>(source_level.boxes.size());
+         ++source_block) {
+      if (source_level_index == params.input_level && source_block == block) {
+        continue;
+      }
+      const auto& source_box = source_level.boxes.at(static_cast<std::size_t>(source_block));
+      std::uint64_t requested_cells = 1;
+      std::uint64_t source_cells = 1;
+      bool intersects = true;
+      for (int axis = 0; axis < 3; ++axis) {
+        const int32_t intersection_lo = std::max(box_lo(source_box, axis), request_lo[axis]);
+        const int32_t intersection_hi = std::min(box_hi(source_box, axis), request_hi[axis]);
+        if (intersection_hi < intersection_lo) {
+          intersects = false;
+          break;
+        }
+        requested_cells = checked_multiply(
+            requested_cells,
+            static_cast<std::uint64_t>(intersection_hi - intersection_lo + 1));
+        source_cells = checked_multiply(
+            source_cells,
+            static_cast<std::uint64_t>(box_hi(source_box, axis) - box_lo(source_box, axis) + 1));
+      }
+      if (!intersects) {
+        continue;
+      }
+
+      const ChunkRef source_ref{params.input_step, source_level_index, params.input_field,
+                                params.input_version, source_block};
+      const std::uint64_t source_bytes = estimate_chunk_bytes(source_ref);
+      if (source_bytes == 0 || source_cells == 0) {
+        throw BufferContractError(BufferContractReason::kInvalidExtent,
+                                  "dataset backend cannot estimate AMR source chunk bytes");
+      }
+      const auto bytes_per_cell = source_bytes / source_cells +
+          static_cast<std::uint64_t>(source_bytes % source_cells != 0);
+      const auto payload_bytes = checked_multiply(requested_cells, bytes_per_cell);
+      capacity = checked_add(capacity, kPackedPatchMetadataMaxBytes);
+      capacity = checked_add(capacity, payload_bytes);
+    }
+  }
+  return capacity;
 }
 
-std::size_t template_output_bytes(const TaskTemplateIR& tmpl) {
-  std::size_t bytes = 0;
-  for (int64_t value : tmpl.output_bytes) {
-    if (value > 0) {
-      bytes += static_cast<std::size_t>(value);
+ResolvedBufferSpec resolve_output_spec(const BufferSpecIR& spec,
+                                       const RunMeta& meta,
+                                       int32_t step,
+                                       int16_t level,
+                                       int32_t block,
+                                       std::span<const ChunkBuffer> inputs) {
+  ResolvedBufferSpec resolved;
+  resolved.init = spec.init;
+  if (const auto desc = resolve_static_output_desc(spec, meta, step, level, block);
+      desc.has_value() && spec.shape_kind != ShapeRuleKind::kDynamic) {
+    resolved.desc = *desc;
+    return resolved;
+  }
+  if (spec.shape_kind == ShapeRuleKind::kLikeInput) {
+    const auto index = static_cast<std::size_t>(spec.like_input_index);
+    if (index >= inputs.size()) {
+      throw BufferContractError(BufferContractReason::kInvalidExtent,
+                                "like-input output index is out of range");
     }
+    const auto& source = inputs[index].desc();
+    std::vector<std::uint64_t> extents(
+        source.extents.begin(), source.extents.begin() + source.rank);
+    resolved.desc = BufferDesc::contiguous(spec.scalar, extents);
+    return resolved;
+  }
+  if (spec.shape_kind != ShapeRuleKind::kDynamic) {
+    throw BufferContractError(BufferContractReason::kInvalidExtent,
+                              "unable to resolve static output buffer specification");
+  }
+
+  std::uint64_t capacity = 0;
+  switch (spec.dynamic_upper_bound.kind) {
+    case DynamicUpperBoundKind::kLiteral:
+      capacity = spec.dynamic_upper_bound.value;
+      break;
+    case DynamicUpperBoundKind::kLikeInput: {
+      const auto index = static_cast<std::size_t>(spec.dynamic_upper_bound.input_index);
+      if (index >= inputs.size()) {
+        throw BufferContractError(BufferContractReason::kInvalidExtent,
+                                  "dynamic like-input index is out of range");
+      }
+      capacity = inputs[index].desc().element_count();
+      break;
+    }
+    case DynamicUpperBoundKind::kBackendChunk:
+    case DynamicUpperBoundKind::kAmrSubboxPack:
+      throw BufferContractError(BufferContractReason::kInvalidExtent,
+                                "dynamic output bound requires task and dataset context");
+  }
+  return make_dynamic_output_spec(spec, capacity);
+}
+
+void finalize_output_buffer(ChunkBuffer& buffer, const BufferSpecIR& spec) {
+  if (spec.shape_kind == ShapeRuleKind::kDynamic) {
+    if (!buffer.awaiting_dynamic_extent_commit()) return;
+    const auto width = scalar_size(spec.scalar);
+    if (width == 0 || buffer.data.size() % width != 0) {
+      throw BufferContractError(BufferContractReason::kDescriptorStorageMismatch,
+                                "dynamic kernel output byte count is not scalar aligned");
+    }
+    buffer.commit_dynamic_extent(buffer.data.size() / width);
+    return;
+  }
+  buffer.desc().validate(buffer.data.size());
+}
+
+struct BufferEstimate {
+  std::size_t storage_bytes = 0;
+  bool storage_known = false;
+  std::optional<BufferDesc> desc;
+  std::optional<std::uint64_t> element_capacity;
+};
+
+using ChunkEstimateMap =
+    std::unordered_map<ChunkRef, BufferEstimate, ChunkRefHash, ChunkRefEq>;
+
+BufferEstimate estimate_input_ref(const ChunkEstimateMap& known_outputs,
+                                  const DataService& data,
+                                  const ChunkRef& ref) {
+  const auto known = known_outputs.find(ref);
+  if (known != known_outputs.end()) return known->second;
+  BufferEstimate estimate;
+  estimate.storage_bytes = data.estimate_host_bytes(ref);
+  estimate.storage_known = estimate.storage_bytes > 0;
+  estimate.desc = data.describe_host(ref);
+  if (estimate.desc.has_value()) {
+    estimate.element_capacity = estimate.desc->element_count();
+    if (estimate.storage_bytes == 0) {
+      estimate.storage_bytes = static_cast<std::size_t>(estimate.desc->required_bytes());
+    }
+    estimate.storage_known = true;
+  }
+  return estimate;
+}
+
+std::optional<BufferEstimate> estimate_output_spec(
+    const BufferSpecIR& spec,
+    const TaskTemplateIR& tmpl,
+    const DataService& data,
+    const RunMeta& meta,
+    int32_t block,
+    std::span<const BufferEstimate> inputs) {
+  BufferEstimate estimate;
+  if (const auto desc = resolve_static_output_desc(
+          spec, meta, tmpl.domain.step, tmpl.domain.level, block);
+      desc.has_value()) {
+    estimate.desc = *desc;
+    estimate.element_capacity = desc->element_count();
+    estimate.storage_bytes = static_cast<std::size_t>(desc->required_bytes());
+    estimate.storage_known = true;
+    return estimate;
+  }
+
+  if (spec.shape_kind == ShapeRuleKind::kLikeInput) {
+    const auto index = static_cast<std::size_t>(spec.like_input_index);
+    if (index >= inputs.size() || !inputs[index].element_capacity.has_value()) {
+      return std::nullopt;
+    }
+    estimate.element_capacity = inputs[index].element_capacity;
+    estimate.storage_bytes = static_cast<std::size_t>(checked_multiply(
+        *estimate.element_capacity, scalar_size(spec.scalar)));
+    estimate.storage_known = true;
+    if (inputs[index].desc.has_value()) {
+      const auto& source = *inputs[index].desc;
+      std::vector<std::uint64_t> extents(
+          source.extents.begin(), source.extents.begin() + source.rank);
+      estimate.desc = BufferDesc::contiguous(spec.scalar, extents);
+    }
+    return estimate;
+  }
+  if (spec.shape_kind != ShapeRuleKind::kDynamic) return std::nullopt;
+
+  std::uint64_t capacity = 0;
+  switch (spec.dynamic_upper_bound.kind) {
+    case DynamicUpperBoundKind::kLiteral:
+      capacity = spec.dynamic_upper_bound.value;
+      break;
+    case DynamicUpperBoundKind::kLikeInput: {
+      const auto index = static_cast<std::size_t>(spec.dynamic_upper_bound.input_index);
+      if (index >= inputs.size() || !inputs[index].element_capacity.has_value()) {
+        return std::nullopt;
+      }
+      capacity = *inputs[index].element_capacity;
+      break;
+    }
+    case DynamicUpperBoundKind::kBackendChunk: {
+      if (tmpl.kernel == "particle_value_counts_reduce") {
+        std::uint64_t input_bytes = 0;
+        for (const auto& input : inputs) {
+          if (!input.storage_known) return std::nullopt;
+          input_bytes = checked_add(input_bytes, input.storage_bytes);
+        }
+        const auto output_bytes = std::max<std::uint64_t>(sizeof(std::uint64_t), input_bytes);
+        const auto width = scalar_size(spec.scalar);
+        capacity = output_bytes / width + static_cast<std::uint64_t>(output_bytes % width != 0);
+        break;
+      }
+      if (tmpl.kernel != "particle_load_field_chunk_f64" &&
+          tmpl.kernel != "particle_topk_modes_map") {
+        return std::nullopt;
+      }
+      const auto& root = cached_params_root(tmpl.params_msgpack);
+      const auto* particle_type = find_msgpack_map_value(root, "particle_type");
+      if (!particle_type || particle_type->type != msgpack::type::STR) return std::nullopt;
+      const auto records = data.estimate_particle_chunk_records(
+          particle_type->as<std::string>(), block);
+      if (!records.has_value()) return std::nullopt;
+      capacity = tmpl.kernel == "particle_load_field_chunk_f64"
+          ? *records
+          : checked_add(sizeof(std::uint64_t),
+                        checked_multiply(*records, sizeof(double) + sizeof(std::int64_t)));
+      break;
+    }
+    case DynamicUpperBoundKind::kAmrSubboxPack:
+      capacity = derive_amr_subbox_pack_capacity(
+          tmpl, meta, tmpl.domain.step, tmpl.domain.level, block,
+          [&](const ChunkRef& ref) { return data.estimate_host_bytes(ref); });
+      break;
+  }
+  const std::array<std::uint64_t, 1> capacity_extent{capacity};
+  estimate.desc = BufferDesc::contiguous(spec.scalar, capacity_extent);
+  estimate.element_capacity = capacity;
+  estimate.storage_bytes = static_cast<std::size_t>(
+      checked_multiply(capacity, scalar_size(spec.scalar)));
+  estimate.storage_known = true;
+  return estimate;
+}
+
+std::optional<std::size_t> template_output_storage_bytes(
+    const TaskTemplateIR& tmpl,
+    const DataService& data,
+    const RunMeta& meta,
+    int32_t block,
+    const std::vector<ChunkRef>& input_refs,
+    const ChunkEstimateMap& known_outputs) {
+  std::vector<BufferEstimate> inputs;
+  inputs.reserve(input_refs.size());
+  for (const auto& ref : input_refs) {
+    inputs.push_back(estimate_input_ref(known_outputs, data, ref));
+  }
+  std::size_t bytes = 0;
+  for (const auto& output : tmpl.outputs) {
+    std::optional<BufferEstimate> estimate;
+    try {
+      estimate = estimate_output_spec(output.buffer, tmpl, data, meta, block, inputs);
+    } catch (...) {
+      return std::nullopt;
+    }
+    if (!estimate.has_value()) return std::nullopt;
+    bytes = static_cast<std::size_t>(checked_add(bytes, estimate->storage_bytes));
   }
   return bytes;
 }
 
-using ChunkByteMap = std::unordered_map<ChunkRef, std::size_t, ChunkRefHash, ChunkRefEq>;
-
-void add_known_output_bytes(ChunkByteMap& known,
-                            const ChunkRef& ref,
-                            std::size_t bytes) {
-  if (bytes == 0) {
-    return;
-  }
-  known[ref] = bytes;
-}
-
-ChunkByteMap build_known_output_bytes(const PlanIR& plan, const RunMeta& meta) {
-  ChunkByteMap known;
+ChunkEstimateMap build_known_output_estimates(const PlanIR& plan,
+                                              const RunMeta& meta,
+                                              const DataService& data) {
+  ChunkEstimateMap known;
   for (const auto& stage : plan.stages) {
     for (const auto& tmpl : stage.templates) {
-      const std::size_t bytes = template_output_bytes(tmpl);
-      if (bytes == 0 || tmpl.outputs.empty()) {
+      if (tmpl.outputs.empty()) {
         continue;
       }
       if (tmpl.plane == ExecPlane::Chunk) {
@@ -395,11 +777,24 @@ ChunkByteMap build_known_output_bytes(const PlanIR& plan, const RunMeta& meta) {
           }
         }
         for (int32_t block : blocks) {
+          std::vector<BufferEstimate> inputs;
+          inputs.reserve(tmpl.inputs.size());
+          for (const auto& input : tmpl.inputs) {
+            const auto loc = resolve_input_location(tmpl, input, block);
+            inputs.push_back(estimate_input_ref(
+                known, data, ChunkRef{loc.step, loc.level, input.field, input.version, loc.block}));
+          }
           for (const auto& out : tmpl.outputs) {
-            add_known_output_bytes(
-                known,
-                ChunkRef{tmpl.domain.step, tmpl.domain.level, out.field, out.version, block},
-                bytes);
+            std::optional<BufferEstimate> estimate;
+            try {
+              estimate = estimate_output_spec(out.buffer, tmpl, data, meta, block, inputs);
+            } catch (...) {
+              estimate = std::nullopt;
+            }
+            if (estimate.has_value()) {
+              known[ChunkRef{tmpl.domain.step, tmpl.domain.level,
+                             out.field.field, out.field.version, block}] = *estimate;
+            }
           }
         }
       } else if (tmpl.plane == ExecPlane::Graph) {
@@ -407,11 +802,33 @@ ChunkByteMap build_known_output_bytes(const PlanIR& plan, const RunMeta& meta) {
         const int32_t n_groups = graph_reduce_group_count(params);
         for (int32_t group_idx = 0; group_idx < n_groups; ++group_idx) {
           const int32_t out_block = graph_reduce_output_block(params, group_idx);
+          const int32_t start = graph_reduce_group_start(params, group_idx);
+          const int32_t end = graph_reduce_group_end(params, group_idx);
+          std::vector<BufferEstimate> inputs;
+          for (const auto& input : tmpl.inputs) {
+            for (int32_t idx = start; idx < end; ++idx) {
+              const int32_t block_id = params.input_blocks.empty()
+                  ? params.input_base + idx
+                  : params.input_blocks.at(static_cast<std::size_t>(idx));
+              const int32_t step = input.domain.has_value() ? input.domain->step : tmpl.domain.step;
+              const int16_t level =
+                  input.domain.has_value() ? input.domain->level : tmpl.domain.level;
+              inputs.push_back(estimate_input_ref(
+                  known, data, ChunkRef{step, level, input.field, input.version, block_id}));
+            }
+          }
           for (const auto& out : tmpl.outputs) {
-            add_known_output_bytes(
-                known,
-                ChunkRef{tmpl.domain.step, tmpl.domain.level, out.field, out.version, out_block},
-                bytes);
+            std::optional<BufferEstimate> estimate;
+            try {
+              estimate = estimate_output_spec(
+                  out.buffer, tmpl, data, meta, out_block, inputs);
+            } catch (...) {
+              estimate = std::nullopt;
+            }
+            if (estimate.has_value()) {
+              known[ChunkRef{tmpl.domain.step, tmpl.domain.level,
+                             out.field.field, out.field.version, out_block}] = *estimate;
+            }
           }
         }
       }
@@ -420,19 +837,10 @@ ChunkByteMap build_known_output_bytes(const PlanIR& plan, const RunMeta& meta) {
   return known;
 }
 
-std::size_t estimate_task_input_ref_bytes(const RunMeta& meta,
-                                          const ChunkByteMap& known_outputs,
-                                          const ChunkRef& ref,
-                                          int32_t bytes_per_value) {
-  auto it = known_outputs.find(ref);
-  if (it != known_outputs.end()) {
-    return it->second;
-  }
-  try {
-    return estimate_block_bytes(meta, ref, bytes_per_value);
-  } catch (...) {
-    return 0;
-  }
+std::size_t estimate_task_input_ref_bytes(const ChunkEstimateMap& known_outputs,
+                                          const DataService& data,
+                                          const ChunkRef& ref) {
+  return estimate_input_ref(known_outputs, data, ref).storage_bytes;
 }
 
 TaskEvent base_task_event(const TaskTemplateIR& tmpl,
@@ -580,7 +988,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
     end_span(resolve_inputs_event);
   }
 
-  std::vector<hpx::future<HostView>> input_futures;
+  std::vector<hpx::future<ChunkBuffer>> input_futures;
   input_futures.reserve(input_refs.size());
   TaskEvent issue_inputs_event;
   if (log_enabled) {
@@ -595,16 +1003,16 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
                         int32_t field,
                         int32_t ver,
                         int32_t step,
-                        int16_t level) -> hpx::future<std::vector<HostView>> {
+                        int16_t level) -> hpx::future<std::vector<ChunkBuffer>> {
     if (tmpl.deps.kind != "FaceNeighbors") {
-      return hpx::make_ready_future(std::vector<HostView>{});
+      return hpx::make_ready_future(std::vector<ChunkBuffer>{});
     }
     const int32_t face_idx = static_cast<int32_t>(face);
     if (!tmpl.deps.faces[face_idx]) {
-      return hpx::make_ready_future(std::vector<HostView>{});
+      return hpx::make_ready_future(std::vector<ChunkBuffer>{});
     }
     if (tmpl.deps.width <= 0) {
-      return hpx::make_ready_future(std::vector<HostView>{});
+      return hpx::make_ready_future(std::vector<ChunkBuffer>{});
     }
 
     std::unordered_set<int32_t> visited;
@@ -639,11 +1047,11 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
       refs.push_back(std::move(cref));
     }
     if (refs.empty()) {
-      return hpx::make_ready_future(std::vector<HostView>{});
+      return hpx::make_ready_future(std::vector<ChunkBuffer>{});
     }
     auto host_futures = data.get_hosts(refs);
     return hpx::when_all(host_futures).then([](auto&& all) {
-      std::vector<HostView> out;
+      std::vector<ChunkBuffer> out;
       out.reserve(all.get().size());
       for (auto& f : all.get()) {
         out.push_back(f.get());
@@ -657,7 +1065,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
     Face face;
   };
 
-  std::vector<hpx::future<std::vector<HostView>>> neighbor_futures;
+  std::vector<hpx::future<std::vector<ChunkBuffer>>> neighbor_futures;
   std::vector<NeighborSlot> neighbor_slots;
   neighbor_futures.reserve(halo_inputs.size() * 6);
   neighbor_slots.reserve(halo_inputs.size() * 6);
@@ -725,7 +1133,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
         auto input_pack = hpx::get<0>(results).get();
         auto neighbor_pack = hpx::get<1>(results).get();
 
-        std::vector<HostView> inputs;
+        std::vector<ChunkBuffer> inputs;
         inputs.reserve(input_pack.size());
         for (auto& f : input_pack) {
           inputs.push_back(f.get());
@@ -736,7 +1144,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
         nbrs.inputs.resize(halo_inputs.size());
 
         auto assign_face = [](NeighborViews::FieldNeighbors& field, Face face,
-                              std::vector<HostView>&& views) {
+                              std::vector<ChunkBuffer>&& views) {
           switch (face) {
             case Face::Xm:
               field.xm = std::move(views);
@@ -772,27 +1180,25 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
         if (log_enabled) {
           alloc_outputs_event = start_span(base_event, "alloc_outputs");
         }
-        std::vector<HostView> outputs;
+        std::vector<ChunkBuffer> outputs;
         outputs.reserve(tmpl.outputs.size());
-        if (!tmpl.output_bytes.empty() && tmpl.output_bytes.size() != tmpl.outputs.size()) {
-          throw std::runtime_error("output_bytes size must match outputs");
-        }
         for (std::size_t i = 0; i < tmpl.outputs.size(); ++i) {
-          std::size_t bytes = 0;
-          if (!tmpl.output_bytes.empty()) {
-            bytes = static_cast<std::size_t>(tmpl.output_bytes[i]);
-          }
           const auto& out = tmpl.outputs[i];
-          ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version, block};
-          outputs.push_back(data.alloc_host(cref, bytes));
+          ChunkRef cref{tmpl.domain.step, tmpl.domain.level,
+                        out.field.field, out.field.version, block};
+          outputs.push_back(data.alloc_host(
+              cref,
+              resolve_output_spec_for_task(
+                  out.buffer, tmpl, execution_context(plan_id).dataset, meta,
+                  tmpl.domain.step, tmpl.domain.level, block, inputs)));
         }
         if (log_enabled) {
           end_span(alloc_outputs_event);
         }
 
-        auto inputs_ptr = std::make_shared<std::vector<HostView>>(std::move(inputs));
+        auto inputs_ptr = std::make_shared<std::vector<ChunkBuffer>>(std::move(inputs));
         auto nbrs_ptr = std::make_shared<NeighborViews>(std::move(nbrs));
-        auto outputs_ptr = std::make_shared<std::vector<HostView>>(std::move(outputs));
+        auto outputs_ptr = std::make_shared<std::vector<ChunkBuffer>>(std::move(outputs));
         auto params_ptr = std::make_shared<std::vector<std::uint8_t>>(tmpl.params_msgpack);
 
         const auto& level = meta.steps.at(tmpl.domain.step).levels.at(tmpl.domain.level);
@@ -830,9 +1236,11 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
               std::vector<hpx::future<void>> puts;
               puts.reserve(tmpl.outputs.size());
               for (std::size_t i = 0; i < tmpl.outputs.size(); ++i) {
+                finalize_output_buffer((*outputs_ptr)[i], tmpl.outputs[i].buffer);
                 log_projection_output_summary(tmpl, block, i, (*outputs_ptr)[i]);
                 const auto& out = tmpl.outputs[i];
-                ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version, block};
+                ChunkRef cref{tmpl.domain.step, tmpl.domain.level,
+                              out.field.field, out.field.version, block};
                 puts.push_back(data.put_host(cref, std::move((*outputs_ptr)[i])));
               }
               if (log_enabled) {
@@ -973,7 +1381,7 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
     end_span(resolve_inputs_event);
   }
 
-  std::vector<hpx::future<HostView>> input_futures;
+  std::vector<hpx::future<ChunkBuffer>> input_futures;
   input_futures.reserve(input_refs.size());
   TaskEvent issue_inputs_event;
   if (log_enabled) {
@@ -1008,7 +1416,7 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
           collect_inputs_event = start_span(base_event, "collect_inputs");
         }
         auto input_pack = all.get();
-        std::vector<HostView> inputs;
+        std::vector<ChunkBuffer> inputs;
         inputs.reserve(input_pack.size());
         for (auto& f : input_pack) {
           inputs.push_back(f.get());
@@ -1033,33 +1441,30 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
           std::cout << oss.str() << std::endl;
         }
 
-        if (!tmpl.output_bytes.empty() && tmpl.output_bytes.size() != tmpl.outputs.size()) {
-          throw std::runtime_error("output_bytes size must match outputs");
-        }
-
         TaskEvent alloc_outputs_event;
         if (log_enabled) {
           alloc_outputs_event = start_span(base_event, "alloc_outputs");
         }
-        std::vector<HostView> outputs;
+        std::vector<ChunkBuffer> outputs;
         outputs.reserve(tmpl.outputs.size());
         for (std::size_t i = 0; i < tmpl.outputs.size(); ++i) {
-          std::size_t bytes = 0;
-          if (!tmpl.output_bytes.empty()) {
-            bytes = static_cast<std::size_t>(tmpl.output_bytes[i]);
-          }
           const auto& out = tmpl.outputs[i];
-          ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version, out_block};
-          outputs.push_back(data.alloc_host(cref, bytes));
+          ChunkRef cref{tmpl.domain.step, tmpl.domain.level,
+                        out.field.field, out.field.version, out_block};
+          outputs.push_back(data.alloc_host(
+              cref,
+              resolve_output_spec_for_task(
+                  out.buffer, tmpl, execution_context(plan_id).dataset, meta,
+                  tmpl.domain.step, tmpl.domain.level, out_block, inputs)));
         }
         if (log_enabled) {
           end_span(alloc_outputs_event);
         }
 
         NeighborViews nbrs;
-        auto inputs_ptr = std::make_shared<std::vector<HostView>>(std::move(inputs));
+        auto inputs_ptr = std::make_shared<std::vector<ChunkBuffer>>(std::move(inputs));
         auto nbrs_ptr = std::make_shared<NeighborViews>(std::move(nbrs));
-        auto outputs_ptr = std::make_shared<std::vector<HostView>>(std::move(outputs));
+        auto outputs_ptr = std::make_shared<std::vector<ChunkBuffer>>(std::move(outputs));
         auto params_ptr = std::make_shared<std::vector<std::uint8_t>>(tmpl.params_msgpack);
 
         const auto& level = meta.steps.at(tmpl.domain.step).levels.at(tmpl.domain.level);
@@ -1097,9 +1502,11 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
               std::vector<hpx::future<void>> puts;
               puts.reserve(tmpl.outputs.size());
               for (std::size_t i = 0; i < tmpl.outputs.size(); ++i) {
+                finalize_output_buffer((*outputs_ptr)[i], tmpl.outputs[i].buffer);
                 log_projection_output_summary(tmpl, out_block, i, (*outputs_ptr)[i]);
                 const auto& out = tmpl.outputs[i];
-                ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version,
+                ChunkRef cref{tmpl.domain.step, tmpl.domain.level,
+                              out.field.field, out.field.version,
                               out_block};
                 puts.push_back(data.put_host(cref, std::move((*outputs_ptr)[i])));
               }
@@ -1187,7 +1594,7 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
                                            std::size_t max_active_tasks,
                                            std::size_t max_active_storage_units,
                                            std::size_t max_input_bytes,
-                                           std::size_t max_output_bytes) {
+                                           std::size_t max_output_storage_bytes) {
   if (tasks.empty()) {
     return hpx::make_ready_future();
   }
@@ -1197,7 +1604,7 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
     std::vector<StorageUnitKey> storage_units;
     std::vector<ChunkRef> input_refs;
     std::size_t input_bytes = 0;
-    std::size_t output_bytes = 0;
+    std::size_t output_storage_bytes = 0;
   };
 
   struct Runner : std::enable_shared_from_this<Runner> {
@@ -1210,12 +1617,12 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
     std::size_t max_active_tasks = 1;
     std::size_t max_active_storage_units = 0;
     std::size_t max_input_bytes = 0;
-    std::size_t max_output_bytes = 0;
+    std::size_t max_output_storage_bytes = 0;
     std::vector<ActiveTask> active;
     std::unordered_map<StorageUnitKey, int32_t, StorageUnitKeyHash> active_storage_units;
     std::size_t active_storage_unit_count = 0;
     std::size_t active_input_bytes = 0;
-    std::size_t active_output_bytes = 0;
+    std::size_t active_output_storage_bytes = 0;
     hpx::promise<void> done;
 
     void log_partition_state(const char* reason,
@@ -1346,8 +1753,8 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
           active_input_bytes + task.estimated_input_bytes > max_input_bytes) {
         return false;
       }
-      if (max_output_bytes > 0 && task.estimated_output_bytes > 0 &&
-          active_output_bytes + task.estimated_output_bytes > max_output_bytes) {
+      if (max_output_storage_bytes > 0 && task.estimated_output_storage_bytes > 0 &&
+          active_output_storage_bytes + task.estimated_output_storage_bytes > max_output_storage_bytes) {
         return false;
       }
       return true;
@@ -1355,16 +1762,16 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
 
     void add_task_bytes(const TaskInstance& task) {
       active_input_bytes += task.estimated_input_bytes;
-      active_output_bytes += task.estimated_output_bytes;
+      active_output_storage_bytes += task.estimated_output_storage_bytes;
     }
 
     void remove_task_bytes(const ActiveTask& task) {
       active_input_bytes = task.input_bytes > active_input_bytes
                                ? 0
                                : active_input_bytes - task.input_bytes;
-      active_output_bytes = task.output_bytes > active_output_bytes
+      active_output_storage_bytes = task.output_storage_bytes > active_output_storage_bytes
                                 ? 0
-                                : active_output_bytes - task.output_bytes;
+                                : active_output_storage_bytes - task.output_storage_bytes;
     }
 
     void add_storage_units(const std::vector<StorageUnitKey>& units) {
@@ -1425,7 +1832,7 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
                                       std::move(units),
                                       std::move(input_refs),
                                       task.estimated_input_bytes,
-                                      task.estimated_output_bytes});
+                                      task.estimated_output_storage_bytes});
           ++admitted_total;
           log_partition_state("launch", admitted_total, scanned_total);
           admitted = true;
@@ -1498,7 +1905,7 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
   runner->max_active_tasks = std::max<std::size_t>(1, max_active_tasks);
   runner->max_active_storage_units = max_active_storage_units;
   runner->max_input_bytes = max_input_bytes;
-  runner->max_output_bytes = max_output_bytes;
+  runner->max_output_storage_bytes = max_output_storage_bytes;
   return runner->start();
 }
 
@@ -1532,7 +1939,7 @@ hpx::future<void> run_stage_partition_remote(int32_t plan_id,
                                              int32_t max_active_tasks,
                                              int32_t max_active_storage_units,
                                              std::uint64_t max_input_bytes,
-                                             std::uint64_t max_output_bytes) {
+                                             std::uint64_t max_output_storage_bytes) {
   auto ctx = execution_context_shared(plan_id);
   auto data = std::make_shared<DataServiceLocal>(plan_id);
   const std::size_t task_limit =
@@ -1548,7 +1955,7 @@ hpx::future<void> run_stage_partition_remote(int32_t plan_id,
                                   task_limit,
                                   storage_unit_limit,
                                   static_cast<std::size_t>(max_input_bytes),
-                                  static_cast<std::size_t>(max_output_bytes))
+                                  static_cast<std::size_t>(max_output_storage_bytes))
       .then([ctx = std::move(ctx), data = std::move(data)](auto&& done) mutable {
         done.get();
       });
@@ -1563,6 +1970,30 @@ HPX_PLAIN_ACTION(kangaroo::run_graph_task_remote, kangaroo_run_graph_task_action
 HPX_PLAIN_ACTION(kangaroo::run_stage_partition_remote, kangaroo_run_stage_partition_action)
 
 namespace kangaroo {
+
+ResolvedBufferSpec resolve_output_spec_for_task(
+    const BufferSpecIR& spec,
+    const TaskTemplateIR& task,
+    const DatasetHandle& dataset,
+    const RunMeta& meta,
+    int32_t step,
+    int16_t level,
+    int32_t block,
+    std::span<const ChunkBuffer> inputs) {
+  if (spec.shape_kind == ShapeRuleKind::kDynamic) {
+    if (spec.dynamic_upper_bound.kind == DynamicUpperBoundKind::kBackendChunk) {
+      return make_dynamic_output_spec(
+          spec, derive_backend_chunk_capacity(spec, task, dataset, block, inputs));
+    }
+    if (spec.dynamic_upper_bound.kind == DynamicUpperBoundKind::kAmrSubboxPack) {
+      return make_dynamic_output_spec(
+          spec, derive_amr_subbox_pack_capacity(
+                    task, meta, step, level, block,
+                    [&](const ChunkRef& ref) { return dataset.estimate_chunk_bytes(ref); }));
+    }
+  }
+  return resolve_output_spec(spec, meta, step, level, block, inputs);
+}
 
 void prepare_plan(PlanIR& plan, KernelRegistry& kernels) {
   std::vector<std::shared_ptr<const CoveredBoxListIR>> shared_covered_boxes;
@@ -1661,9 +2092,9 @@ ExecutorOptions executor_options_from_environment() {
   options.max_input_bytes_per_locality = positive_env_size(
       "KANGAROO_EXECUTOR_MAX_INPUT_BYTES_PER_LOCALITY",
       options.max_input_bytes_per_locality);
-  options.max_output_bytes_per_locality = positive_env_size(
+  options.max_output_storage_bytes_per_locality = positive_env_size(
       "KANGAROO_EXECUTOR_MAX_OUTPUT_BYTES_PER_LOCALITY",
-      options.max_output_bytes_per_locality);
+      options.max_output_storage_bytes_per_locality);
   return options;
 }
 
@@ -1876,12 +2307,12 @@ std::vector<TaskInstance> Executor::expand_stage_tasks(int32_t stage_idx,
   if (current_plan_ == nullptr) {
     throw std::runtime_error("executor expand_stage_tasks requires active plan");
   }
-  const ChunkByteMap known_outputs = build_known_output_bytes(*current_plan_, meta_);
+  const ChunkEstimateMap known_outputs =
+      build_known_output_estimates(*current_plan_, meta_, data_);
   std::vector<TaskInstance> tasks;
   for (std::size_t tmpl_idx_size = 0; tmpl_idx_size < stage.templates.size(); ++tmpl_idx_size) {
     const int32_t tmpl_idx = static_cast<int32_t>(tmpl_idx_size);
     const auto& tmpl = stage.templates[tmpl_idx_size];
-    const std::vector<int32_t> input_bpvs = input_bytes_per_value_from_params(tmpl);
     if (stage.plane == ExecPlane::Chunk) {
       if (tmpl.plane != ExecPlane::Chunk) {
         throw std::runtime_error("chunk stage requires chunk templates");
@@ -1910,16 +2341,22 @@ std::vector<TaskInstance> Executor::expand_stage_tasks(int32_t stage_idx,
           const auto loc = resolve_input_location(tmpl, input, block);
           ChunkRef ref{loc.step, loc.level, input.field, input.version, loc.block};
           task.input_refs.push_back(ref);
-          const int32_t bpv = input_idx < input_bpvs.size() ? input_bpvs[input_idx] : 0;
           task.estimated_input_bytes +=
-              estimate_task_input_ref_bytes(meta_, known_outputs, ref, bpv);
+              estimate_task_input_ref_bytes(known_outputs, data_, ref);
         }
         task.output_refs.reserve(tmpl.outputs.size());
         for (const auto& out : tmpl.outputs) {
           task.output_refs.push_back(
-              ChunkRef{tmpl.domain.step, tmpl.domain.level, out.field, out.version, block});
+              ChunkRef{tmpl.domain.step, tmpl.domain.level,
+                       out.field.field, out.field.version, block});
         }
-        task.estimated_output_bytes = template_output_bytes(tmpl);
+        const auto output_bytes = template_output_storage_bytes(
+            tmpl, data_, meta_, block, task.input_refs, known_outputs);
+        if (!output_bytes.has_value() && options_.max_output_storage_bytes_per_locality > 0) {
+          throw std::runtime_error(
+              "unable to derive output storage bound while output memory capping is enabled");
+        }
+        task.estimated_output_storage_bytes = output_bytes.value_or(0);
         ChunkRef target_ref;
         if (task.input_refs.empty()) {
           if (task.output_refs.empty()) {
@@ -1963,17 +2400,23 @@ std::vector<TaskInstance> Executor::expand_stage_tasks(int32_t stage_idx,
             }
             ChunkRef ref{step, level, input.field, input.version, block_id};
             task.input_refs.push_back(ref);
-            const int32_t bpv = input_idx < input_bpvs.size() ? input_bpvs[input_idx] : 0;
             task.estimated_input_bytes +=
-                estimate_task_input_ref_bytes(meta_, known_outputs, ref, bpv);
+                estimate_task_input_ref_bytes(known_outputs, data_, ref);
           }
         }
         task.output_refs.reserve(tmpl.outputs.size());
         for (const auto& out : tmpl.outputs) {
           task.output_refs.push_back(
-              ChunkRef{tmpl.domain.step, tmpl.domain.level, out.field, out.version, out_block});
+              ChunkRef{tmpl.domain.step, tmpl.domain.level,
+                       out.field.field, out.field.version, out_block});
         }
-        task.estimated_output_bytes = template_output_bytes(tmpl);
+        const auto output_bytes = template_output_storage_bytes(
+            tmpl, data_, meta_, out_block, task.input_refs, known_outputs);
+        if (!output_bytes.has_value() && options_.max_output_storage_bytes_per_locality > 0) {
+          throw std::runtime_error(
+              "unable to derive output storage bound while output memory capping is enabled");
+        }
+        task.estimated_output_storage_bytes = output_bytes.value_or(0);
         if (task.output_refs.empty()) {
           throw std::runtime_error("graph templates must specify outputs");
         }
@@ -2036,7 +2479,7 @@ hpx::future<void> Executor::run_stage_streaming(int32_t stage_idx, const StageIR
   const std::uint64_t action_input_byte_limit =
       static_cast<std::uint64_t>(options_.max_input_bytes_per_locality);
   const std::uint64_t action_output_byte_limit =
-      static_cast<std::uint64_t>(options_.max_output_bytes_per_locality);
+      static_cast<std::uint64_t>(options_.max_output_storage_bytes_per_locality);
 
   std::vector<hpx::future<void>> partition_futures;
   partition_futures.reserve(locality_count);
@@ -2054,7 +2497,7 @@ hpx::future<void> Executor::run_stage_streaming(int32_t stage_idx, const StageIR
                                                            task_limit,
                                                            storage_unit_limit,
                                                            options_.max_input_bytes_per_locality,
-                                                           options_.max_output_bytes_per_locality));
+                                                           options_.max_output_storage_bytes_per_locality));
       continue;
     }
     partition_futures.push_back(
@@ -2101,8 +2544,9 @@ hpx::future<void> Executor::run_block_task(const TaskTemplateIR& tmpl, int32_t s
   }
   ChunkRef target_ref;
   if (tmpl.inputs.empty()) {
-    target_ref = ChunkRef{tmpl.domain.step, tmpl.domain.level, tmpl.outputs.front().field,
-                          tmpl.outputs.front().version, block};
+    target_ref = ChunkRef{tmpl.domain.step, tmpl.domain.level,
+                          tmpl.outputs.front().field.field,
+                          tmpl.outputs.front().field.version, block};
   } else {
     const auto& first_input = tmpl.inputs.front();
     const auto loc = resolve_input_location(tmpl, first_input, block);
@@ -2156,7 +2600,8 @@ hpx::future<void> Executor::run_graph_task(const TaskTemplateIR& tmpl, int32_t s
     resolve_target_event = start_span(dispatch_event, "dispatch_resolve_target");
   }
   const auto& out = tmpl.outputs.front();
-  ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version, out_block};
+  ChunkRef cref{tmpl.domain.step, tmpl.domain.level,
+                out.field.field, out.field.version, out_block};
 
   int target = data_.home_rank(cref);
   if (log_enabled) {

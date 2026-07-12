@@ -28,8 +28,8 @@ def test_task_inputs_for_same_block_are_loaded_as_one_batch(tmp_path) -> None:
     ds = open_dataset("memory://coalesced-inputs", runmeta=runmeta, step=0, level=0, runtime=rt)
     ds.register_field("a", 101)
     ds.register_field("b", 102)
-    ds._h.set_chunk_ref(0, 0, 101, 0, 0, struct.pack("<d", 2.0))
-    ds._h.set_chunk_ref(0, 0, 102, 0, 0, struct.pack("<d", 3.0))
+    ds._h.set_chunk_ref(0, 0, 101, 0, 0, struct.pack("<d", 2.0), "f64", [1, 1, 1])
+    ds._h.set_chunk_ref(0, 0, 102, 0, 0, struct.pack("<d", 3.0), "f64", [1, 1, 1])
 
     rt.set_event_log_path(str(log_path))
     try:
@@ -116,6 +116,8 @@ def test_dataset_load_byte_budget_limits_in_flight_storage_units(tmp_path, monke
             0,
             block,
             np.asarray([[[float(block)]]], dtype=np.float64).tobytes(order="C"),
+            "f64",
+            [1, 1, 1],
         )
         ds._h.set_chunk_ref(
             0,
@@ -124,12 +126,14 @@ def test_dataset_load_byte_budget_limits_in_flight_storage_units(tmp_path, monke
             0,
             block,
             np.asarray([[[10.0]]], dtype=np.float64).tobytes(order="C"),
+            "f64",
+            [1, 1, 1],
         )
 
     rt.set_event_log_path(str(log_path))
     try:
         pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
-        out = pipe.field_add(pipe.field(left), pipe.field(right), out="sum", bytes_per_value=8)
+        out = pipe.field_add(pipe.field(left), pipe.field(right), out="sum", dtype="f64")
         pipe.run()
     finally:
         rt.set_event_log_path("")
@@ -298,7 +302,7 @@ def test_get_subbox_completes_when_backing_chunk_arrives_later() -> None:
         chunk_hi=(3, 1, 1),
         request_lo=(1, 0, 0),
         request_hi=(2, 1, 1),
-        bytes_per_value=4,
+        dtype="f32",
         payload=_pack_f32_chunk(4, 2, 2, 0.0),
     )
 

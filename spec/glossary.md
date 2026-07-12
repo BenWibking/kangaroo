@@ -24,8 +24,8 @@ A logical AMR subdomain (box) on a level. In many APIs this is identified by a z
 `BlockBox`  
 Run metadata structure containing integer lower/upper corners (`lo`, `hi`) of a block in index space.
 
-`bytes_per_value`  
-Element width (typically 4 or 8 bytes) used to interpret raw chunk payload bytes.
+`Buffer Specification`  
+Plan-time dtype, shape rule, initialization policy, and dynamic upper-bound contract for one output.
 
 ## C
 
@@ -33,7 +33,10 @@ Element width (typically 4 or 8 bytes) used to interpret raw chunk payload bytes
 Data values represent cell-center samples (not node/corner values).
 
 `chunk`  
-Runtime unit of stored data addressed by `(step, level, field, version, block)`. A chunk payload is raw bytes.
+Runtime unit addressed by `(step, level, field, version, block)` and transported as a Chunk Buffer.
+
+`Chunk Buffer`  
+Owned bytes plus a concrete scalar/rank/extents/strides descriptor and optional dynamic capacity.
 
 `ChunkRef`  
 Identifier tuple used to locate a chunk in runtime storage.
@@ -99,8 +102,8 @@ Neighbor data region needed from adjacent blocks for stencil or neighborhood ope
 `halo_inputs`  
 Indices of template inputs that should receive `FaceNeighbors` halo collections.
 
-`HostView`  
-C++ runtime buffer wrapper containing raw byte storage for one chunk payload.
+`Block Grid`  
+Typed logical `(i, j, k)` view over a numeric rank-three Chunk Buffer.
 
 ## I
 
@@ -136,8 +139,8 @@ Accepted plan label in decoding; not required as an executable stage plane in cu
 
 ## O
 
-`output_bytes`  
-Optional template hint listing byte sizes for each output chunk allocation.
+`Opaque Payload`  
+Rank-one byte Chunk Buffer for heterogeneous records that cannot expose numeric views.
 
 ## P
 

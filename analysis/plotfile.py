@@ -6,6 +6,10 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import numpy as np
+
+from .buffer import numpy_dtype
+
 try:
     from . import _plotfile as _plotfile  # type: ignore
 except ImportError as exc:
@@ -70,19 +74,8 @@ class PlotfileReader:
         payload = self._reader.read_particle_field_chunk(particle_type, field_name, int(chunk_index))
         if not return_ndarray:
             return payload
-
-        import numpy as np
-
         dtype = payload["dtype"]
-        np_dtype: Any
-        if dtype == "float32":
-            np_dtype = np.float32
-        elif dtype == "float64":
-            np_dtype = np.float64
-        elif dtype == "int64":
-            np_dtype = np.int64
-        else:
-            raise RuntimeError(f"unsupported particle dtype '{dtype}'")
+        np_dtype = numpy_dtype(dtype)
         payload["data"] = np.frombuffer(payload["data"], dtype=np_dtype)
         return payload
 
@@ -99,12 +92,10 @@ class PlotfileReader:
         if not return_ndarray:
             return payload
 
-        import numpy as np
-
         data = payload["data"]
         dtype = payload["dtype"]
         shape = payload["shape"]
-        np_dtype = np.float32 if dtype == "float32" else np.float64
+        np_dtype = numpy_dtype(dtype)
         arr = np.frombuffer(data, dtype=np_dtype).reshape(shape)
         payload["data"] = arr
         return payload

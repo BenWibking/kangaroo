@@ -155,6 +155,14 @@ Runtime MUST track memory consumption for:
 - Device memory buffers.
 - Scheduler/task metadata overhead.
 
+Input accounting MUST use concrete chunk descriptors or backend estimates. Output
+accounting MUST use resolved buffer specifications, including conservative dynamic upper
+bounds. Memory-capped admission MUST fail explicitly when a required bound is unresolved.
+
+Logical strided views MUST avoid forced plotfile copies. Numeric inner loops MUST contain
+no per-element dtype/layout branch or virtual dispatch, and mutable access MUST preserve
+copy-on-write slice ownership.
+
 ## 6.2 Bounded Growth
 
 Runtime MUST avoid unbounded growth in:

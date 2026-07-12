@@ -43,7 +43,6 @@ def main() -> int:
         metadata = ds.metadata_bundle()
         runmeta = metadata.runmeta
         comp, field, _ = ds.resolve_field(a.var)
-        bytes_per_value = ds.infer_bytes_per_value(rt, field=field, level=a.level)
 
         view = ds.plane_geometry(
             axis=a.axis,
@@ -65,7 +64,6 @@ def main() -> int:
             rect=rect,
             resolution=res,
             out="projection",
-            bytes_per_value=bytes_per_value,
             amr_cell_average=True,
         )
         rt.run(pipe.plan(), runmeta=runmeta, dataset=ds)
@@ -76,8 +74,6 @@ def main() -> int:
             field=out.field,
             version=0,
             block=0,
-            shape=res,
-            bytes_per_value=bytes_per_value,
             dataset=ds,
         )
 

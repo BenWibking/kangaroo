@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstdint>
+#include <fstream>
 #include <iostream>
 #include <unordered_map>
 
@@ -46,15 +47,18 @@ struct FabGroupKeyHash {
 };
 
 template <typename T>
-HostView transposed_component_view(const plotfile::FabData& fab, int32_t component_offset) {
+ChunkBuffer transposed_component_view(const plotfile::FabData& fab, int32_t component_offset) {
   const std::size_t npts =
       static_cast<std::size_t>(fab.nx) * static_cast<std::size_t>(fab.ny) *
       static_cast<std::size_t>(fab.nz);
   const auto* in = reinterpret_cast<const T*>(fab.bytes.data()) +
                    static_cast<std::size_t>(component_offset) * npts;
 
-  HostView view;
-  view.data.resize(npts * sizeof(T));
+  const std::array<std::uint64_t, 3> extents{
+      static_cast<std::uint64_t>(fab.nx), static_cast<std::uint64_t>(fab.ny),
+      static_cast<std::uint64_t>(fab.nz)};
+  auto view = ChunkBuffer::allocate(
+      BufferDesc::runtime_grid(scalar_type_for<T>::value, extents));
   auto* out = reinterpret_cast<T*>(view.data.data());
   transpose_plotfile_axes(in, out, fab.nx, fab.ny, fab.nz);
   return view;
@@ -122,7 +126,7 @@ void log_plotfile_read_fab_event(const char* status,
 PlotfileBackend::PlotfileBackend(std::string plotfile_dir)
     : plotfile_dir_(std::move(plotfile_dir)), reader_(plotfile_dir_) {}
 
-std::optional<HostView> PlotfileBackend::get_chunk(const ChunkRef& ref) {
+std::optional<ChunkBuffer> PlotfileBackend::get_chunk(const ChunkRef& ref) {
   auto chunks = get_chunks(std::vector<ChunkRef>{ref});
   if (chunks.empty()) {
     return std::nullopt;
@@ -130,8 +134,8 @@ std::optional<HostView> PlotfileBackend::get_chunk(const ChunkRef& ref) {
   return std::move(chunks.front());
 }
 
-std::vector<std::optional<HostView>> PlotfileBackend::get_chunks(const std::vector<ChunkRef>& refs) {
-  std::vector<std::optional<HostView>> out(refs.size());
+std::vector<std::optional<ChunkBuffer>> PlotfileBackend::get_chunks(const std::vector<ChunkRef>& refs) {
+  std::vector<std::optional<ChunkBuffer>> out(refs.size());
   if (refs.empty()) {
     return out;
   }
@@ -211,11 +215,16 @@ std::vector<std::optional<HostView>> PlotfileBackend::get_chunks(const std::vect
           for (std::size_t run_pos = run_begin; run_pos < run_end; ++run_pos) {
             const std::size_t idx = sorted[run_pos];
             const int32_t component_offset = components[idx] - min_comp;
-            HostView view;
-            view.data = read_buffer.slice(static_cast<std::size_t>(component_offset) *
-                                              component_bytes,
-                                          component_bytes);
-            view.layout = HostViewLayout::kPlotfileKJI;
+            const auto scalar = fab.type == plotfile::RealType::kFloat32
+                                    ? ScalarType::kF32
+                                    : ScalarType::kF64;
+            const std::array<std::uint64_t, 3> extents{
+                static_cast<std::uint64_t>(fab.nx), static_cast<std::uint64_t>(fab.ny),
+                static_cast<std::uint64_t>(fab.nz)};
+            auto view = ChunkBuffer::wrap(
+                read_buffer.slice(static_cast<std::size_t>(component_offset) * component_bytes,
+                                  component_bytes),
+                BufferDesc::plotfile_grid(scalar, extents));
             out[idx] = std::move(view);
           }
         } else {
@@ -264,23 +273,62 @@ bool PlotfileBackend::has_chunk(const ChunkRef& ref) const {
   return get_component_index(ref.field) >= 0;
 }
 
-std::size_t PlotfileBackend::estimate_chunk_bytes(const ChunkRef& ref) const {
+std::optional<BufferDesc> PlotfileBackend::describe_chunk(const ChunkRef& ref) const {
   if (ref.level < 0 || ref.level >= reader_.num_levels()) {
-    return 0;
+    return std::nullopt;
   }
   const auto& header = reader_.vismf_header(ref.level);
   const auto block = static_cast<std::size_t>(ref.block);
-  if (ref.block < 0 || block >= header.box_array.boxes.size()) {
-    return 0;
+  if (ref.block < 0 || block >= header.box_array.boxes.size() ||
+      block >= header.fab_on_disk.size()) {
+    return std::nullopt;
   }
-  if (get_component_index(ref.field) < 0) {
-    return 0;
+  const int32_t component = get_component_index(ref.field);
+  if (component < 0) {
+    return std::nullopt;
   }
-  const auto points = header.box_array.boxes[block].num_pts();
-  if (points <= 0) {
-    return 0;
+
+  try {
+    const auto& fab_on_disk = header.fab_on_disk[block];
+    const std::string path = plotfile_dir_ + "/Level_" + std::to_string(ref.level) + "/" +
+                             fab_on_disk.file_name;
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+      return std::nullopt;
+    }
+    stream.seekg(fab_on_disk.offset, std::ios::beg);
+    const auto fab = plotfile::read_fab_header(stream);
+    if (component >= fab.ncomp) {
+      return std::nullopt;
+    }
+    const int64_t nx = static_cast<int64_t>(fab.box.hi.x) - fab.box.lo.x + 1;
+    const int64_t ny = static_cast<int64_t>(fab.box.hi.y) - fab.box.lo.y + 1;
+    const int64_t nz = static_cast<int64_t>(fab.box.hi.z) - fab.box.lo.z + 1;
+    if (nx <= 0 || ny <= 0 || nz <= 0) {
+      return std::nullopt;
+    }
+    const auto scalar = fab.real_desc.type == plotfile::RealType::kFloat32
+                            ? ScalarType::kF32
+                            : ScalarType::kF64;
+    const std::array<std::uint64_t, 3> extents{
+        static_cast<std::uint64_t>(nx), static_cast<std::uint64_t>(ny),
+        static_cast<std::uint64_t>(nz)};
+    return plotfile_zero_copy_reads_enabled() ? BufferDesc::plotfile_grid(scalar, extents)
+                                              : BufferDesc::runtime_grid(scalar, extents);
+  } catch (const std::exception&) {
+    return std::nullopt;
   }
-  return static_cast<std::size_t>(points) * sizeof(double);
+}
+
+std::size_t PlotfileBackend::estimate_chunk_bytes(const ChunkRef& ref) const {
+  const auto desc = describe_chunk(ref);
+  return desc.has_value() ? static_cast<std::size_t>(desc->required_bytes()) : 0;
+}
+
+std::optional<std::uint64_t> PlotfileBackend::estimate_particle_chunk_records(
+    const std::string& particle_type, std::int64_t chunk_index) const {
+  const auto records = reader_.particle_chunk_records(particle_type, chunk_index);
+  return static_cast<std::uint64_t>(std::max<std::int64_t>(0, records));
 }
 
 DatasetMetadata PlotfileBackend::get_metadata() const {

@@ -106,15 +106,14 @@ For slice/projection output plane labeling:
 
 Associated axis labels MUST match output plane orientation.
 
-## 8. Byte-Width and Dtype Semantics
+## 8. Chunk Buffer Semantics
 
-Chunk payloads are raw bytes. Consumers interpret data type using context.
+Every chunk carries a concrete descriptor containing scalar type, rank, logical extents,
+and physical byte strides. Supported scalar tags are `opaque`, `u8`, `i64`, `f32`, and
+`f64`. Numeric descriptors are dense positive-stride layouts; logical Block Grid access
+is always `(i, j, k)` regardless of the physical stride permutation.
 
-Required widths for standardized array conversion paths:
-- 4 bytes per value (`float32`)
-- 8 bytes per value (`float64`)
-
-Unsupported inferred widths MUST fail explicitly in ndarray conversion helpers.
+Opaque payloads are rank-one bytes and MUST NOT expose numeric views.
 
 ## 9. AMR Coverage Semantics
 
@@ -137,10 +136,8 @@ A subbox request includes:
 - Source chunk reference.
 - Source chunk index bounds.
 - Requested index bounds.
-- Bytes-per-value.
 
 A subbox response includes:
 - Returned overlap bounds.
-- Returned payload bytes corresponding exactly to overlap region.
-- Bytes-per-value used for packing.
-
+- A contiguous runtime-layout Chunk Buffer corresponding exactly to the overlap region.
+- The same scalar type as the source chunk.

@@ -43,8 +43,10 @@ class OpenPMDBackend : public DatasetBackend {
  public:
   explicit OpenPMDBackend(std::string uri);
 
-  std::optional<HostView> get_chunk(const ChunkRef& ref) override;
+  std::optional<ChunkBuffer> get_chunk(const ChunkRef& ref) override;
   bool has_chunk(const ChunkRef& ref) const override;
+  std::optional<BufferDesc> describe_chunk(const ChunkRef& ref) const override;
+  std::size_t estimate_chunk_bytes(const ChunkRef& ref) const override;
   DatasetMetadata get_metadata() const override;
 
   OpenPMDMetadata metadata(int32_t step) const;

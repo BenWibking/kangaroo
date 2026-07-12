@@ -113,6 +113,107 @@ std::vector<FieldRefIR> parse_field_refs(const msgpack::object& obj) {
   return out;
 }
 
+ScalarType parse_scalar_type(const msgpack::object& obj) {
+  const auto value = obj.as<std::string>();
+  if (value == "opaque") return ScalarType::kOpaque;
+  if (value == "u8") return ScalarType::kU8;
+  if (value == "i64") return ScalarType::kI64;
+  if (value == "f32") return ScalarType::kF32;
+  if (value == "f64") return ScalarType::kF64;
+  throw std::runtime_error("unknown buffer dtype: " + value);
+}
+
+InitPolicy parse_init_policy(const msgpack::object& obj) {
+  const auto value = obj.as<std::string>();
+  if (value == "uninitialized") return InitPolicy::kUninitialized;
+  if (value == "zero") return InitPolicy::kZero;
+  throw std::runtime_error("unknown buffer init policy: " + value);
+}
+
+DynamicUpperBoundIR parse_dynamic_upper_bound(const msgpack::object& obj) {
+  DynamicUpperBoundIR bound;
+  const auto kind = expect_map_value(obj, "kind").as<std::string>();
+  if (kind == "literal") {
+    bound.kind = DynamicUpperBoundKind::kLiteral;
+    bound.value = expect_map_value(obj, "value").as<std::uint64_t>();
+  } else if (kind == "like_input") {
+    bound.kind = DynamicUpperBoundKind::kLikeInput;
+    bound.input_index = expect_map_value(obj, "input_index").as<std::int32_t>();
+  } else if (kind == "backend_chunk") {
+    bound.kind = DynamicUpperBoundKind::kBackendChunk;
+    const msgpack::object* input_index = nullptr;
+    if (try_get_map_value(obj, "input_index", &input_index)) {
+      bound.input_index = input_index->as<std::int32_t>();
+    }
+  } else if (kind == "amr_subbox_pack") {
+    bound.kind = DynamicUpperBoundKind::kAmrSubboxPack;
+  } else {
+    throw std::runtime_error("unknown dynamic upper-bound kind: " + kind);
+  }
+  if (bound.input_index < -1) {
+    throw std::runtime_error("dynamic upper-bound input index must be non-negative");
+  }
+  return bound;
+}
+
+BufferSpecIR parse_buffer_spec(const msgpack::object& obj) {
+  BufferSpecIR spec;
+  spec.scalar = parse_scalar_type(expect_map_value(obj, "dtype"));
+  spec.init = parse_init_policy(expect_map_value(obj, "init"));
+  const auto& shape = expect_map_value(obj, "shape");
+  const auto kind = expect_map_value(shape, "kind").as<std::string>();
+  if (kind == "block") {
+    spec.shape_kind = ShapeRuleKind::kBlock;
+    spec.block_components = expect_map_value(shape, "components").as<std::uint32_t>();
+    if (spec.block_components == 0) throw std::runtime_error("block components must be positive");
+  } else if (kind == "fixed") {
+    spec.shape_kind = ShapeRuleKind::kFixed;
+    const auto& extents = expect_map_value(shape, "extents");
+    if (extents.type != msgpack::type::ARRAY || extents.via.array.size < 1 ||
+        extents.via.array.size > kMaxBufferRank) {
+      throw std::runtime_error("fixed buffer rank must be between 1 and 4");
+    }
+    spec.fixed_extents.reserve(extents.via.array.size);
+    for (std::uint32_t i = 0; i < extents.via.array.size; ++i) {
+      const auto extent = extents.via.array.ptr[i].as<std::uint64_t>();
+      if (extent == 0) throw std::runtime_error("fixed buffer extents must be positive");
+      spec.fixed_extents.push_back(extent);
+    }
+  } else if (kind == "like_input") {
+    spec.shape_kind = ShapeRuleKind::kLikeInput;
+    spec.like_input_index = expect_map_value(shape, "input_index").as<std::int32_t>();
+    if (spec.like_input_index < 0) throw std::runtime_error("like-input index must be non-negative");
+  } else if (kind == "dynamic") {
+    spec.shape_kind = ShapeRuleKind::kDynamic;
+    spec.dynamic_upper_bound = parse_dynamic_upper_bound(expect_map_value(shape, "upper_bound"));
+  } else {
+    throw std::runtime_error("unknown buffer shape kind: " + kind);
+  }
+  if (spec.scalar == ScalarType::kOpaque && spec.shape_kind == ShapeRuleKind::kBlock) {
+    throw std::runtime_error("opaque buffers cannot use block shape");
+  }
+  if (spec.scalar == ScalarType::kOpaque && spec.shape_kind == ShapeRuleKind::kFixed &&
+      spec.fixed_extents.size() != 1) {
+    throw std::runtime_error("opaque fixed buffers must have rank 1");
+  }
+  return spec;
+}
+
+std::vector<OutputRefIR> parse_output_refs(const msgpack::object& obj) {
+  if (obj.type != msgpack::type::ARRAY) throw std::runtime_error("output list must be array");
+  std::vector<OutputRefIR> outputs;
+  outputs.reserve(obj.via.array.size);
+  for (std::uint32_t i = 0; i < obj.via.array.size; ++i) {
+    const auto& entry = obj.via.array.ptr[i];
+    OutputRefIR out;
+    out.field.field = expect_map_value(entry, "field").as<std::int32_t>();
+    out.field.version = expect_map_value(entry, "version").as<std::int32_t>();
+    out.buffer = parse_buffer_spec(expect_map_value(entry, "buffer"));
+    outputs.push_back(std::move(out));
+  }
+  return outputs;
+}
+
 DepRuleIR parse_deps(const msgpack::object& obj) {
   DepRuleIR deps;
   if (obj.type != msgpack::type::MAP) {
@@ -323,16 +424,13 @@ PlanIR decode_plan_msgpack(std::span<const std::uint8_t> payload) {
       tmpl.domain = parse_domain(domain_obj);
 
       tmpl.inputs = parse_field_refs(expect_map_value(tmpl_obj, "inputs"));
-      tmpl.outputs = parse_field_refs(expect_map_value(tmpl_obj, "outputs"));
-      const msgpack::object* out_bytes_obj = nullptr;
-      if (try_get_map_value(tmpl_obj, "output_bytes", &out_bytes_obj)) {
-        if (out_bytes_obj->type != msgpack::type::ARRAY) {
-          throw std::runtime_error("output_bytes must be array");
-        }
-        tmpl.output_bytes.reserve(out_bytes_obj->via.array.size);
-        for (uint32_t i = 0; i < out_bytes_obj->via.array.size; ++i) {
-          tmpl.output_bytes.push_back(out_bytes_obj->via.array.ptr[i].as<int32_t>());
-        }
+      tmpl.outputs = parse_output_refs(expect_map_value(tmpl_obj, "outputs"));
+      const msgpack::object* legacy_allocation_obj = nullptr;
+      const std::string legacy_allocation_key = std::string("output_") + "bytes";
+      if (try_get_map_value(tmpl_obj, legacy_allocation_key.c_str(), &legacy_allocation_obj)) {
+        (void)legacy_allocation_obj;
+        throw std::runtime_error(
+            "legacy output byte lists are not supported; use output buffer specifications");
       }
       tmpl.deps = parse_deps(expect_map_value(tmpl_obj, "deps"));
       const auto& params_obj = expect_map_value(tmpl_obj, "params");

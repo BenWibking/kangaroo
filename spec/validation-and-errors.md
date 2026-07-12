@@ -9,7 +9,7 @@ This document defines mandatory rejection behavior and failure cases. A conforma
 Errors required for:
 - Missing required keys in plan/stage/template/domain entries.
 - Non-map where map is required.
-- Non-array where array is required (`stages`, `after`, `templates`, field lists, output bytes).
+- Non-array where array is required (`stages`, `after`, `templates`, and field lists).
 
 ### 1.2 Plane validation
 
@@ -37,7 +37,8 @@ Errors required for:
 
 Errors required for:
 - Missing required outputs on templates.
-- `output_bytes` length mismatch with output count.
+- Missing or malformed output buffer specification.
+- Use of the removed legacy output byte-list key.
 - Graph templates with non-`None` deps.
 - Graph templates missing required input/output wiring.
 - Invalid graph reduce parameter combinations.
@@ -72,11 +73,10 @@ Errors required for:
 - Non-positive resolution dimensions.
 - Invalid axis-bound parse formats.
 
-### 7.2 Array conversion validation
+### 7.2 Buffer validation
 
-Errors required for:
-- Non-positive total element count in shape for array conversion.
-- Unsupported bytes-per-value for inferred dtype conversion.
+Errors required for invalid rank/extents, arithmetic overflow, descriptor/storage mismatch,
+dtype or rank mismatch, invalid dynamic commit, dynamic-bound overflow, and opaque numeric access.
 
 ## 8. Field Expression Validation
 
@@ -86,7 +86,7 @@ Errors required for:
 - Empty/invalid variable names.
 - Variable/input count mismatch.
 - More than supported max variable count.
-- Unsupported input/output byte widths.
+- Unsupported input/output scalar types or ranks.
 - Parse/evaluation setup failures.
 
 ## 9. Histogram Validation

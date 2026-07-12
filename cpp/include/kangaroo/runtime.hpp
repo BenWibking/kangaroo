@@ -38,9 +38,9 @@ struct DatasetHandle {
 
   std::shared_ptr<DatasetBackend> backend;
 
-  void set_chunk(const ChunkRef& ref, HostView view);
-  std::optional<HostView> get_chunk(const ChunkRef& ref) const;
-  std::vector<std::optional<HostView>> get_chunks(const std::vector<ChunkRef>& refs) const;
+  void set_chunk(const ChunkRef& ref, ChunkBuffer view);
+  std::optional<ChunkBuffer> get_chunk(const ChunkRef& ref) const;
+  std::vector<std::optional<ChunkBuffer>> get_chunks(const std::vector<ChunkRef>& refs) const;
   bool has_chunk(const ChunkRef& ref) const;
   std::size_t estimate_chunk_bytes(const ChunkRef& ref) const;
 
@@ -94,7 +94,7 @@ struct DatasetHandle {
 
     if (is_memory) {
       auto mem = std::make_shared<MemoryBackend>();
-      std::unordered_map<ChunkRef, HostView, ChunkRefHash, ChunkRefEq> map;
+      std::unordered_map<ChunkRef, ChunkBuffer, ChunkRefHash, ChunkRefEq> map;
       ar& map;
       mem->set_data(std::move(map));
       backend = mem;
@@ -134,9 +134,9 @@ struct DatasetHandle {
 };
 
 struct ChunkSlot {
-  std::shared_ptr<hpx::promise<std::shared_ptr<HostView>>> promise;
-  hpx::shared_future<std::shared_ptr<HostView>> future;
-  std::shared_ptr<HostView> value;
+  std::shared_ptr<hpx::promise<std::shared_ptr<ChunkBuffer>>> promise;
+  hpx::shared_future<std::shared_ptr<ChunkBuffer>> future;
+  std::shared_ptr<ChunkBuffer> value;
   bool ready = false;
   bool dataset_load_started = false;
 };
@@ -188,7 +188,7 @@ class Runtime {
                        const DatasetHandle& dataset,
                        const std::vector<int32_t>& fields);
 
-  HostView get_task_chunk(int32_t step,
+  ChunkBuffer get_task_chunk(int32_t step,
                           int16_t level,
                           int32_t field,
                           int32_t version,
