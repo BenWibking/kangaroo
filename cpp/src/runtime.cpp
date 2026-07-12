@@ -3045,6 +3045,69 @@ void register_default_kernels(KernelRegistry& registry) {
       std::vector<std::string> variables;
     };
 
+    using FieldExprExecutor =
+        std::variant<std::monostate, amrexpr::ParserExecutor<1>,
+                     amrexpr::ParserExecutor<2>, amrexpr::ParserExecutor<3>,
+                     amrexpr::ParserExecutor<4>, amrexpr::ParserExecutor<5>,
+                     amrexpr::ParserExecutor<6>, amrexpr::ParserExecutor<7>,
+                     amrexpr::ParserExecutor<8>>;
+
+    struct PreparedParams {
+      Params params;
+      amrexpr::Parser parser;
+      FieldExprExecutor executor;
+
+      explicit PreparedParams(Params decoded) : params(std::move(decoded)) {
+        if (params.expression.empty()) {
+          throw std::runtime_error(
+              "field_expr requires a non-empty expression");
+        }
+        if (params.variables.empty()) {
+          throw std::runtime_error("field_expr requires at least one variable");
+        }
+        if (params.variables.size() > 8) {
+          throw std::runtime_error(
+              "field_expr currently supports at most 8 variables");
+        }
+
+        try {
+          parser.define(params.expression);
+          parser.registerVariables(params.variables);
+          switch (params.variables.size()) {
+            case 1:
+              executor = parser.compileHost<1>();
+              break;
+            case 2:
+              executor = parser.compileHost<2>();
+              break;
+            case 3:
+              executor = parser.compileHost<3>();
+              break;
+            case 4:
+              executor = parser.compileHost<4>();
+              break;
+            case 5:
+              executor = parser.compileHost<5>();
+              break;
+            case 6:
+              executor = parser.compileHost<6>();
+              break;
+            case 7:
+              executor = parser.compileHost<7>();
+              break;
+            case 8:
+              executor = parser.compileHost<8>();
+              break;
+            default:
+              throw std::runtime_error(
+                  "field_expr variable count is out of range");
+          }
+        } catch (const std::runtime_error& e) {
+          throw std::runtime_error(std::string("field_expr parse failed: ") + e.what());
+        }
+      }
+    };
+
     auto decode_params = [](const msgpack::object& root) {
       Params params;
       if (const auto* expr = find_msgpack_map_value(root, "expression");
@@ -3066,25 +3129,22 @@ void register_default_kernels(KernelRegistry& registry) {
 
     registry.register_kernel(
         KernelDesc{.name = "field_expr", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},
-        [decode_params](const LevelMeta& level, int32_t block, std::span<const ChunkBuffer> inputs,
-                        const NeighborViews&, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
-        const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
+        [](const LevelMeta& level, int32_t block, std::span<const ChunkBuffer> inputs,
+           const NeighborViews&, std::span<ChunkBuffer> outputs,
+           std::span<const std::uint8_t>) {
+        auto prepared_ptr = detail::current_prepared_params(
+            std::type_index(typeid(PreparedParams)));
+        if (!prepared_ptr) {
+          throw std::runtime_error("field_expr task was not prepared");
+        }
+        const auto& prepared = *static_cast<const PreparedParams*>(prepared_ptr.get());
+        const auto& params = prepared.params;
 
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }
-        if (params.expression.empty()) {
-          throw std::runtime_error("field_expr requires a non-empty expression");
-        }
-        if (params.variables.empty()) {
-          throw std::runtime_error("field_expr requires at least one variable");
-        }
         if (params.variables.size() != inputs.size()) {
           throw std::runtime_error("field_expr variables/input size mismatch");
-        }
-        if (params.variables.size() > 8) {
-          throw std::runtime_error("field_expr currently supports at most 8 variables");
         }
         int nx = 0;
         int ny = 0;
@@ -3094,14 +3154,6 @@ void register_default_kernels(KernelRegistry& registry) {
           nx = box.hi.x - box.lo.x + 1;
           ny = box.hi.y - box.lo.y + 1;
           nz = box.hi.z - box.lo.z + 1;
-        }
-
-        amrexpr::Parser parser;
-        try {
-          parser.define(params.expression);
-          parser.registerVariables(params.variables);
-        } catch (const std::runtime_error& e) {
-          throw std::runtime_error(std::string("field_expr parse failed: ") + e.what());
         }
 
         std::array<RealGridAccessor, 8> input_views{};
@@ -3144,7 +3196,8 @@ void register_default_kernels(KernelRegistry& registry) {
 
 #define KANGAROO_FIELD_EXPR_CASE(N)                                                   \
         case N: {                                                                     \
-          auto executable = parser.compileHost<N>();                                  \
+          const auto& executable =                                                     \
+              std::get<amrexpr::ParserExecutor<N>>(prepared.executor);                 \
           for (std::size_t index = 0; index < cell_count; ++index) {                  \
             double vars[N];                                                           \
             for (int variable = 0; variable < N; ++variable)                         \
@@ -3167,7 +3220,19 @@ void register_default_kernels(KernelRegistry& registry) {
 #undef KANGAROO_FIELD_EXPR_CASE
         return hpx::make_ready_future();
         },
-        make_kernel_params_preparer<Params>(decode_params));
+        [decode_params](const KernelParamContext& context)
+            -> KernelRegistry::PreparedParams {
+          if (context.params_msgpack.empty()) {
+            return {};
+          }
+          const auto& decoded =
+              decode_params_cached<Params>(context.params_msgpack, decode_params);
+          auto prepared = std::shared_ptr<const void>(
+              new PreparedParams(decoded),
+              [](const void* ptr) { delete static_cast<const PreparedParams*>(ptr); });
+          return KernelRegistry::PreparedParams{
+              std::type_index(typeid(PreparedParams)), std::move(prepared)};
+        });
   }
   registry.register_kernel(
       KernelDesc{.name = "vorticity_mag", .n_inputs = 1, .n_outputs = 1, .needs_neighbors = false},

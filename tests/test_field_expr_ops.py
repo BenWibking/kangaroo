@@ -80,3 +80,79 @@ def test_field_expr_runtime_velocity_like_expression() -> None:
     expected_vel = mx / rho
     assert np.allclose(vel_out, expected_vel)
     assert np.allclose(shifted_out, expected_vel + rho)
+
+
+def test_field_expr_compiled_executor_is_reused_concurrently(monkeypatch) -> None:
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MODE", "streaming")
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MAX_ACTIVE_TASKS_PER_STAGE", "32")
+
+    nblocks = 512
+    rt = Runtime()
+    runmeta = RunMeta(
+        steps=[
+            StepMeta(
+                step=0,
+                levels=[
+                    LevelMeta(
+                        geom=LevelGeom(
+                            dx=(1.0, 1.0, 1.0),
+                            x0=(0.0, 0.0, 0.0),
+                            ref_ratio=1,
+                        ),
+                        boxes=[
+                            BlockBox((block, 0, 0), (block, 0, 0))
+                            for block in range(nblocks)
+                        ],
+                    )
+                ],
+            )
+        ]
+    )
+    ds = open_dataset(
+        "memory://expr-concurrent-reuse",
+        runmeta=runmeta,
+        step=0,
+        level=0,
+        runtime=rt,
+    )
+    left = 24011
+    right = 24012
+    ds.register_field("left", left)
+    ds.register_field("right", right)
+    for block in range(nblocks):
+        _set_block_double(
+            ds,
+            step=0,
+            level=0,
+            field=left,
+            block=block,
+            values=np.asarray([[[float(block)]]]),
+        )
+        _set_block_double(
+            ds,
+            step=0,
+            level=0,
+            field=right,
+            block=block,
+            values=np.asarray([[[2.0]]]),
+        )
+
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    summed = pipe.field_expr(
+        "a + b",
+        {"a": pipe.field(left), "b": pipe.field(right)},
+        out="sum",
+    )
+    pipe.run()
+
+    for block in range(nblocks):
+        got = rt.get_task_chunk_array(
+            step=0,
+            level=0,
+            field=summed.field,
+            shape=(1, 1, 1),
+            dtype=np.float64,
+            dataset=ds,
+            block=block,
+        )
+        assert got[0, 0, 0] == float(block) + 2.0
