@@ -1,5 +1,6 @@
 #include "kangaroo/runtime.hpp"
 
+#include "kangaroo/amr_patch_codec.hpp"
 #include "kangaroo/param_decode.hpp"
 #include "kangaroo/plan_decode.hpp"
 #include "kangaroo/plotfile_reader.hpp"
@@ -1555,95 +1556,6 @@ std::optional<SamplePoint> composite_sample_at(
   return std::nullopt;
 }
 
-std::vector<SamplePatch> unpack_sample_patches(std::span<const std::uint8_t> packed) {
-  std::vector<SamplePatch> patches;
-  if (packed.empty()) {
-    return patches;
-  }
-  auto handle = msgpack::unpack(reinterpret_cast<const char*>(packed.data()), packed.size());
-  auto root = handle.get();
-  if (root.type != msgpack::type::MAP) {
-    return patches;
-  }
-  const msgpack::object* arr_obj = nullptr;
-  for (uint32_t i = 0; i < root.via.map.size; ++i) {
-    const auto& k = root.via.map.ptr[i].key;
-    if (k.type == msgpack::type::STR && k.as<std::string>() == "patches") {
-      arr_obj = &root.via.map.ptr[i].val;
-      break;
-    }
-  }
-  if (arr_obj == nullptr || arr_obj->type != msgpack::type::ARRAY) {
-    return patches;
-  }
-  patches.reserve(arr_obj->via.array.size);
-  for (uint32_t i = 0; i < arr_obj->via.array.size; ++i) {
-    const auto& p = arr_obj->via.array.ptr[i];
-    if (p.type != msgpack::type::MAP) {
-      continue;
-    }
-    SamplePatch patch;
-    BufferDesc desc;
-    std::vector<std::uint8_t> payload;
-    for (uint32_t j = 0; j < p.via.map.size; ++j) {
-      const auto& key = p.via.map.ptr[j].key;
-      const auto& val = p.via.map.ptr[j].val;
-      if (key.type != msgpack::type::STR) {
-        continue;
-      }
-      const auto ks = key.as<std::string>();
-      if (ks == "level") {
-        patch.level = val.as<int16_t>();
-      } else if (ks == "lo" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
-        patch.box.lo[0] = val.via.array.ptr[0].as<int32_t>();
-        patch.box.lo[1] = val.via.array.ptr[1].as<int32_t>();
-        patch.box.lo[2] = val.via.array.ptr[2].as<int32_t>();
-      } else if (ks == "hi" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
-        patch.box.hi[0] = val.via.array.ptr[0].as<int32_t>();
-        patch.box.hi[1] = val.via.array.ptr[1].as<int32_t>();
-        patch.box.hi[2] = val.via.array.ptr[2].as<int32_t>();
-      } else if (ks == "dx" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
-        patch.geom.dx[0] = val.via.array.ptr[0].as<double>();
-        patch.geom.dx[1] = val.via.array.ptr[1].as<double>();
-        patch.geom.dx[2] = val.via.array.ptr[2].as<double>();
-      } else if (ks == "x0" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
-        patch.geom.x0[0] = val.via.array.ptr[0].as<double>();
-        patch.geom.x0[1] = val.via.array.ptr[1].as<double>();
-        patch.geom.x0[2] = val.via.array.ptr[2].as<double>();
-      } else if (ks == "index_origin" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
-        patch.geom.index_origin[0] = val.via.array.ptr[0].as<int32_t>();
-        patch.geom.index_origin[1] = val.via.array.ptr[1].as<int32_t>();
-        patch.geom.index_origin[2] = val.via.array.ptr[2].as<int32_t>();
-      } else if (ks == "is_periodic" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
-        patch.geom.is_periodic[0] = val.via.array.ptr[0].as<bool>();
-        patch.geom.is_periodic[1] = val.via.array.ptr[1].as<bool>();
-        patch.geom.is_periodic[2] = val.via.array.ptr[2].as<bool>();
-      } else if (ks == "scalar") {
-        desc.scalar = static_cast<ScalarType>(val.as<std::uint8_t>());
-      } else if (ks == "extents" && val.type == msgpack::type::ARRAY &&
-                 val.via.array.size >= 1 && val.via.array.size <= kMaxBufferRank) {
-        desc.rank = static_cast<std::uint8_t>(val.via.array.size);
-        for (std::size_t axis = 0; axis < desc.rank; ++axis) {
-          desc.extents[axis] = val.via.array.ptr[axis].as<std::uint64_t>();
-        }
-      } else if (ks == "strides_bytes" && val.type == msgpack::type::ARRAY &&
-                 val.via.array.size >= 1 && val.via.array.size <= kMaxBufferRank) {
-        for (std::size_t axis = 0; axis < val.via.array.size; ++axis) {
-          desc.strides_bytes[axis] = val.via.array.ptr[axis].as<std::int64_t>();
-        }
-      } else if (ks == "data" && val.type == msgpack::type::BIN) {
-        payload.assign(val.via.bin.ptr, val.via.bin.ptr + val.via.bin.size);
-      }
-    }
-    if (!payload.empty()) {
-      patch.view = ChunkBuffer::wrap(SharedByteBuffer(std::move(payload)), desc);
-      patch.values = make_real_grid_accessor(patch.view);
-      patches.push_back(std::move(patch));
-    }
-  }
-  return patches;
-}
-
 template <typename Params, typename DecodeFn>
 KernelRegistry::KernelParamsPrepareFn make_kernel_params_preparer(DecodeFn decode_fn) {
   return [decode_fn = std::move(decode_fn)](
@@ -2113,75 +2025,6 @@ void register_default_kernels(KernelRegistry& registry) {
           query_hi[ax] = cell_edge(target_geom, ax, hi + 1) + static_cast<double>(halo) * target_geom.dx[ax];
         }
 
-        struct PackedPatch {
-          int16_t level = 0;
-          IndexBox3 box;
-          LevelGeom geom;
-          ChunkBuffer data;
-        };
-        auto pack_patches = [](const std::vector<PackedPatch>& packed_patches) {
-          ChunkBuffer packed;
-          msgpack::sbuffer sbuf;
-          msgpack::packer<msgpack::sbuffer> pk(&sbuf);
-          pk.pack_map(1);
-          pk.pack(std::string("patches"));
-          pk.pack_array(packed_patches.size());
-          for (const auto& p : packed_patches) {
-            pk.pack_map(11);
-            pk.pack(std::string("level"));
-            pk.pack_int16(p.level);
-            pk.pack(std::string("lo"));
-            pk.pack_array(3);
-            pk.pack_int32(p.box.lo[0]);
-            pk.pack_int32(p.box.lo[1]);
-            pk.pack_int32(p.box.lo[2]);
-            pk.pack(std::string("hi"));
-            pk.pack_array(3);
-            pk.pack_int32(p.box.hi[0]);
-            pk.pack_int32(p.box.hi[1]);
-            pk.pack_int32(p.box.hi[2]);
-            pk.pack(std::string("dx"));
-            pk.pack_array(3);
-            pk.pack_double(p.geom.dx[0]);
-            pk.pack_double(p.geom.dx[1]);
-            pk.pack_double(p.geom.dx[2]);
-            pk.pack(std::string("x0"));
-            pk.pack_array(3);
-            pk.pack_double(p.geom.x0[0]);
-            pk.pack_double(p.geom.x0[1]);
-            pk.pack_double(p.geom.x0[2]);
-            pk.pack(std::string("index_origin"));
-            pk.pack_array(3);
-            pk.pack_int32(p.geom.index_origin[0]);
-            pk.pack_int32(p.geom.index_origin[1]);
-            pk.pack_int32(p.geom.index_origin[2]);
-            pk.pack(std::string("is_periodic"));
-            pk.pack_array(3);
-            pk.pack(static_cast<bool>(p.geom.is_periodic[0]));
-            pk.pack(static_cast<bool>(p.geom.is_periodic[1]));
-            pk.pack(static_cast<bool>(p.geom.is_periodic[2]));
-            pk.pack(std::string("scalar"));
-            pk.pack_uint8(static_cast<std::uint8_t>(p.data.desc().scalar));
-            pk.pack(std::string("extents"));
-            pk.pack_array(p.data.desc().rank);
-            for (std::size_t axis = 0; axis < p.data.desc().rank; ++axis) {
-              pk.pack_uint64(p.data.desc().extents[axis]);
-            }
-            pk.pack(std::string("strides_bytes"));
-            pk.pack_array(p.data.desc().rank);
-            for (std::size_t axis = 0; axis < p.data.desc().rank; ++axis) {
-              pk.pack_int64(p.data.desc().strides_bytes[axis]);
-            }
-            pk.pack(std::string("data"));
-            const auto payload = p.data.byte_view();
-            pk.pack_bin(payload.size());
-            if (!payload.empty()) {
-              pk.pack_bin_body(reinterpret_cast<const char*>(payload.data()), payload.size());
-            }
-          }
-          return ChunkBuffer::opaque(std::vector<std::uint8_t>(sbuf.data(), sbuf.data() + sbuf.size()));
-        };
-
         struct PendingPatch {
           int16_t level = 0;
           LevelGeom geom;
@@ -2233,10 +2076,9 @@ void register_default_kernels(KernelRegistry& registry) {
 
         return hpx::when_all(std::move(pending_subboxes))
             .then([pending_patches = std::move(pending_patches),
-                   pack_patches = std::move(pack_patches),
                    output](auto&& all) mutable {
               auto ready_subboxes = all.get();
-              std::vector<PackedPatch> packed_patches;
+              std::vector<AmrPatchRecord> packed_patches;
               packed_patches.reserve(ready_subboxes.size());
               for (std::size_t i = 0; i < ready_subboxes.size(); ++i) {
                 auto sub = ready_subboxes[i].get();
@@ -2245,7 +2087,7 @@ void register_default_kernels(KernelRegistry& registry) {
                   continue;
                 }
 
-                PackedPatch pp;
+                AmrPatchRecord pp;
                 pp.level = pending_patches[i].level;
                 pp.box = sub.box;
                 pp.geom = pending_patches[i].geom;
@@ -2253,7 +2095,7 @@ void register_default_kernels(KernelRegistry& registry) {
                 packed_patches.push_back(std::move(pp));
               }
 
-              const auto packed = pack_patches(packed_patches);
+              const auto packed = encode_amr_patch_payload(packed_patches);
               output->replace_dynamic_bytes(packed.byte_view());
               return;
             });
@@ -2349,11 +2191,17 @@ void register_default_kernels(KernelRegistry& registry) {
         patches.reserve(64);
         self.level = target_level;
         patches.push_back(std::move(self));
-        if (!inputs[1].empty()) {
-          auto prefetched = unpack_sample_patches(inputs[1].byte_view());
-          patches.insert(patches.end(),
-                         std::make_move_iterator(prefetched.begin()),
-                         std::make_move_iterator(prefetched.end()));
+        if (!inputs[1].empty() && inputs[1].desc().scalar == ScalarType::kOpaque) {
+          auto decoded = decode_amr_patch_payload(inputs[1].byte_view());
+          for (auto& record : decoded) {
+            SamplePatch patch;
+            patch.level = record.level;
+            patch.box = record.box;
+            patch.geom = record.geom;
+            patch.view = std::move(record.data);
+            patch.values = make_real_grid_accessor(patch.view);
+            patches.push_back(std::move(patch));
+          }
         }
 
         const auto& target_geom = level.geom;

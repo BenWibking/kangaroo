@@ -61,6 +61,15 @@ def test_layout_copy_converts_scalar_type() -> None:
     assert _core.test_chunk_buffer_layout_copy_converts_dtype() == (1.25, 2.5, 3.75, 5.0)
 
 
+def test_amr_patch_codec_roundtrips_geometry_descriptor_and_data() -> None:
+    assert _core.test_amr_patch_codec_roundtrip() == (1, 2, 4, 0.125, True, 7.5, "f32")
+
+
+def test_amr_patch_codec_rejects_malformed_payload() -> None:
+    with pytest.raises(RuntimeError, match="root must be a map"):
+        _core.test_amr_patch_codec_rejects_malformed()
+
+
 def test_mutating_a_copy_detaches_storage() -> None:
     assert _core.test_chunk_buffer_cow() == (7, 11)
 

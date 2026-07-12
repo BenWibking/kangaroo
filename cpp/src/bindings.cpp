@@ -1,4 +1,5 @@
 #include "kangaroo/runtime.hpp"
+#include "kangaroo/amr_patch_codec.hpp"
 #include "kangaroo/chunk_buffer.hpp"
 #include "kangaroo/data_service_local.hpp"
 
@@ -350,6 +351,36 @@ NB_MODULE(_core, m) {
     auto output = converted.view<double, 3>();
     return nb::make_tuple(output(0, 0, 0), output(0, 0, 1),
                           output(1, 0, 0), output(1, 0, 1));
+  });
+  m.def("test_amr_patch_codec_roundtrip", []() {
+    kangaroo::AmrPatchRecord patch;
+    patch.level = 2;
+    patch.box.lo[0] = 4;
+    patch.box.lo[1] = 5;
+    patch.box.lo[2] = 6;
+    patch.box.hi[0] = 5;
+    patch.box.hi[1] = 6;
+    patch.box.hi[2] = 7;
+    patch.geom.dx[0] = 0.5;
+    patch.geom.dx[1] = 0.25;
+    patch.geom.dx[2] = 0.125;
+    patch.geom.is_periodic[1] = true;
+    const std::array<std::uint64_t, 3> extents{2, 2, 2};
+    patch.data = kangaroo::ChunkBuffer::allocate(
+        kangaroo::BufferDesc::plotfile_grid(kangaroo::ScalarType::kF32, extents));
+    patch.data.mutable_view<float, 3>()(1, 1, 1) = 7.5F;
+    const std::array<kangaroo::AmrPatchRecord, 1> records{patch};
+    auto encoded = kangaroo::encode_amr_patch_payload(records);
+    auto decoded = kangaroo::decode_amr_patch_payload(encoded.byte_view());
+    const auto value = decoded.at(0).data.view<float, 3>()(1, 1, 1);
+    return nb::make_tuple(decoded.size(), decoded.at(0).level,
+                          decoded.at(0).box.lo[0], decoded.at(0).geom.dx[2],
+                          decoded.at(0).geom.is_periodic[1], value,
+                          kangaroo::scalar_type_name(decoded.at(0).data.desc().scalar));
+  });
+  m.def("test_amr_patch_codec_rejects_malformed", []() {
+    const std::array<std::uint8_t, 1> malformed{0x90};
+    return kangaroo::decode_amr_patch_payload(malformed).size();
   });
   m.def("test_chunk_buffer_cow", []() {
     const std::array<std::uint64_t, 1> extents{3};
