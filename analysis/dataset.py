@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from . import _core  # type: ignore
-from .buffer import DType, dtype_from_numpy, numpy_dtype, parse_dtype_tag
+from .buffer import DType, dtype_from_numpy, materialize_payload, parse_dtype_tag
 
 
 @dataclass(frozen=True)
@@ -120,10 +120,7 @@ class Dataset:
         if not hasattr(self._h, "read_particle_field_chunk"):
             raise RuntimeError("Particle chunk field access is not available in this runtime")
         payload = self._h.read_particle_field_chunk(particle_type, field, int(chunk_index))
-        dtype = payload["dtype"]
-        raw = payload["data"]
-        np_dtype = numpy_dtype(dtype)
-        return np.frombuffer(raw, dtype=np_dtype)
+        return materialize_payload(payload)
 
     def register_field(self, name: str, fid: int) -> None:
         self._fields[name] = fid

@@ -13,6 +13,8 @@ from analysis.buffer import (
     FixedShape,
     LikeInputShape,
     dtype_from_numpy,
+    materialize_numpy,
+    materialize_payload,
     numpy_dtype,
 )
 from analysis.dataset import Dataset
@@ -184,3 +186,49 @@ def test_shared_numpy_dtype_mapping() -> None:
     assert dtype_from_numpy("int64") is DType.I64
     with pytest.raises(TypeError, match="opaque"):
         numpy_dtype(DType.OPAQUE)
+
+
+def test_materialize_payload_honors_shape_strides_and_lifetime() -> None:
+    storage = np.arange(6, dtype=np.float64).tobytes()
+    payload = {
+        "data": storage,
+        "dtype": "f64",
+        "shape": [2, 3],
+        "strides_bytes": [8, 16],
+    }
+    array = materialize_payload(payload)
+    del payload
+    assert array.tolist() == [[0.0, 2.0, 4.0], [1.0, 3.0, 5.0]]
+    assert not array.flags.writeable
+
+
+def test_materialize_payload_uses_count_and_validates_assertions() -> None:
+    payload = {
+        "data": np.asarray([1, 2, 3], dtype=np.int64).tobytes(),
+        "dtype": "int64",
+        "count": 3,
+    }
+    assert materialize_payload(payload).tolist() == [1, 2, 3]
+    with pytest.raises(ValueError, match="requested shape"):
+        materialize_payload(payload, expected_shape=(2,))
+    with pytest.raises(ValueError, match="requested dtype"):
+        materialize_payload(payload, expected_dtype=np.float64)
+
+
+def test_materialize_numpy_rejects_invalid_descriptors_and_opaque_payloads() -> None:
+    with pytest.raises(TypeError, match="opaque"):
+        materialize_numpy(b"abc", dtype="opaque")
+    with pytest.raises(ValueError, match="equal rank"):
+        materialize_numpy(b"\0" * 16, dtype="f64", shape=(2,), strides_bytes=(8, 8))
+    with pytest.raises(ValueError, match="storage exposes"):
+        materialize_numpy(b"\0" * 8, dtype="f64", shape=(2,))
+
+
+def test_materialize_payload_copy_is_owning_and_writeable() -> None:
+    array = materialize_payload(
+        {"data": np.asarray([1.0], dtype=np.float32).tobytes(), "dtype": "f32"},
+        copy=True,
+    )
+    array[0] = 2.0
+    assert array.tolist() == [2.0]
+    assert array.flags.owndata
