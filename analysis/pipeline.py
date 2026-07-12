@@ -989,7 +989,9 @@ class Pipeline:
                 kernel="particle_and_mask",
                 domain=Domain(step=0, level=0, blocks=list(range(out_h.chunk_count))),
                 inputs=[FieldRef(out_h.field), FieldRef(rhs_h.field)],
-                outputs=[_like_output(fid, DType.U8)],
+                outputs=[
+                    _dynamic_output(fid, DType.U8, DynamicUpperBound.like_input(0))
+                ],
                 deps={"kind": "None"},
                 params={},
             )
@@ -1032,7 +1034,9 @@ class Pipeline:
             kernel="particle_subtract",
             domain=Domain(step=0, level=0, blocks=list(range(a_h.chunk_count))),
             inputs=[FieldRef(a_h.field), FieldRef(b_h.field)],
-            outputs=[_like_output(fid, DType.F64)],
+            outputs=[
+                _dynamic_output(fid, DType.F64, DynamicUpperBound.like_input(0))
+            ],
             deps={"kind": "None"},
             params={},
         )
@@ -1072,7 +1076,9 @@ class Pipeline:
                 FieldRef(by_h.field),
                 FieldRef(bz_h.field),
             ],
-            outputs=[_like_output(fid, DType.F64)],
+            outputs=[
+                _dynamic_output(fid, DType.F64, DynamicUpperBound.like_input(0))
+            ],
             deps={"kind": "None"},
             params={},
         )
@@ -1261,6 +1267,13 @@ class Pipeline:
         weights: ParticleArrayHandle | np.ndarray | None = None,
         density: bool = False,
     ) -> tuple[np.ndarray, np.ndarray]:
+        if (
+            weights is not None
+            and not isinstance(values, ParticleArrayHandle)
+            and not isinstance(weights, ParticleArrayHandle)
+            and np.asarray(values).shape != np.asarray(weights).shape
+        ):
+            raise ValueError("particle_histogram1d values and weights must have matching shapes")
         in_h = self._coerce_particle_array_handle(values)
         if isinstance(bins, int):
             if hist_range is None:
@@ -1277,11 +1290,12 @@ class Pipeline:
             if w_h.chunk_count != chunk_count:
                 raise ValueError("weights must match values chunk_count")
             inputs.append(FieldRef(w_h.field))
+        kernel = "particle_histogram1d_weighted" if weights is not None else "particle_histogram1d"
         fid = self._alloc_runtime_field("particle_hist1d")
         stage = Stage(name=self._unique_name("particle_hist1d"))
         stage.map_blocks(
-            name="particle_histogram1d",
-            kernel="particle_histogram1d",
+            name=kernel,
+            kernel=kernel,
             domain=Domain(step=0, level=0, blocks=list(range(chunk_count))),
             inputs=inputs,
             outputs=[_fixed_output(fid, DType.F64, edges.size - 1)],

@@ -4290,10 +4290,12 @@ void register_default_kernels(KernelRegistry& registry) {
         }
         const auto a = inputs[0].array<std::uint8_t>();
         const auto b = inputs[1].array<std::uint8_t>();
-        auto out = outputs[0].mutable_array<std::uint8_t>();
         const std::size_t n = std::min(a.extent(0), b.extent(0));
+        outputs[0].data.resize(n * sizeof(std::uint8_t));
+        auto* out_data = outputs[0].data.mutable_data();
         for (std::size_t i = 0; i < n; ++i) {
-          out(i) = (a(i) != 0 && b(i) != 0) ? 1 : 0;
+          store_buffer_scalar<std::uint8_t>(
+              out_data, i, (a(i) != 0 && b(i) != 0) ? std::uint8_t{1} : std::uint8_t{0});
         }
         return hpx::make_ready_future();
       });
@@ -4332,10 +4334,11 @@ void register_default_kernels(KernelRegistry& registry) {
         }
         const auto a = inputs[0].array<double>();
         const auto b = inputs[1].array<double>();
-        auto out = outputs[0].mutable_array<double>();
         const std::size_t n = std::min(a.extent(0), b.extent(0));
+        outputs[0].data.resize(n * sizeof(double));
+        auto* out_data = outputs[0].data.mutable_data();
         for (std::size_t i = 0; i < n; ++i) {
-          out(i) = a(i) - b(i);
+          store_buffer_scalar<double>(out_data, i, a(i) - b(i));
         }
         return hpx::make_ready_future();
       });
@@ -4352,12 +4355,13 @@ void register_default_kernels(KernelRegistry& registry) {
         const std::size_t n = std::min(
             {values[0].extent(0), values[1].extent(0), values[2].extent(0),
              values[3].extent(0), values[4].extent(0), values[5].extent(0)});
-        auto out = outputs[0].mutable_array<double>();
+        outputs[0].data.resize(n * sizeof(double));
+        auto* out_data = outputs[0].data.mutable_data();
         for (std::size_t i = 0; i < n; ++i) {
           const double dx = values[0](i) - values[3](i);
           const double dy = values[1](i) - values[4](i);
           const double dz = values[2](i) - values[5](i);
-          out(i) = std::sqrt(dx * dx + dy * dy + dz * dz);
+          store_buffer_scalar<double>(out_data, i, std::sqrt(dx * dx + dy * dy + dz * dz));
         }
         return hpx::make_ready_future();
       });
@@ -4500,25 +4504,36 @@ void register_default_kernels(KernelRegistry& registry) {
       return params;
     };
 
-    registry.register_kernel(
-        KernelDesc{.name = "particle_histogram1d", .n_inputs = 1, .n_outputs = 1,
-                   .needs_neighbors = false},
-        [decode_params](const LevelMeta&, int32_t, std::span<const ChunkBuffer> inputs,
-                        const NeighborViews&, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+    auto make_histogram_kernel = [decode_params](bool weighted) -> KernelFn {
+      return [decode_params, weighted](const LevelMeta&, int32_t,
+                                       std::span<const ChunkBuffer> inputs,
+                                       const NeighborViews&, std::span<ChunkBuffer> outputs,
+                                       std::span<const std::uint8_t> params_msgpack) {
           const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
-          if (inputs.empty() || outputs.empty() || params.edges.size() < 2) {
+          if (outputs.empty() || params.edges.size() < 2) {
             return hpx::make_ready_future();
+          }
+          const std::size_t expected_inputs = weighted ? 2 : 1;
+          if (inputs.size() != expected_inputs) {
+            throw BufferContractError(
+                BufferContractReason::kInvalidExtent,
+                weighted ? "particle_histogram1d_weighted requires values and weights"
+                         : "particle_histogram1d requires exactly one input");
           }
           const std::size_t bins = params.edges.size() - 1;
           auto out = outputs[0].mutable_array<double>();
           for (std::size_t i = 0; i < bins; ++i) out(i) = 0.0;
           const auto values = inputs[0].array<double>();
           const std::size_t n = values.extent(0);
-          const bool weighted = inputs.size() >= 2;
-          const std::optional<ArrayView<const double>> weights =
-              weighted ? std::optional(inputs[1].array<double>()) : std::nullopt;
-          const std::size_t nw = weights ? weights->extent(0) : 0;
+          std::optional<ArrayView<const double>> weights;
+          if (weighted) {
+            weights = inputs[1].array<double>();
+            if (weights->extent(0) != n) {
+              throw BufferContractError(
+                  BufferContractReason::kInvalidExtent,
+                  "particle_histogram1d values and weights must have matching extents");
+            }
+          }
           for (std::size_t i = 0; i < n; ++i) {
             const double x = values(i);
             if (!std::isfinite(x) || x < params.edges.front() || x > params.edges.back()) {
@@ -4533,7 +4548,7 @@ void register_default_kernels(KernelRegistry& registry) {
               continue;
             }
             double w = 1.0;
-            if (weighted && i < nw) {
+            if (weights) {
               w = (*weights)(i);
               if (!std::isfinite(w)) {
                 continue;
@@ -4556,7 +4571,18 @@ void register_default_kernels(KernelRegistry& registry) {
             }
           }
           return hpx::make_ready_future();
-        },
+        };
+    };
+
+    registry.register_kernel(
+        KernelDesc{.name = "particle_histogram1d", .n_inputs = 1, .n_outputs = 1,
+                   .needs_neighbors = false},
+        make_histogram_kernel(false),
+        make_kernel_params_preparer<Params>(decode_params));
+    registry.register_kernel(
+        KernelDesc{.name = "particle_histogram1d_weighted", .n_inputs = 2, .n_outputs = 1,
+                   .needs_neighbors = false},
+        make_histogram_kernel(true),
         make_kernel_params_preparer<Params>(decode_params));
   }
   {
