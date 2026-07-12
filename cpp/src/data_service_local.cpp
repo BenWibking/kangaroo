@@ -276,51 +276,17 @@ SubboxView build_subbox_view(const ChunkBuffer& chunk, const ChunkSubboxRef& ref
   out.box.hi[1] = oy1;
   out.box.hi[2] = oz1;
 
-  const std::size_t bytes_per = scalar_size(chunk.desc().scalar);
-  const std::size_t elems_total =
-      static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
-  const std::size_t needed = elems_total * bytes_per;
-  if (chunk.bytes() < needed) {
-    return SubboxView{};
-  }
-
   const int32_t onx = ox1 - ox0 + 1;
   const int32_t ony = oy1 - oy0 + 1;
   const int32_t onz = oz1 - oz0 + 1;
-  const std::array<std::uint64_t, 3> out_extents{
+  const std::array<std::uint64_t, 3> origin{
+      static_cast<std::uint64_t>(ox0 - ref.chunk_box.lo[0]),
+      static_cast<std::uint64_t>(oy0 - ref.chunk_box.lo[1]),
+      static_cast<std::uint64_t>(oz0 - ref.chunk_box.lo[2])};
+  const std::array<std::uint64_t, 3> extents{
       static_cast<std::uint64_t>(onx), static_cast<std::uint64_t>(ony),
       static_cast<std::uint64_t>(onz)};
-  out.data = ChunkBuffer::allocate(
-      BufferDesc::runtime_grid(chunk.desc().scalar, out_extents), InitPolicy::kZero);
-
-  auto out_index = [&](int32_t i, int32_t j, int32_t k) -> std::size_t {
-    return (static_cast<std::size_t>(i) * static_cast<std::size_t>(ony) +
-            static_cast<std::size_t>(j)) *
-               static_cast<std::size_t>(onz) +
-           static_cast<std::size_t>(k);
-  };
-
-  auto* dst = out.data.mutable_byte_view().data();
-  const auto& source_desc = chunk.desc();
-  const auto* source = chunk.byte_view().data();
-  for (int32_t i = 0; i < onx; ++i) {
-    const int32_t gi = ox0 + i;
-    const int32_t li = gi - ref.chunk_box.lo[0];
-    for (int32_t j = 0; j < ony; ++j) {
-      const int32_t gj = oy0 + j;
-      const int32_t lj = gj - ref.chunk_box.lo[1];
-      for (int32_t k = 0; k < onz; ++k) {
-        const int32_t gk = oz0 + k;
-        const int32_t lk = gk - ref.chunk_box.lo[2];
-        const std::size_t dst_byte = out_index(i, j, k) * bytes_per;
-        const auto source_byte =
-            static_cast<std::uint64_t>(li) * source_desc.strides_bytes[0] +
-            static_cast<std::uint64_t>(lj) * source_desc.strides_bytes[1] +
-            static_cast<std::uint64_t>(lk) * source_desc.strides_bytes[2];
-        std::memcpy(dst + dst_byte, source + source_byte, bytes_per);
-      }
-    }
-  }
+  out.data = chunk.copy_grid_region(origin, extents);
 
   return out;
 }

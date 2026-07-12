@@ -82,6 +82,42 @@ template <> struct scalar_type_for<std::int64_t> { static constexpr ScalarType v
 template <> struct scalar_type_for<float> { static constexpr ScalarType value = ScalarType::kF32; };
 template <> struct scalar_type_for<double> { static constexpr ScalarType value = ScalarType::kF64; };
 
+template <typename T>
+inline T load_unaligned_scalar(const std::uint8_t* source) noexcept {
+  T value;
+  std::memcpy(&value, source, sizeof(T));
+  return value;
+}
+
+template <typename Source>
+inline void store_converted_scalar(std::uint8_t* destination, ScalarType target,
+                                   Source value) noexcept {
+  switch (target) {
+    case ScalarType::kU8: {
+      const auto converted = static_cast<std::uint8_t>(value);
+      std::memcpy(destination, &converted, sizeof(converted));
+      return;
+    }
+    case ScalarType::kI64: {
+      const auto converted = static_cast<std::int64_t>(value);
+      std::memcpy(destination, &converted, sizeof(converted));
+      return;
+    }
+    case ScalarType::kF32: {
+      const auto converted = static_cast<float>(value);
+      std::memcpy(destination, &converted, sizeof(converted));
+      return;
+    }
+    case ScalarType::kF64: {
+      const auto converted = static_cast<double>(value);
+      std::memcpy(destination, &converted, sizeof(converted));
+      return;
+    }
+    case ScalarType::kOpaque:
+      return;
+  }
+}
+
 inline std::uint64_t checked_multiply(std::uint64_t lhs, std::uint64_t rhs) {
   if (rhs != 0 && lhs > std::numeric_limits<std::uint64_t>::max() / rhs) {
     throw BufferContractError(BufferContractReason::kArithmeticOverflow,
@@ -643,6 +679,119 @@ class ChunkBuffer {
 
   ChunkBuffer slice(std::size_t offset, std::size_t count, BufferDesc desc) const {
     return wrap(storage_.slice(offset, count), desc);
+  }
+
+  ChunkBuffer copy_to(BufferDesc target) const {
+    synchronize_dynamic_extent();
+    if (desc_.scalar == ScalarType::kOpaque || target.scalar == ScalarType::kOpaque ||
+        desc_.rank != target.rank) {
+      throw BufferContractError(BufferContractReason::kScalarMismatch,
+                                "layout copy requires numeric descriptors of equal rank");
+    }
+    for (std::size_t axis = 0; axis < desc_.rank; ++axis) {
+      if (desc_.extents[axis] != target.extents[axis]) {
+        throw BufferContractError(BufferContractReason::kInvalidExtent,
+                                  "layout copy requires matching logical extents");
+      }
+    }
+    target.validate(static_cast<std::size_t>(target.required_bytes()));
+    auto output = allocate(target);
+    if (desc_.scalar == target.scalar && desc_.strides_bytes == target.strides_bytes) {
+      std::copy(byte_view().begin(), byte_view().end(), output.mutable_byte_view().begin());
+      return output;
+    }
+
+    const auto source = byte_view();
+    auto destination = output.mutable_byte_view();
+    std::array<std::uint64_t, kMaxBufferRank> index{};
+    const auto elements = desc_.element_count();
+    for (std::uint64_t element = 0; element < elements; ++element) {
+      std::uint64_t source_offset = 0;
+      std::uint64_t destination_offset = 0;
+      for (std::size_t axis = 0; axis < desc_.rank; ++axis) {
+        source_offset = checked_add(
+            source_offset,
+            checked_multiply(index[axis], static_cast<std::uint64_t>(desc_.strides_bytes[axis])));
+        destination_offset = checked_add(
+            destination_offset,
+            checked_multiply(index[axis], static_cast<std::uint64_t>(target.strides_bytes[axis])));
+      }
+      const auto* source_scalar = source.data() + source_offset;
+      auto* destination_scalar = destination.data() + destination_offset;
+      switch (desc_.scalar) {
+        case ScalarType::kU8:
+          store_converted_scalar(destination_scalar, target.scalar,
+                                 load_unaligned_scalar<std::uint8_t>(source_scalar));
+          break;
+        case ScalarType::kI64:
+          store_converted_scalar(destination_scalar, target.scalar,
+                                 load_unaligned_scalar<std::int64_t>(source_scalar));
+          break;
+        case ScalarType::kF32:
+          store_converted_scalar(destination_scalar, target.scalar,
+                                 load_unaligned_scalar<float>(source_scalar));
+          break;
+        case ScalarType::kF64:
+          store_converted_scalar(destination_scalar, target.scalar,
+                                 load_unaligned_scalar<double>(source_scalar));
+          break;
+        case ScalarType::kOpaque:
+          break;
+      }
+      for (std::size_t reverse = desc_.rank; reverse > 0; --reverse) {
+        const auto axis = reverse - 1;
+        if (++index[axis] < desc_.extents[axis]) break;
+        index[axis] = 0;
+      }
+    }
+    return output;
+  }
+
+  void copy_from(const ChunkBuffer& source) {
+    auto converted = source.copy_to(desc());
+    auto destination = mutable_byte_view();
+    const auto source_bytes = converted.byte_view();
+    std::copy(source_bytes.begin(), source_bytes.end(), destination.begin());
+  }
+
+  ChunkBuffer copy_grid_region(std::array<std::uint64_t, 3> origin,
+                               std::array<std::uint64_t, 3> extents) const {
+    synchronize_dynamic_extent();
+    if (desc_.scalar == ScalarType::kOpaque || desc_.rank != 3) {
+      throw BufferContractError(BufferContractReason::kRankMismatch,
+                                "grid-region copy requires a numeric rank-three buffer");
+    }
+    for (std::size_t axis = 0; axis < 3; ++axis) {
+      if (origin[axis] > desc_.extents[axis] ||
+          extents[axis] > desc_.extents[axis] - origin[axis]) {
+        throw BufferContractError(BufferContractReason::kInvalidExtent,
+                                  "grid-region copy exceeds the source extents");
+      }
+    }
+    auto output = allocate(BufferDesc::runtime_grid(desc_.scalar, extents));
+    const auto source = byte_view();
+    auto destination = output.mutable_byte_view();
+    const auto width = scalar_size(desc_.scalar);
+    const auto& output_desc = output.desc();
+    for (std::uint64_t i = 0; i < extents[0]; ++i) {
+      for (std::uint64_t j = 0; j < extents[1]; ++j) {
+        for (std::uint64_t k = 0; k < extents[2]; ++k) {
+          const std::array<std::uint64_t, 3> source_index{
+              origin[0] + i, origin[1] + j, origin[2] + k};
+          const std::array<std::uint64_t, 3> destination_index{i, j, k};
+          std::uint64_t source_offset = 0;
+          std::uint64_t destination_offset = 0;
+          for (std::size_t axis = 0; axis < 3; ++axis) {
+            source_offset += source_index[axis] * desc_.strides_bytes[axis];
+            destination_offset +=
+                destination_index[axis] * output_desc.strides_bytes[axis];
+          }
+          std::memcpy(destination.data() + destination_offset,
+                      source.data() + source_offset, width);
+        }
+      }
+    }
+    return output;
   }
 
   template <typename T, std::size_t Rank>

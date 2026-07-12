@@ -16,19 +16,6 @@ namespace kangaroo {
 
 namespace {
 
-template <typename InT, typename OutT>
-void transpose_plotfile_axes(const InT* in, OutT* out, int nx, int ny, int nz) {
-  for (int k = 0; k < nz; ++k) {
-    for (int j = 0; j < ny; ++j) {
-      for (int i = 0; i < nx; ++i) {
-        const std::size_t in_idx = (static_cast<std::size_t>(k) * ny + j) * nx + i;
-        const std::size_t out_idx = (static_cast<std::size_t>(i) * ny + j) * nz + k;
-        out[out_idx] = static_cast<OutT>(in[in_idx]);
-      }
-    }
-  }
-}
-
 struct FabGroupKey {
   int32_t level = 0;
   int32_t block = 0;
@@ -45,25 +32,6 @@ struct FabGroupKeyHash {
     return static_cast<std::size_t>((level << 32U) ^ block);
   }
 };
-
-template <typename T>
-ChunkBuffer transposed_component_view(const plotfile::FabData& fab, int32_t component_offset) {
-  const std::size_t npts =
-      static_cast<std::size_t>(fab.nx) * static_cast<std::size_t>(fab.ny) *
-      static_cast<std::size_t>(fab.nz);
-  const auto* in = reinterpret_cast<const T*>(fab.bytes.data()) +
-                   static_cast<std::size_t>(component_offset) * npts;
-
-  const std::array<std::uint64_t, 3> extents{
-      static_cast<std::uint64_t>(fab.nx), static_cast<std::uint64_t>(fab.ny),
-      static_cast<std::uint64_t>(fab.nz)};
-  auto view = ChunkBuffer::allocate(
-      BufferDesc::runtime_grid(scalar_type_for<T>::value, extents));
-  auto bytes = view.mutable_byte_view();
-  auto* out = reinterpret_cast<T*>(bytes.data());
-  transpose_plotfile_axes(in, out, fab.nx, fab.ny, fab.nz);
-  return view;
-}
 
 bool plotfile_zero_copy_reads_enabled() {
   static const bool enabled = [] {
@@ -205,39 +173,29 @@ std::vector<std::optional<ChunkBuffer>> PlotfileBackend::get_chunks(const std::v
                                     min_comp,
                                     max_comp - min_comp + 1);
 
-        if (plotfile_zero_copy_reads_enabled()) {
-          const std::size_t npts =
-              static_cast<std::size_t>(fab.nx) * static_cast<std::size_t>(fab.ny) *
-              static_cast<std::size_t>(fab.nz);
-          const std::size_t bytes_per =
-              fab.type == plotfile::RealType::kFloat32 ? sizeof(float) : sizeof(double);
-          const std::size_t component_bytes = npts * bytes_per;
-          SharedByteBuffer read_buffer(std::move(fab.bytes));
-          for (std::size_t run_pos = run_begin; run_pos < run_end; ++run_pos) {
-            const std::size_t idx = sorted[run_pos];
-            const int32_t component_offset = components[idx] - min_comp;
-            const auto scalar = fab.type == plotfile::RealType::kFloat32
-                                    ? ScalarType::kF32
-                                    : ScalarType::kF64;
-            const std::array<std::uint64_t, 3> extents{
-                static_cast<std::uint64_t>(fab.nx), static_cast<std::uint64_t>(fab.ny),
-                static_cast<std::uint64_t>(fab.nz)};
-            auto view = ChunkBuffer::wrap(
-                read_buffer.slice(static_cast<std::size_t>(component_offset) * component_bytes,
-                                  component_bytes),
-                BufferDesc::plotfile_grid(scalar, extents));
-            out[idx] = std::move(view);
-          }
-        } else {
-          for (std::size_t run_pos = run_begin; run_pos < run_end; ++run_pos) {
-            const std::size_t idx = sorted[run_pos];
-            const int32_t component_offset = components[idx] - min_comp;
-            if (fab.type == plotfile::RealType::kFloat32) {
-              out[idx] = transposed_component_view<float>(fab, component_offset);
-            } else {
-              out[idx] = transposed_component_view<double>(fab, component_offset);
-            }
-          }
+        const std::size_t npts =
+            static_cast<std::size_t>(fab.nx) * static_cast<std::size_t>(fab.ny) *
+            static_cast<std::size_t>(fab.nz);
+        const std::size_t bytes_per =
+            fab.type == plotfile::RealType::kFloat32 ? sizeof(float) : sizeof(double);
+        const std::size_t component_bytes = npts * bytes_per;
+        SharedByteBuffer read_buffer(std::move(fab.bytes));
+        for (std::size_t run_pos = run_begin; run_pos < run_end; ++run_pos) {
+          const std::size_t idx = sorted[run_pos];
+          const int32_t component_offset = components[idx] - min_comp;
+          const auto scalar = fab.type == plotfile::RealType::kFloat32
+                                  ? ScalarType::kF32
+                                  : ScalarType::kF64;
+          const std::array<std::uint64_t, 3> extents{
+              static_cast<std::uint64_t>(fab.nx), static_cast<std::uint64_t>(fab.ny),
+              static_cast<std::uint64_t>(fab.nz)};
+          auto view = ChunkBuffer::wrap(
+              read_buffer.slice(static_cast<std::size_t>(component_offset) * component_bytes,
+                                component_bytes),
+              BufferDesc::plotfile_grid(scalar, extents));
+          out[idx] = plotfile_zero_copy_reads_enabled()
+                         ? std::move(view)
+                         : view.copy_to(BufferDesc::runtime_grid(scalar, extents));
         }
       } catch (const std::exception& e) {
         const auto& fod =

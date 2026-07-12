@@ -2559,29 +2559,17 @@ void register_default_kernels(KernelRegistry& registry) {
 
         const ScalarType file_scalar =
             data.type == plotfile::RealType::kFloat32 ? ScalarType::kF32 : ScalarType::kF64;
+        auto source = ChunkBuffer::wrap(
+            SharedByteBuffer(std::move(data.bytes)),
+            BufferDesc::plotfile_grid(file_scalar,
+                                      {static_cast<std::uint64_t>(nx),
+                                       static_cast<std::uint64_t>(ny),
+                                       static_cast<std::uint64_t>(nz)}));
         if (plotfile_zero_copy_reads_enabled() && outputs[0].desc().scalar == file_scalar) {
-          outputs[0] = ChunkBuffer::wrap(
-              SharedByteBuffer(std::move(data.bytes)),
-              BufferDesc::plotfile_grid(file_scalar,
-                                        {static_cast<std::uint64_t>(nx),
-                                         static_cast<std::uint64_t>(ny),
-                                         static_cast<std::uint64_t>(nz)}));
+          outputs[0] = std::move(source);
           return hpx::make_ready_future();
         }
-
-        auto transpose_into = [&]<typename OutT>() {
-          auto out = outputs[0].mutable_view<OutT, 3>();
-          for (int i = 0; i < nx; ++i) for (int j = 0; j < ny; ++j) for (int k = 0; k < nz; ++k) {
-            const auto source = (static_cast<std::size_t>(k) * ny + j) * nx + i;
-            out(i, j, k) = data.type == plotfile::RealType::kFloat32
-                               ? static_cast<OutT>(load_buffer_scalar<float>(data.bytes.data(), source))
-                               : static_cast<OutT>(load_buffer_scalar<double>(data.bytes.data(), source));
-          }
-        };
-        if (outputs[0].desc().scalar == ScalarType::kF32) transpose_into.template operator()<float>();
-        else if (outputs[0].desc().scalar == ScalarType::kF64) transpose_into.template operator()<double>();
-        else throw BufferContractError(BufferContractReason::kScalarMismatch,
-                                       "plotfile_load output must be f32 or f64");
+        outputs[0].copy_from(source);
 
         return hpx::make_ready_future();
         },

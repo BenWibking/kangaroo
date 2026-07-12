@@ -518,19 +518,18 @@ std::optional<ChunkBuffer> ParthenonBackend::get_chunk(const ChunkRef& ref) {
   }
 
   const std::size_t comp_bytes = spatial_elems * bytes_per;
-  std::vector<std::uint8_t> selected(static_cast<std::size_t>(spec.comp_count) * comp_bytes);
-  for (int c = 0; c < spec.comp_count; ++c) {
-    const std::size_t src = static_cast<std::size_t>(spec.comp_start + c) * comp_bytes;
-    const std::size_t dst = static_cast<std::size_t>(c) * comp_bytes;
-    std::memcpy(selected.data() + dst, block_raw.data() + src, comp_bytes);
-  }
+  const std::size_t selected_offset =
+      static_cast<std::size_t>(spec.comp_start) * comp_bytes;
+  const std::size_t selected_bytes =
+      static_cast<std::size_t>(spec.comp_count) * comp_bytes;
+  SharedByteBuffer storage(std::move(block_raw));
   const auto scalar = bytes_per == 4 ? ScalarType::kF32 : ScalarType::kF64;
   const std::array<std::uint64_t, 3> extents{
       static_cast<std::uint64_t>(mem_dims[mem_dims.size() - 1]),
       static_cast<std::uint64_t>(mem_dims[mem_dims.size() - 2]),
       static_cast<std::uint64_t>(mem_dims[mem_dims.size() - 3])};
   return ChunkBuffer::wrap(
-      SharedByteBuffer(std::move(selected)),
+      storage.slice(selected_offset, selected_bytes),
       BufferDesc::component_major_grid(
           scalar, extents, static_cast<std::uint64_t>(spec.comp_count)));
 }

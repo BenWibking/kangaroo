@@ -53,6 +53,14 @@ def test_plotfile_and_runtime_layouts_have_equal_logical_values() -> None:
     assert all(runtime == plotfile for runtime, plotfile in values)
 
 
+def test_grid_region_copy_uses_logical_indices_across_layouts() -> None:
+    assert _core.test_chunk_buffer_grid_region() == [110, 111, 120, 121, 210, 211, 220, 221]
+
+
+def test_layout_copy_converts_scalar_type() -> None:
+    assert _core.test_chunk_buffer_layout_copy_converts_dtype() == (1.25, 2.5, 3.75, 5.0)
+
+
 def test_mutating_a_copy_detaches_storage() -> None:
     assert _core.test_chunk_buffer_cow() == (7, 11)
 

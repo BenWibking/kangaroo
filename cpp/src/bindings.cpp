@@ -308,14 +308,48 @@ NB_MODULE(_core, m) {
         }
       }
     }
+    auto plotfile_as_runtime = plotfile.copy_to(
+        kangaroo::BufferDesc::runtime_grid(kangaroo::ScalarType::kF64, extents));
     const auto runtime_const = std::as_const(runtime).view<double, 3>();
-    const auto plotfile_const = std::as_const(plotfile).view<double, 3>();
+    const auto plotfile_const = std::as_const(plotfile_as_runtime).view<double, 3>();
     nb::list values;
     for (std::uint64_t i = 0; i < extents[0]; ++i)
       for (std::uint64_t j = 0; j < extents[1]; ++j)
         for (std::uint64_t k = 0; k < extents[2]; ++k)
           values.append(nb::make_tuple(runtime_const(i, j, k), plotfile_const(i, j, k)));
     return values;
+  });
+  m.def("test_chunk_buffer_grid_region", []() {
+    const std::array<std::uint64_t, 3> extents{4, 3, 2};
+    auto source = kangaroo::ChunkBuffer::allocate(
+        kangaroo::BufferDesc::plotfile_grid(kangaroo::ScalarType::kI64, extents));
+    auto grid = source.mutable_view<std::int64_t, 3>();
+    for (std::uint64_t i = 0; i < extents[0]; ++i)
+      for (std::uint64_t j = 0; j < extents[1]; ++j)
+        for (std::uint64_t k = 0; k < extents[2]; ++k)
+          grid(i, j, k) = static_cast<std::int64_t>(100 * i + 10 * j + k);
+    auto region = source.copy_grid_region({1, 1, 0}, {2, 2, 2});
+    auto values = region.view<std::int64_t, 3>();
+    nb::list out;
+    for (std::uint64_t i = 0; i < 2; ++i)
+      for (std::uint64_t j = 0; j < 2; ++j)
+        for (std::uint64_t k = 0; k < 2; ++k) out.append(values(i, j, k));
+    return out;
+  });
+  m.def("test_chunk_buffer_layout_copy_converts_dtype", []() {
+    const std::array<std::uint64_t, 3> extents{2, 1, 2};
+    auto source = kangaroo::ChunkBuffer::allocate(
+        kangaroo::BufferDesc::plotfile_grid(kangaroo::ScalarType::kF32, extents));
+    auto input = source.mutable_view<float, 3>();
+    input(0, 0, 0) = 1.25F;
+    input(0, 0, 1) = 2.5F;
+    input(1, 0, 0) = 3.75F;
+    input(1, 0, 1) = 5.0F;
+    auto converted = source.copy_to(
+        kangaroo::BufferDesc::runtime_grid(kangaroo::ScalarType::kF64, extents));
+    auto output = converted.view<double, 3>();
+    return nb::make_tuple(output(0, 0, 0), output(0, 0, 1),
+                          output(1, 0, 0), output(1, 0, 1));
   });
   m.def("test_chunk_buffer_cow", []() {
     const std::array<std::uint64_t, 1> extents{3};
