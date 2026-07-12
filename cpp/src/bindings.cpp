@@ -173,7 +173,8 @@ kangaroo::ChunkBuffer host_view_from_bytes(
 }
 
 nb::bytes host_view_bytes(const kangaroo::ChunkBuffer& view) {
-  return nb::bytes(reinterpret_cast<const char*>(view.data.data()), view.data.size());
+  const auto bytes = view.byte_view();
+  return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
 }
 
 nb::dict chunk_buffer_dict(const kangaroo::ChunkBuffer& buffer) {
@@ -194,8 +195,8 @@ nb::dict subbox_view_dict(const kangaroo::SubboxView& view) {
     return nb::make_tuple(v[0], v[1], v[2]);
   };
   nb::dict d;
-  d["data"] = nb::bytes(reinterpret_cast<const char*>(view.data.data.data()),
-                        view.data.data.size());
+  const auto bytes = view.data.byte_view();
+  d["data"] = nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
   d["dtype"] = kangaroo::scalar_type_name(view.data.desc().scalar);
   d["lo"] = to_tuple(view.box.lo);
   d["hi"] = to_tuple(view.box.hi);
@@ -331,16 +332,29 @@ NB_MODULE(_core, m) {
     auto uninitialized = kangaroo::ChunkBuffer::allocate(
         desc, kangaroo::InitPolicy::kUninitialized);
     auto zeroed = kangaroo::ChunkBuffer::allocate(desc, kangaroo::InitPolicy::kZero);
+    const auto zeroed_bytes = zeroed.byte_view();
     const bool all_zero = std::all_of(
-        zeroed.data.cbegin(), zeroed.data.cend(),
+        zeroed_bytes.begin(), zeroed_bytes.end(),
         [](std::uint8_t value) { return value == std::uint8_t{0}; });
     return nb::make_tuple(
-        uninitialized.data.uses_raw_storage(), zeroed.data.uses_raw_storage(), all_zero);
+        uninitialized.uses_uninitialized_storage(), zeroed.uses_uninitialized_storage(), all_zero);
   });
   m.def("test_chunk_buffer_dynamic", [](std::uint64_t capacity, std::uint64_t extent) {
     auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(kangaroo::ScalarType::kF64, capacity);
     buffer.commit_dynamic_extent(extent);
     return nb::make_tuple(buffer.desc().extents[0], buffer.bytes(), buffer.capacity_bytes());
+  });
+  m.def("test_chunk_buffer_dynamic_write", [](std::uint64_t capacity,
+                                               const std::vector<double>& values) {
+    auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(kangaroo::ScalarType::kF64, capacity);
+    auto output = buffer.mutable_dynamic_array<double>();
+    for (std::size_t i = 0; i < values.size(); ++i) output.at(i) = values[i];
+    buffer.commit_dynamic_extent(values.size());
+    const auto visible = buffer.array<double>();
+    std::vector<double> restored;
+    restored.reserve(visible.extent(0));
+    for (std::size_t i = 0; i < visible.extent(0); ++i) restored.push_back(visible(i));
+    return restored;
   });
   m.def("test_chunk_buffer_dynamic_roundtrip", [](std::uint64_t capacity, std::uint64_t extent) {
     auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(kangaroo::ScalarType::kF64, capacity);
@@ -1169,7 +1183,7 @@ NB_MODULE(_core, m) {
 
              nb::list out;
              for (const auto& view : views) {
-               out.append(view.has_value() ? static_cast<std::uint64_t>(view->data.size())
+               out.append(view.has_value() ? static_cast<std::uint64_t>(view->bytes())
                                            : static_cast<std::uint64_t>(0));
              }
              return out;
@@ -1205,7 +1219,7 @@ NB_MODULE(_core, m) {
                auto ready = hpx::when_all(std::move(futures)).get();
                for (auto& future : ready) {
                  auto view = future.get();
-                 sizes.push_back(view ? static_cast<std::uint64_t>(view->data.size())
+                 sizes.push_back(view ? static_cast<std::uint64_t>(view->bytes())
                                       : static_cast<std::uint64_t>(0));
                }
              }

@@ -524,13 +524,6 @@ class ChunkBuffer {
  public:
   ChunkBuffer() = default;
 
-  // Transitional compatibility for kernels being migrated to typed views.
-  // Backends and the executor must always attach a concrete descriptor.
-  SharedByteBuffer data;
-
-  void* ptr() { return data.data(); }
-  const void* ptr() const { return data.data(); }
-
   static ChunkBuffer allocate(BufferDesc desc, InitPolicy init = InitPolicy::kUninitialized) {
     const auto bytes64 = desc.required_bytes();
     if (bytes64 > std::numeric_limits<std::size_t>::max()) {
@@ -540,12 +533,12 @@ class ChunkBuffer {
     ChunkBuffer out;
     const auto bytes = static_cast<std::size_t>(bytes64);
     if (init == InitPolicy::kZero) {
-      out.data = SharedByteBuffer(std::vector<std::uint8_t>(bytes, std::uint8_t{0}));
+      out.storage_ = SharedByteBuffer(std::vector<std::uint8_t>(bytes, std::uint8_t{0}));
     } else {
-      out.data = SharedByteBuffer::allocate_uninitialized(bytes);
+      out.storage_ = SharedByteBuffer::allocate_uninitialized(bytes);
     }
     out.desc_ = desc;
-    out.desc_.validate(out.data.size());
+    out.desc_.validate(out.storage_.size());
     return out;
   }
 
@@ -555,6 +548,8 @@ class ChunkBuffer {
     auto desc = BufferDesc::contiguous(scalar, capacity);
     auto out = allocate(desc, init);
     out.dynamic_capacity_elements_ = capacity_elements;
+    out.dynamic_committed_elements_ =
+        std::make_shared<std::optional<std::uint64_t>>(std::nullopt);
     out.desc_.extents[0] = 0;
     return out;
   }
@@ -562,7 +557,7 @@ class ChunkBuffer {
   static ChunkBuffer wrap(SharedByteBuffer storage, BufferDesc desc) {
     desc.validate(storage.size());
     ChunkBuffer out;
-    out.data = std::move(storage);
+    out.storage_ = std::move(storage);
     out.desc_ = desc;
     return out;
   }
@@ -572,30 +567,82 @@ class ChunkBuffer {
     return wrap(SharedByteBuffer(std::move(bytes)), BufferDesc::contiguous(ScalarType::kOpaque, extents));
   }
 
-  const BufferDesc& desc() const noexcept { return desc_; }
+  const BufferDesc& desc() const noexcept {
+    synchronize_dynamic_extent();
+    return desc_;
+  }
   void replace_desc(BufferDesc desc) {
-    desc.validate(data.size());
+    desc.validate(storage_.size());
     desc_ = desc;
   }
   std::size_t bytes() const noexcept {
     if (dynamic_capacity_elements_) {
-      if (desc_.extents[0] == 0) return 0;
-      return static_cast<std::size_t>(desc_.extents[0] * scalar_size(desc_.scalar));
+      if (!dynamic_committed_elements_ || !dynamic_committed_elements_->has_value()) return 0;
+      return static_cast<std::size_t>(dynamic_committed_elements_->value() *
+                                      scalar_size(desc_.scalar));
     }
-    return data.size();
+    return storage_.size();
   }
-  std::size_t capacity_bytes() const noexcept { return data.size(); }
+  std::size_t capacity_bytes() const noexcept { return storage_.size(); }
+  bool empty() const noexcept { return bytes() == 0; }
+  bool uses_uninitialized_storage() const noexcept { return storage_.uses_raw_storage(); }
   bool awaiting_dynamic_extent_commit() const noexcept {
-    return dynamic_capacity_elements_.has_value() && !dynamic_extent_committed_;
+    return dynamic_capacity_elements_.has_value() &&
+           (!dynamic_committed_elements_ || !dynamic_committed_elements_->has_value());
   }
-  std::span<const std::uint8_t> byte_view() const noexcept { return {data.data(), bytes()}; }
+  std::span<const std::uint8_t> byte_view() const noexcept { return {storage_.data(), bytes()}; }
   std::span<std::uint8_t> mutable_byte_view() {
-    data.detach();
-    return {data.mutable_data(), bytes()};
+    storage_.detach();
+    return {storage_.mutable_data(), bytes()};
+  }
+
+  std::span<std::uint8_t> mutable_capacity_byte_view() {
+    if (!awaiting_dynamic_extent_commit()) {
+      throw BufferContractError(BufferContractReason::kInvalidDynamicResize,
+                                "capacity access requires an uncommitted dynamic buffer");
+    }
+    storage_.detach();
+    return {storage_.mutable_data(), storage_.size()};
+  }
+
+  void assign_dynamic_bytes(std::span<const std::uint8_t> source) {
+    if (!awaiting_dynamic_extent_commit()) {
+      throw BufferContractError(BufferContractReason::kInvalidDynamicResize,
+                                "byte assignment requires an uncommitted dynamic buffer");
+    }
+    const auto width = scalar_size(desc_.scalar);
+    if (width == 0 || source.size() % width != 0 || source.size() > storage_.size()) {
+      throw BufferContractError(BufferContractReason::kDescriptorStorageMismatch,
+                                "dynamic byte assignment violates the buffer contract");
+    }
+    auto destination = mutable_capacity_byte_view();
+    std::copy(source.begin(), source.end(), destination.begin());
+    commit_dynamic_extent(source.size() / width);
+  }
+
+  void replace_dynamic_bytes(std::span<const std::uint8_t> source) {
+    if (!dynamic_capacity_elements_) {
+      throw BufferContractError(BufferContractReason::kInvalidDynamicResize,
+                                "byte replacement requires a dynamic buffer");
+    }
+    const auto width = scalar_size(desc_.scalar);
+    if (width == 0 || source.size() % width != 0 || source.size() > storage_.size()) {
+      throw BufferContractError(BufferContractReason::kDescriptorStorageMismatch,
+                                "dynamic byte replacement violates the buffer contract");
+    }
+    storage_.detach();
+    std::copy(source.begin(), source.end(), storage_.mutable_data());
+    desc_.extents[0] = source.size() / width;
+    if (!dynamic_committed_elements_) {
+      dynamic_committed_elements_ =
+          std::make_shared<std::optional<std::uint64_t>>(std::nullopt);
+    }
+    *dynamic_committed_elements_ = desc_.extents[0];
+    dynamic_extent_committed_ = true;
   }
 
   ChunkBuffer slice(std::size_t offset, std::size_t count, BufferDesc desc) const {
-    return wrap(data.slice(offset, count), desc);
+    return wrap(storage_.slice(offset, count), desc);
   }
 
   template <typename T, std::size_t Rank>
@@ -605,25 +652,39 @@ class ChunkBuffer {
     std::array<std::int64_t, Rank> strides{};
     std::copy_n(desc_.extents.begin(), Rank, extents.begin());
     std::copy_n(desc_.strides_bytes.begin(), Rank, strides.begin());
-    return {data.data(), extents, strides};
+    return {storage_.data(), extents, strides};
   }
 
   template <typename T, std::size_t Rank>
   TensorView<T, Rank> mutable_view() {
     validate_typed_view<T, Rank>();
-    data.detach();
+    storage_.detach();
     std::array<std::uint64_t, Rank> extents{};
     std::array<std::int64_t, Rank> strides{};
     std::copy_n(desc_.extents.begin(), Rank, extents.begin());
     std::copy_n(desc_.strides_bytes.begin(), Rank, strides.begin());
-    return {data.mutable_data(), extents, strides};
+    return {storage_.mutable_data(), extents, strides};
   }
 
   template <typename T> ArrayView<const T> array() const { return view<T, 1>(); }
   template <typename T> ArrayView<T> mutable_array() { return mutable_view<T, 1>(); }
 
+  template <typename T> ArrayView<T> mutable_dynamic_array() {
+    if (!awaiting_dynamic_extent_commit() || desc_.rank != 1 ||
+        desc_.scalar != scalar_type_for<std::remove_cv_t<T>>::value) {
+      throw BufferContractError(BufferContractReason::kInvalidDynamicResize,
+                                "dynamic array access does not match the buffer contract");
+    }
+    storage_.detach();
+    const std::array<std::uint64_t, 1> extents{*dynamic_capacity_elements_};
+    const std::array<std::int64_t, 1> strides{
+        static_cast<std::int64_t>(scalar_size(desc_.scalar))};
+    return {storage_.mutable_data(), extents, strides};
+  }
+
   void commit_dynamic_extent(std::uint64_t elements) {
-    if (!dynamic_capacity_elements_ || desc_.rank != 1 || dynamic_extent_committed_) {
+    if (!dynamic_capacity_elements_ || desc_.rank != 1 ||
+        (dynamic_committed_elements_ && dynamic_committed_elements_->has_value())) {
       throw BufferContractError(BufferContractReason::kInvalidDynamicResize,
                                 "buffer is not awaiting a dynamic extent commit");
     }
@@ -632,19 +693,32 @@ class ChunkBuffer {
                                 "dynamic extent exceeds its declared upper bound");
     }
     desc_.extents[0] = elements;
+    if (!dynamic_committed_elements_) {
+      dynamic_committed_elements_ =
+          std::make_shared<std::optional<std::uint64_t>>(std::nullopt);
+    }
+    *dynamic_committed_elements_ = elements;
     dynamic_extent_committed_ = true;
   }
 
   template <typename Archive>
   void save(Archive& ar, unsigned) const {
-    const auto serialized_bytes = dynamic_extent_committed_ ? bytes() : data.size();
-    auto visible_data = data.slice(0, serialized_bytes);
+    synchronize_dynamic_extent();
+    const auto serialized_bytes = dynamic_extent_committed_ ? bytes() : storage_.size();
+    auto visible_data = storage_.slice(0, serialized_bytes);
     ar& visible_data& desc_& dynamic_capacity_elements_& dynamic_extent_committed_;
   }
 
   template <typename Archive>
   void load(Archive& ar, unsigned) {
-    ar& data& desc_& dynamic_capacity_elements_& dynamic_extent_committed_;
+    ar& storage_& desc_& dynamic_capacity_elements_& dynamic_extent_committed_;
+    if (dynamic_capacity_elements_) {
+      dynamic_committed_elements_ = std::make_shared<std::optional<std::uint64_t>>(
+          dynamic_extent_committed_ ? std::optional<std::uint64_t>(desc_.extents[0])
+                                    : std::nullopt);
+    } else {
+      dynamic_committed_elements_.reset();
+    }
     if (dynamic_capacity_elements_) {
       if (desc_.rank != 1) {
         throw BufferContractError(BufferContractReason::kInvalidExtent,
@@ -655,19 +729,27 @@ class ChunkBuffer {
                                   "dynamic extent exceeds capacity after deserialization");
       }
       const auto expected = checked_multiply(desc_.extents[0], scalar_size(desc_.scalar));
-      if (dynamic_extent_committed_ && expected != data.size()) {
+      if (dynamic_extent_committed_ && expected != storage_.size()) {
         throw BufferContractError(BufferContractReason::kDescriptorStorageMismatch,
                                   "dynamic buffer extent/storage mismatch after deserialization");
       }
     } else {
-      desc_.validate(data.size());
+      desc_.validate(storage_.size());
     }
   }
   HPX_SERIALIZATION_SPLIT_MEMBER()
 
  private:
+  void synchronize_dynamic_extent() const noexcept {
+    if (dynamic_committed_elements_ && dynamic_committed_elements_->has_value()) {
+      desc_.extents[0] = dynamic_committed_elements_->value();
+      dynamic_extent_committed_ = true;
+    }
+  }
+
   template <typename T, std::size_t Rank>
   void validate_typed_view() const {
+    synchronize_dynamic_extent();
     if (desc_.scalar == ScalarType::kOpaque) {
       throw BufferContractError(BufferContractReason::kOpaqueNumericAccess,
                                 "opaque payload cannot be viewed as numeric data");
@@ -683,9 +765,11 @@ class ChunkBuffer {
     desc_.validate(bytes());
   }
 
-  BufferDesc desc_;
+  SharedByteBuffer storage_;
+  mutable BufferDesc desc_;
   std::optional<std::uint64_t> dynamic_capacity_elements_;
-  bool dynamic_extent_committed_ = false;
+  std::shared_ptr<std::optional<std::uint64_t>> dynamic_committed_elements_;
+  mutable bool dynamic_extent_committed_ = false;
 };
 
 template <typename T>

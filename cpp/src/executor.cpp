@@ -204,15 +204,15 @@ struct ViewSummary {
 
 ViewSummary summarize_view_f64(const ChunkBuffer& view) {
   ViewSummary summary;
-  summary.bytes = view.data.size();
-  if (view.data.empty() || (view.data.size() % sizeof(double)) != 0) {
+  summary.bytes = view.bytes();
+  if (view.empty() || view.desc().scalar != ScalarType::kF64 || view.desc().rank != 1) {
     return summary;
   }
   summary.interpreted_as_f64 = true;
-  const std::size_t n = view.data.size() / sizeof(double);
-  const auto* ptr = reinterpret_cast<const double*>(view.data.data());
+  const auto values = view.array<double>();
+  const std::size_t n = values.extent(0);
   for (std::size_t i = 0; i < n; ++i) {
-    const double value = ptr[i];
+    const double value = values(i);
     summary.sum += value;
     if (std::isfinite(value)) {
       summary.min = std::min(summary.min, value);
@@ -592,18 +592,17 @@ ResolvedBufferSpec resolve_output_spec(const BufferSpecIR& spec,
   return make_dynamic_output_spec(spec, capacity);
 }
 
-void finalize_output_buffer(ChunkBuffer& buffer, const BufferSpecIR& spec) {
+void finalize_output_buffer(ChunkBuffer& buffer, const BufferSpecIR& spec,
+                            std::string_view kernel) {
   if (spec.shape_kind == ShapeRuleKind::kDynamic) {
-    if (!buffer.awaiting_dynamic_extent_commit()) return;
-    const auto width = scalar_size(spec.scalar);
-    if (width == 0 || buffer.data.size() % width != 0) {
-      throw BufferContractError(BufferContractReason::kDescriptorStorageMismatch,
-                                "dynamic kernel output byte count is not scalar aligned");
+    if (buffer.awaiting_dynamic_extent_commit()) {
+      throw BufferContractError(BufferContractReason::kInvalidDynamicResize,
+                                "dynamic kernel output was not committed: " +
+                                    std::string(kernel));
     }
-    buffer.commit_dynamic_extent(buffer.data.size() / width);
     return;
   }
-  buffer.desc().validate(buffer.data.size());
+  buffer.desc().validate(buffer.bytes());
 }
 
 struct BufferEstimate {
@@ -1236,7 +1235,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
               std::vector<hpx::future<void>> puts;
               puts.reserve(tmpl.outputs.size());
               for (std::size_t i = 0; i < tmpl.outputs.size(); ++i) {
-                finalize_output_buffer((*outputs_ptr)[i], tmpl.outputs[i].buffer);
+                finalize_output_buffer((*outputs_ptr)[i], tmpl.outputs[i].buffer, tmpl.kernel);
                 log_projection_output_summary(tmpl, block, i, (*outputs_ptr)[i]);
                 const auto& out = tmpl.outputs[i];
                 ChunkRef cref{tmpl.domain.step, tmpl.domain.level,
@@ -1436,7 +1435,7 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
             if (i > 0) {
               oss << ",";
             }
-            oss << inputs[i].data.size();
+            oss << inputs[i].bytes();
           }
           std::cout << oss.str() << std::endl;
         }
@@ -1502,7 +1501,7 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
               std::vector<hpx::future<void>> puts;
               puts.reserve(tmpl.outputs.size());
               for (std::size_t i = 0; i < tmpl.outputs.size(); ++i) {
-                finalize_output_buffer((*outputs_ptr)[i], tmpl.outputs[i].buffer);
+                finalize_output_buffer((*outputs_ptr)[i], tmpl.outputs[i].buffer, tmpl.kernel);
                 log_projection_output_summary(tmpl, out_block, i, (*outputs_ptr)[i]);
                 const auto& out = tmpl.outputs[i];
                 ChunkRef cref{tmpl.domain.step, tmpl.domain.level,

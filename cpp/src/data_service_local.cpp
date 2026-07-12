@@ -243,7 +243,7 @@ SubboxView build_subbox_view(const ChunkBuffer& chunk, const ChunkSubboxRef& ref
   SubboxView out;
   out.box = ref.request_box;
 
-  if (chunk.data.empty() || chunk.desc().rank != 3 ||
+  if (chunk.empty() || chunk.desc().rank != 3 ||
       chunk.desc().scalar == ScalarType::kOpaque) {
     return out;
   }
@@ -280,7 +280,7 @@ SubboxView build_subbox_view(const ChunkBuffer& chunk, const ChunkSubboxRef& ref
   const std::size_t elems_total =
       static_cast<std::size_t>(nx) * static_cast<std::size_t>(ny) * static_cast<std::size_t>(nz);
   const std::size_t needed = elems_total * bytes_per;
-  if (chunk.data.size() < needed) {
+  if (chunk.bytes() < needed) {
     return SubboxView{};
   }
 
@@ -300,7 +300,7 @@ SubboxView build_subbox_view(const ChunkBuffer& chunk, const ChunkSubboxRef& ref
            static_cast<std::size_t>(k);
   };
 
-  auto* dst = out.data.data.data();
+  auto* dst = out.data.mutable_byte_view().data();
   const auto& source_desc = chunk.desc();
   const auto* source = chunk.byte_view().data();
   for (int32_t i = 0; i < onx; ++i) {
@@ -626,7 +626,7 @@ class DatasetLoadQueue {
       std::size_t total_bytes = 0;
       for (const auto& view : views) {
         if (view.has_value()) {
-          total_bytes += view->data.size();
+          total_bytes += view->bytes();
         }
       }
       log_dataset_load_unit_event("dataset_load_unit_read",
@@ -659,7 +659,7 @@ class DatasetLoadQueue {
                                 std::runtime_error("dataset chunk disappeared during load")));
           continue;
         }
-        const std::size_t bytes = views[i]->data.size();
+        const std::size_t bytes = views[i]->bytes();
         fulfill_dataset_load(request.chunk_store, request.ref, std::move(*views[i]));
         log_dataset_load_event("dataset_load_read",
                                "end",
@@ -1396,7 +1396,7 @@ void data_release_consumed_inputs_local_impl(
           !data_it->second.value) {
         continue;
       }
-      const std::size_t bytes = data_it->second.value->data.size();
+      const std::size_t bytes = data_it->second.value->bytes();
       chunk_store->data.erase(data_it);
       evicted.push_back(EvictedChunk{entry.ref, bytes});
     }
@@ -1475,7 +1475,7 @@ hpx::future<void> DataServiceLocal::release_consumed_inputs(const std::vector<Ch
 
 void DataServiceLocal::put_local_impl(const ChunkRef& ref, ChunkBuffer view) {
   const int here = hpx::get_locality_id();
-  const std::size_t bytes = view.data.size();
+  const std::size_t bytes = view.bytes();
   log_dataflow_marker("put_local_enter", ref, here, here, bytes);
 
   auto chunk_store = resolve_chunk_store();
@@ -1522,15 +1522,15 @@ hpx::future<ChunkBuffer> DataServiceLocal::get_host(const ChunkRef& ref) {
     auto local = get_local_impl(ref);
     if (local.is_ready()) {
       ChunkBuffer view = local.get();
-      log_dataflow_fetch("get_host_local", ref, here, target, view.data.size());
-      log_dataflow_event("get_host", "end", ref, here, target, view.data.size(), start);
+      log_dataflow_fetch("get_host_local", ref, here, target, view.bytes());
+      log_dataflow_event("get_host", "end", ref, here, target, view.bytes(), start);
       return hpx::make_ready_future(std::move(view));
     }
     return local.then([ref, here, target, start](auto&& result) mutable {
       try {
         ChunkBuffer view = result.get();
-        log_dataflow_fetch("get_host_local", ref, here, target, view.data.size());
-        log_dataflow_event("get_host", "end", ref, here, target, view.data.size(), start);
+        log_dataflow_fetch("get_host_local", ref, here, target, view.bytes());
+        log_dataflow_event("get_host", "end", ref, here, target, view.bytes(), start);
         return view;
       } catch (...) {
         log_dataflow_event("get_host", "error", ref, here, target, 0, start);
@@ -1543,8 +1543,8 @@ hpx::future<ChunkBuffer> DataServiceLocal::get_host(const ChunkRef& ref) {
       .then([ref, here, target, start](auto&& result) mutable {
         try {
           ChunkBuffer view = result.get();
-          log_dataflow_fetch("get_host_remote", ref, here, target, view.data.size());
-          log_dataflow_event("get_host", "end", ref, here, target, view.data.size(), start);
+          log_dataflow_fetch("get_host_remote", ref, here, target, view.bytes());
+          log_dataflow_event("get_host", "end", ref, here, target, view.bytes(), start);
           return view;
         } catch (...) {
           log_dataflow_event("get_host", "error", ref, here, target, 0, start);
@@ -1623,15 +1623,15 @@ std::vector<hpx::future<ChunkBuffer>> DataServiceLocal::get_hosts(
       if (ready.is_ready()) {
         ++ready_count;
         ChunkBuffer view = *ready.get();
-        log_dataflow_fetch("get_host_local", ref, here, target, view.data.size());
-        log_dataflow_event("get_host", "end", ref, here, target, view.data.size(), start);
+        log_dataflow_fetch("get_host_local", ref, here, target, view.bytes());
+        log_dataflow_event("get_host", "end", ref, here, target, view.bytes(), start);
         out[local_indices[j]] = hpx::make_ready_future(std::move(view));
       } else {
         out[local_indices[j]] = ready.then([ref, here, target, start](auto&& result) mutable {
           try {
             ChunkBuffer view = *result.get();
-            log_dataflow_fetch("get_host_local", ref, here, target, view.data.size());
-            log_dataflow_event("get_host", "end", ref, here, target, view.data.size(), start);
+            log_dataflow_fetch("get_host_local", ref, here, target, view.bytes());
+            log_dataflow_event("get_host", "end", ref, here, target, view.bytes(), start);
             return view;
           } catch (...) {
             log_dataflow_event("get_host", "error", ref, here, target, 0, start);
@@ -1658,7 +1658,7 @@ hpx::future<void> DataServiceLocal::put_host(const ChunkRef& ref, ChunkBuffer vi
   int target = home_rank(ref);
   int here = hpx::get_locality_id();
   const double start = now_seconds();
-  const std::size_t bytes = view.data.size();
+  const std::size_t bytes = view.bytes();
   log_dataflow_marker("put_host_enter", ref, here, target, bytes);
   log_dataflow_fetch("put_host", ref, here, target, bytes);
   if (target == here) {

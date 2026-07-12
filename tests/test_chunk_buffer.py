@@ -67,6 +67,12 @@ def test_dynamic_extent_commit() -> None:
         _core.test_chunk_buffer_dynamic(2, 3)
 
 
+def test_dynamic_typed_writer_commits_only_visible_values() -> None:
+    assert _core.test_chunk_buffer_dynamic_write(5, [1.5, 2.5]) == [1.5, 2.5]
+    with pytest.raises(IndexError, match="TensorView index out of range"):
+        _core.test_chunk_buffer_dynamic_write(1, [1.0, 2.0])
+
+
 @pytest.mark.parametrize("extent", [0, 3])
 def test_committed_dynamic_buffer_roundtrips_by_visible_size(extent: int) -> None:
     visible_bytes = extent * 8

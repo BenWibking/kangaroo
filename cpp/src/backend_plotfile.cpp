@@ -59,7 +59,8 @@ ChunkBuffer transposed_component_view(const plotfile::FabData& fab, int32_t comp
       static_cast<std::uint64_t>(fab.nz)};
   auto view = ChunkBuffer::allocate(
       BufferDesc::runtime_grid(scalar_type_for<T>::value, extents));
-  auto* out = reinterpret_cast<T*>(view.data.data());
+  auto bytes = view.mutable_byte_view();
+  auto* out = reinterpret_cast<T*>(bytes.data());
   transpose_plotfile_axes(in, out, fab.nx, fab.ny, fab.nz);
   return view;
 }
