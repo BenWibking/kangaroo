@@ -122,7 +122,7 @@ Integer and mask arrays do not join this combinatorial visitor. They use exact t
 
 Typed scalar access over byte-owned storage uses fixed-size `memcpy` loads and stores hidden by an inline scalar reference/proxy.
 
-On the same Clang 19 ARM64 toolchain, an AXPY loop using these helpers compiled to the same scalar and vectorized load/FMA/store loops as direct `double*` access. This avoids exposing alignment and object-lifetime assumptions while preserving zero-cost generated code.
+On the same Clang 19 ARM64 toolchain, an AXPY loop using these helpers compiled to native scalar load/FMA/store instructions without out-of-line `memcpy`. Unlike direct `double*` access, a general runtime-strided `TensorView` is not required to vectorize because its unit-stride and aliasing properties are unavailable at compile time. This avoids exposing alignment and object-lifetime assumptions while keeping scalar access free of helper calls; direct-pointer-equivalent vectorization is reserved for a future precompiled contiguous-layout specialization.
 
 Generated assembly must remain a performance gate during implementation.
 
@@ -857,7 +857,7 @@ Keep `HostView` as a temporary alias or wrapper if required to avoid migrating a
 Exit criteria:
 
 - all descriptor, view, COW, serialization, and visitation tests pass;
-- scalar-proxy assembly remains equivalent to direct access for the representative loop;
+- scalar-proxy assembly uses native scalar loads/stores and contains no out-of-line `memcpy` in the representative loop;
 - existing tests still pass through the temporary compatibility layer.
 
 ### Milestone 2: backend and data-service metadata propagation
@@ -1078,7 +1078,7 @@ Do not enforce host-specific wall-clock thresholds in ordinary CI.
 
 ### 13.2 Generated-code check
 
-For contiguous f64 loops, confirm optimized output contains native loads/stores and vectorization equivalent to direct typed pointers. No out-of-line `memcpy` call may remain in the inner loop.
+For runtime-strided f64 loops, confirm optimized output contains native scalar loads/stores and no out-of-line `memcpy` call in the inner loop. Vectorization equivalent to direct typed pointers is not required unless the loop uses a future precompiled contiguous-layout specialization.
 
 Repeat for:
 
