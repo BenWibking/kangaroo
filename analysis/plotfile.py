@@ -8,7 +8,7 @@ from pathlib import Path
 
 import numpy as np
 
-from .buffer import numpy_dtype
+from .buffer import materialize_payload
 
 try:
     from . import _plotfile as _plotfile  # type: ignore
@@ -74,9 +74,7 @@ class PlotfileReader:
         payload = self._reader.read_particle_field_chunk(particle_type, field_name, int(chunk_index))
         if not return_ndarray:
             return payload
-        dtype = payload["dtype"]
-        np_dtype = numpy_dtype(dtype)
-        payload["data"] = np.frombuffer(payload["data"], dtype=np_dtype)
+        payload["data"] = materialize_payload(payload)
         return payload
 
     def read_fab(
@@ -92,10 +90,5 @@ class PlotfileReader:
         if not return_ndarray:
             return payload
 
-        data = payload["data"]
-        dtype = payload["dtype"]
-        shape = payload["shape"]
-        np_dtype = numpy_dtype(dtype)
-        arr = np.frombuffer(data, dtype=np_dtype).reshape(shape)
-        payload["data"] = arr
+        payload["data"] = materialize_payload(payload)
         return payload

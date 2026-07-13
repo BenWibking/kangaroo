@@ -169,3 +169,98 @@ def dtype_from_numpy(dtype: np.dtype[Any] | str | type[Any]) -> DType:
         if normalized == candidate:
             return tag
     raise TypeError(f"unsupported NumPy dtype: {normalized}")
+
+
+def materialize_numpy(
+    data: bytes | bytearray | memoryview,
+    *,
+    dtype: DType | str,
+    shape: tuple[int, ...] | list[int] | None = None,
+    strides_bytes: tuple[int, ...] | list[int] | None = None,
+    copy: bool = False,
+) -> np.ndarray:
+    """Materialize numeric buffer storage using its descriptor semantics."""
+    resolved_dtype = numpy_dtype(dtype)
+    buffer = memoryview(data)
+    resolved_shape = None if shape is None else tuple(int(value) for value in shape)
+    resolved_strides = (
+        None if strides_bytes is None else tuple(int(value) for value in strides_bytes)
+    )
+
+    if resolved_shape is None:
+        if resolved_strides is not None:
+            raise ValueError("buffer strides require an explicit shape")
+        if buffer.nbytes % resolved_dtype.itemsize != 0:
+            raise ValueError("buffer byte count is not aligned to its dtype")
+        array = np.frombuffer(buffer, dtype=resolved_dtype)
+    else:
+        if not 1 <= len(resolved_shape) <= 4:
+            raise ValueError("buffer rank must be between 1 and 4")
+        if any(extent < 0 for extent in resolved_shape):
+            raise ValueError("buffer extents must be non-negative")
+        if resolved_strides is not None:
+            if len(resolved_strides) != len(resolved_shape):
+                raise ValueError("buffer shape and strides must have equal rank")
+            if any(stride <= 0 for stride in resolved_strides):
+                raise ValueError("buffer strides must be positive")
+            required_bytes = 0
+            if all(resolved_shape):
+                required_bytes = resolved_dtype.itemsize + sum(
+                    (extent - 1) * stride
+                    for extent, stride in zip(resolved_shape, resolved_strides, strict=True)
+                )
+            if required_bytes != buffer.nbytes:
+                raise ValueError(
+                    f"buffer descriptor requires {required_bytes} bytes but storage exposes "
+                    f"{buffer.nbytes}"
+                )
+            array = np.ndarray(
+                shape=resolved_shape,
+                dtype=resolved_dtype,
+                buffer=buffer,
+                strides=resolved_strides,
+            )
+        else:
+            elements = int(np.prod(resolved_shape, dtype=np.int64))
+            required_bytes = elements * resolved_dtype.itemsize
+            if required_bytes != buffer.nbytes:
+                raise ValueError(
+                    f"buffer descriptor requires {required_bytes} bytes but storage exposes "
+                    f"{buffer.nbytes}"
+                )
+            array = np.frombuffer(buffer, dtype=resolved_dtype).reshape(resolved_shape)
+    return array.copy() if copy else array
+
+
+def materialize_payload(
+    payload: Mapping[str, Any],
+    *,
+    expected_shape: tuple[int, ...] | None = None,
+    expected_dtype: Any | None = None,
+    copy: bool = False,
+) -> np.ndarray:
+    """Materialize a native numeric payload dictionary through one interface."""
+    try:
+        data = payload["data"]
+        dtype = payload["dtype"]
+    except KeyError as exc:
+        raise ValueError(f"numeric payload is missing {exc.args[0]!r}") from exc
+    shape = payload.get("shape")
+    if shape is None and "count" in payload:
+        shape = (int(payload["count"]),)
+    array = materialize_numpy(
+        data,
+        dtype=dtype,
+        shape=shape,
+        strides_bytes=payload.get("strides_bytes"),
+        copy=copy,
+    )
+    if expected_dtype is not None and np.dtype(expected_dtype) != array.dtype:
+        raise ValueError(
+            f"requested dtype {np.dtype(expected_dtype)} does not match chunk dtype {array.dtype}"
+        )
+    if expected_shape is not None and tuple(expected_shape) != array.shape:
+        raise ValueError(
+            f"requested shape {tuple(expected_shape)} does not match chunk shape {array.shape}"
+        )
+    return array

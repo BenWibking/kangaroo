@@ -101,7 +101,8 @@ std::optional<ChunkBuffer> OpenPMDBackend::get_chunk(const ChunkRef& ref) {
     const std::array<std::uint64_t, 3> extents{nx, ny, nz};
     if (component.getDatatype() == openPMD::Datatype::DOUBLE) {
       auto view = ChunkBuffer::allocate(BufferDesc::runtime_grid(ScalarType::kF64, extents));
-      auto* data = reinterpret_cast<double*>(view.data.data());
+      auto bytes = view.mutable_byte_view();
+      auto* data = reinterpret_cast<double*>(bytes.data());
       component.loadChunkRaw(data, patch.storage_offset, patch.storage_extent);
       series_->flush();
       scale_values<double>(data, static_cast<size_t>(elem_count), component.unitSI());
@@ -110,7 +111,8 @@ std::optional<ChunkBuffer> OpenPMDBackend::get_chunk(const ChunkRef& ref) {
     }
     if (component.getDatatype() == openPMD::Datatype::FLOAT) {
       auto view = ChunkBuffer::allocate(BufferDesc::runtime_grid(ScalarType::kF32, extents));
-      auto* data = reinterpret_cast<float*>(view.data.data());
+      auto bytes = view.mutable_byte_view();
+      auto* data = reinterpret_cast<float*>(bytes.data());
       component.loadChunkRaw(data, patch.storage_offset, patch.storage_extent);
       series_->flush();
       scale_values<float>(data, static_cast<size_t>(elem_count), component.unitSI());

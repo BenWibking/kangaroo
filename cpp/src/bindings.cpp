@@ -1,4 +1,5 @@
 #include "kangaroo/runtime.hpp"
+#include "kangaroo/amr_patch_codec.hpp"
 #include "kangaroo/chunk_buffer.hpp"
 #include "kangaroo/data_service_local.hpp"
 
@@ -16,11 +17,90 @@
 #include <hpx/version.hpp>
 #include <msgpack.hpp>
 
+#ifdef KANGAROO_USE_PARTHENON_HDF5
+#include <hdf5.h>
+#endif
+
 namespace nb = nanobind;
 
 namespace {
 
 std::atomic<std::uint64_t> g_py_event_counter{0};
+
+#ifdef KANGAROO_USE_PARTHENON_HDF5
+void write_string_attribute(hid_t object, const char* name,
+                            const std::vector<std::string>& values) {
+  constexpr std::size_t width = 16;
+  const hsize_t extent = values.size();
+  hid_t space = H5Screate_simple(1, &extent, nullptr);
+  hid_t type = H5Tcopy(H5T_C_S1);
+  H5Tset_size(type, width);
+  H5Tset_strpad(type, H5T_STR_NULLTERM);
+  hid_t attribute = H5Acreate2(object, name, type, space, H5P_DEFAULT, H5P_DEFAULT);
+  std::vector<char> data(values.size() * width, '\0');
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    std::copy_n(values[i].data(), std::min(values[i].size(), width - 1),
+                data.data() + i * width);
+  }
+  H5Awrite(attribute, type, data.data());
+  H5Aclose(attribute);
+  H5Tclose(type);
+  H5Sclose(space);
+}
+
+void write_i64_attribute(hid_t object, const char* name,
+                         const std::vector<std::int64_t>& values) {
+  const hsize_t extent = values.size();
+  hid_t space = H5Screate_simple(1, &extent, nullptr);
+  hid_t attribute = H5Acreate2(object, name, H5T_NATIVE_LLONG, space,
+                               H5P_DEFAULT, H5P_DEFAULT);
+  H5Awrite(attribute, H5T_NATIVE_LLONG, values.data());
+  H5Aclose(attribute);
+  H5Sclose(space);
+}
+
+void write_test_parthenon_file(const std::string& path) {
+  hid_t file = H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+  if (file < 0) throw std::runtime_error("failed to create test Parthenon file");
+  hid_t info = H5Gcreate2(file, "/Info", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  write_string_attribute(info, "OutputDatasetNames", {"prim"});
+  write_i64_attribute(info, "NumComponents", {4});
+  write_string_attribute(info, "ComponentNames", {"rho", "v1", "v2", "v3"});
+  write_i64_attribute(info, "MeshBlockSize", {2, 1, 1});
+  write_i64_attribute(info, "RootGridSize", {2, 1, 1});
+  H5Gclose(info);
+
+  const hsize_t level_extent = 1;
+  hid_t level_space = H5Screate_simple(1, &level_extent, nullptr);
+  hid_t levels = H5Dcreate2(file, "/Levels", H5T_NATIVE_LLONG, level_space,
+                            H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  const std::int64_t level = 0;
+  H5Dwrite(levels, H5T_NATIVE_LLONG, H5S_ALL, H5S_ALL, H5P_DEFAULT, &level);
+  H5Dclose(levels);
+  H5Sclose(level_space);
+
+  const hsize_t location_extents[2] = {1, 3};
+  hid_t location_space = H5Screate_simple(2, location_extents, nullptr);
+  hid_t locations = H5Dcreate2(file, "/LogicalLocations", H5T_NATIVE_LLONG,
+                               location_space, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  const std::array<std::int64_t, 3> location{0, 0, 0};
+  H5Dwrite(locations, H5T_NATIVE_LLONG, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+           location.data());
+  H5Dclose(locations);
+  H5Sclose(location_space);
+
+  const hsize_t field_extents[5] = {1, 4, 1, 1, 2};
+  hid_t field_space = H5Screate_simple(5, field_extents, nullptr);
+  hid_t field = H5Dcreate2(file, "/prim", H5T_IEEE_F64LE, field_space,
+                           H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  const std::array<double, 8> values{0.0, 1.0, 10.0, 11.0,
+                                     20.0, 21.0, 30.0, 31.0};
+  H5Dwrite(field, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, values.data());
+  H5Dclose(field);
+  H5Sclose(field_space);
+  H5Fclose(file);
+}
+#endif
 
 nb::object require_key(const nb::dict& d, const char* key) {
   if (!d.contains(key)) {
@@ -173,7 +253,8 @@ kangaroo::ChunkBuffer host_view_from_bytes(
 }
 
 nb::bytes host_view_bytes(const kangaroo::ChunkBuffer& view) {
-  return nb::bytes(reinterpret_cast<const char*>(view.data.data()), view.data.size());
+  const auto bytes = view.byte_view();
+  return nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
 }
 
 nb::dict chunk_buffer_dict(const kangaroo::ChunkBuffer& buffer) {
@@ -194,8 +275,8 @@ nb::dict subbox_view_dict(const kangaroo::SubboxView& view) {
     return nb::make_tuple(v[0], v[1], v[2]);
   };
   nb::dict d;
-  d["data"] = nb::bytes(reinterpret_cast<const char*>(view.data.data.data()),
-                        view.data.data.size());
+  const auto bytes = view.data.byte_view();
+  d["data"] = nb::bytes(reinterpret_cast<const char*>(bytes.data()), bytes.size());
   d["dtype"] = kangaroo::scalar_type_name(view.data.desc().scalar);
   d["lo"] = to_tuple(view.box.lo);
   d["hi"] = to_tuple(view.box.hi);
@@ -307,14 +388,78 @@ NB_MODULE(_core, m) {
         }
       }
     }
+    auto plotfile_as_runtime = plotfile.copy_to(
+        kangaroo::BufferDesc::runtime_grid(kangaroo::ScalarType::kF64, extents));
     const auto runtime_const = std::as_const(runtime).view<double, 3>();
-    const auto plotfile_const = std::as_const(plotfile).view<double, 3>();
+    const auto plotfile_const = std::as_const(plotfile_as_runtime).view<double, 3>();
     nb::list values;
     for (std::uint64_t i = 0; i < extents[0]; ++i)
       for (std::uint64_t j = 0; j < extents[1]; ++j)
         for (std::uint64_t k = 0; k < extents[2]; ++k)
           values.append(nb::make_tuple(runtime_const(i, j, k), plotfile_const(i, j, k)));
     return values;
+  });
+  m.def("test_chunk_buffer_grid_region", []() {
+    const std::array<std::uint64_t, 3> extents{4, 3, 2};
+    auto source = kangaroo::ChunkBuffer::allocate(
+        kangaroo::BufferDesc::plotfile_grid(kangaroo::ScalarType::kI64, extents));
+    auto grid = source.mutable_view<std::int64_t, 3>();
+    for (std::uint64_t i = 0; i < extents[0]; ++i)
+      for (std::uint64_t j = 0; j < extents[1]; ++j)
+        for (std::uint64_t k = 0; k < extents[2]; ++k)
+          grid(i, j, k) = static_cast<std::int64_t>(100 * i + 10 * j + k);
+    auto region = source.copy_grid_region({1, 1, 0}, {2, 2, 2});
+    auto values = region.view<std::int64_t, 3>();
+    nb::list out;
+    for (std::uint64_t i = 0; i < 2; ++i)
+      for (std::uint64_t j = 0; j < 2; ++j)
+        for (std::uint64_t k = 0; k < 2; ++k) out.append(values(i, j, k));
+    return out;
+  });
+  m.def("test_chunk_buffer_layout_copy_converts_dtype", []() {
+    const std::array<std::uint64_t, 3> extents{2, 1, 2};
+    auto source = kangaroo::ChunkBuffer::allocate(
+        kangaroo::BufferDesc::plotfile_grid(kangaroo::ScalarType::kF32, extents));
+    auto input = source.mutable_view<float, 3>();
+    input(0, 0, 0) = 1.25F;
+    input(0, 0, 1) = 2.5F;
+    input(1, 0, 0) = 3.75F;
+    input(1, 0, 1) = 5.0F;
+    auto converted = source.copy_to(
+        kangaroo::BufferDesc::runtime_grid(kangaroo::ScalarType::kF64, extents));
+    auto output = converted.view<double, 3>();
+    return nb::make_tuple(output(0, 0, 0), output(0, 0, 1),
+                          output(1, 0, 0), output(1, 0, 1));
+  });
+  m.def("test_amr_patch_codec_roundtrip", []() {
+    kangaroo::AmrPatchRecord patch;
+    patch.level = 2;
+    patch.box.lo[0] = 4;
+    patch.box.lo[1] = 5;
+    patch.box.lo[2] = 6;
+    patch.box.hi[0] = 5;
+    patch.box.hi[1] = 6;
+    patch.box.hi[2] = 7;
+    patch.geom.dx[0] = 0.5;
+    patch.geom.dx[1] = 0.25;
+    patch.geom.dx[2] = 0.125;
+    patch.geom.is_periodic[1] = true;
+    const std::array<std::uint64_t, 3> extents{2, 2, 2};
+    patch.data = kangaroo::ChunkBuffer::allocate(
+        kangaroo::BufferDesc::plotfile_grid(kangaroo::ScalarType::kF32, extents));
+    patch.data.mutable_view<float, 3>()(1, 1, 1) = 7.5F;
+    const std::array<kangaroo::AmrPatchRecord, 1> records{patch};
+    auto encoded = kangaroo::encode_amr_patch_payload(records);
+    auto decoded = kangaroo::decode_amr_patch_payload(encoded.byte_view());
+    const auto value = decoded.at(0).data.view<float, 3>()(1, 1, 1);
+    return nb::make_tuple(decoded.size(), decoded.at(0).level,
+                          decoded.at(0).box.lo[0], decoded.at(0).geom.dx[2],
+                          decoded.at(0).geom.is_periodic[1], value,
+                          kangaroo::scalar_type_name(decoded.at(0).data.desc().scalar));
+  });
+  m.def("test_amr_patch_codec_rejects_malformed", []() {
+    const std::array<std::uint8_t, 1> malformed{0x90};
+    return kangaroo::decode_amr_patch_payload(malformed).size();
   });
   m.def("test_chunk_buffer_cow", []() {
     const std::array<std::uint64_t, 1> extents{3};
@@ -331,17 +476,112 @@ NB_MODULE(_core, m) {
     auto uninitialized = kangaroo::ChunkBuffer::allocate(
         desc, kangaroo::InitPolicy::kUninitialized);
     auto zeroed = kangaroo::ChunkBuffer::allocate(desc, kangaroo::InitPolicy::kZero);
+    const auto zeroed_bytes = zeroed.byte_view();
     const bool all_zero = std::all_of(
-        zeroed.data.cbegin(), zeroed.data.cend(),
+        zeroed_bytes.begin(), zeroed_bytes.end(),
         [](std::uint8_t value) { return value == std::uint8_t{0}; });
     return nb::make_tuple(
-        uninitialized.data.uses_raw_storage(), zeroed.data.uses_raw_storage(), all_zero);
+        uninitialized.uses_uninitialized_storage(), zeroed.uses_uninitialized_storage(), all_zero);
   });
   m.def("test_chunk_buffer_dynamic", [](std::uint64_t capacity, std::uint64_t extent) {
     auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(kangaroo::ScalarType::kF64, capacity);
     buffer.commit_dynamic_extent(extent);
     return nb::make_tuple(buffer.desc().extents[0], buffer.bytes(), buffer.capacity_bytes());
   });
+  m.def("test_chunk_buffer_dynamic_write", [](std::uint64_t capacity,
+                                               const std::vector<double>& values) {
+    auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(kangaroo::ScalarType::kF64, capacity);
+    auto output = buffer.mutable_dynamic_array<double>();
+    for (std::size_t i = 0; i < values.size(); ++i) output.at(i) = values[i];
+    buffer.commit_dynamic_extent(values.size());
+    const auto visible = buffer.array<double>();
+    std::vector<double> restored;
+    restored.reserve(visible.extent(0));
+    for (std::size_t i = 0; i < visible.extent(0); ++i) restored.push_back(visible(i));
+    return restored;
+  });
+  m.def("test_chunk_buffer_dynamic_cow", [](bool copy_assignment) {
+    auto original = kangaroo::ChunkBuffer::allocate_dynamic(
+        kangaroo::ScalarType::kI64, 3, kangaroo::InitPolicy::kZero);
+    kangaroo::ChunkBuffer copy;
+    if (copy_assignment) {
+      copy = original;
+    } else {
+      auto constructed = original;
+      copy = std::move(constructed);
+    }
+
+    auto copy_output = copy.mutable_dynamic_array<std::int64_t>();
+    copy_output(0) = 11;
+    copy_output(1) = 22;
+    copy.commit_dynamic_extent(2);
+
+    const bool original_still_uncommitted = original.awaiting_dynamic_extent_commit();
+    const auto original_bytes_before_commit = original.bytes();
+    auto original_output = original.mutable_dynamic_array<std::int64_t>();
+    original_output(0) = 7;
+    original.commit_dynamic_extent(1);
+
+    return nb::make_tuple(
+        original_still_uncommitted, original_bytes_before_commit,
+        original.desc().extents[0], original.array<std::int64_t>()(0),
+        copy.desc().extents[0], copy.array<std::int64_t>()(0),
+        copy.array<std::int64_t>()(1));
+  });
+  m.def("test_chunk_buffer_async_byte_writer", []() {
+    auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(
+        kangaroo::ScalarType::kOpaque, 8);
+    auto writer = buffer.begin_async_dynamic_write();
+    const std::array<std::uint8_t, 3> payload{1, 2, 3};
+    writer.replace(payload);
+    return std::vector<std::uint8_t>(buffer.byte_view().begin(), buffer.byte_view().end());
+  });
+  m.def("test_chunk_buffer_async_byte_writer_survives_move", []() {
+    auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(
+        kangaroo::ScalarType::kOpaque, 8);
+    auto writer = buffer.begin_async_dynamic_write();
+    auto moved = std::move(buffer);
+    const std::array<std::uint8_t, 3> payload{1, 2, 3};
+    writer.replace(payload);
+    return std::vector<std::uint8_t>(moved.byte_view().begin(), moved.byte_view().end());
+  });
+  m.def("test_chunk_buffer_async_byte_writer_preserves_cow", []() {
+    auto written = kangaroo::ChunkBuffer::allocate_dynamic(
+        kangaroo::ScalarType::kOpaque, 8, kangaroo::InitPolicy::kZero);
+    auto untouched = written;
+    auto writer = written.begin_async_dynamic_write();
+    const std::array<std::uint8_t, 3> payload{1, 2, 3};
+    writer.replace(payload);
+    untouched.commit_dynamic_extent(payload.size());
+    return nb::make_tuple(
+        std::vector<std::uint8_t>(written.byte_view().begin(), written.byte_view().end()),
+        std::vector<std::uint8_t>(untouched.byte_view().begin(), untouched.byte_view().end()));
+  });
+  m.def("test_chunk_buffer_async_byte_writer_reuse", []() {
+    auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(
+        kangaroo::ScalarType::kOpaque, 8);
+    auto writer = buffer.begin_async_dynamic_write();
+    const std::array<std::uint8_t, 1> payload{1};
+    writer.replace(payload);
+    writer.replace(payload);
+  });
+#ifdef KANGAROO_USE_PARTHENON_HDF5
+  m.def("test_parthenon_component_storage", [](const std::string& path) {
+    write_test_parthenon_file(path);
+    kangaroo::ParthenonBackend backend(path);
+    constexpr std::int32_t field_id = 7;
+    backend.register_field(field_id, "v2");
+    const kangaroo::ChunkRef ref{0, 0, field_id, 0, 0};
+    auto buffer = backend.get_chunk(ref);
+    if (!buffer.has_value()) {
+      throw std::runtime_error("failed to read test Parthenon component");
+    }
+    const auto values = buffer->view<double, 3>();
+    return nb::make_tuple(
+        std::vector<double>{values(0, 0, 0), values(1, 0, 0)}, buffer->bytes(),
+        buffer->resident_bytes(), backend.estimate_chunk_bytes(ref));
+  });
+#endif
   m.def("test_chunk_buffer_dynamic_roundtrip", [](std::uint64_t capacity, std::uint64_t extent) {
     auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(kangaroo::ScalarType::kF64, capacity);
     buffer.commit_dynamic_extent(extent);
@@ -1169,7 +1409,7 @@ NB_MODULE(_core, m) {
 
              nb::list out;
              for (const auto& view : views) {
-               out.append(view.has_value() ? static_cast<std::uint64_t>(view->data.size())
+               out.append(view.has_value() ? static_cast<std::uint64_t>(view->bytes())
                                            : static_cast<std::uint64_t>(0));
              }
              return out;
@@ -1205,7 +1445,7 @@ NB_MODULE(_core, m) {
                auto ready = hpx::when_all(std::move(futures)).get();
                for (auto& future : ready) {
                  auto view = future.get();
-                 sizes.push_back(view ? static_cast<std::uint64_t>(view->data.size())
+                 sizes.push_back(view ? static_cast<std::uint64_t>(view->bytes())
                                       : static_cast<std::uint64_t>(0));
                }
              }

@@ -1,5 +1,6 @@
 #include "kangaroo/runtime.hpp"
 
+#include "kangaroo/amr_patch_codec.hpp"
 #include "kangaroo/param_decode.hpp"
 #include "kangaroo/plan_decode.hpp"
 #include "kangaroo/plotfile_reader.hpp"
@@ -1555,95 +1556,6 @@ std::optional<SamplePoint> composite_sample_at(
   return std::nullopt;
 }
 
-std::vector<SamplePatch> unpack_sample_patches(std::span<const std::uint8_t> packed) {
-  std::vector<SamplePatch> patches;
-  if (packed.empty()) {
-    return patches;
-  }
-  auto handle = msgpack::unpack(reinterpret_cast<const char*>(packed.data()), packed.size());
-  auto root = handle.get();
-  if (root.type != msgpack::type::MAP) {
-    return patches;
-  }
-  const msgpack::object* arr_obj = nullptr;
-  for (uint32_t i = 0; i < root.via.map.size; ++i) {
-    const auto& k = root.via.map.ptr[i].key;
-    if (k.type == msgpack::type::STR && k.as<std::string>() == "patches") {
-      arr_obj = &root.via.map.ptr[i].val;
-      break;
-    }
-  }
-  if (arr_obj == nullptr || arr_obj->type != msgpack::type::ARRAY) {
-    return patches;
-  }
-  patches.reserve(arr_obj->via.array.size);
-  for (uint32_t i = 0; i < arr_obj->via.array.size; ++i) {
-    const auto& p = arr_obj->via.array.ptr[i];
-    if (p.type != msgpack::type::MAP) {
-      continue;
-    }
-    SamplePatch patch;
-    BufferDesc desc;
-    std::vector<std::uint8_t> payload;
-    for (uint32_t j = 0; j < p.via.map.size; ++j) {
-      const auto& key = p.via.map.ptr[j].key;
-      const auto& val = p.via.map.ptr[j].val;
-      if (key.type != msgpack::type::STR) {
-        continue;
-      }
-      const auto ks = key.as<std::string>();
-      if (ks == "level") {
-        patch.level = val.as<int16_t>();
-      } else if (ks == "lo" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
-        patch.box.lo[0] = val.via.array.ptr[0].as<int32_t>();
-        patch.box.lo[1] = val.via.array.ptr[1].as<int32_t>();
-        patch.box.lo[2] = val.via.array.ptr[2].as<int32_t>();
-      } else if (ks == "hi" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
-        patch.box.hi[0] = val.via.array.ptr[0].as<int32_t>();
-        patch.box.hi[1] = val.via.array.ptr[1].as<int32_t>();
-        patch.box.hi[2] = val.via.array.ptr[2].as<int32_t>();
-      } else if (ks == "dx" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
-        patch.geom.dx[0] = val.via.array.ptr[0].as<double>();
-        patch.geom.dx[1] = val.via.array.ptr[1].as<double>();
-        patch.geom.dx[2] = val.via.array.ptr[2].as<double>();
-      } else if (ks == "x0" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
-        patch.geom.x0[0] = val.via.array.ptr[0].as<double>();
-        patch.geom.x0[1] = val.via.array.ptr[1].as<double>();
-        patch.geom.x0[2] = val.via.array.ptr[2].as<double>();
-      } else if (ks == "index_origin" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
-        patch.geom.index_origin[0] = val.via.array.ptr[0].as<int32_t>();
-        patch.geom.index_origin[1] = val.via.array.ptr[1].as<int32_t>();
-        patch.geom.index_origin[2] = val.via.array.ptr[2].as<int32_t>();
-      } else if (ks == "is_periodic" && val.type == msgpack::type::ARRAY && val.via.array.size == 3) {
-        patch.geom.is_periodic[0] = val.via.array.ptr[0].as<bool>();
-        patch.geom.is_periodic[1] = val.via.array.ptr[1].as<bool>();
-        patch.geom.is_periodic[2] = val.via.array.ptr[2].as<bool>();
-      } else if (ks == "scalar") {
-        desc.scalar = static_cast<ScalarType>(val.as<std::uint8_t>());
-      } else if (ks == "extents" && val.type == msgpack::type::ARRAY &&
-                 val.via.array.size >= 1 && val.via.array.size <= kMaxBufferRank) {
-        desc.rank = static_cast<std::uint8_t>(val.via.array.size);
-        for (std::size_t axis = 0; axis < desc.rank; ++axis) {
-          desc.extents[axis] = val.via.array.ptr[axis].as<std::uint64_t>();
-        }
-      } else if (ks == "strides_bytes" && val.type == msgpack::type::ARRAY &&
-                 val.via.array.size >= 1 && val.via.array.size <= kMaxBufferRank) {
-        for (std::size_t axis = 0; axis < val.via.array.size; ++axis) {
-          desc.strides_bytes[axis] = val.via.array.ptr[axis].as<std::int64_t>();
-        }
-      } else if (ks == "data" && val.type == msgpack::type::BIN) {
-        payload.assign(val.via.bin.ptr, val.via.bin.ptr + val.via.bin.size);
-      }
-    }
-    if (!payload.empty()) {
-      patch.view = ChunkBuffer::wrap(SharedByteBuffer(std::move(payload)), desc);
-      patch.values = make_real_grid_accessor(patch.view);
-      patches.push_back(std::move(patch));
-    }
-  }
-  return patches;
-}
-
 template <typename Params, typename DecodeFn>
 KernelRegistry::KernelParamsPrepareFn make_kernel_params_preparer(DecodeFn decode_fn) {
   return [decode_fn = std::move(decode_fn)](
@@ -2085,17 +1997,19 @@ void register_default_kernels(KernelRegistry& registry) {
 
         const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
 
-        outputs[0].data.clear();
         if (params.input_field < 0) {
+          outputs[0].commit_dynamic_extent(0);
           return hpx::make_ready_future();
         }
 
         const RunMeta& meta = current_runmeta();
         if (params.input_step < 0 || static_cast<std::size_t>(params.input_step) >= meta.steps.size()) {
+          outputs[0].commit_dynamic_extent(0);
           return hpx::make_ready_future();
         }
         const auto& step_meta = meta.steps.at(static_cast<std::size_t>(params.input_step));
         if (params.input_level < 0 || static_cast<std::size_t>(params.input_level) >= step_meta.levels.size()) {
+          outputs[0].commit_dynamic_extent(0);
           return hpx::make_ready_future();
         }
 
@@ -2111,80 +2025,13 @@ void register_default_kernels(KernelRegistry& registry) {
           query_hi[ax] = cell_edge(target_geom, ax, hi + 1) + static_cast<double>(halo) * target_geom.dx[ax];
         }
 
-        struct PackedPatch {
-          int16_t level = 0;
-          IndexBox3 box;
-          LevelGeom geom;
-          ChunkBuffer data;
-        };
-        auto pack_patches = [](const std::vector<PackedPatch>& packed_patches) {
-          ChunkBuffer packed;
-          msgpack::sbuffer sbuf;
-          msgpack::packer<msgpack::sbuffer> pk(&sbuf);
-          pk.pack_map(1);
-          pk.pack(std::string("patches"));
-          pk.pack_array(packed_patches.size());
-          for (const auto& p : packed_patches) {
-            pk.pack_map(11);
-            pk.pack(std::string("level"));
-            pk.pack_int16(p.level);
-            pk.pack(std::string("lo"));
-            pk.pack_array(3);
-            pk.pack_int32(p.box.lo[0]);
-            pk.pack_int32(p.box.lo[1]);
-            pk.pack_int32(p.box.lo[2]);
-            pk.pack(std::string("hi"));
-            pk.pack_array(3);
-            pk.pack_int32(p.box.hi[0]);
-            pk.pack_int32(p.box.hi[1]);
-            pk.pack_int32(p.box.hi[2]);
-            pk.pack(std::string("dx"));
-            pk.pack_array(3);
-            pk.pack_double(p.geom.dx[0]);
-            pk.pack_double(p.geom.dx[1]);
-            pk.pack_double(p.geom.dx[2]);
-            pk.pack(std::string("x0"));
-            pk.pack_array(3);
-            pk.pack_double(p.geom.x0[0]);
-            pk.pack_double(p.geom.x0[1]);
-            pk.pack_double(p.geom.x0[2]);
-            pk.pack(std::string("index_origin"));
-            pk.pack_array(3);
-            pk.pack_int32(p.geom.index_origin[0]);
-            pk.pack_int32(p.geom.index_origin[1]);
-            pk.pack_int32(p.geom.index_origin[2]);
-            pk.pack(std::string("is_periodic"));
-            pk.pack_array(3);
-            pk.pack(static_cast<bool>(p.geom.is_periodic[0]));
-            pk.pack(static_cast<bool>(p.geom.is_periodic[1]));
-            pk.pack(static_cast<bool>(p.geom.is_periodic[2]));
-            pk.pack(std::string("scalar"));
-            pk.pack_uint8(static_cast<std::uint8_t>(p.data.desc().scalar));
-            pk.pack(std::string("extents"));
-            pk.pack_array(p.data.desc().rank);
-            for (std::size_t axis = 0; axis < p.data.desc().rank; ++axis) {
-              pk.pack_uint64(p.data.desc().extents[axis]);
-            }
-            pk.pack(std::string("strides_bytes"));
-            pk.pack_array(p.data.desc().rank);
-            for (std::size_t axis = 0; axis < p.data.desc().rank; ++axis) {
-              pk.pack_int64(p.data.desc().strides_bytes[axis]);
-            }
-            pk.pack(std::string("data"));
-            pk.pack_bin(p.data.data.size());
-            if (!p.data.data.empty()) {
-              pk.pack_bin_body(reinterpret_cast<const char*>(p.data.data.data()), p.data.data.size());
-            }
-          }
-          return ChunkBuffer::opaque(std::vector<std::uint8_t>(sbuf.data(), sbuf.data() + sbuf.size()));
-        };
-
         struct PendingPatch {
           int16_t level = 0;
           LevelGeom geom;
         };
         std::vector<PendingPatch> pending_patches;
         std::vector<hpx::future<SubboxView>> pending_subboxes;
+        auto output_writer = outputs[0].begin_async_dynamic_write();
 
         DataServiceLocal data_service;
         for (int16_t lev = 0; lev < static_cast<int16_t>(step_meta.levels.size()); ++lev) {
@@ -2228,19 +2075,18 @@ void register_default_kernels(KernelRegistry& registry) {
 
         return hpx::when_all(std::move(pending_subboxes))
             .then([pending_patches = std::move(pending_patches),
-                   pack_patches = std::move(pack_patches),
-                   outputs](auto&& all) mutable {
+                   output_writer](auto&& all) mutable {
               auto ready_subboxes = all.get();
-              std::vector<PackedPatch> packed_patches;
+              std::vector<AmrPatchRecord> packed_patches;
               packed_patches.reserve(ready_subboxes.size());
               for (std::size_t i = 0; i < ready_subboxes.size(); ++i) {
                 auto sub = ready_subboxes[i].get();
                 if (sub.box.hi[0] < sub.box.lo[0] || sub.box.hi[1] < sub.box.lo[1] ||
-                    sub.box.hi[2] < sub.box.lo[2] || sub.data.data.empty()) {
+                    sub.box.hi[2] < sub.box.lo[2] || sub.data.empty()) {
                   continue;
                 }
 
-                PackedPatch pp;
+                AmrPatchRecord pp;
                 pp.level = pending_patches[i].level;
                 pp.box = sub.box;
                 pp.geom = pending_patches[i].geom;
@@ -2248,8 +2094,8 @@ void register_default_kernels(KernelRegistry& registry) {
                 packed_patches.push_back(std::move(pp));
               }
 
-              const auto packed = pack_patches(packed_patches);
-              outputs[0].data.assign(packed.data.cbegin(), packed.data.cend());
+              const auto packed = encode_amr_patch_payload(packed_patches);
+              output_writer.replace(packed.byte_view());
               return;
             });
         },
@@ -2301,7 +2147,7 @@ void register_default_kernels(KernelRegistry& registry) {
         [decode_params](const LevelMeta& level, int32_t block, std::span<const ChunkBuffer> inputs,
                         const NeighborViews&, std::span<ChunkBuffer> outputs,
                         std::span<const std::uint8_t> params_msgpack) {
-        if (inputs.size() < 2 || inputs[0].data.empty() || outputs.empty() || block < 0 ||
+        if (inputs.size() < 2 || inputs[0].empty() || outputs.empty() || block < 0 ||
             static_cast<std::size_t>(block) >= level.boxes.size()) {
           return hpx::make_ready_future();
         }
@@ -2344,11 +2190,17 @@ void register_default_kernels(KernelRegistry& registry) {
         patches.reserve(64);
         self.level = target_level;
         patches.push_back(std::move(self));
-        if (!inputs[1].data.empty()) {
-          auto prefetched = unpack_sample_patches(inputs[1].data);
-          patches.insert(patches.end(),
-                         std::make_move_iterator(prefetched.begin()),
-                         std::make_move_iterator(prefetched.end()));
+        if (!inputs[1].empty() && inputs[1].desc().scalar == ScalarType::kOpaque) {
+          auto decoded = decode_amr_patch_payload(inputs[1].byte_view());
+          for (auto& record : decoded) {
+            SamplePatch patch;
+            patch.level = record.level;
+            patch.box = record.box;
+            patch.geom = record.geom;
+            patch.view = std::move(record.data);
+            patch.values = make_real_grid_accessor(patch.view);
+            patches.push_back(std::move(patch));
+          }
         }
 
         const auto& target_geom = level.geom;
@@ -2554,29 +2406,17 @@ void register_default_kernels(KernelRegistry& registry) {
 
         const ScalarType file_scalar =
             data.type == plotfile::RealType::kFloat32 ? ScalarType::kF32 : ScalarType::kF64;
+        auto source = ChunkBuffer::wrap(
+            SharedByteBuffer(std::move(data.bytes)),
+            BufferDesc::plotfile_grid(file_scalar,
+                                      {static_cast<std::uint64_t>(nx),
+                                       static_cast<std::uint64_t>(ny),
+                                       static_cast<std::uint64_t>(nz)}));
         if (plotfile_zero_copy_reads_enabled() && outputs[0].desc().scalar == file_scalar) {
-          outputs[0] = ChunkBuffer::wrap(
-              SharedByteBuffer(std::move(data.bytes)),
-              BufferDesc::plotfile_grid(file_scalar,
-                                        {static_cast<std::uint64_t>(nx),
-                                         static_cast<std::uint64_t>(ny),
-                                         static_cast<std::uint64_t>(nz)}));
+          outputs[0] = std::move(source);
           return hpx::make_ready_future();
         }
-
-        auto transpose_into = [&]<typename OutT>() {
-          auto out = outputs[0].mutable_view<OutT, 3>();
-          for (int i = 0; i < nx; ++i) for (int j = 0; j < ny; ++j) for (int k = 0; k < nz; ++k) {
-            const auto source = (static_cast<std::size_t>(k) * ny + j) * nx + i;
-            out(i, j, k) = data.type == plotfile::RealType::kFloat32
-                               ? static_cast<OutT>(load_buffer_scalar<float>(data.bytes.data(), source))
-                               : static_cast<OutT>(load_buffer_scalar<double>(data.bytes.data(), source));
-          }
-        };
-        if (outputs[0].desc().scalar == ScalarType::kF32) transpose_into.template operator()<float>();
-        else if (outputs[0].desc().scalar == ScalarType::kF64) transpose_into.template operator()<double>();
-        else throw BufferContractError(BufferContractReason::kScalarMismatch,
-                                       "plotfile_load output must be f32 or f64");
+        outputs[0].copy_from(source);
 
         return hpx::make_ready_future();
         },
@@ -3496,8 +3336,8 @@ void register_default_kernels(KernelRegistry& registry) {
           auto data =
               reader->read_particle_field_chunk(params.particle_type, params.field_name, block);
           const std::size_t n = static_cast<std::size_t>(std::max<int64_t>(0, data.count));
-          outputs[0].data.resize(n * sizeof(double));
-          auto* out = outputs[0].data.mutable_data();
+          auto out_values = outputs[0].mutable_dynamic_array<double>();
+          auto* out = out_values.byte_data();
 
           if (data.dtype == "float64") {
             if (data.bytes.size() < n * sizeof(double)) {
@@ -3524,6 +3364,7 @@ void register_default_kernels(KernelRegistry& registry) {
             throw std::runtime_error("particle_load_field_chunk_f64: unsupported particle dtype '" +
                                      data.dtype + "'");
           }
+          outputs[0].commit_dynamic_extent(n);
           return hpx::make_ready_future();
         },
         make_kernel_params_preparer<Params>(decode_params));
@@ -4291,12 +4132,11 @@ void register_default_kernels(KernelRegistry& registry) {
         const auto a = inputs[0].array<std::uint8_t>();
         const auto b = inputs[1].array<std::uint8_t>();
         const std::size_t n = std::min(a.extent(0), b.extent(0));
-        outputs[0].data.resize(n * sizeof(std::uint8_t));
-        auto* out_data = outputs[0].data.mutable_data();
+        auto out = outputs[0].mutable_dynamic_array<std::uint8_t>();
         for (std::size_t i = 0; i < n; ++i) {
-          store_buffer_scalar<std::uint8_t>(
-              out_data, i, (a(i) != 0 && b(i) != 0) ? std::uint8_t{1} : std::uint8_t{0});
+          out(i) = (a(i) != 0 && b(i) != 0) ? std::uint8_t{1} : std::uint8_t{0};
         }
+        outputs[0].commit_dynamic_extent(n);
         return hpx::make_ready_future();
       });
   registry.register_kernel(
@@ -4315,14 +4155,14 @@ void register_default_kernels(KernelRegistry& registry) {
             ++count;
           }
         }
-        outputs[0].data.resize(count * sizeof(double));
-        auto* out_data = outputs[0].data.mutable_data();
+        auto out = outputs[0].mutable_dynamic_array<double>();
         std::size_t out_idx = 0;
         for (std::size_t i = 0; i < n; ++i) {
           if (mask(i) != 0) {
-            store_buffer_scalar<double>(out_data, out_idx++, values(i));
+            out(out_idx++) = values(i);
           }
         }
+        outputs[0].commit_dynamic_extent(count);
         return hpx::make_ready_future();
       });
   registry.register_kernel(
@@ -4335,11 +4175,11 @@ void register_default_kernels(KernelRegistry& registry) {
         const auto a = inputs[0].array<double>();
         const auto b = inputs[1].array<double>();
         const std::size_t n = std::min(a.extent(0), b.extent(0));
-        outputs[0].data.resize(n * sizeof(double));
-        auto* out_data = outputs[0].data.mutable_data();
+        auto out = outputs[0].mutable_dynamic_array<double>();
         for (std::size_t i = 0; i < n; ++i) {
-          store_buffer_scalar<double>(out_data, i, a(i) - b(i));
+          out(i) = a(i) - b(i);
         }
+        outputs[0].commit_dynamic_extent(n);
         return hpx::make_ready_future();
       });
   registry.register_kernel(
@@ -4355,14 +4195,14 @@ void register_default_kernels(KernelRegistry& registry) {
         const std::size_t n = std::min(
             {values[0].extent(0), values[1].extent(0), values[2].extent(0),
              values[3].extent(0), values[4].extent(0), values[5].extent(0)});
-        outputs[0].data.resize(n * sizeof(double));
-        auto* out_data = outputs[0].data.mutable_data();
+        auto out = outputs[0].mutable_dynamic_array<double>();
         for (std::size_t i = 0; i < n; ++i) {
           const double dx = values[0](i) - values[3](i);
           const double dy = values[1](i) - values[4](i);
           const double dz = values[2](i) - values[5](i);
-          store_buffer_scalar<double>(out_data, i, std::sqrt(dx * dx + dy * dy + dz * dz));
+          out(i) = std::sqrt(dx * dx + dy * dy + dz * dz);
         }
+        outputs[0].commit_dynamic_extent(n);
         return hpx::make_ready_future();
       });
   registry.register_kernel(
@@ -4615,7 +4455,7 @@ void register_default_kernels(KernelRegistry& registry) {
           }
           const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
           if (params.particle_type.empty() || params.field_name.empty()) {
-            outputs[0].data.clear();
+            outputs[0].commit_dynamic_extent(0);
             return hpx::make_ready_future();
           }
 
@@ -4639,7 +4479,9 @@ void register_default_kernels(KernelRegistry& registry) {
             }
             counts[v] += 1;
           }
-          encode_particle_value_counts(counts, outputs[0].data.mutable_vector());
+          std::vector<std::uint8_t> encoded;
+          encode_particle_value_counts(counts, encoded);
+          outputs[0].assign_dynamic_bytes(encoded);
           return hpx::make_ready_future();
         },
         make_kernel_params_preparer<Params>(decode_params));
@@ -4654,7 +4496,7 @@ void register_default_kernels(KernelRegistry& registry) {
         }
         std::unordered_map<double, int64_t> merged;
         for (const auto& in_view : inputs) {
-          auto counts = decode_particle_value_counts(in_view.data);
+          auto counts = decode_particle_value_counts(in_view.byte_view());
           if (merged.empty()) {
             merged = std::move(counts);
             continue;
@@ -4663,7 +4505,9 @@ void register_default_kernels(KernelRegistry& registry) {
             merged[value] += count;
           }
         }
-        encode_particle_value_counts(merged, outputs[0].data.mutable_vector());
+        std::vector<std::uint8_t> encoded;
+        encode_particle_value_counts(merged, encoded);
+        outputs[0].assign_dynamic_bytes(encoded);
         return hpx::make_ready_future();
       });
   {
@@ -4692,10 +4536,9 @@ void register_default_kernels(KernelRegistry& registry) {
           }
           const auto& params = decode_params_cached<Params>(params_msgpack, decode_params);
           if (inputs.empty() || params.k <= 0) {
-            outputs[0].data.clear();
             return hpx::make_ready_future();
           }
-          auto counts = decode_particle_value_counts(inputs[0].data);
+          auto counts = decode_particle_value_counts(inputs[0].byte_view());
           std::vector<std::pair<double, int64_t>> modes;
           modes.reserve(counts.size());
           for (const auto& it : counts) {

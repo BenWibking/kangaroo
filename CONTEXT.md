@@ -20,12 +20,17 @@ _Avoid_: raw grid pointer
 A **Chunk Buffer** whose packed representation has no numeric scalar or shape semantics at the buffer seam.
 _Avoid_: fake numeric array
 
+**AMR Patch Payload**:
+An **Opaque Payload** containing validated AMR patch geometry, level identity, and embedded **Chunk Buffers** for stencil sampling.
+_Avoid_: packed neighbor bytes
+
 ## Relationships
 
 - A field and block identify one **Chunk Buffer** at a particular step, level, and version.
 - A **Buffer Specification** resolves to one output **Chunk Buffer** for each task instance.
 - A numeric rank-three **Chunk Buffer** exposes a **Block Grid**.
 - An **Opaque Payload** exposes bytes but cannot expose a typed **Block Grid** or numeric array.
+- An **AMR Patch Payload** transports neighboring **Chunk Buffers** without exposing its wire format to kernels.
 
 ## Example dialogue
 

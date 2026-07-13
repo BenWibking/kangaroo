@@ -56,9 +56,11 @@ endif()
 
 set(KANGAROO_RUNTIME_SOURCES
   src/adjacency.cpp
+  src/amr_patch_codec.cpp
   src/backend_parthenon.cpp
   src/backend_memory.cpp
   src/backend_plotfile.cpp
+  src/chunk_buffer.cpp
   src/data_service_local.cpp
   src/executor.cpp
   src/kernel_registry.cpp

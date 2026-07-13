@@ -14,7 +14,7 @@ from pathlib import Path
 import msgpack
 import numpy as np
 
-from .buffer import DType, numpy_dtype
+from .buffer import materialize_payload
 
 from .plan import Plan
 
@@ -295,23 +295,10 @@ class Runtime:
         info = self._rt.get_task_chunk_info(
             step, level, field, version, block, dataset_h
         )
-        descriptor_dtype = DType(info["dtype"])
-        resolved_dtype = numpy_dtype(descriptor_dtype)
-        resolved_shape = tuple(int(value) for value in info["shape"])
-        strides = tuple(int(value) for value in info["strides_bytes"])
-        if dtype is not None and np.dtype(dtype) != resolved_dtype:
-            raise ValueError(
-                f"requested dtype {np.dtype(dtype)} does not match chunk dtype {resolved_dtype}"
-            )
-        if shape is not None and tuple(shape) != resolved_shape:
-            raise ValueError(
-                f"requested shape {tuple(shape)} does not match chunk shape {resolved_shape}"
-            )
-        return np.ndarray(
-            shape=resolved_shape,
-            dtype=resolved_dtype,
-            buffer=info["data"],
-            strides=strides,
+        return materialize_payload(
+            info,
+            expected_shape=shape,
+            expected_dtype=dtype,
         )
 
 

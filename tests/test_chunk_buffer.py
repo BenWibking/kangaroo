@@ -13,6 +13,8 @@ from analysis.buffer import (
     FixedShape,
     LikeInputShape,
     dtype_from_numpy,
+    materialize_numpy,
+    materialize_payload,
     numpy_dtype,
 )
 from analysis.dataset import Dataset
@@ -53,6 +55,23 @@ def test_plotfile_and_runtime_layouts_have_equal_logical_values() -> None:
     assert all(runtime == plotfile for runtime, plotfile in values)
 
 
+def test_grid_region_copy_uses_logical_indices_across_layouts() -> None:
+    assert _core.test_chunk_buffer_grid_region() == [110, 111, 120, 121, 210, 211, 220, 221]
+
+
+def test_layout_copy_converts_scalar_type() -> None:
+    assert _core.test_chunk_buffer_layout_copy_converts_dtype() == (1.25, 2.5, 3.75, 5.0)
+
+
+def test_amr_patch_codec_roundtrips_geometry_descriptor_and_data() -> None:
+    assert _core.test_amr_patch_codec_roundtrip() == (1, 2, 4, 0.125, True, 7.5, "f32")
+
+
+def test_amr_patch_codec_rejects_malformed_payload() -> None:
+    with pytest.raises(RuntimeError, match="root must be a map"):
+        _core.test_amr_patch_codec_rejects_malformed()
+
+
 def test_mutating_a_copy_detaches_storage() -> None:
     assert _core.test_chunk_buffer_cow() == (7, 11)
 
@@ -65,6 +84,42 @@ def test_dynamic_extent_commit() -> None:
     assert _core.test_chunk_buffer_dynamic(10, 3) == (3, 24, 80)
     with pytest.raises(RuntimeError, match="upper bound"):
         _core.test_chunk_buffer_dynamic(2, 3)
+
+
+def test_dynamic_typed_writer_commits_only_visible_values() -> None:
+    assert _core.test_chunk_buffer_dynamic_write(5, [1.5, 2.5]) == [1.5, 2.5]
+    with pytest.raises(IndexError, match="TensorView index out of range"):
+        _core.test_chunk_buffer_dynamic_write(1, [1.0, 2.0])
+
+
+@pytest.mark.parametrize("copy_assignment", [False, True])
+def test_dynamic_buffer_copy_preserves_cow_isolation(copy_assignment: bool) -> None:
+    assert _core.test_chunk_buffer_dynamic_cow(copy_assignment) == (
+        True,
+        0,
+        1,
+        7,
+        2,
+        11,
+        22,
+    )
+
+
+def test_async_dynamic_byte_writer_is_scoped_and_one_shot() -> None:
+    assert _core.test_chunk_buffer_async_byte_writer() == [1, 2, 3]
+    with pytest.raises(RuntimeError, match="already complete"):
+        _core.test_chunk_buffer_async_byte_writer_reuse()
+
+
+def test_async_dynamic_byte_writer_survives_buffer_move() -> None:
+    assert _core.test_chunk_buffer_async_byte_writer_survives_move() == [1, 2, 3]
+
+
+def test_async_dynamic_byte_writer_preserves_cow_isolation() -> None:
+    assert _core.test_chunk_buffer_async_byte_writer_preserves_cow() == (
+        [1, 2, 3],
+        [0, 0, 0],
+    )
 
 
 @pytest.mark.parametrize("extent", [0, 3])
@@ -161,3 +216,49 @@ def test_shared_numpy_dtype_mapping() -> None:
     assert dtype_from_numpy("int64") is DType.I64
     with pytest.raises(TypeError, match="opaque"):
         numpy_dtype(DType.OPAQUE)
+
+
+def test_materialize_payload_honors_shape_strides_and_lifetime() -> None:
+    storage = np.arange(6, dtype=np.float64).tobytes()
+    payload = {
+        "data": storage,
+        "dtype": "f64",
+        "shape": [2, 3],
+        "strides_bytes": [8, 16],
+    }
+    array = materialize_payload(payload)
+    del payload
+    assert array.tolist() == [[0.0, 2.0, 4.0], [1.0, 3.0, 5.0]]
+    assert not array.flags.writeable
+
+
+def test_materialize_payload_uses_count_and_validates_assertions() -> None:
+    payload = {
+        "data": np.asarray([1, 2, 3], dtype=np.int64).tobytes(),
+        "dtype": "int64",
+        "count": 3,
+    }
+    assert materialize_payload(payload).tolist() == [1, 2, 3]
+    with pytest.raises(ValueError, match="requested shape"):
+        materialize_payload(payload, expected_shape=(2,))
+    with pytest.raises(ValueError, match="requested dtype"):
+        materialize_payload(payload, expected_dtype=np.float64)
+
+
+def test_materialize_numpy_rejects_invalid_descriptors_and_opaque_payloads() -> None:
+    with pytest.raises(TypeError, match="opaque"):
+        materialize_numpy(b"abc", dtype="opaque")
+    with pytest.raises(ValueError, match="equal rank"):
+        materialize_numpy(b"\0" * 16, dtype="f64", shape=(2,), strides_bytes=(8, 8))
+    with pytest.raises(ValueError, match="storage exposes"):
+        materialize_numpy(b"\0" * 8, dtype="f64", shape=(2,))
+
+
+def test_materialize_payload_copy_is_owning_and_writeable() -> None:
+    array = materialize_payload(
+        {"data": np.asarray([1.0], dtype=np.float32).tobytes(), "dtype": "f32"},
+        copy=True,
+    )
+    array[0] = 2.0
+    assert array.tolist() == [2.0]
+    assert array.flags.owndata
