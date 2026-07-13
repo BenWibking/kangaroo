@@ -18,16 +18,7 @@ namespace kangaroo {
 struct DatasetHandle;
 
 void prepare_plan(PlanIR& plan, KernelRegistry& kernels);
-
-ResolvedBufferSpec resolve_output_spec_for_task(
-    const BufferSpecIR& spec,
-    const TaskTemplateIR& task,
-    const DatasetHandle& dataset,
-    const RunMeta& meta,
-    int32_t step,
-    int16_t level,
-    int32_t block,
-    std::span<const ChunkBuffer> inputs);
+void validate_plan_output_bounds(const PlanIR& plan, const KernelRegistry& kernels);
 
 struct ExecutorOptions {
   std::string mode = "eager";

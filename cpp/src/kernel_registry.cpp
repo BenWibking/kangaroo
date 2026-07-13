@@ -6,7 +6,8 @@ namespace kangaroo {
 
 void KernelRegistry::register_kernel(const KernelDesc& desc,
                                     KernelFn fn,
-                                    KernelParamsPrepareFn prepare_params) {
+                                    KernelParamsPrepareFn prepare_params,
+                                    DynamicOutputBoundFn dynamic_output_bound) {
   std::lock_guard<std::mutex> lock(mutex_);
   kernels_[desc.name] = std::make_shared<KernelFn>(std::move(fn));
   if (prepare_params) {
@@ -14,7 +15,20 @@ void KernelRegistry::register_kernel(const KernelDesc& desc,
   } else {
     params_prepare_.erase(desc.name);
   }
+  if (dynamic_output_bound) {
+    dynamic_output_bounds_[desc.name] =
+        std::make_shared<const DynamicOutputBoundEvaluator>(std::move(dynamic_output_bound));
+  } else {
+    dynamic_output_bounds_.erase(desc.name);
+  }
   descs_[desc.name] = desc;
+}
+
+std::shared_ptr<const DynamicOutputBoundEvaluator> KernelRegistry::get_dynamic_output_bound_by_name(
+    const std::string& name) const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = dynamic_output_bounds_.find(name);
+  return it == dynamic_output_bounds_.end() ? nullptr : it->second;
 }
 
 void KernelRegistry::register_kernel_params_preparer(const std::string& name,

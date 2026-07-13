@@ -1,5 +1,6 @@
 #pragma once
 
+#include "kangaroo/buffer_resolution.hpp"
 #include "kangaroo/kernel.hpp"
 #include "kangaroo/plan_ir.hpp"
 
@@ -33,11 +34,14 @@ class KernelRegistry {
 
   void register_kernel(const KernelDesc& desc,
                        KernelFn fn,
-                       KernelParamsPrepareFn prepare_params = {});
+                       KernelParamsPrepareFn prepare_params = {},
+                       DynamicOutputBoundFn dynamic_output_bound = {});
   void register_kernel_params_preparer(const std::string& name, KernelParamsPrepareFn prepare_params);
   PreparedParams prepare_params_by_name(const std::string& name,
                                         const KernelParamContext& context) const;
   std::shared_ptr<const KernelFn> get_shared_by_name(const std::string& name) const;
+  std::shared_ptr<const DynamicOutputBoundEvaluator> get_dynamic_output_bound_by_name(
+      const std::string& name) const;
   const KernelFn& get_by_name(const std::string& name) const;
   std::vector<KernelDesc> list_kernel_descs() const;
 
@@ -45,6 +49,8 @@ class KernelRegistry {
   mutable std::mutex mutex_;
   std::unordered_map<std::string, std::shared_ptr<const KernelFn>> kernels_;
   std::unordered_map<std::string, KernelParamsPrepareFn> params_prepare_;
+  std::unordered_map<std::string, std::shared_ptr<const DynamicOutputBoundEvaluator>>
+      dynamic_output_bounds_;
   std::unordered_map<std::string, KernelDesc> descs_;
 };
 

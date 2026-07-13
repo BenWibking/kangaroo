@@ -1563,9 +1563,9 @@ KernelRegistry::KernelParamsPrepareFn make_kernel_params_preparer(DecodeFn decod
     if (context.params_msgpack.empty()) {
       return {};
     }
-    const auto& decoded = decode_params_cached<Params>(context.params_msgpack, decode_fn);
+    auto decoded = decode_fn(cached_params_root(context.params_msgpack));
     auto prepared = std::shared_ptr<const void>(
-        new Params(decoded),
+        new Params(std::move(decoded)),
         [](const void* ptr) { delete static_cast<const Params*>(ptr); });
     return KernelRegistry::PreparedParams{std::type_index(typeid(Params)), std::move(prepared)};
   };
@@ -1580,7 +1580,7 @@ KernelRegistry::KernelParamsPrepareFn make_covered_box_params_preparer(DecodeFn 
     }
     Params decoded;
     if (!context.params_msgpack.empty()) {
-      decoded = decode_params_cached<Params>(context.params_msgpack, decode_fn);
+      decoded = decode_fn(cached_params_root(context.params_msgpack));
     }
     if (context.covered_boxes) {
       decoded.covered_boxes = context.covered_boxes;
@@ -1956,13 +1956,7 @@ void register_default_kernels(KernelRegistry& registry) {
     return env != nullptr && *env != '\0' && *env != '0';
   }();
   {
-    struct Params {
-      int32_t input_field = -1;
-      int32_t input_version = 0;
-      int32_t input_step = 0;
-      int16_t input_level = 0;
-      int32_t halo_cells = 1;
-    };
+    using Params = AmrSubboxPackParams;
 
     auto decode_params = [](const msgpack::object& root) {
       Params params;
@@ -2099,7 +2093,10 @@ void register_default_kernels(KernelRegistry& registry) {
               return;
             });
         },
-        make_kernel_params_preparer<Params>(decode_params));
+        make_kernel_params_preparer<Params>(decode_params),
+        [](const DynamicOutputBoundContext& context) {
+          return estimate_amr_subbox_pack_capacity(context, context.params<Params>());
+        });
   }
   {
     struct Params {
@@ -3367,7 +3364,13 @@ void register_default_kernels(KernelRegistry& registry) {
           outputs[0].commit_dynamic_extent(n);
           return hpx::make_ready_future();
         },
-        make_kernel_params_preparer<Params>(decode_params));
+        make_kernel_params_preparer<Params>(decode_params),
+        [](const DynamicOutputBoundContext& context) -> std::optional<std::uint64_t> {
+          const auto& params = context.params<Params>();
+          if (params.particle_type.empty()) return std::nullopt;
+          return context.data.estimate_particle_chunk_records(
+              params.particle_type, context.block);
+        });
   }
   {
     struct Params {
@@ -4484,7 +4487,17 @@ void register_default_kernels(KernelRegistry& registry) {
           outputs[0].assign_dynamic_bytes(encoded);
           return hpx::make_ready_future();
         },
-        make_kernel_params_preparer<Params>(decode_params));
+        make_kernel_params_preparer<Params>(decode_params),
+        [](const DynamicOutputBoundContext& context) -> std::optional<std::uint64_t> {
+          const auto& params = context.params<Params>();
+          if (params.particle_type.empty()) return std::nullopt;
+          const auto records = context.data.estimate_particle_chunk_records(
+              params.particle_type, context.block);
+          if (!records.has_value()) return std::nullopt;
+          return checked_add(
+              sizeof(std::uint64_t),
+              checked_multiply(*records, sizeof(double) + sizeof(std::int64_t)));
+        });
   }
   registry.register_kernel(
       KernelDesc{.name = "particle_value_counts_reduce", .n_inputs = 1, .n_outputs = 1,
@@ -4509,6 +4522,17 @@ void register_default_kernels(KernelRegistry& registry) {
         encode_particle_value_counts(merged, encoded);
         outputs[0].assign_dynamic_bytes(encoded);
         return hpx::make_ready_future();
+      },
+      {},
+      [](const DynamicOutputBoundContext& context) -> std::optional<std::uint64_t> {
+        std::uint64_t input_bytes = 0;
+        for (const auto& input : context.inputs) {
+          if (!input.storage_known) return std::nullopt;
+          input_bytes = checked_add(input_bytes, input.payload_bytes);
+        }
+        const auto output_bytes = std::max<std::uint64_t>(sizeof(std::uint64_t), input_bytes);
+        const auto width = scalar_size(context.scalar);
+        return output_bytes / width + static_cast<std::uint64_t>(output_bytes % width != 0);
       });
   {
     struct Params {
@@ -6257,6 +6281,10 @@ void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
 
   PlanIR plan = timed_phase("runtime_decode_plan_msgpack", "kangaroo.runtime.setup", [&]() {
     return decode_plan_msgpack(std::span<const std::uint8_t>(packed.data(), packed.size()));
+  });
+  timed_phase("runtime_validate_plan_output_bounds", "kangaroo.runtime.setup", [&]() {
+    validate_plan_output_bounds(plan, global_kernels());
+    return 0;
   });
 
   auto localities = hpx::find_all_localities();

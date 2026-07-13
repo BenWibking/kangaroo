@@ -12,6 +12,10 @@ _Avoid_: HostView, raw byte buffer
 A plan-time storage contract that resolves to the descriptor and allocation policy of a **Chunk Buffer**.
 _Avoid_: output bytes, bytes-per-value parameter
 
+**Buffer Resolution**:
+The runtime process that turns a **Buffer Specification**, task context, and input buffer facts into one authoritative allocation and conservative scheduler storage estimate.
+_Avoid_: executor-local output sizing, kernel-name sizing branches
+
 **Block Grid**:
 A logical three-dimensional field view over a **Chunk Buffer**, indexed in runtime `(i, j, k)` order regardless of physical layout.
 _Avoid_: raw grid pointer
@@ -36,6 +40,7 @@ _Avoid_: covered-box helpers, operator-local masks
 
 - A field and block identify one **Chunk Buffer** at a particular step, level, and version.
 - A **Buffer Specification** resolves to one output **Chunk Buffer** for each task instance.
+- **Buffer Resolution** owns both output allocation facts and scheduler storage facts; kernels provide any backend-derived dynamic bound through prepared kernel metadata.
 - A numeric rank-three **Chunk Buffer** exposes a **Block Grid**.
 - An **Opaque Payload** exposes bytes but cannot expose a typed **Block Grid** or numeric array.
 - An **AMR Patch Payload** transports neighboring **Chunk Buffers** without exposing its wire format to kernels.
