@@ -421,6 +421,34 @@ NB_MODULE(_core, m) {
     for (std::size_t i = 0; i < visible.extent(0); ++i) restored.push_back(visible(i));
     return restored;
   });
+  m.def("test_chunk_buffer_dynamic_cow", [](bool copy_assignment) {
+    auto original = kangaroo::ChunkBuffer::allocate_dynamic(
+        kangaroo::ScalarType::kI64, 3, kangaroo::InitPolicy::kZero);
+    kangaroo::ChunkBuffer copy;
+    if (copy_assignment) {
+      copy = original;
+    } else {
+      auto constructed = original;
+      copy = std::move(constructed);
+    }
+
+    auto copy_output = copy.mutable_dynamic_array<std::int64_t>();
+    copy_output(0) = 11;
+    copy_output(1) = 22;
+    copy.commit_dynamic_extent(2);
+
+    const bool original_still_uncommitted = original.awaiting_dynamic_extent_commit();
+    const auto original_bytes_before_commit = original.bytes();
+    auto original_output = original.mutable_dynamic_array<std::int64_t>();
+    original_output(0) = 7;
+    original.commit_dynamic_extent(1);
+
+    return nb::make_tuple(
+        original_still_uncommitted, original_bytes_before_commit,
+        original.desc().extents[0], original.array<std::int64_t>()(0),
+        copy.desc().extents[0], copy.array<std::int64_t>()(0),
+        copy.array<std::int64_t>()(1));
+  });
   m.def("test_chunk_buffer_async_byte_writer", []() {
     auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(
         kangaroo::ScalarType::kOpaque, 8);

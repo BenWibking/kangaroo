@@ -422,6 +422,25 @@ class ChunkBuffer {
   };
 
   ChunkBuffer() = default;
+  ChunkBuffer(const ChunkBuffer& other)
+      : storage_(other.storage_), desc_(other.desc_),
+        dynamic_capacity_elements_(other.dynamic_capacity_elements_),
+        dynamic_committed_elements_(clone_dynamic_commit_state(
+            other.dynamic_committed_elements_)),
+        dynamic_extent_committed_(other.dynamic_extent_committed_) {}
+  ChunkBuffer& operator=(const ChunkBuffer& other) {
+    if (this == &other) return *this;
+    auto committed_elements =
+        clone_dynamic_commit_state(other.dynamic_committed_elements_);
+    storage_ = other.storage_;
+    desc_ = other.desc_;
+    dynamic_capacity_elements_ = other.dynamic_capacity_elements_;
+    dynamic_committed_elements_ = std::move(committed_elements);
+    dynamic_extent_committed_ = other.dynamic_extent_committed_;
+    return *this;
+  }
+  ChunkBuffer(ChunkBuffer&&) noexcept = default;
+  ChunkBuffer& operator=(ChunkBuffer&&) noexcept = default;
 
   static ChunkBuffer allocate(BufferDesc desc, InitPolicy init = InitPolicy::kUninitialized) {
     const auto bytes64 = desc.required_bytes();
@@ -624,6 +643,12 @@ class ChunkBuffer {
   HPX_SERIALIZATION_SPLIT_MEMBER()
 
  private:
+  static std::shared_ptr<std::optional<std::uint64_t>> clone_dynamic_commit_state(
+      const std::shared_ptr<std::optional<std::uint64_t>>& committed_elements) {
+    if (!committed_elements) return {};
+    return std::make_shared<std::optional<std::uint64_t>>(*committed_elements);
+  }
+
   std::span<std::uint8_t> mutable_capacity_byte_view() {
     if (!awaiting_dynamic_extent_commit()) {
       throw BufferContractError(BufferContractReason::kInvalidDynamicResize,

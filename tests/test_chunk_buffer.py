@@ -92,6 +92,19 @@ def test_dynamic_typed_writer_commits_only_visible_values() -> None:
         _core.test_chunk_buffer_dynamic_write(1, [1.0, 2.0])
 
 
+@pytest.mark.parametrize("copy_assignment", [False, True])
+def test_dynamic_buffer_copy_preserves_cow_isolation(copy_assignment: bool) -> None:
+    assert _core.test_chunk_buffer_dynamic_cow(copy_assignment) == (
+        True,
+        0,
+        1,
+        7,
+        2,
+        11,
+        22,
+    )
+
+
 def test_async_dynamic_byte_writer_is_scoped_and_one_shot() -> None:
     assert _core.test_chunk_buffer_async_byte_writer() == [1, 2, 3]
     with pytest.raises(RuntimeError, match="already complete"):
