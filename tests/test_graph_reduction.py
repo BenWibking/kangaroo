@@ -69,6 +69,34 @@ def test_domain_params_cannot_override_graph_topology() -> None:
         raise AssertionError("expected graph topology override to be rejected")
 
 
+def test_block_reduction_builder_rejects_fan_in_one() -> None:
+    ctx = _ctx()
+    builder = GraphReductionBuilder(ctx)
+    accumulate = ctx.stage("accumulate")
+    source = FieldRef(10)
+    builder.add_stage(accumulate, outputs=[source])
+
+    try:
+        builder.reduce_blocks(
+            value=ReducedField(source, level=0),
+            input_blocks=[0, 1],
+            step=0,
+            fan_in=1,
+            kernel="sum",
+            output_buffer=_buffer(),
+            stage_name="reduce",
+            template_name="reduce_{round}",
+            temporary_name="temporary_{round}",
+            after=accumulate,
+        )
+    except ValueError as exc:
+        assert "fan_in must be >= 2" in str(exc)
+    else:
+        raise AssertionError("expected fan_in=1 to be rejected")
+
+    assert builder.stages == [accumulate]
+
+
 def test_block_reduction_builder_owns_topology_and_producer_edges() -> None:
     ctx = _ctx()
     builder = GraphReductionBuilder(ctx)

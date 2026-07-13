@@ -25,7 +25,10 @@ def default_reduce_fan_in(num_inputs: int) -> int:
 def resolve_reduce_fan_in(configured: int | None, num_inputs: int) -> int:
     if configured is None:
         return default_reduce_fan_in(num_inputs)
-    return max(1, int(configured))
+    fan_in = int(configured)
+    if fan_in < 2:
+        raise ValueError("reduce_fan_in must be >= 2 when provided")
+    return fan_in
 
 
 def _contiguous_groups(input_blocks: Sequence[int], fan_in: int) -> list[list[int]]:
@@ -209,7 +212,10 @@ class GraphReductionBuilder:
         current_blocks = [int(block) for block in input_blocks]
         if not current_blocks:
             raise ValueError("block reduction requires at least one input block")
-        fan_in = max(1, int(fan_in))
+        fan_in = int(fan_in)
+        if len(current_blocks) > 1 and fan_in < 2:
+            raise ValueError("fan_in must be >= 2 for multi-block reductions")
+        fan_in = max(1, fan_in)
         round_index = 0
         tail = after
 
