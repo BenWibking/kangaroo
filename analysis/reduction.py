@@ -353,6 +353,7 @@ class GraphReductionBuilder:
                     params=graph_reduce_params(
                         fan_in=1,
                         num_inputs=1,
+                        input_base=output_block,
                         output_base=output_block,
                         output_blocks=[output_block] if explicit_blocks else None,
                         extra=extra_params,

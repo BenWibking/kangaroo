@@ -189,3 +189,39 @@ def test_pairwise_builder_tracks_cross_level_dependencies() -> None:
         "input_base": 0,
         "output_base": 0,
     }
+
+
+def test_pairwise_builder_preserves_nonzero_input_block() -> None:
+    ctx = _ctx()
+    builder = GraphReductionBuilder(ctx)
+    left = FieldRef(10)
+    right = FieldRef(11)
+
+    reduced = builder.reduce_pairwise(
+        [
+            ReducedField(left, level=0, block=7),
+            ReducedField(right, level=1, block=7),
+        ],
+        step=0,
+        target_level=0,
+        kernel="add",
+        output_buffer=_buffer(),
+        stage_name="add",
+        template_name="add_{round}_{index}",
+        temporary_name="temporary_{round}_{index}",
+        preserve_location=True,
+    )
+
+    stage = builder.producer(reduced.field)
+    assert stage is not None
+    template = stage.templates[0]
+    assert [ref.domain.blocks for ref in template.inputs] == [[7], [7]]
+    assert template.params == {
+        "graph_kind": "reduce",
+        "fan_in": 1,
+        "num_inputs": 1,
+        "input_base": 7,
+        "output_base": 7,
+        "output_blocks": [7],
+    }
+    assert reduced.block == 7
