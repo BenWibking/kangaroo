@@ -98,6 +98,10 @@ def test_async_dynamic_byte_writer_is_scoped_and_one_shot() -> None:
         _core.test_chunk_buffer_async_byte_writer_reuse()
 
 
+def test_async_dynamic_byte_writer_survives_buffer_move() -> None:
+    assert _core.test_chunk_buffer_async_byte_writer_survives_move() == [1, 2, 3]
+
+
 @pytest.mark.parametrize("extent", [0, 3])
 def test_committed_dynamic_buffer_roundtrips_by_visible_size(extent: int) -> None:
     visible_bytes = extent * 8

@@ -212,6 +212,15 @@ class SharedByteBuffer {
     materialize_vector();
     vector_data_->assign(count, value);
   }
+  void copy_into_shared(std::span<const std::uint8_t> source) const {
+    if (source.size() > size()) {
+      throw std::out_of_range("shared byte-buffer write exceeds visible storage");
+    }
+    auto* destination = vector_data_ ? vector_data_->data() : raw_data_.get();
+    if (!source.empty()) {
+      std::copy(source.begin(), source.end(), destination + start_offset());
+    }
+  }
   template <class InputIt> void assign(InputIt first, InputIt last) {
     detach();
     materialize_vector();
@@ -398,9 +407,17 @@ class ChunkBuffer {
 
    private:
     friend class ChunkBuffer;
-    explicit DynamicByteWriter(ChunkBuffer* buffer)
-        : buffer_(buffer), completed_(std::make_shared<bool>(false)) {}
-    ChunkBuffer* buffer_;
+    DynamicByteWriter(SharedByteBuffer storage, ScalarType scalar,
+                      std::uint64_t capacity_elements,
+                      std::shared_ptr<std::optional<std::uint64_t>> committed_elements)
+        : storage_(std::move(storage)), scalar_(scalar),
+          capacity_elements_(capacity_elements),
+          committed_elements_(std::move(committed_elements)),
+          completed_(std::make_shared<bool>(false)) {}
+    SharedByteBuffer storage_;
+    ScalarType scalar_;
+    std::uint64_t capacity_elements_;
+    std::shared_ptr<std::optional<std::uint64_t>> committed_elements_;
     std::shared_ptr<bool> completed_;
   };
 
@@ -499,7 +516,8 @@ class ChunkBuffer {
                                 "async writing requires an uncommitted dynamic buffer");
     }
     commit_dynamic_extent(0);
-    return DynamicByteWriter(this);
+    return DynamicByteWriter(storage_, desc_.scalar, *dynamic_capacity_elements_,
+                             dynamic_committed_elements_);
   }
 
   ChunkBuffer slice(std::size_t offset, std::size_t count, BufferDesc desc) const {
@@ -615,27 +633,6 @@ class ChunkBuffer {
     return {storage_.mutable_data(), storage_.size()};
   }
 
-  void replace_dynamic_bytes(std::span<const std::uint8_t> source) {
-    if (!dynamic_capacity_elements_) {
-      throw BufferContractError(BufferContractReason::kInvalidDynamicResize,
-                                "byte replacement requires a dynamic buffer");
-    }
-    const auto width = scalar_size(desc_.scalar);
-    if (width == 0 || source.size() % width != 0 || source.size() > storage_.size()) {
-      throw BufferContractError(BufferContractReason::kDescriptorStorageMismatch,
-                                "dynamic byte replacement violates the buffer contract");
-    }
-    storage_.detach();
-    std::copy(source.begin(), source.end(), storage_.mutable_data());
-    desc_.extents[0] = source.size() / width;
-    if (!dynamic_committed_elements_) {
-      dynamic_committed_elements_ =
-          std::make_shared<std::optional<std::uint64_t>>(std::nullopt);
-    }
-    *dynamic_committed_elements_ = desc_.extents[0];
-    dynamic_extent_committed_ = true;
-  }
-
   void synchronize_dynamic_extent() const noexcept {
     if (dynamic_committed_elements_ && dynamic_committed_elements_->has_value()) {
       desc_.extents[0] = dynamic_committed_elements_->value();
@@ -674,7 +671,14 @@ inline void ChunkBuffer::DynamicByteWriter::replace(
     throw BufferContractError(BufferContractReason::kInvalidDynamicResize,
                               "dynamic byte writer is already complete");
   }
-  buffer_->replace_dynamic_bytes(source);
+  const auto width = scalar_size(scalar_);
+  if (width == 0 || source.size() % width != 0 ||
+      source.size() / width > capacity_elements_) {
+    throw BufferContractError(BufferContractReason::kDescriptorStorageMismatch,
+                              "dynamic byte replacement violates the buffer contract");
+  }
+  storage_.copy_into_shared(source);
+  *committed_elements_ = source.size() / width;
   *completed_ = true;
 }
 

@@ -429,6 +429,15 @@ NB_MODULE(_core, m) {
     writer.replace(payload);
     return std::vector<std::uint8_t>(buffer.byte_view().begin(), buffer.byte_view().end());
   });
+  m.def("test_chunk_buffer_async_byte_writer_survives_move", []() {
+    auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(
+        kangaroo::ScalarType::kOpaque, 8);
+    auto writer = buffer.begin_async_dynamic_write();
+    auto moved = std::move(buffer);
+    const std::array<std::uint8_t, 3> payload{1, 2, 3};
+    writer.replace(payload);
+    return std::vector<std::uint8_t>(moved.byte_view().begin(), moved.byte_view().end());
+  });
   m.def("test_chunk_buffer_async_byte_writer_reuse", []() {
     auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(
         kangaroo::ScalarType::kOpaque, 8);
