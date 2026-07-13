@@ -24,6 +24,10 @@ _Avoid_: fake numeric array
 An **Opaque Payload** containing validated AMR patch geometry, level identity, and embedded **Chunk Buffers** for stencil sampling.
 _Avoid_: packed neighbor bytes
 
+**Graph Reduction**:
+A locality-aware plan fragment that combines block-indexed intermediate fields into one published field while owning fan-in, grouping, task placement, and producer dependencies.
+_Avoid_: hand-built reduce stages in an analysis operator
+
 ## Relationships
 
 - A field and block identify one **Chunk Buffer** at a particular step, level, and version.
@@ -31,6 +35,7 @@ _Avoid_: packed neighbor bytes
 - A numeric rank-three **Chunk Buffer** exposes a **Block Grid**.
 - An **Opaque Payload** exposes bytes but cannot expose a typed **Block Grid** or numeric array.
 - An **AMR Patch Payload** transports neighboring **Chunk Buffers** without exposing its wire format to kernels.
+- A **Graph Reduction** combines intermediate **Chunk Buffers** without exposing execution topology to the scientific operator.
 
 ## Example dialogue
 

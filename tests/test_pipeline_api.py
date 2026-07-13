@@ -253,6 +253,26 @@ def test_pipeline_histogram1d_lowering_and_result_shape() -> None:
     assert all(tmpl.params["range"] == [0.0, 1.0] for tmpl in acc)
 
 
+def test_pipeline_rejects_reduce_fan_in_one() -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_two_block_runmeta()
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+
+    scalar = pipe.field("scalar")
+    try:
+        pipe.histogram1d(
+            scalar,
+            hist_range=(0.0, 1.0),
+            bins=8,
+            reduce_fan_in=1,
+        )
+    except ValueError as exc:
+        assert "reduce_fan_in must be >= 2" in str(exc)
+    else:
+        raise AssertionError("expected reduce_fan_in=1 to be rejected")
+
+
 def test_pipeline_histogram2d_weighted_input_wiring() -> None:
     rt = _FakeRuntime()
     runmeta = _single_level_runmeta()

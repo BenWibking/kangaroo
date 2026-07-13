@@ -25,11 +25,15 @@ from .ops import (
     UniformProjection,
     UniformSlice,
     VorticityMag,
-    _reduce_group_plan,
     histogram_edges_1d,
     histogram_edges_2d,
 )
 from .plan import Domain, FieldRef, OutputRef, Plan, Stage
+from .reduction import (
+    GraphReductionBuilder,
+    ReducedField,
+    default_reduce_fan_in,
+)
 from .runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
 
 
@@ -257,9 +261,6 @@ class Pipeline:
         self._particle_executed = False
         self._particle_cache.clear()
 
-    def _particle_reduce_fan_in(self, num_inputs: int) -> int:
-        return max(2, min(8, int(np.sqrt(max(1, num_inputs)))))
-
     def _append_particle_reduce_tree(
         self,
         *,
@@ -269,48 +270,32 @@ class Pipeline:
         output_buffer: BufferSpec,
         params: dict[str, Any],
     ) -> int:
-        num_inputs = int(chunk_count)
-        fan_in = self._particle_reduce_fan_in(num_inputs)
-        in_field = int(input_field)
-        current_blocks = list(range(chunk_count))
-        reduce_idx = 0
-        while num_inputs > 1:
-            input_blocks, output_blocks, group_offsets = _reduce_group_plan(
-                self._ctx,
-                step=0,
-                level=0,
-                input_blocks=current_blocks,
-                fan_in=fan_in,
-            )
-            num_groups = len(output_blocks)
-            out_field = in_field if num_groups == 1 else self._alloc_runtime_field("particle_reduce")
-            reduce_stage = Stage(name=self._unique_name(f"{kernel}_reduce"), plane="graph")
-            reduce_params = {
-                "graph_kind": "reduce",
-                "fan_in": fan_in,
-                "num_inputs": num_inputs,
-                "input_base": 0,
-                "output_base": 0,
-                "input_blocks": list(input_blocks),
-                "output_blocks": list(output_blocks),
-                "group_offsets": list(group_offsets),
-                **params,
-            }
-            reduce_stage.map_blocks(
-                name=kernel,
-                kernel=kernel,
-                domain=Domain(step=0, level=0),
-                inputs=[FieldRef(in_field)],
-                outputs=[OutputRef(FieldRef(out_field), output_buffer)],
-                deps={"kind": "None"},
-                params=reduce_params,
-            )
-            self._append_particle_stage(reduce_stage, chunk_count=max(1, num_groups))
-            in_field = out_field
-            current_blocks = output_blocks
-            num_inputs = num_groups
-            reduce_idx += 1
-        return in_field
+        if chunk_count <= 1:
+            return int(input_field)
+        if not self._particle_frontier:
+            raise RuntimeError("particle reduction requires a producer stage")
+
+        reductions = GraphReductionBuilder(self._ctx)
+        source = FieldRef(int(input_field))
+        source_stage = self._particle_frontier[-1]
+        reductions.add_stage(source_stage, outputs=[source])
+        reduced = reductions.reduce_blocks(
+            value=ReducedField(source, level=0),
+            input_blocks=list(range(chunk_count)),
+            step=0,
+            fan_in=default_reduce_fan_in(chunk_count),
+            kernel=kernel,
+            output_buffer=output_buffer,
+            stage_name=f"{kernel}_reduce_{{round}}",
+            template_name=kernel,
+            temporary_name="particle_reduce_{round}",
+            after=source_stage,
+            extra_params=params,
+        )
+        for stage in reductions.stages[1:]:
+            group_count = len(stage.templates[0].params["output_blocks"])
+            self._append_particle_stage(stage, chunk_count=max(1, group_count))
+        return reduced.field.field
 
     def _particle_import_array(
         self, values: np.ndarray, *, dtype: str, chunk_count: int
