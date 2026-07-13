@@ -1,8 +1,17 @@
 from __future__ import annotations
 
 import math
-from typing import Iterable, Optional, Sequence
+from typing import Optional, Sequence
 
+from .amr_coverage import (
+    axis_ranges_by_level,
+    covered_plane_boxes,
+    covered_slab_boxes,
+    covered_volume_boxes,
+    intersecting_plane_blocks,
+    intersecting_slab_blocks,
+    plane_indices_by_level,
+)
 from .buffer import (
     BlockShape,
     BufferSpec,
@@ -153,31 +162,11 @@ def _bounds_1d(
     return x0 + (lo - origin) * dx, x0 + (hi + 1 - origin) * dx
 
 
-def _overlaps_1d(a0: float, a1: float, b0: float, b1: float) -> bool:
-    return not (a1 < b0 or b1 < a0)
-
-
 def _resolve_real_dtype(dtype: DType | str) -> DType:
     resolved = DType(dtype)
     if resolved not in (DType.F32, DType.F64):
         raise ValueError("numeric grid outputs require dtype='f32' or dtype='f64'")
     return resolved
-
-
-def _coarsen_box(
-    lo: tuple[int, int, int],
-    hi: tuple[int, int, int],
-    *,
-    ratio: int,
-    fine_origin: tuple[int, int, int],
-    coarse_origin: tuple[int, int, int],
-) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-    clo = []
-    chi = []
-    for d in range(3):
-        clo.append(int(math.floor((lo[d] - fine_origin[d]) / ratio)) + coarse_origin[d])
-        chi.append(int(math.floor((hi[d] - fine_origin[d] + 1) / ratio)) + coarse_origin[d] - 1)
-    return tuple(clo), tuple(chi)
 
 
 class UniformSlice:
@@ -202,123 +191,6 @@ class UniformSlice:
         self.dtype = _resolve_real_dtype(dtype)
         self.reduce_fan_in = reduce_fan_in
 
-    def _intersecting_blocks_level(self, level_meta, *, plane_index: int | None = None) -> Iterable[int]:
-        axis_idx = _axis_index(self.axis)
-        u_axis, v_axis = [i for i in range(3) if i != axis_idx]
-
-        u0, v0, u1, v1 = self.rect
-        umin, umax = (u0, u1) if u0 <= u1 else (u1, u0)
-        vmin, vmax = (v0, v1) if v0 <= v1 else (v1, v0)
-
-        geom = level_meta.geom
-        for i, box in enumerate(level_meta.boxes):
-            if plane_index is not None:
-                if plane_index < box.lo[axis_idx] or plane_index > box.hi[axis_idx]:
-                    continue
-            else:
-                ax0, ax1 = _bounds_1d(
-                    box.lo[axis_idx],
-                    box.hi[axis_idx],
-                    geom.x0[axis_idx],
-                    geom.dx[axis_idx],
-                    geom.index_origin[axis_idx],
-                )
-                if not (ax0 <= self.coord <= ax1):
-                    continue
-
-            u0_b, u1_b = _bounds_1d(
-                box.lo[u_axis],
-                box.hi[u_axis],
-                geom.x0[u_axis],
-                geom.dx[u_axis],
-                geom.index_origin[u_axis],
-            )
-            v0_b, v1_b = _bounds_1d(
-                box.lo[v_axis],
-                box.hi[v_axis],
-                geom.x0[v_axis],
-                geom.dx[v_axis],
-                geom.index_origin[v_axis],
-            )
-            if not (_overlaps_1d(u0_b, u1_b, umin, umax) and _overlaps_1d(v0_b, v1_b, vmin, vmax)):
-                continue
-            yield i
-
-    def _coarsen_box(
-        self,
-        lo: tuple[int, int, int],
-        hi: tuple[int, int, int],
-        *,
-        ratio: int,
-        fine_origin: tuple[int, int, int],
-        coarse_origin: tuple[int, int, int],
-    ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-        clo = []
-        chi = []
-        for d in range(3):
-            clo.append(int(math.floor((lo[d] - fine_origin[d]) / ratio)) + coarse_origin[d])
-            chi.append(int(math.floor((hi[d] - fine_origin[d] + 1) / ratio)) + coarse_origin[d] - 1)
-        return tuple(clo), tuple(chi)
-
-    def _ref_ratio_between(self, levels, coarse: int, fine: int) -> int:
-        ratio = 1
-        for lev in range(coarse, fine):
-            ratio *= int(levels[lev].geom.ref_ratio)
-        return ratio
-
-    def _cell_index(self, geom, axis: int, coord: float) -> int:
-        x0 = geom.x0[axis]
-        dx = geom.dx[axis]
-        origin = geom.index_origin[axis]
-        if dx == 0.0:
-            return origin
-        idx_f = (coord - x0) / dx
-        return int(math.floor(idx_f)) + origin
-
-    def _covered_boxes_for_level(
-        self,
-        ctx: LoweringContext,
-        *,
-        level: int,
-        axis_idx: int,
-        plane_index_by_level: dict[int, int],
-    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
-        ds = ctx.dataset
-        levels = ctx.runmeta.steps[ds.step].levels
-        coarse_geom = levels[level].geom
-        coarse_k = plane_index_by_level[level]
-        covered: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
-        coarse_origin = levels[level].geom.index_origin
-        for fine in range(level + 1, len(levels)):
-            fine_k = plane_index_by_level[fine]
-            ratio = self._ref_ratio_between(levels, level, fine)
-            fine_origin = levels[fine].geom.index_origin
-            for box in levels[fine].boxes:
-                if fine_k < box.lo[axis_idx] or fine_k > box.hi[axis_idx]:
-                    continue
-                covered.append(
-                    self._coarsen_box(
-                        box.lo,
-                        box.hi,
-                        ratio=ratio,
-                        fine_origin=fine_origin,
-                        coarse_origin=coarse_origin,
-                    )
-                )
-        if not covered:
-            return []
-        clamped: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
-        for lo, hi in covered:
-            if coarse_k < lo[axis_idx] or coarse_k > hi[axis_idx]:
-                continue
-            clo = list(lo)
-            chi = list(hi)
-            clo[axis_idx] = coarse_k
-            chi[axis_idx] = coarse_k
-            clamped.append((tuple(clo), tuple(chi)))
-        return clamped
-        return covered
-
     def _lower_amr_cell_average(self, ctx: LoweringContext):
         ds = ctx.dataset
         axis_idx = _axis_index(self.axis)
@@ -329,14 +201,9 @@ class UniformSlice:
             raise ValueError("resolution must be positive")
 
         levels = ctx.runmeta.steps[ds.step].levels
-        base_level = 0
-        base_origin = levels[base_level].geom.index_origin
-        base_k = self._cell_index(levels[base_level].geom, axis_idx, self.coord)
-        plane_index_by_level: dict[int, int] = {}
-        for level_idx in range(len(levels)):
-            ratio = self._ref_ratio_between(levels, base_level, level_idx)
-            origin = levels[level_idx].geom.index_origin
-            plane_index_by_level[level_idx] = (base_k - base_origin[axis_idx]) * ratio + origin[axis_idx]
+        plane_index_by_level = plane_indices_by_level(
+            levels, axis=axis_idx, coord=self.coord
+        )
         sum_fields: list[ReducedField] = []
         area_fields: list[ReducedField] = []
         reductions = GraphReductionBuilder(ctx)
@@ -345,18 +212,21 @@ class UniformSlice:
         for level_idx in range(len(levels) - 1, -1, -1):
             level_meta = levels[level_idx]
             blocks = list(
-                self._intersecting_blocks_level(
-                    level_meta, plane_index=plane_index_by_level[level_idx]
+                intersecting_plane_blocks(
+                    level_meta,
+                    axis=axis_idx,
+                    plane_index=plane_index_by_level[level_idx],
+                    rect=self.rect,
                 )
             )
             if not blocks:
                 continue
 
-            covered_boxes = self._covered_boxes_for_level(
-                ctx,
+            covered_boxes = covered_plane_boxes(
+                levels,
                 level=level_idx,
-                axis_idx=axis_idx,
-                plane_index_by_level=plane_index_by_level,
+                axis=axis_idx,
+                plane_indices=plane_index_by_level,
             )
             covered_payload = [[list(lo), list(hi)] for lo, hi in covered_boxes]
 
@@ -500,122 +370,6 @@ class UniformProjection:
         self.reduce_fan_in = reduce_fan_in
         self.amr_cell_average = amr_cell_average
 
-    def _intersecting_blocks_level(
-        self, level_meta, *, axis_range: tuple[int, int]
-    ) -> Iterable[int]:
-        axis_idx = _axis_index(self.axis)
-        u_axis, v_axis = [i for i in range(3) if i != axis_idx]
-
-        u0, v0, u1, v1 = self.rect
-        umin, umax = (u0, u1) if u0 <= u1 else (u1, u0)
-        vmin, vmax = (v0, v1) if v0 <= v1 else (v1, v0)
-        k_lo, k_hi = axis_range
-
-        geom = level_meta.geom
-        for i, box in enumerate(level_meta.boxes):
-            if box.hi[axis_idx] < k_lo or box.lo[axis_idx] > k_hi:
-                continue
-
-            u0_b, u1_b = _bounds_1d(
-                box.lo[u_axis],
-                box.hi[u_axis],
-                geom.x0[u_axis],
-                geom.dx[u_axis],
-                geom.index_origin[u_axis],
-            )
-            v0_b, v1_b = _bounds_1d(
-                box.lo[v_axis],
-                box.hi[v_axis],
-                geom.x0[v_axis],
-                geom.dx[v_axis],
-                geom.index_origin[v_axis],
-            )
-            if not (_overlaps_1d(u0_b, u1_b, umin, umax) and _overlaps_1d(v0_b, v1_b, vmin, vmax)):
-                continue
-            yield i
-
-    def _coarsen_box(
-        self,
-        lo: tuple[int, int, int],
-        hi: tuple[int, int, int],
-        *,
-        ratio: int,
-        fine_origin: tuple[int, int, int],
-        coarse_origin: tuple[int, int, int],
-    ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
-        clo = []
-        chi = []
-        for d in range(3):
-            clo.append(int(math.floor((lo[d] - fine_origin[d]) / ratio)) + coarse_origin[d])
-            chi.append(int(math.floor((hi[d] - fine_origin[d] + 1) / ratio)) + coarse_origin[d] - 1)
-        return tuple(clo), tuple(chi)
-
-    def _ref_ratio_between(self, levels, coarse: int, fine: int) -> int:
-        ratio = 1
-        for lev in range(coarse, fine):
-            ratio *= int(levels[lev].geom.ref_ratio)
-        return ratio
-
-    def _cell_index(self, geom, axis: int, coord: float) -> int:
-        x0 = geom.x0[axis]
-        dx = geom.dx[axis]
-        origin = geom.index_origin[axis]
-        if dx == 0.0:
-            return origin
-        idx_f = (coord - x0) / dx
-        return int(math.floor(idx_f)) + origin
-
-    def _axis_index_range(self, geom, axis: int, bounds: tuple[float, float]) -> tuple[int, int]:
-        b0, b1 = bounds
-        lo = b0 if b0 <= b1 else b1
-        hi = b1 if b0 <= b1 else b0
-        hi_adj = math.nextafter(hi, -math.inf)
-        k_lo = self._cell_index(geom, axis, lo)
-        k_hi = self._cell_index(geom, axis, hi_adj)
-        return (k_lo, k_hi) if k_lo <= k_hi else (k_hi, k_lo)
-
-    def _covered_boxes_for_level(
-        self,
-        ctx: LoweringContext,
-        *,
-        level: int,
-        axis_idx: int,
-        axis_range_by_level: dict[int, tuple[int, int]],
-    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
-        ds = ctx.dataset
-        levels = ctx.runmeta.steps[ds.step].levels
-        coarse_origin = levels[level].geom.index_origin
-        coarse_k_lo, coarse_k_hi = axis_range_by_level[level]
-        covered: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
-        for fine in range(level + 1, len(levels)):
-            fine_k_lo, fine_k_hi = axis_range_by_level[fine]
-            ratio = self._ref_ratio_between(levels, level, fine)
-            fine_origin = levels[fine].geom.index_origin
-            for box in levels[fine].boxes:
-                if box.hi[axis_idx] < fine_k_lo or box.lo[axis_idx] > fine_k_hi:
-                    continue
-                covered.append(
-                    self._coarsen_box(
-                        box.lo,
-                        box.hi,
-                        ratio=ratio,
-                        fine_origin=fine_origin,
-                        coarse_origin=coarse_origin,
-                    )
-                )
-        if not covered:
-            return []
-        clamped: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
-        for lo, hi in covered:
-            if hi[axis_idx] < coarse_k_lo or lo[axis_idx] > coarse_k_hi:
-                continue
-            clo = list(lo)
-            chi = list(hi)
-            clo[axis_idx] = max(clo[axis_idx], coarse_k_lo)
-            chi[axis_idx] = min(chi[axis_idx], coarse_k_hi)
-            clamped.append((tuple(clo), tuple(chi)))
-        return clamped
-
     def _lower_amr_projection(self, ctx: LoweringContext):
         ds = ctx.dataset
         axis_idx = _axis_index(self.axis)
@@ -624,12 +378,9 @@ class UniformProjection:
             raise ValueError("resolution must be positive")
 
         levels = ctx.runmeta.steps[ds.step].levels
-        axis_range_by_level: dict[int, tuple[int, int]] = {}
-        for level_idx in range(len(levels)):
-            geom = levels[level_idx].geom
-            axis_range_by_level[level_idx] = self._axis_index_range(
-                geom, axis_idx, self.axis_bounds
-            )
+        axis_range_by_level = axis_ranges_by_level(
+            levels, axis=axis_idx, bounds=self.axis_bounds
+        )
 
         sum_fields: list[ReducedField] = []
         reductions = GraphReductionBuilder(ctx)
@@ -638,15 +389,22 @@ class UniformProjection:
         for level_idx in range(len(levels) - 1, -1, -1):
             level_meta = levels[level_idx]
             axis_range = axis_range_by_level[level_idx]
-            blocks = list(self._intersecting_blocks_level(level_meta, axis_range=axis_range))
+            blocks = list(
+                intersecting_slab_blocks(
+                    level_meta,
+                    axis=axis_idx,
+                    axis_range=axis_range,
+                    rect=self.rect,
+                )
+            )
             if not blocks:
                 continue
 
-            covered_boxes = self._covered_boxes_for_level(
-                ctx,
+            covered_boxes = covered_slab_boxes(
+                levels,
                 level=level_idx,
-                axis_idx=axis_idx,
-                axis_range_by_level=axis_range_by_level,
+                axis=axis_idx,
+                axis_ranges=axis_range_by_level,
             )
             covered_payload = [[list(lo), list(hi)] for lo, hi in covered_boxes]
 
@@ -765,106 +523,6 @@ class ParticleCICProjection:
         self.out_name = out_name
         self.reduce_fan_in = reduce_fan_in
 
-    def _intersecting_blocks_level(
-        self, level_meta, *, axis_range: tuple[int, int]
-    ) -> Iterable[int]:
-        axis_idx = _axis_index(self.axis)
-        u_axis, v_axis = [i for i in range(3) if i != axis_idx]
-
-        u0, v0, u1, v1 = self.rect
-        umin, umax = (u0, u1) if u0 <= u1 else (u1, u0)
-        vmin, vmax = (v0, v1) if v0 <= v1 else (v1, v0)
-        k_lo, k_hi = axis_range
-
-        geom = level_meta.geom
-        for i, box in enumerate(level_meta.boxes):
-            if box.hi[axis_idx] < k_lo or box.lo[axis_idx] > k_hi:
-                continue
-
-            u0_b, u1_b = _bounds_1d(
-                box.lo[u_axis],
-                box.hi[u_axis],
-                geom.x0[u_axis],
-                geom.dx[u_axis],
-                geom.index_origin[u_axis],
-            )
-            v0_b, v1_b = _bounds_1d(
-                box.lo[v_axis],
-                box.hi[v_axis],
-                geom.x0[v_axis],
-                geom.dx[v_axis],
-                geom.index_origin[v_axis],
-            )
-            if not (_overlaps_1d(u0_b, u1_b, umin, umax) and _overlaps_1d(v0_b, v1_b, vmin, vmax)):
-                continue
-            yield i
-
-    def _ref_ratio_between(self, levels, coarse: int, fine: int) -> int:
-        ratio = 1
-        for lev in range(coarse, fine):
-            ratio *= int(levels[lev].geom.ref_ratio)
-        return ratio
-
-    def _cell_index(self, geom, axis: int, coord: float) -> int:
-        x0 = geom.x0[axis]
-        dx = geom.dx[axis]
-        origin = geom.index_origin[axis]
-        if dx == 0.0:
-            return origin
-        idx_f = (coord - x0) / dx
-        return int(math.floor(idx_f)) + origin
-
-    def _axis_index_range(self, geom, axis: int, bounds: tuple[float, float]) -> tuple[int, int]:
-        b0, b1 = bounds
-        lo = b0 if b0 <= b1 else b1
-        hi = b1 if b0 <= b1 else b0
-        hi_adj = math.nextafter(hi, -math.inf)
-        k_lo = self._cell_index(geom, axis, lo)
-        k_hi = self._cell_index(geom, axis, hi_adj)
-        return (k_lo, k_hi) if k_lo <= k_hi else (k_hi, k_lo)
-
-    def _covered_boxes_for_level(
-        self,
-        ctx: LoweringContext,
-        *,
-        level: int,
-        axis_idx: int,
-        axis_range_by_level: dict[int, tuple[int, int]],
-    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
-        ds = ctx.dataset
-        levels = ctx.runmeta.steps[ds.step].levels
-        coarse_origin = levels[level].geom.index_origin
-        coarse_k_lo, coarse_k_hi = axis_range_by_level[level]
-        covered: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
-        for fine in range(level + 1, len(levels)):
-            fine_k_lo, fine_k_hi = axis_range_by_level[fine]
-            ratio = self._ref_ratio_between(levels, level, fine)
-            fine_origin = levels[fine].geom.index_origin
-            for box in levels[fine].boxes:
-                if box.hi[axis_idx] < fine_k_lo or box.lo[axis_idx] > fine_k_hi:
-                    continue
-                covered.append(
-                    _coarsen_box(
-                        box.lo,
-                        box.hi,
-                        ratio=ratio,
-                        fine_origin=fine_origin,
-                        coarse_origin=coarse_origin,
-                    )
-                )
-        if not covered:
-            return []
-        clamped: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
-        for lo, hi in covered:
-            if hi[axis_idx] < coarse_k_lo or lo[axis_idx] > coarse_k_hi:
-                continue
-            clo = list(lo)
-            chi = list(hi)
-            clo[axis_idx] = max(clo[axis_idx], coarse_k_lo)
-            chi[axis_idx] = min(chi[axis_idx], coarse_k_hi)
-            clamped.append((tuple(clo), tuple(chi)))
-        return clamped
-
     def lower(self, ctx: LoweringContext):
         ds = ctx.dataset
         axis_idx = _axis_index(self.axis)
@@ -873,12 +531,9 @@ class ParticleCICProjection:
             raise ValueError("resolution must be positive")
 
         levels = ctx.runmeta.steps[ds.step].levels
-        axis_range_by_level: dict[int, tuple[int, int]] = {}
-        for level_idx in range(len(levels)):
-            geom = levels[level_idx].geom
-            axis_range_by_level[level_idx] = self._axis_index_range(
-                geom, axis_idx, self.axis_bounds
-            )
+        axis_range_by_level = axis_ranges_by_level(
+            levels, axis=axis_idx, bounds=self.axis_bounds
+        )
 
         sum_fields: list[ReducedField] = []
         reductions = GraphReductionBuilder(ctx)
@@ -888,15 +543,22 @@ class ParticleCICProjection:
         for level_idx in range(len(levels) - 1, -1, -1):
             level_meta = levels[level_idx]
             axis_range = axis_range_by_level[level_idx]
-            blocks = list(self._intersecting_blocks_level(level_meta, axis_range=axis_range))
+            blocks = list(
+                intersecting_slab_blocks(
+                    level_meta,
+                    axis=axis_idx,
+                    axis_range=axis_range,
+                    rect=self.rect,
+                )
+            )
             if not blocks:
                 continue
 
-            covered_boxes = self._covered_boxes_for_level(
-                ctx,
+            covered_boxes = covered_slab_boxes(
+                levels,
                 level=level_idx,
-                axis_idx=axis_idx,
-                axis_range_by_level=axis_range_by_level,
+                axis=axis_idx,
+                axis_ranges=axis_range_by_level,
             )
             covered_payload = [[list(lo), list(hi)] for lo, hi in covered_boxes]
 
@@ -1014,117 +676,14 @@ class ParticleCICGrid:
         self.mass_max = mass_max
         self.out_name = out_name
 
-    def _intersecting_blocks_level(
-        self, level_meta, *, axis_range: tuple[int, int]
-    ) -> Iterable[int]:
-        axis_idx = _axis_index(self.axis)
-        u_axis, v_axis = [i for i in range(3) if i != axis_idx]
-
-        u0, v0, u1, v1 = self.rect
-        umin, umax = (u0, u1) if u0 <= u1 else (u1, u0)
-        vmin, vmax = (v0, v1) if v0 <= v1 else (v1, v0)
-        k_lo, k_hi = axis_range
-
-        geom = level_meta.geom
-        for i, box in enumerate(level_meta.boxes):
-            if box.hi[axis_idx] < k_lo or box.lo[axis_idx] > k_hi:
-                continue
-
-            u0_b, u1_b = _bounds_1d(
-                box.lo[u_axis],
-                box.hi[u_axis],
-                geom.x0[u_axis],
-                geom.dx[u_axis],
-                geom.index_origin[u_axis],
-            )
-            v0_b, v1_b = _bounds_1d(
-                box.lo[v_axis],
-                box.hi[v_axis],
-                geom.x0[v_axis],
-                geom.dx[v_axis],
-                geom.index_origin[v_axis],
-            )
-            if not (_overlaps_1d(u0_b, u1_b, umin, umax) and _overlaps_1d(v0_b, v1_b, vmin, vmax)):
-                continue
-            yield i
-
-    def _ref_ratio_between(self, levels, coarse: int, fine: int) -> int:
-        ratio = 1
-        for lev in range(coarse, fine):
-            ratio *= int(levels[lev].geom.ref_ratio)
-        return ratio
-
-    def _cell_index(self, geom, axis: int, coord: float) -> int:
-        x0 = geom.x0[axis]
-        dx = geom.dx[axis]
-        origin = geom.index_origin[axis]
-        if dx == 0.0:
-            return origin
-        idx_f = (coord - x0) / dx
-        return int(math.floor(idx_f)) + origin
-
-    def _axis_index_range(self, geom, axis: int, bounds: tuple[float, float]) -> tuple[int, int]:
-        b0, b1 = bounds
-        lo = b0 if b0 <= b1 else b1
-        hi = b1 if b0 <= b1 else b0
-        hi_adj = math.nextafter(hi, -math.inf)
-        k_lo = self._cell_index(geom, axis, lo)
-        k_hi = self._cell_index(geom, axis, hi_adj)
-        return (k_lo, k_hi) if k_lo <= k_hi else (k_hi, k_lo)
-
-    def _covered_boxes_for_level(
-        self,
-        ctx: LoweringContext,
-        *,
-        level: int,
-        axis_idx: int,
-        axis_range_by_level: dict[int, tuple[int, int]],
-    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
-        ds = ctx.dataset
-        levels = ctx.runmeta.steps[ds.step].levels
-        coarse_origin = levels[level].geom.index_origin
-        coarse_k_lo, coarse_k_hi = axis_range_by_level[level]
-        covered: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
-        for fine in range(level + 1, len(levels)):
-            fine_k_lo, fine_k_hi = axis_range_by_level[fine]
-            ratio = self._ref_ratio_between(levels, level, fine)
-            fine_origin = levels[fine].geom.index_origin
-            for box in levels[fine].boxes:
-                if box.hi[axis_idx] < fine_k_lo or box.lo[axis_idx] > fine_k_hi:
-                    continue
-                covered.append(
-                    _coarsen_box(
-                        box.lo,
-                        box.hi,
-                        ratio=ratio,
-                        fine_origin=fine_origin,
-                        coarse_origin=coarse_origin,
-                    )
-                )
-        if not covered:
-            return []
-        clamped: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
-        for lo, hi in covered:
-            if hi[axis_idx] < coarse_k_lo or lo[axis_idx] > coarse_k_hi:
-                continue
-            clo = list(lo)
-            chi = list(hi)
-            clo[axis_idx] = max(clo[axis_idx], coarse_k_lo)
-            chi[axis_idx] = min(chi[axis_idx], coarse_k_hi)
-            clamped.append((tuple(clo), tuple(chi)))
-        return clamped
-
     def lower(self, ctx: LoweringContext):
         ds = ctx.dataset
         axis_idx = _axis_index(self.axis)
 
         levels = ctx.runmeta.steps[ds.step].levels
-        axis_range_by_level: dict[int, tuple[int, int]] = {}
-        for level_idx in range(len(levels)):
-            geom = levels[level_idx].geom
-            axis_range_by_level[level_idx] = self._axis_index_range(
-                geom, axis_idx, self.axis_bounds
-            )
+        axis_range_by_level = axis_ranges_by_level(
+            levels, axis=axis_idx, bounds=self.axis_bounds
+        )
 
         stages: list = []
         grid_field = ctx.temp_field(self.out_name)
@@ -1132,15 +691,22 @@ class ParticleCICGrid:
         for level_idx in range(len(levels) - 1, -1, -1):
             level_meta = levels[level_idx]
             axis_range = axis_range_by_level[level_idx]
-            blocks = list(self._intersecting_blocks_level(level_meta, axis_range=axis_range))
+            blocks = list(
+                intersecting_slab_blocks(
+                    level_meta,
+                    axis=axis_idx,
+                    axis_range=axis_range,
+                    rect=self.rect,
+                )
+            )
             if not blocks:
                 continue
 
-            covered_boxes = self._covered_boxes_for_level(
-                ctx,
+            covered_boxes = covered_slab_boxes(
+                levels,
                 level=level_idx,
-                axis_idx=axis_idx,
-                axis_range_by_level=axis_range_by_level,
+                axis=axis_idx,
+                axis_ranges=axis_range_by_level,
             )
             covered_payload = [[list(lo), list(hi)] for lo, hi in covered_boxes]
 
@@ -1219,37 +785,6 @@ class FluxSurfaceIntegral:
             raise TypeError("temperature_bins must be a sequence of numbers")
         values = tuple(float(v) for v in temperature_bins)
         return values
-
-    def _ref_ratio_between(self, levels, coarse: int, fine: int) -> int:
-        ratio = 1
-        for lev in range(coarse, fine):
-            ratio *= int(levels[lev].geom.ref_ratio)
-        return ratio
-
-    def _covered_boxes_for_level(
-        self,
-        ctx: LoweringContext,
-        *,
-        level: int,
-    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
-        ds = ctx.dataset
-        levels = ctx.runmeta.steps[ds.step].levels
-        coarse_origin = levels[level].geom.index_origin
-        covered: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
-        for fine in range(level + 1, len(levels)):
-            ratio = self._ref_ratio_between(levels, level, fine)
-            fine_origin = levels[fine].geom.index_origin
-            for box in levels[fine].boxes:
-                covered.append(
-                    _coarsen_box(
-                        box.lo,
-                        box.hi,
-                        ratio=ratio,
-                        fine_origin=fine_origin,
-                        coarse_origin=coarse_origin,
-                    )
-                )
-        return covered
 
     def _block_radius_bounds2(self, level_meta, block) -> tuple[float, float]:
         geom = level_meta.geom
@@ -1340,7 +875,7 @@ class FluxSurfaceIntegral:
                 continue
             blocks = [block_idx for block_idx, _ in block_radius_indices]
 
-            covered_boxes = self._covered_boxes_for_level(ctx, level=level_idx)
+            covered_boxes = covered_volume_boxes(levels, level=level_idx)
             covered_payload = [[list(c_lo), list(c_hi)] for c_lo, c_hi in covered_boxes]
             flux_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 
@@ -1600,7 +1135,7 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
                 continue
             blocks = [block_idx for block_idx, _ in block_height_indices]
 
-            covered_boxes = self._covered_boxes_for_level(ctx, level=level_idx)
+            covered_boxes = covered_volume_boxes(levels, level=level_idx)
             covered_payload = [[list(c_lo), list(c_hi)] for c_lo, c_hi in covered_boxes]
             flux_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 
@@ -1728,37 +1263,6 @@ class Histogram1D:
         self.weight_field = weight_field
         self.reduce_fan_in = reduce_fan_in
 
-    def _ref_ratio_between(self, levels, coarse: int, fine: int) -> int:
-        ratio = 1
-        for lev in range(coarse, fine):
-            ratio *= int(levels[lev].geom.ref_ratio)
-        return ratio
-
-    def _covered_boxes_for_level(
-        self,
-        ctx: LoweringContext,
-        *,
-        level: int,
-    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
-        ds = ctx.dataset
-        levels = ctx.runmeta.steps[ds.step].levels
-        coarse_origin = levels[level].geom.index_origin
-        covered: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
-        for fine in range(level + 1, len(levels)):
-            ratio = self._ref_ratio_between(levels, level, fine)
-            fine_origin = levels[fine].geom.index_origin
-            for box in levels[fine].boxes:
-                covered.append(
-                    _coarsen_box(
-                        box.lo,
-                        box.hi,
-                        ratio=ratio,
-                        fine_origin=fine_origin,
-                        coarse_origin=coarse_origin,
-                    )
-                )
-        return covered
-
     def lower(self, ctx: LoweringContext):
         ds = ctx.dataset
         if self.bins <= 0:
@@ -1779,7 +1283,7 @@ class Histogram1D:
             if not blocks:
                 continue
 
-            covered_boxes = self._covered_boxes_for_level(ctx, level=level_idx)
+            covered_boxes = covered_volume_boxes(levels, level=level_idx)
             covered_payload = [[list(c_lo), list(c_hi)] for c_lo, c_hi in covered_boxes]
             hist_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 
@@ -1887,37 +1391,6 @@ class Histogram2D:
         self.weight_mode = weight_mode
         self.reduce_fan_in = reduce_fan_in
 
-    def _ref_ratio_between(self, levels, coarse: int, fine: int) -> int:
-        ratio = 1
-        for lev in range(coarse, fine):
-            ratio *= int(levels[lev].geom.ref_ratio)
-        return ratio
-
-    def _covered_boxes_for_level(
-        self,
-        ctx: LoweringContext,
-        *,
-        level: int,
-    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
-        ds = ctx.dataset
-        levels = ctx.runmeta.steps[ds.step].levels
-        coarse_origin = levels[level].geom.index_origin
-        covered: list[tuple[tuple[int, int, int], tuple[int, int, int]]] = []
-        for fine in range(level + 1, len(levels)):
-            ratio = self._ref_ratio_between(levels, level, fine)
-            fine_origin = levels[fine].geom.index_origin
-            for box in levels[fine].boxes:
-                covered.append(
-                    _coarsen_box(
-                        box.lo,
-                        box.hi,
-                        ratio=ratio,
-                        fine_origin=fine_origin,
-                        coarse_origin=coarse_origin,
-                    )
-                )
-        return covered
-
     def lower(self, ctx: LoweringContext):
         ds = ctx.dataset
         nx, ny = self.bins
@@ -1940,7 +1413,7 @@ class Histogram2D:
             if not blocks:
                 continue
 
-            covered_boxes = self._covered_boxes_for_level(ctx, level=level_idx)
+            covered_boxes = covered_volume_boxes(levels, level=level_idx)
             covered_payload = [[list(c_lo), list(c_hi)] for c_lo, c_hi in covered_boxes]
             hist_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 

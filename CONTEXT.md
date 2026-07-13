@@ -28,6 +28,10 @@ _Avoid_: packed neighbor bytes
 A locality-aware plan fragment that combines block-indexed intermediate fields into one published field while owning fan-in, grouping, task placement, and producer dependencies.
 _Avoid_: hand-built reduce stages in an analysis operator
 
+**AMR Coverage**:
+The regions where finer levels supersede cells on a target level for masking and block selection.
+_Avoid_: covered-box helpers, operator-local masks
+
 ## Relationships
 
 - A field and block identify one **Chunk Buffer** at a particular step, level, and version.
@@ -36,11 +40,15 @@ _Avoid_: hand-built reduce stages in an analysis operator
 - An **Opaque Payload** exposes bytes but cannot expose a typed **Block Grid** or numeric array.
 - An **AMR Patch Payload** transports neighboring **Chunk Buffers** without exposing its wire format to kernels.
 - A **Graph Reduction** combines intermediate **Chunk Buffers** without exposing execution topology to the scientific operator.
+- Scientific operators apply **AMR Coverage** before a **Graph Reduction** to avoid coarse/fine double counting.
 
 ## Example dialogue
 
 > **Developer:** "Does this kernel need to know the input field's bytes per value?"
 > **Runtime maintainer:** "No. The **Chunk Buffer** carries its scalar type, and the kernel requests a typed **Block Grid**."
+
+> **Developer:** "Should each projection calculate its own covered coarse boxes?"
+> **Runtime maintainer:** "No. **AMR Coverage** owns level mapping and masking; the projection only specifies its spatial selection."
 
 ## Flagged ambiguities
 
