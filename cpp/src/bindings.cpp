@@ -17,11 +17,90 @@
 #include <hpx/version.hpp>
 #include <msgpack.hpp>
 
+#ifdef KANGAROO_USE_PARTHENON_HDF5
+#include <hdf5.h>
+#endif
+
 namespace nb = nanobind;
 
 namespace {
 
 std::atomic<std::uint64_t> g_py_event_counter{0};
+
+#ifdef KANGAROO_USE_PARTHENON_HDF5
+void write_string_attribute(hid_t object, const char* name,
+                            const std::vector<std::string>& values) {
+  constexpr std::size_t width = 16;
+  const hsize_t extent = values.size();
+  hid_t space = H5Screate_simple(1, &extent, nullptr);
+  hid_t type = H5Tcopy(H5T_C_S1);
+  H5Tset_size(type, width);
+  H5Tset_strpad(type, H5T_STR_NULLTERM);
+  hid_t attribute = H5Acreate2(object, name, type, space, H5P_DEFAULT, H5P_DEFAULT);
+  std::vector<char> data(values.size() * width, '\0');
+  for (std::size_t i = 0; i < values.size(); ++i) {
+    std::copy_n(values[i].data(), std::min(values[i].size(), width - 1),
+                data.data() + i * width);
+  }
+  H5Awrite(attribute, type, data.data());
+  H5Aclose(attribute);
+  H5Tclose(type);
+  H5Sclose(space);
+}
+
+void write_i64_attribute(hid_t object, const char* name,
+                         const std::vector<std::int64_t>& values) {
+  const hsize_t extent = values.size();
+  hid_t space = H5Screate_simple(1, &extent, nullptr);
+  hid_t attribute = H5Acreate2(object, name, H5T_NATIVE_LLONG, space,
+                               H5P_DEFAULT, H5P_DEFAULT);
+  H5Awrite(attribute, H5T_NATIVE_LLONG, values.data());
+  H5Aclose(attribute);
+  H5Sclose(space);
+}
+
+void write_test_parthenon_file(const std::string& path) {
+  hid_t file = H5Fcreate(path.c_str(), H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT);
+  if (file < 0) throw std::runtime_error("failed to create test Parthenon file");
+  hid_t info = H5Gcreate2(file, "/Info", H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  write_string_attribute(info, "OutputDatasetNames", {"prim"});
+  write_i64_attribute(info, "NumComponents", {4});
+  write_string_attribute(info, "ComponentNames", {"rho", "v1", "v2", "v3"});
+  write_i64_attribute(info, "MeshBlockSize", {2, 1, 1});
+  write_i64_attribute(info, "RootGridSize", {2, 1, 1});
+  H5Gclose(info);
+
+  const hsize_t level_extent = 1;
+  hid_t level_space = H5Screate_simple(1, &level_extent, nullptr);
+  hid_t levels = H5Dcreate2(file, "/Levels", H5T_NATIVE_LLONG, level_space,
+                            H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  const std::int64_t level = 0;
+  H5Dwrite(levels, H5T_NATIVE_LLONG, H5S_ALL, H5S_ALL, H5P_DEFAULT, &level);
+  H5Dclose(levels);
+  H5Sclose(level_space);
+
+  const hsize_t location_extents[2] = {1, 3};
+  hid_t location_space = H5Screate_simple(2, location_extents, nullptr);
+  hid_t locations = H5Dcreate2(file, "/LogicalLocations", H5T_NATIVE_LLONG,
+                               location_space, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  const std::array<std::int64_t, 3> location{0, 0, 0};
+  H5Dwrite(locations, H5T_NATIVE_LLONG, H5S_ALL, H5S_ALL, H5P_DEFAULT,
+           location.data());
+  H5Dclose(locations);
+  H5Sclose(location_space);
+
+  const hsize_t field_extents[5] = {1, 4, 1, 1, 2};
+  hid_t field_space = H5Screate_simple(5, field_extents, nullptr);
+  hid_t field = H5Dcreate2(file, "/prim", H5T_IEEE_F64LE, field_space,
+                           H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT);
+  const std::array<double, 8> values{0.0, 1.0, 10.0, 11.0,
+                                     20.0, 21.0, 30.0, 31.0};
+  H5Dwrite(field, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, values.data());
+  H5Dclose(field);
+  H5Sclose(field_space);
+  H5Fclose(file);
+}
+#endif
 
 nb::object require_key(const nb::dict& d, const char* key) {
   if (!d.contains(key)) {
@@ -466,6 +545,18 @@ NB_MODULE(_core, m) {
     writer.replace(payload);
     return std::vector<std::uint8_t>(moved.byte_view().begin(), moved.byte_view().end());
   });
+  m.def("test_chunk_buffer_async_byte_writer_preserves_cow", []() {
+    auto written = kangaroo::ChunkBuffer::allocate_dynamic(
+        kangaroo::ScalarType::kOpaque, 8, kangaroo::InitPolicy::kZero);
+    auto untouched = written;
+    auto writer = written.begin_async_dynamic_write();
+    const std::array<std::uint8_t, 3> payload{1, 2, 3};
+    writer.replace(payload);
+    untouched.commit_dynamic_extent(payload.size());
+    return nb::make_tuple(
+        std::vector<std::uint8_t>(written.byte_view().begin(), written.byte_view().end()),
+        std::vector<std::uint8_t>(untouched.byte_view().begin(), untouched.byte_view().end()));
+  });
   m.def("test_chunk_buffer_async_byte_writer_reuse", []() {
     auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(
         kangaroo::ScalarType::kOpaque, 8);
@@ -474,6 +565,23 @@ NB_MODULE(_core, m) {
     writer.replace(payload);
     writer.replace(payload);
   });
+#ifdef KANGAROO_USE_PARTHENON_HDF5
+  m.def("test_parthenon_component_storage", [](const std::string& path) {
+    write_test_parthenon_file(path);
+    kangaroo::ParthenonBackend backend(path);
+    constexpr std::int32_t field_id = 7;
+    backend.register_field(field_id, "v2");
+    const kangaroo::ChunkRef ref{0, 0, field_id, 0, 0};
+    auto buffer = backend.get_chunk(ref);
+    if (!buffer.has_value()) {
+      throw std::runtime_error("failed to read test Parthenon component");
+    }
+    const auto values = buffer->view<double, 3>();
+    return nb::make_tuple(
+        std::vector<double>{values(0, 0, 0), values(1, 0, 0)}, buffer->bytes(),
+        buffer->resident_bytes(), backend.estimate_chunk_bytes(ref));
+  });
+#endif
   m.def("test_chunk_buffer_dynamic_roundtrip", [](std::uint64_t capacity, std::uint64_t extent) {
     auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(kangaroo::ScalarType::kF64, capacity);
     buffer.commit_dynamic_extent(extent);

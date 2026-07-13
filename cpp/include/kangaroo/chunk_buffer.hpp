@@ -167,6 +167,9 @@ class SharedByteBuffer {
   }
   bool empty() const noexcept { return size() == 0; }
   size_type size() const noexcept { return visible_size(); }
+  size_type allocation_bytes() const noexcept {
+    return vector_data_ ? vector_data_->capacity() : raw_capacity_;
+  }
   bool uses_raw_storage() const noexcept { return !vector_data_; }
   bool is_shared_or_sliced() const noexcept {
     return storage_use_count() != 1 || start_offset() != 0 ||
@@ -502,6 +505,7 @@ class ChunkBuffer {
     return storage_.size();
   }
   std::size_t capacity_bytes() const noexcept { return storage_.size(); }
+  std::size_t resident_bytes() const noexcept { return storage_.allocation_bytes(); }
   bool empty() const noexcept { return bytes() == 0; }
   bool uses_uninitialized_storage() const noexcept { return storage_.uses_raw_storage(); }
   bool awaiting_dynamic_extent_commit() const noexcept {
@@ -534,6 +538,7 @@ class ChunkBuffer {
       throw BufferContractError(BufferContractReason::kInvalidDynamicResize,
                                 "async writing requires an uncommitted dynamic buffer");
     }
+    storage_.detach();
     commit_dynamic_extent(0);
     return DynamicByteWriter(storage_, desc_.scalar, *dynamic_capacity_elements_,
                              dynamic_committed_elements_);

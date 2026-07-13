@@ -522,14 +522,16 @@ std::optional<ChunkBuffer> ParthenonBackend::get_chunk(const ChunkRef& ref) {
       static_cast<std::size_t>(spec.comp_start) * comp_bytes;
   const std::size_t selected_bytes =
       static_cast<std::size_t>(spec.comp_count) * comp_bytes;
-  SharedByteBuffer storage(std::move(block_raw));
+  std::vector<std::uint8_t> selected_raw(selected_bytes);
+  std::copy_n(block_raw.data() + selected_offset, selected_bytes, selected_raw.data());
+  SharedByteBuffer storage(std::move(selected_raw));
   const auto scalar = bytes_per == 4 ? ScalarType::kF32 : ScalarType::kF64;
   const std::array<std::uint64_t, 3> extents{
       static_cast<std::uint64_t>(mem_dims[mem_dims.size() - 1]),
       static_cast<std::uint64_t>(mem_dims[mem_dims.size() - 2]),
       static_cast<std::uint64_t>(mem_dims[mem_dims.size() - 3])};
   return ChunkBuffer::wrap(
-      storage.slice(selected_offset, selected_bytes),
+      std::move(storage),
       BufferDesc::component_major_grid(
           scalar, extents, static_cast<std::uint64_t>(spec.comp_count)));
 }
