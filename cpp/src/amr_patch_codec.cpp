@@ -22,7 +22,8 @@ ChunkBuffer encode_amr_patch_payload(std::span<const AmrPatchRecord> patches) {
     for (int axis = 0; axis < 3; ++axis) {
       if (patch.box.hi[axis] < patch.box.lo[axis] ||
           desc.extents[axis] != static_cast<std::uint64_t>(
-                                    patch.box.hi[axis] - patch.box.lo[axis] + 1)) {
+                                    static_cast<std::int64_t>(patch.box.hi[axis]) -
+                                    static_cast<std::int64_t>(patch.box.lo[axis]) + 1)) {
         throw std::runtime_error("AMR patch box does not match its Block Grid extents");
       }
     }
@@ -162,7 +163,8 @@ std::vector<AmrPatchRecord> decode_amr_patch_payload(
     for (int axis = 0; axis < 3; ++axis) {
       if (patch.box.hi[axis] < patch.box.lo[axis] ||
           desc.extents[axis] != static_cast<std::uint64_t>(
-                                    patch.box.hi[axis] - patch.box.lo[axis] + 1)) {
+                                    static_cast<std::int64_t>(patch.box.hi[axis]) -
+                                    static_cast<std::int64_t>(patch.box.lo[axis]) + 1)) {
         throw std::runtime_error("AMR patch box does not match its Block Grid extents");
       }
     }
