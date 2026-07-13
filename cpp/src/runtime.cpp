@@ -2031,8 +2031,7 @@ void register_default_kernels(KernelRegistry& registry) {
         };
         std::vector<PendingPatch> pending_patches;
         std::vector<hpx::future<SubboxView>> pending_subboxes;
-        ChunkBuffer* output = &outputs[0];
-        output->commit_dynamic_extent(0);
+        auto output_writer = outputs[0].begin_async_dynamic_write();
 
         DataServiceLocal data_service;
         for (int16_t lev = 0; lev < static_cast<int16_t>(step_meta.levels.size()); ++lev) {
@@ -2076,7 +2075,7 @@ void register_default_kernels(KernelRegistry& registry) {
 
         return hpx::when_all(std::move(pending_subboxes))
             .then([pending_patches = std::move(pending_patches),
-                   output](auto&& all) mutable {
+                   output_writer](auto&& all) mutable {
               auto ready_subboxes = all.get();
               std::vector<AmrPatchRecord> packed_patches;
               packed_patches.reserve(ready_subboxes.size());
@@ -2096,7 +2095,7 @@ void register_default_kernels(KernelRegistry& registry) {
               }
 
               const auto packed = encode_amr_patch_payload(packed_patches);
-              output->replace_dynamic_bytes(packed.byte_view());
+              output_writer.replace(packed.byte_view());
               return;
             });
         },
@@ -4116,7 +4115,7 @@ void register_default_kernels(KernelRegistry& registry) {
           return hpx::make_ready_future();
         }
         const auto in = inputs[0].array<double>();
-        auto out = outputs[0].mutable_dynamic_array<std::uint8_t>();
+        auto out = outputs[0].mutable_array<std::uint8_t>();
         const std::size_t n = in.extent(0);
         for (std::size_t i = 0; i < n; ++i) {
           out(i) = std::isfinite(in(i)) ? 1 : 0;
@@ -4133,7 +4132,7 @@ void register_default_kernels(KernelRegistry& registry) {
         const auto a = inputs[0].array<std::uint8_t>();
         const auto b = inputs[1].array<std::uint8_t>();
         const std::size_t n = std::min(a.extent(0), b.extent(0));
-        auto out = outputs[0].mutable_array<std::uint8_t>();
+        auto out = outputs[0].mutable_dynamic_array<std::uint8_t>();
         for (std::size_t i = 0; i < n; ++i) {
           out(i) = (a(i) != 0 && b(i) != 0) ? std::uint8_t{1} : std::uint8_t{0};
         }

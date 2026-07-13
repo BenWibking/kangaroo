@@ -71,6 +71,12 @@ def test_particle_elementwise_ops_truncate_unequal_chunk_lengths() -> None:
     np.testing.assert_array_equal(distance_chunk, [0.0, 5.0])
 
 
+def test_particle_isfinite_uses_fixed_like_input_output() -> None:
+    p = _memory_particle_pipeline("particle-isfinite")
+    mask = p.particle_isfinite(np.array([1.0, np.nan, np.inf, -2.0]))
+    np.testing.assert_array_equal(mask.iter_chunks()[0], [True, False, False, True])
+
+
 @pytest.mark.parametrize(
     ("values", "weights"),
     [

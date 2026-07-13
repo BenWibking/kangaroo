@@ -421,6 +421,22 @@ NB_MODULE(_core, m) {
     for (std::size_t i = 0; i < visible.extent(0); ++i) restored.push_back(visible(i));
     return restored;
   });
+  m.def("test_chunk_buffer_async_byte_writer", []() {
+    auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(
+        kangaroo::ScalarType::kOpaque, 8);
+    auto writer = buffer.begin_async_dynamic_write();
+    const std::array<std::uint8_t, 3> payload{1, 2, 3};
+    writer.replace(payload);
+    return std::vector<std::uint8_t>(buffer.byte_view().begin(), buffer.byte_view().end());
+  });
+  m.def("test_chunk_buffer_async_byte_writer_reuse", []() {
+    auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(
+        kangaroo::ScalarType::kOpaque, 8);
+    auto writer = buffer.begin_async_dynamic_write();
+    const std::array<std::uint8_t, 1> payload{1};
+    writer.replace(payload);
+    writer.replace(payload);
+  });
   m.def("test_chunk_buffer_dynamic_roundtrip", [](std::uint64_t capacity, std::uint64_t extent) {
     auto buffer = kangaroo::ChunkBuffer::allocate_dynamic(kangaroo::ScalarType::kF64, capacity);
     buffer.commit_dynamic_extent(extent);
