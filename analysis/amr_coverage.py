@@ -18,12 +18,16 @@ def plane_indices_by_level(
     base_geom = levels[0].geom
     base_index = _cell_index(base_geom, axis, coord)
     base_origin = base_geom.index_origin[axis]
-    return {
-        level: (base_index - base_origin)
-        * _refinement_ratio(levels, 0, level)
-        + levels[level].geom.index_origin[axis]
-        for level in range(len(levels))
-    }
+    indices: dict[int, int] = {}
+    ratio = 1
+    for level in range(len(levels)):
+        if level > 0:
+            ratio *= int(levels[level - 1].geom.ref_ratio)
+        indices[level] = (
+            (base_index - base_origin) * ratio
+            + levels[level].geom.index_origin[axis]
+        )
+    return indices
 
 
 def axis_ranges_by_level(
@@ -130,13 +134,6 @@ def intersecting_slab_blocks(
     )
 
 
-def _refinement_ratio(levels: Sequence[Any], coarse: int, fine: int) -> int:
-    ratio = 1
-    for level in range(coarse, fine):
-        ratio *= int(levels[level].geom.ref_ratio)
-    return ratio
-
-
 def _cell_index(geom: Any, axis: int, coord: float) -> int:
     origin = geom.index_origin[axis]
     dx = geom.dx[axis]
@@ -164,12 +161,12 @@ def _coarsen_box(
     coarse_origin: Index3,
 ) -> IndexBox:
     coarse_lo = tuple(
-        int(math.floor((lo[axis] - fine_origin[axis]) / ratio))
+        (lo[axis] - fine_origin[axis]) // ratio
         + coarse_origin[axis]
         for axis in range(3)
     )
     coarse_hi = tuple(
-        int(math.floor((hi[axis] - fine_origin[axis] + 1) / ratio))
+        (hi[axis] - fine_origin[axis] + 1) // ratio
         + coarse_origin[axis]
         - 1
         for axis in range(3)
@@ -185,8 +182,9 @@ def _coarsened_fine_boxes(
 ) -> list[IndexBox]:
     coarse_origin = levels[level].geom.index_origin
     covered: list[IndexBox] = []
+    ratio = 1
     for fine in range(level + 1, len(levels)):
-        ratio = _refinement_ratio(levels, level, fine)
+        ratio *= int(levels[fine - 1].geom.ref_ratio)
         fine_origin = levels[fine].geom.index_origin
         for box in levels[fine].boxes:
             if include is not None and not include(fine, box):

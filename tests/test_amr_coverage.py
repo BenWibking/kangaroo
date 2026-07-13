@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from analysis.amr_coverage import (
+    _coarsen_box,
     axis_ranges_by_level,
     covered_plane_boxes,
     covered_slab_boxes,
@@ -61,6 +62,62 @@ def test_volume_coverage_is_origin_aware_and_empty_on_finest_level() -> None:
         ((10, 10, 10), (13, 17, 17))
     ]
     assert covered_volume_boxes(levels, level=1) == []
+
+
+def test_multilevel_refinement_ratios_are_accumulated() -> None:
+    levels = [
+        LevelMeta(
+            geom=LevelGeom(
+                dx=(1.0, 1.0, 1.0),
+                x0=(0.0, 0.0, 0.0),
+                index_origin=(10, 10, 10),
+                ref_ratio=2,
+            ),
+            boxes=[],
+        ),
+        LevelMeta(
+            geom=LevelGeom(
+                dx=(0.5, 0.5, 0.5),
+                x0=(0.0, 0.0, 0.0),
+                index_origin=(20, 20, 20),
+                ref_ratio=3,
+            ),
+            boxes=[],
+        ),
+        LevelMeta(
+            geom=LevelGeom(
+                dx=(1.0 / 6.0, 1.0 / 6.0, 1.0 / 6.0),
+                x0=(0.0, 0.0, 0.0),
+                index_origin=(60, 60, 60),
+                ref_ratio=1,
+            ),
+            boxes=[BlockBox((60, 60, 60), (65, 65, 65))],
+        ),
+    ]
+
+    assert plane_indices_by_level(levels, axis=2, coord=2.5) == {
+        0: 12,
+        1: 24,
+        2: 72,
+    }
+    assert covered_volume_boxes(levels, level=0) == [
+        ((10, 10, 10), (10, 10, 10))
+    ]
+
+
+def test_coarsen_box_uses_exact_integer_floor_division() -> None:
+    index = 2**54 - 1
+
+    assert _coarsen_box(
+        (index, -index, 1),
+        (index, -index, 1),
+        ratio=2,
+        fine_origin=(0, 0, 0),
+        coarse_origin=(0, 0, 0),
+    ) == (
+        (2**53 - 1, -(2**53), 0),
+        (2**53 - 1, -(2**53), 0),
+    )
 
 
 def test_block_selection_uses_the_same_plane_and_slab_seam() -> None:
