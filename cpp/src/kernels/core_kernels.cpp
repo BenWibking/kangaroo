@@ -14,28 +14,6 @@ void register_core_kernels(KernelRegistry &registry) {
   {
     using Params = AmrSubboxPackParams;
 
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      if (root.type == msgpack::type::MAP) {
-        if (const auto *fld = find_msgpack_map_value(root, "input_field")) {
-          params.input_field = fld->as<int32_t>();
-        }
-        if (const auto *ver = find_msgpack_map_value(root, "input_version")) {
-          params.input_version = ver->as<int32_t>();
-        }
-        if (const auto *stp = find_msgpack_map_value(root, "input_step")) {
-          params.input_step = stp->as<int32_t>();
-        }
-        if (const auto *lev = find_msgpack_map_value(root, "input_level")) {
-          params.input_level = lev->as<int16_t>();
-        }
-        if (const auto *halo = find_msgpack_map_value(root, "halo_cells")) {
-          params.halo_cells = halo->as<int32_t>();
-        }
-      }
-      return params;
-    };
-
     /**
      * @brief Fetches an AMR sub-box and packs its selected cells contiguously.
      * @par Chunk inputs None; source chunks are fetched from the data service.
@@ -49,17 +27,16 @@ void register_core_kernels(KernelRegistry &registry) {
                    .n_inputs = 0,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &level, int32_t block,
-                        std::span<const ChunkBuffer>, const NeighborViews &,
-                        std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+        [](const LevelMeta &level, int32_t block, std::span<const ChunkBuffer>,
+           const NeighborViews &, std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
           if (outputs.empty() || block < 0 ||
               static_cast<std::size_t>(block) >= level.boxes.size()) {
             return hpx::make_ready_future();
           }
 
-          const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+          const auto &params = require_kernel_params<Params>(
+              kernel_params, "amr_subbox_fetch_pack");
 
           if (params.input_field < 0) {
             outputs[0].commit_dynamic_extent(0);
@@ -179,52 +156,13 @@ void register_core_kernels(KernelRegistry &registry) {
                 return;
               });
         },
-        make_kernel_params_preparer<Params>(decode_params),
         [](const DynamicOutputBoundContext &context) {
           return estimate_amr_subbox_pack_capacity(context,
                                                    context.params<Params>());
         });
   }
   {
-    struct Params {
-      int32_t input_field = -1;
-      int32_t input_version = 0;
-      int32_t input_step = 0;
-      int16_t input_level = 0;
-      int32_t stencil_radius = 1;
-    };
-
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      if (root.type == msgpack::type::MAP) {
-        if (const auto *fld = find_msgpack_map_value(root, "input_field");
-            fld && (fld->type == msgpack::type::POSITIVE_INTEGER ||
-                    fld->type == msgpack::type::NEGATIVE_INTEGER)) {
-          params.input_field = fld->as<int32_t>();
-        }
-        if (const auto *ver = find_msgpack_map_value(root, "input_version");
-            ver && (ver->type == msgpack::type::POSITIVE_INTEGER ||
-                    ver->type == msgpack::type::NEGATIVE_INTEGER)) {
-          params.input_version = ver->as<int32_t>();
-        }
-        if (const auto *stp = find_msgpack_map_value(root, "input_step");
-            stp && (stp->type == msgpack::type::POSITIVE_INTEGER ||
-                    stp->type == msgpack::type::NEGATIVE_INTEGER)) {
-          params.input_step = stp->as<int32_t>();
-        }
-        if (const auto *lev = find_msgpack_map_value(root, "input_level");
-            lev && (lev->type == msgpack::type::POSITIVE_INTEGER ||
-                    lev->type == msgpack::type::NEGATIVE_INTEGER)) {
-          params.input_level = lev->as<int16_t>();
-        }
-        if (const auto *sr = find_msgpack_map_value(root, "stencil_radius");
-            sr && (sr->type == msgpack::type::POSITIVE_INTEGER ||
-                   sr->type == msgpack::type::NEGATIVE_INTEGER)) {
-          params.stencil_radius = sr->as<int32_t>();
-        }
-      }
-      return params;
-    };
+    using Params = GradStencilParams;
 
     /**
      * @brief Computes the selected velocity-gradient component on a grid block.
@@ -240,10 +178,10 @@ void register_core_kernels(KernelRegistry &registry) {
                    .n_inputs = 1,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &level, int32_t block,
-                        std::span<const ChunkBuffer> inputs,
-                        const NeighborViews &, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+        [](const LevelMeta &level, int32_t block,
+           std::span<const ChunkBuffer> inputs, const NeighborViews &,
+           std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
           if (inputs.size() < 2 || inputs[0].empty() || outputs.empty() ||
               block < 0 ||
               static_cast<std::size_t>(block) >= level.boxes.size()) {
@@ -251,7 +189,7 @@ void register_core_kernels(KernelRegistry &registry) {
           }
 
           const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+              require_kernel_params<Params>(kernel_params, "gradU_stencil");
 
           const auto &box = level.boxes.at(static_cast<std::size_t>(block));
           const int32_t nx = box.hi.x - box.lo.x + 1;
@@ -448,34 +386,10 @@ void register_core_kernels(KernelRegistry &registry) {
             }
           }
           return hpx::make_ready_future();
-        },
-        make_kernel_params_preparer<Params>(decode_params));
+        });
   }
   {
-    struct Params {
-      std::string plotfile;
-      int level = 0;
-      int comp = 0;
-    };
-
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      if (const auto *path = find_msgpack_map_value(root, "plotfile");
-          path && path->type == msgpack::type::STR) {
-        params.plotfile = path->as<std::string>();
-      }
-      if (const auto *lvl = find_msgpack_map_value(root, "level");
-          lvl && (lvl->type == msgpack::type::POSITIVE_INTEGER ||
-                  lvl->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.level = lvl->as<int>();
-      }
-      if (const auto *comp = find_msgpack_map_value(root, "comp");
-          comp && (comp->type == msgpack::type::POSITIVE_INTEGER ||
-                   comp->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.comp = comp->as<int>();
-      }
-      return params;
-    };
+    using Params = PlotfileLoadParams;
 
     /**
      * @brief Loads one plotfile field component for a grid block.
@@ -490,16 +404,15 @@ void register_core_kernels(KernelRegistry &registry) {
                    .n_inputs = 0,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &level, int32_t block,
-                        std::span<const ChunkBuffer>, const NeighborViews &,
-                        std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+        [](const LevelMeta &level, int32_t block, std::span<const ChunkBuffer>,
+           const NeighborViews &, std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
           if (outputs.empty()) {
             return hpx::make_ready_future();
           }
 
           const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+              require_kernel_params<Params>(kernel_params, "plotfile_load");
 
           if (params.plotfile.empty()) {
             return hpx::make_ready_future();
@@ -550,8 +463,7 @@ void register_core_kernels(KernelRegistry &registry) {
           outputs[0].copy_from(source);
 
           return hpx::make_ready_future();
-        },
-        make_kernel_params_preparer<Params>(decode_params));
+        });
   }
 }
 

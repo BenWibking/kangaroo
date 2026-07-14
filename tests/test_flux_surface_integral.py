@@ -8,6 +8,7 @@ import pytest
 from analysis import Runtime
 from analysis.buffer import FixedShape, numpy_dtype
 from analysis.dataset import open_dataset
+from analysis.kernel_params import NoKernelParams
 from analysis.pipeline import Pipeline
 from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
 
@@ -188,12 +189,12 @@ def test_flux_surface_integral_lowering_wires_accumulate_reduce_and_covered_boxe
     fine = [tmpl for tmpl in accum if tmpl.domain.level == 1]
     assert coarse
     assert fine
-    assert [[0, 0, 0], [0, 1, 1]] in coarse[0].params["covered_boxes"]
-    assert fine[0].params["covered_boxes"] == []
+    assert ((0, 0, 0), (0, 1, 1)) in coarse[0].params.covered_boxes
+    assert fine[0].params.covered_boxes == ()
 
     reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
     assert reducers
-    assert all("bytes_per_value" not in tmpl.params for tmpl in reducers)
+    assert all(isinstance(tmpl.params, NoKernelParams) for tmpl in reducers)
     assert all(_output_bytes(tmpl) == 64 for tmpl in reducers)
     first_reduce_stages = [
         stage
@@ -241,7 +242,7 @@ def test_flux_surface_integral_lowering_accepts_radius_array() -> None:
     templates = [tmpl for stage in plan.stages for tmpl in stage.templates]
     accum = [tmpl for tmpl in templates if tmpl.kernel == "flux_surface_integral_accumulate"]
     assert len(accum) == 1
-    assert accum[0].params["radii"] == [0.25, 0.5, 0.75]
+    assert accum[0].params.radii == (0.25, 0.5, 0.75)
     assert _output_bytes(accum[0]) == 192
     reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
     assert reducers
@@ -287,7 +288,7 @@ def test_flux_surface_integral_lowering_accepts_temperature_bins() -> None:
     accum = [tmpl for tmpl in templates if tmpl.kernel == "flux_surface_integral_accumulate"]
     assert len(accum) == 1
     assert len(accum[0].inputs) == 10
-    assert accum[0].params["temperature_bins"] == [1.0, 10.0, 100.0]
+    assert accum[0].params.temperature_bins == (1.0, 10.0, 100.0)
     assert _output_bytes(accum[0]) == 128
     reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
     assert reducers
@@ -347,8 +348,8 @@ def test_cylindrical_flux_surface_integral_lowering_accepts_height_array() -> No
         if tmpl.kernel == "cylindrical_flux_surface_integral_accumulate"
     ]
     assert len(accum) == 1
-    assert accum[0].params["radius"] == 0.5
-    assert accum[0].params["heights"] == [0.5, 1.5]
+    assert accum[0].params.radius == 0.5
+    assert accum[0].params.heights == (0.5, 1.5)
     assert _output_bytes(accum[0]) == 256
     reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
     assert reducers
@@ -427,11 +428,11 @@ def test_flux_surface_integral_lowering_uses_per_block_radius_subsets() -> None:
     accum = [tmpl for tmpl in templates if tmpl.kernel == "flux_surface_integral_accumulate"]
     assert len(accum) == 2
     by_block = {tmpl.domain.blocks[0]: tmpl for tmpl in accum}
-    assert by_block[0].params["radii"] == [0.5]
-    assert by_block[0].params["radius_indices"] == [0]
-    assert by_block[1].params["radii"] == [3.5]
-    assert by_block[1].params["radius_indices"] == [1]
-    assert all(tmpl.params["num_radii"] == 2 for tmpl in accum)
+    assert by_block[0].params.radii == (0.5,)
+    assert by_block[0].params.radius_indices == (0,)
+    assert by_block[1].params.radii == (3.5,)
+    assert by_block[1].params.radius_indices == (1,)
+    assert all(tmpl.params.num_radii == 2 for tmpl in accum)
     assert all(_output_bytes(tmpl) == 128 for tmpl in accum)
 
 
@@ -482,9 +483,9 @@ def test_flux_surface_integral_lowering_normalizes_single_nonzero_block() -> Non
         and tmpl.name == "flux_surface_integral_reduce_single"
     ]
     assert len(reductions) == 1
-    assert reductions[0].params["input_blocks"] == [1]
-    assert reductions[0].params["output_blocks"] == [0]
-    assert reductions[0].params["group_offsets"] == [0, 1]
+    assert reductions[0].graph_reduce.input_blocks == (1,)
+    assert reductions[0].graph_reduce.output_blocks == (0,)
+    assert reductions[0].graph_reduce.group_offsets == (0, 1)
 
 
 def test_flux_surface_integral_rejects_invalid_radius() -> None:

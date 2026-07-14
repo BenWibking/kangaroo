@@ -22,7 +22,20 @@ from .buffer import (
     InitPolicy,
 )
 from .ctx import LoweringContext
-from .plan import FieldRef, OutputRef
+from .kernel_params import (
+    AmrSubboxPackParams,
+    CylindricalFluxParams,
+    FluxSurfaceParams,
+    GradStencilParams,
+    Histogram1DParams,
+    Histogram2DParams,
+    ParticleCicGridParams,
+    ParticleCicProjectionParams,
+    SliceFinalizeParams,
+    UniformProjectionParams,
+    UniformSliceCellParams,
+)
+from .plan import DependencyRule, FieldRef, GraphReduceSpec, OutputRef
 from .reduction import (
     GraphReductionBuilder,
     ReducedField,
@@ -66,6 +79,10 @@ def _amr_patch_payload(field: FieldRef) -> OutputRef:
     )
 
 
+def _covered_boxes_payload(boxes) -> tuple:
+    return tuple((tuple(lo), tuple(hi)) for lo, hi in boxes)
+
+
 class VorticityMag:
     def __init__(
         self,
@@ -99,14 +116,13 @@ class VorticityMag:
                 domain=dom,
                 inputs=[],
                 outputs=[_amr_patch_payload(fetch_f)],
-                deps={"kind": "None"},
-                params={
-                    "input_field": field_id,
-                    "input_version": 0,
-                    "input_step": ds.step,
-                    "input_level": ds.level,
-                    "halo_cells": self.stencil_radius,
-                },
+                deps=DependencyRule(),
+                params=AmrSubboxPackParams(
+                    input_field=field_id,
+                    input_step=ds.step,
+                    input_level=ds.level,
+                    halo_cells=self.stencil_radius,
+                ),
             )
             grad_f = ctx.temp_field(f"gradU_{comp}")
             grad_fields.append(grad_f)
@@ -116,15 +132,13 @@ class VorticityMag:
                 domain=dom,
                 inputs=[FieldRef(field_id), fetch_f],
                 outputs=[_block_f64(grad_f, 3)],
-                deps={"kind": "None"},
-                params={
-                    "order": 2,
-                    "input_field": field_id,
-                    "input_version": 0,
-                    "input_step": ds.step,
-                    "input_level": ds.level,
-                    "stencil_radius": self.stencil_radius,
-                },
+                deps=DependencyRule(),
+                params=GradStencilParams(
+                    input_field=field_id,
+                    input_step=ds.step,
+                    input_level=ds.level,
+                    stencil_radius=self.stencil_radius,
+                ),
             )
 
         s2 = ctx.stage("vortmag", after=[s1])
@@ -134,8 +148,7 @@ class VorticityMag:
             domain=dom,
             inputs=grad_fields,
             outputs=[_block_f64(vort)],
-            deps={"kind": "None"},
-            params={},
+            deps=DependencyRule(),
         )
 
         return ctx.fragment([s0, s1, s2])
@@ -228,7 +241,7 @@ class UniformSlice:
                 axis=axis_idx,
                 plane_indices=plane_index_by_level,
             )
-            covered_payload = [[list(lo), list(hi)] for lo, hi in covered_boxes]
+            covered_payload = _covered_boxes_payload(covered_boxes)
 
             sum_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
             area_field = ctx.temp_field(f"{self.out_name}_area_l{level_idx}")
@@ -242,16 +255,15 @@ class UniformSlice:
                     domain=dom,
                     inputs=[FieldRef(self.field)],
                     outputs=[_fixed_f64_shape(sum_field, out_shape), _fixed_f64_shape(area_field, out_shape)],
-                    deps={"kind": "None"},
-                    params={
-                        "axis": axis_idx,
-                        "coord": self.coord,
-                        "plane_index": plane_index_by_level[level_idx],
-                        "rect": list(self.rect),
-                        "resolution": [nx, ny],
-                        "plane_axes": [u_axis, v_axis],
-                        "covered_boxes": covered_payload,
-                    },
+                    deps=DependencyRule(),
+                    params=UniformSliceCellParams(
+                        axis=axis_idx,
+                        coord=self.coord,
+                        plane_index=plane_index_by_level[level_idx],
+                        rect=tuple(self.rect),
+                        resolution=(nx, ny),
+                        covered_boxes=covered_payload,
+                    ),
                 )
             reductions.add_stage(stage, outputs=[sum_field, area_field])
             output_buffer = BufferSpec(
@@ -331,15 +343,12 @@ class UniformSlice:
                 ),
             ],
             outputs=[_fixed_real_shape(out_field, out_shape, dtype)],
-            deps={"kind": "None"},
-            params={
-                "graph_kind": "reduce",
-                "fan_in": 1,
-                "num_inputs": 1,
-                "input_base": 0,
-                "output_base": 0,
-                "pixel_area": abs((self.rect[2] - self.rect[0]) / nx) * abs((self.rect[3] - self.rect[1]) / ny),
-            },
+            deps=DependencyRule(),
+            params=SliceFinalizeParams(
+                pixel_area=abs((self.rect[2] - self.rect[0]) / nx)
+                * abs((self.rect[3] - self.rect[1]) / ny)
+            ),
+            graph_reduce=GraphReduceSpec(fan_in=1, num_inputs=1),
         )
         reductions.add_stage(finalize, outputs=[out_field])
         return ctx.fragment(reductions.stages)
@@ -406,7 +415,7 @@ class UniformProjection:
                 axis=axis_idx,
                 axis_ranges=axis_range_by_level,
             )
-            covered_payload = [[list(lo), list(hi)] for lo, hi in covered_boxes]
+            covered_payload = _covered_boxes_payload(covered_boxes)
 
             sum_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 
@@ -419,14 +428,14 @@ class UniformProjection:
                     domain=dom,
                     inputs=[FieldRef(self.field)],
                     outputs=[_fixed_f64_shape(sum_field, out_shape)],
-                    deps={"kind": "None"},
-                    params={
-                        "axis": axis_idx,
-                        "axis_bounds": [float(self.axis_bounds[0]), float(self.axis_bounds[1])],
-                        "rect": list(self.rect),
-                        "resolution": [nx, ny],
-                        "covered_boxes": covered_payload,
-                    },
+                    deps=DependencyRule(),
+                    params=UniformProjectionParams(
+                        axis=axis_idx,
+                        axis_bounds=(float(self.axis_bounds[0]), float(self.axis_bounds[1])),
+                        rect=tuple(self.rect),
+                        resolution=(nx, ny),
+                        covered_boxes=covered_payload,
+                    ),
                 )
             reductions.add_stage(stage, outputs=[sum_field])
             sum_fields.append(
@@ -483,14 +492,8 @@ class UniformProjection:
                 )
             ],
             outputs=[_fixed_f64_shape(out_field, out_shape)],
-            deps={"kind": "None"},
-            params={
-                "graph_kind": "reduce",
-                "fan_in": 1,
-                "num_inputs": 1,
-                "input_base": 0,
-                "output_base": 0,
-            },
+            deps=DependencyRule(),
+            graph_reduce=GraphReduceSpec(fan_in=1, num_inputs=1),
         )
         reductions.add_stage(finalize, outputs=[out_field])
         return ctx.fragment(reductions.stages)
@@ -560,7 +563,7 @@ class ParticleCICProjection:
                 axis=axis_idx,
                 axis_ranges=axis_range_by_level,
             )
-            covered_payload = [[list(lo), list(hi)] for lo, hi in covered_boxes]
+            covered_payload = _covered_boxes_payload(covered_boxes)
 
             sum_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 
@@ -569,24 +572,23 @@ class ParticleCICProjection:
                 after=[previous_level_tail] if previous_level_tail is not None else None,
             )
             dom = ctx.domain(step=ds.step, level=level_idx, blocks=blocks)
-            params = {
-                "particle_type": self.particle_type,
-                "level_index": int(level_idx),
-                "axis": axis_idx,
-                "axis_bounds": [float(self.axis_bounds[0]), float(self.axis_bounds[1])],
-                "rect": list(self.rect),
-                "resolution": [nx, ny],
-                "covered_boxes": covered_payload,
-            }
-            if self.mass_max is not None:
-                params["mass_max"] = float(self.mass_max)
+            params = ParticleCicProjectionParams(
+                particle_type=self.particle_type,
+                level_index=int(level_idx),
+                axis=axis_idx,
+                axis_bounds=(float(self.axis_bounds[0]), float(self.axis_bounds[1])),
+                rect=tuple(self.rect),
+                resolution=(nx, ny),
+                mass_max=float(self.mass_max) if self.mass_max is not None else math.nan,
+                covered_boxes=covered_payload,
+            )
             stage.map_blocks(
                 name=f"particle_cic_projection_l{level_idx}",
                 kernel="particle_cic_projection_accumulate",
                 domain=dom,
                 inputs=[],
                 outputs=[_fixed_f64_shape(sum_field, out_shape)],
-                deps={"kind": "None"},
+                deps=DependencyRule(),
                 params=params,
             )
             reductions.add_stage(stage, outputs=[sum_field])
@@ -645,14 +647,8 @@ class ParticleCICProjection:
                 )
             ],
             outputs=[_fixed_f64_shape(out_field, out_shape)],
-            deps={"kind": "None"},
-            params={
-                "graph_kind": "reduce",
-                "fan_in": 1,
-                "num_inputs": 1,
-                "input_base": 0,
-                "output_base": 0,
-            },
+            deps=DependencyRule(),
+            graph_reduce=GraphReduceSpec(fan_in=1, num_inputs=1),
         )
         reductions.add_stage(finalize, outputs=[out_field])
         return ctx.fragment(reductions.stages)
@@ -708,27 +704,26 @@ class ParticleCICGrid:
                 axis=axis_idx,
                 axis_ranges=axis_range_by_level,
             )
-            covered_payload = [[list(lo), list(hi)] for lo, hi in covered_boxes]
+            covered_payload = _covered_boxes_payload(covered_boxes)
 
             stage = ctx.stage("particle_cic_grid")
             for block in blocks:
                 dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
-                params = {
-                    "particle_type": self.particle_type,
-                    "level_index": int(level_idx),
-                    "axis": axis_idx,
-                    "axis_bounds": [float(self.axis_bounds[0]), float(self.axis_bounds[1])],
-                    "covered_boxes": covered_payload,
-                }
-                if self.mass_max is not None:
-                    params["mass_max"] = float(self.mass_max)
+                params = ParticleCicGridParams(
+                    particle_type=self.particle_type,
+                    level_index=int(level_idx),
+                    axis=axis_idx,
+                    axis_bounds=(float(self.axis_bounds[0]), float(self.axis_bounds[1])),
+                    mass_max=float(self.mass_max) if self.mass_max is not None else math.nan,
+                    covered_boxes=covered_payload,
+                )
                 stage.map_blocks(
                     name=f"particle_cic_grid_b{block}",
                     kernel="particle_cic_grid_accumulate",
                     domain=dom,
                     inputs=[],
                     outputs=[_block_f64(grid_field)],
-                    deps={"kind": "None"},
+                    deps=DependencyRule(),
                     params=params,
                 )
             stages.append(stage)
@@ -876,7 +871,7 @@ class FluxSurfaceIntegral:
             blocks = [block_idx for block_idx, _ in block_radius_indices]
 
             covered_boxes = covered_volume_boxes(levels, level=level_idx)
-            covered_payload = [[list(c_lo), list(c_hi)] for c_lo, c_hi in covered_boxes]
+            covered_payload = _covered_boxes_payload(covered_boxes)
             flux_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 
             for block, active_radius_indices in block_radius_indices:
@@ -888,19 +883,15 @@ class FluxSurfaceIntegral:
                     domain=dom,
                     inputs=[FieldRef(fid) for fid in input_fields],
                     outputs=[_fixed_f64_shape(flux_field, out_shape)],
-                    deps={"kind": "None"},
-                    params={
-                        "radii": list(active_radii),
-                        "radius_indices": list(active_radius_indices),
-                        "num_radii": len(self.radii),
-                        "temperature_bins": (
-                            list(self.temperature_bins)
-                            if self.temperature_bins is not None
-                            else []
-                        ),
-                        "gamma": self.gamma,
-                        "covered_boxes": covered_payload,
-                    },
+                    deps=DependencyRule(),
+                    params=FluxSurfaceParams(
+                        radii=tuple(active_radii),
+                        radius_indices=tuple(active_radius_indices),
+                        num_radii=len(self.radii),
+                        temperature_bins=tuple(self.temperature_bins or ()),
+                        gamma=self.gamma,
+                        covered_boxes=covered_payload,
+                    ),
                 )
             reductions.add_stage(accumulate_stage, outputs=[flux_field])
             flux_fields.append(
@@ -963,14 +954,8 @@ class FluxSurfaceIntegral:
                 )
             ],
             outputs=[_fixed_f64_shape(out_field, out_shape)],
-            deps={"kind": "None"},
-            params={
-                "graph_kind": "reduce",
-                "fan_in": 1,
-                "num_inputs": 1,
-                "input_base": 0,
-                "output_base": 0,
-            },
+            deps=DependencyRule(),
+            graph_reduce=GraphReduceSpec(fan_in=1, num_inputs=1),
         )
         reductions.add_stage(finalize, outputs=[out_field])
         return ctx.fragment(reductions.stages)
@@ -1136,7 +1121,7 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
             blocks = [block_idx for block_idx, _ in block_height_indices]
 
             covered_boxes = covered_volume_boxes(levels, level=level_idx)
-            covered_payload = [[list(c_lo), list(c_hi)] for c_lo, c_hi in covered_boxes]
+            covered_payload = _covered_boxes_payload(covered_boxes)
             flux_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 
             for block, active_height_indices in block_height_indices:
@@ -1148,20 +1133,16 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
                     domain=dom,
                     inputs=[FieldRef(fid) for fid in input_fields],
                     outputs=[_fixed_f64_shape(flux_field, out_shape)],
-                    deps={"kind": "None"},
-                    params={
-                        "radius": self.radius,
-                        "heights": list(active_heights),
-                        "height_indices": list(active_height_indices),
-                        "num_heights": len(self.heights),
-                        "temperature_bins": (
-                            list(self.temperature_bins)
-                            if self.temperature_bins is not None
-                            else []
-                        ),
-                        "gamma": self.gamma,
-                        "covered_boxes": covered_payload,
-                    },
+                    deps=DependencyRule(),
+                    params=CylindricalFluxParams(
+                        radius=self.radius,
+                        heights=tuple(active_heights),
+                        height_indices=tuple(active_height_indices),
+                        num_heights=len(self.heights),
+                        temperature_bins=tuple(self.temperature_bins or ()),
+                        gamma=self.gamma,
+                        covered_boxes=covered_payload,
+                    ),
                 )
             reductions.add_stage(accumulate_stage, outputs=[flux_field])
             flux_fields.append(
@@ -1232,14 +1213,8 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
                 )
             ],
             outputs=[_fixed_f64_shape(out_field, out_shape)],
-            deps={"kind": "None"},
-            params={
-                "graph_kind": "reduce",
-                "fan_in": 1,
-                "num_inputs": 1,
-                "input_base": 0,
-                "output_base": 0,
-            },
+            deps=DependencyRule(),
+            graph_reduce=GraphReduceSpec(fan_in=1, num_inputs=1),
         )
         reductions.add_stage(finalize, outputs=[out_field])
         return ctx.fragment(reductions.stages)
@@ -1284,7 +1259,7 @@ class Histogram1D:
                 continue
 
             covered_boxes = covered_volume_boxes(levels, level=level_idx)
-            covered_payload = [[list(c_lo), list(c_hi)] for c_lo, c_hi in covered_boxes]
+            covered_payload = _covered_boxes_payload(covered_boxes)
             hist_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 
             stage = ctx.stage("histogram1d")
@@ -1299,12 +1274,12 @@ class Histogram1D:
                     domain=dom,
                     inputs=inputs,
                     outputs=[_fixed_f64_shape(hist_field, out_shape)],
-                    deps={"kind": "None"},
-                    params={
-                        "range": [float(lo), float(hi)],
-                        "bins": int(self.bins),
-                        "covered_boxes": covered_payload,
-                    },
+                    deps=DependencyRule(),
+                    params=Histogram1DParams(
+                        range=(float(lo), float(hi)),
+                        bins=int(self.bins),
+                        covered_boxes=covered_payload,
+                    ),
                 )
             reductions.add_stage(stage, outputs=[hist_field])
             hist_fields.append(
@@ -1354,14 +1329,8 @@ class Histogram1D:
                 )
             ],
             outputs=[_fixed_f64_shape(out_field, out_shape)],
-            deps={"kind": "None"},
-            params={
-                "graph_kind": "reduce",
-                "fan_in": 1,
-                "num_inputs": 1,
-                "input_base": 0,
-                "output_base": 0,
-            },
+            deps=DependencyRule(),
+            graph_reduce=GraphReduceSpec(fan_in=1, num_inputs=1),
         )
         reductions.add_stage(finalize, outputs=[out_field])
         return ctx.fragment(reductions.stages)
@@ -1414,7 +1383,7 @@ class Histogram2D:
                 continue
 
             covered_boxes = covered_volume_boxes(levels, level=level_idx)
-            covered_payload = [[list(c_lo), list(c_hi)] for c_lo, c_hi in covered_boxes]
+            covered_payload = _covered_boxes_payload(covered_boxes)
             hist_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 
             stage = ctx.stage("histogram2d")
@@ -1429,14 +1398,14 @@ class Histogram2D:
                     domain=dom,
                     inputs=inputs,
                     outputs=[_fixed_f64_shape(hist_field, (nx, ny))],
-                    deps={"kind": "None"},
-                    params={
-                        "x_range": [float(x0), float(x1)],
-                        "y_range": [float(y0), float(y1)],
-                        "bins": [int(nx), int(ny)],
-                        "weight_mode": self.weight_mode,
-                        "covered_boxes": covered_payload,
-                    },
+                    deps=DependencyRule(),
+                    params=Histogram2DParams(
+                        x_range=(float(x0), float(x1)),
+                        y_range=(float(y0), float(y1)),
+                        bins=(int(nx), int(ny)),
+                        weight_mode=self.weight_mode,
+                        covered_boxes=covered_payload,
+                    ),
                 )
             reductions.add_stage(stage, outputs=[hist_field])
             hist_fields.append(
@@ -1488,14 +1457,8 @@ class Histogram2D:
                 )
             ],
             outputs=[_fixed_f64_shape(out_field, (nx, ny))],
-            deps={"kind": "None"},
-            params={
-                "graph_kind": "reduce",
-                "fan_in": 1,
-                "num_inputs": 1,
-                "input_base": 0,
-                "output_base": 0,
-            },
+            deps=DependencyRule(),
+            graph_reduce=GraphReduceSpec(fan_in=1, num_inputs=1),
         )
         reductions.add_stage(finalize, outputs=[out_field])
         return ctx.fragment(reductions.stages)

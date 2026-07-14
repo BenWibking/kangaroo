@@ -19,6 +19,7 @@ import numpy as np
 
 from analysis import Runtime
 from analysis.dataset import open_dataset
+from analysis.kernel_params import FieldExprParams, ScalarParams
 from analysis.pipeline import Pipeline
 from analysis.plan import Domain, FieldRef, Plan, Stage
 from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
@@ -66,8 +67,7 @@ def test_plan_preparation_rejects_missing_dynamic_bound_evaluator() -> None:
                 ),
             )
         ],
-        deps={"kind": "None"},
-        params={"expression": "value", "variables": ["value"]},
+        params=FieldExprParams("value", ("value",)),
     )
 
     with pytest.raises(RuntimeError, match="does not define its dynamic output bound"):
@@ -278,8 +278,6 @@ def test_streaming_executor_bounds_active_output_bytes(tmp_path, monkeypatch) ->
             domain=Domain(step=0, level=0),
             inputs=[FieldRef(source)],
             outputs=[OutputRef(FieldRef(output), BufferSpec(DType.I64, FixedShape((1,))))],
-            deps={"kind": "None"},
-            params={},
         )
         rt.run(Plan(stages=[stage]), runmeta=runmeta, dataset=ds)
     finally:
@@ -343,8 +341,7 @@ def test_streaming_executor_accounts_like_input_output_bytes(tmp_path, monkeypat
                     BufferSpec(DType.U8, LikeInputShape(0)),
                 )
             ],
-            deps={"kind": "None"},
-            params={"scalar": -1.0},
+            params=ScalarParams(-1.0),
         )
         rt.run(Plan(stages=[stage]), runmeta=runmeta, dataset=ds)
     finally:
@@ -381,8 +378,7 @@ def test_streaming_executor_accounts_plotfile_like_input_output_bytes(
         domain=Domain(step=0, level=0),
         inputs=[FieldRef(source)],
         outputs=[OutputRef(FieldRef(output), BufferSpec(DType.F64, LikeInputShape(0)))],
-        deps={"kind": "None"},
-        params={"expression": "density", "variables": ["density"]},
+        params=FieldExprParams("density", ("density",)),
     )
     rt.run(Plan(stages=[stage]), runmeta=runmeta, dataset=ds)
 
@@ -445,8 +441,6 @@ def test_streaming_executor_accounts_dynamic_like_input_capacity(tmp_path, monke
                     ),
                 )
             ],
-            deps={"kind": "None"},
-            params={},
         )
         rt.run(Plan(stages=[stage]), runmeta=runmeta, dataset=ds)
     finally:

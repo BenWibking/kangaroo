@@ -6,7 +6,7 @@ from analysis.plan import FieldRef
 from analysis.reduction import (
     GraphReductionBuilder,
     ReducedField,
-    graph_reduce_params,
+    graph_reduce_spec,
     reduce_group_plan,
 )
 
@@ -56,17 +56,10 @@ def test_reduce_group_plan_keeps_locality_groups_together() -> None:
     assert offsets == [0, 2, 4, 6, 8]
 
 
-def test_domain_params_cannot_override_graph_topology() -> None:
-    try:
-        graph_reduce_params(
-            fan_in=2,
-            num_inputs=4,
-            extra={"fan_in": 8},
-        )
-    except ValueError as exc:
-        assert "cannot override graph topology: fan_in" in str(exc)
-    else:
-        raise AssertionError("expected graph topology override to be rejected")
+def test_graph_topology_is_a_typed_plan_record() -> None:
+    spec = graph_reduce_spec(fan_in=2, num_inputs=4)
+    assert spec.fan_in == 2
+    assert spec.num_inputs == 4
 
 
 def test_block_reduction_builder_rejects_fan_in_one() -> None:
@@ -121,8 +114,8 @@ def test_block_reduction_builder_owns_topology_and_producer_edges() -> None:
     assert len(reductions) == 2
     assert reductions[0].after == [accumulate]
     assert reductions[1].after == [reductions[0]]
-    assert reductions[0].templates[0].params["output_blocks"] == [0, 4, 8, 12]
-    assert reductions[1].templates[0].params["input_blocks"] == [0, 4, 8, 12]
+    assert reductions[0].templates[0].graph_reduce.output_blocks == (0, 4, 8, 12)
+    assert reductions[1].templates[0].graph_reduce.input_blocks == (0, 4, 8, 12)
     assert reduced.block == 0
     assert builder.producer(reduced.field) is reductions[-1]
 
@@ -151,9 +144,9 @@ def test_block_reduction_normalizes_single_nonzero_block() -> None:
 
     template = builder.stages[-1].templates[0]
     assert template.name == "reduce_single"
-    assert template.params["input_blocks"] == [7]
-    assert template.params["output_blocks"] == [0]
-    assert template.params["group_offsets"] == [0, 1]
+    assert template.graph_reduce.input_blocks == (7,)
+    assert template.graph_reduce.output_blocks == (0,)
+    assert template.graph_reduce.group_offsets == (0, 1)
     assert reduced == ReducedField(source, level=0, block=0)
 
 
@@ -182,13 +175,9 @@ def test_pairwise_builder_tracks_cross_level_dependencies() -> None:
     assert stage is not None
     assert stage.after == [left_stage, right_stage]
     assert [ref.domain.level for ref in stage.templates[0].inputs] == [0, 1]
-    assert stage.templates[0].params == {
-        "graph_kind": "reduce",
-        "fan_in": 1,
-        "num_inputs": 1,
-        "input_base": 0,
-        "output_base": 0,
-    }
+    assert stage.templates[0].graph_reduce == graph_reduce_spec(
+        fan_in=1, num_inputs=1
+    )
 
 
 def test_pairwise_builder_preserves_nonzero_input_block() -> None:
@@ -216,12 +205,11 @@ def test_pairwise_builder_preserves_nonzero_input_block() -> None:
     assert stage is not None
     template = stage.templates[0]
     assert [ref.domain.blocks for ref in template.inputs] == [[7], [7]]
-    assert template.params == {
-        "graph_kind": "reduce",
-        "fan_in": 1,
-        "num_inputs": 1,
-        "input_base": 7,
-        "output_base": 7,
-        "output_blocks": [7],
-    }
+    assert template.graph_reduce == graph_reduce_spec(
+        fan_in=1,
+        num_inputs=1,
+        input_base=7,
+        output_base=7,
+        output_blocks=[7],
+    )
     assert reduced.block == 7

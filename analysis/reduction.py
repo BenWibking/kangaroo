@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, Mapping, Sequence
+from typing import Sequence
 
 from .buffer import BufferSpec
 from .ctx import LoweringContext
-from .plan import FieldRef, OutputRef, Stage
+from .kernel_params import KernelParams, NoKernelParams
+from .plan import DependencyRule, FieldRef, GraphReduceSpec, OutputRef, Stage
 
 
 @dataclass(frozen=True)
@@ -130,7 +131,7 @@ def reduce_group_plan(
     return ordered_blocks, output_blocks, group_offsets
 
 
-def graph_reduce_params(
+def graph_reduce_spec(
     *,
     fan_in: int,
     num_inputs: int,
@@ -139,32 +140,18 @@ def graph_reduce_params(
     group_offsets: Sequence[int] | None = None,
     input_base: int = 0,
     output_base: int = 0,
-    extra: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
+) -> GraphReduceSpec:
     """Build the executor's graph-reduction contract in one place."""
 
-    params: dict[str, Any] = {
-        "graph_kind": "reduce",
-        "fan_in": int(fan_in),
-        "num_inputs": int(num_inputs),
-        "input_base": int(input_base),
-        "output_base": int(output_base),
-    }
-    if input_blocks is not None:
-        params["input_blocks"] = [int(block) for block in input_blocks]
-    if output_blocks is not None:
-        params["output_blocks"] = [int(block) for block in output_blocks]
-    if group_offsets is not None:
-        params["group_offsets"] = [int(offset) for offset in group_offsets]
-    if extra:
-        reserved = params.keys() & extra.keys()
-        if reserved:
-            names = ", ".join(sorted(reserved))
-            raise ValueError(
-                f"reduction-specific params cannot override graph topology: {names}"
-            )
-        params.update(extra)
-    return params
+    return GraphReduceSpec(
+        fan_in=int(fan_in),
+        num_inputs=int(num_inputs),
+        input_base=int(input_base),
+        output_base=int(output_base),
+        input_blocks=tuple(int(block) for block in input_blocks or ()),
+        output_blocks=tuple(int(block) for block in output_blocks or ()),
+        group_offsets=tuple(int(offset) for offset in group_offsets or ()),
+    )
 
 
 class GraphReductionBuilder:
@@ -204,7 +191,7 @@ class GraphReductionBuilder:
         template_name: str,
         temporary_name: str,
         after: Stage,
-        extra_params: Mapping[str, Any] | None = None,
+        params: KernelParams = NoKernelParams(),
         normalize_single: bool = False,
         singleton_template_name: str | None = None,
     ) -> ReducedField:
@@ -252,14 +239,14 @@ class GraphReductionBuilder:
                 domain=self.ctx.domain(step=step, level=current.level),
                 inputs=[current.field],
                 outputs=[OutputRef(output_field, output_buffer)],
-                deps={"kind": "None"},
-                params=graph_reduce_params(
+                deps=DependencyRule(),
+                params=params,
+                graph_reduce=graph_reduce_spec(
                     fan_in=round_fan_in,
                     num_inputs=len(current_blocks),
                     input_blocks=input_order,
                     output_blocks=output_blocks,
                     group_offsets=group_offsets,
-                    extra=extra_params,
                 ),
             )
             self.add_stage(stage, outputs=[output_field])
@@ -290,7 +277,7 @@ class GraphReductionBuilder:
         temporary_name: str,
         order_by_home: bool = False,
         preserve_location: bool = False,
-        extra_params: Mapping[str, Any] | None = None,
+        params: KernelParams = NoKernelParams(),
     ) -> ReducedField:
         if not values:
             raise ValueError("pairwise reduction requires at least one value")
@@ -349,14 +336,14 @@ class GraphReductionBuilder:
                     ),
                     inputs=[left_ref, right_ref],
                     outputs=[OutputRef(output_field, output_buffer)],
-                    deps={"kind": "None"},
-                    params=graph_reduce_params(
+                    deps=DependencyRule(),
+                    params=params,
+                    graph_reduce=graph_reduce_spec(
                         fan_in=1,
                         num_inputs=1,
                         input_base=output_block,
                         output_base=output_block,
                         output_blocks=[output_block] if explicit_blocks else None,
-                        extra=extra_params,
                     ),
                 )
                 self.add_stage(stage, outputs=[output_field])

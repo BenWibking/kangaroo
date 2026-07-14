@@ -8,98 +8,14 @@ namespace kangaroo {
 
 void register_flux_kernels(KernelRegistry &registry) {
   {
-    struct Params {
-      std::vector<double> radii;
-      std::vector<int32_t> radius_indices;
-      std::vector<double> temperature_bins;
-      std::size_t num_radii = 0;
-      double gamma = 5.0 / 3.0;
-      std::shared_ptr<const CoveredBoxListIR> covered_boxes;
-    };
-
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      auto append_radius = [](const msgpack::object &obj,
-                              std::vector<double> &radii) {
-        if (obj.type == msgpack::type::FLOAT ||
-            obj.type == msgpack::type::POSITIVE_INTEGER ||
-            obj.type == msgpack::type::NEGATIVE_INTEGER) {
-          radii.push_back(obj.as<double>());
-        }
-      };
-      if (const auto *radii = find_msgpack_map_value(root, "radii");
-          radii && radii->type == msgpack::type::ARRAY) {
-        params.radii.reserve(radii->via.array.size);
-        for (uint32_t i = 0; i < radii->via.array.size; ++i) {
-          append_radius(radii->via.array.ptr[i], params.radii);
-        }
-      }
-      if (const auto *radius_indices =
-              find_msgpack_map_value(root, "radius_indices");
-          radius_indices && radius_indices->type == msgpack::type::ARRAY) {
-        params.radius_indices.reserve(radius_indices->via.array.size);
-        for (uint32_t i = 0; i < radius_indices->via.array.size; ++i) {
-          const auto &idx = radius_indices->via.array.ptr[i];
-          if (idx.type == msgpack::type::POSITIVE_INTEGER ||
-              idx.type == msgpack::type::NEGATIVE_INTEGER) {
-            params.radius_indices.push_back(idx.as<int32_t>());
-          }
-        }
-      }
-      if (const auto *radius = find_msgpack_map_value(root, "radius");
-          radius &&
-          (radius->type == msgpack::type::FLOAT ||
-           radius->type == msgpack::type::POSITIVE_INTEGER ||
-           radius->type == msgpack::type::NEGATIVE_INTEGER) &&
-          params.radii.empty()) {
-        append_radius(*radius, params.radii);
-      }
-      if (params.radius_indices.empty()) {
-        params.radius_indices.reserve(params.radii.size());
-        for (std::size_t i = 0; i < params.radii.size(); ++i) {
-          params.radius_indices.push_back(static_cast<int32_t>(i));
-        }
-      }
-      if (const auto *count = find_msgpack_map_value(root, "num_radii");
-          count && (count->type == msgpack::type::POSITIVE_INTEGER ||
-                    count->type == msgpack::type::NEGATIVE_INTEGER)) {
-        const int parsed = count->as<int>();
-        if (parsed > 0) {
-          params.num_radii = static_cast<std::size_t>(parsed);
-        }
-      }
-      if (params.num_radii == 0) {
-        params.num_radii = params.radii.size();
-        for (int32_t idx : params.radius_indices) {
-          if (idx >= 0) {
-            params.num_radii =
-                std::max(params.num_radii, static_cast<std::size_t>(idx) + 1);
-          }
-        }
-      }
-      if (const auto *bins = find_msgpack_map_value(root, "temperature_bins");
-          bins && bins->type == msgpack::type::ARRAY) {
-        params.temperature_bins.reserve(bins->via.array.size);
-        for (uint32_t i = 0; i < bins->via.array.size; ++i) {
-          append_radius(bins->via.array.ptr[i], params.temperature_bins);
-        }
-      }
-      if (const auto *gamma = find_msgpack_map_value(root, "gamma");
-          gamma && (gamma->type == msgpack::type::FLOAT ||
-                    gamma->type == msgpack::type::POSITIVE_INTEGER ||
-                    gamma->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.gamma = gamma->as<double>();
-      }
-      params.covered_boxes = parse_covered_boxes_param(root);
-      return params;
-    };
+    using Params = FluxSurfaceParams;
 
     /**
      * @brief Accumulates fluxes through concentric spherical surfaces.
      * @par Chunk inputs Real block grids ordered as density, momentum x/y/z,
      * total energy, passive scalar, and magnetic field x/y/z; an optional tenth
      * input supplies temperature when temperature binning is enabled.
-     * @par MessagePack parameters `radii` (or `radius`), `radius_indices`,
+     * @par Typed parameters `radii` (or `radius`), `radius_indices`,
      * `num_radii`, `temperature_bins`, `gamma`, and `covered_boxes` select the
      * surfaces, output slots, thermodynamic bins, equation of state, and AMR
      * mask.
@@ -112,12 +28,12 @@ void register_flux_kernels(KernelRegistry &registry) {
                    .n_inputs = 9,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &level, int32_t block,
-                        std::span<const ChunkBuffer> inputs,
-                        const NeighborViews &, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
-          const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+        [](const LevelMeta &level, int32_t block,
+           std::span<const ChunkBuffer> inputs, const NeighborViews &,
+           std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
+          const auto &params = require_kernel_params<Params>(
+              kernel_params, "flux_surface_integral_accumulate");
 
           const bool use_temperature_bins = params.temperature_bins.size() >= 2;
           const std::size_t num_temperature_bins =
@@ -438,101 +354,17 @@ void register_flux_kernels(KernelRegistry &registry) {
             }
           }
           return hpx::make_ready_future();
-        },
-        make_covered_box_params_preparer<Params>(decode_params));
+        });
   }
   {
-    struct Params {
-      double radius = 0.0;
-      std::vector<double> heights;
-      std::vector<int32_t> height_indices;
-      std::vector<double> temperature_bins;
-      std::size_t num_heights = 0;
-      double gamma = 5.0 / 3.0;
-      std::shared_ptr<const CoveredBoxListIR> covered_boxes;
-    };
-
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      auto append_double = [](const msgpack::object &obj,
-                              std::vector<double> &values) {
-        if (obj.type == msgpack::type::FLOAT ||
-            obj.type == msgpack::type::POSITIVE_INTEGER ||
-            obj.type == msgpack::type::NEGATIVE_INTEGER) {
-          values.push_back(obj.as<double>());
-        }
-      };
-      if (const auto *radius = find_msgpack_map_value(root, "radius");
-          radius && (radius->type == msgpack::type::FLOAT ||
-                     radius->type == msgpack::type::POSITIVE_INTEGER ||
-                     radius->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.radius = radius->as<double>();
-      }
-      if (const auto *heights = find_msgpack_map_value(root, "heights");
-          heights && heights->type == msgpack::type::ARRAY) {
-        params.heights.reserve(heights->via.array.size);
-        for (uint32_t i = 0; i < heights->via.array.size; ++i) {
-          append_double(heights->via.array.ptr[i], params.heights);
-        }
-      }
-      if (const auto *height_indices =
-              find_msgpack_map_value(root, "height_indices");
-          height_indices && height_indices->type == msgpack::type::ARRAY) {
-        params.height_indices.reserve(height_indices->via.array.size);
-        for (uint32_t i = 0; i < height_indices->via.array.size; ++i) {
-          const auto &idx = height_indices->via.array.ptr[i];
-          if (idx.type == msgpack::type::POSITIVE_INTEGER ||
-              idx.type == msgpack::type::NEGATIVE_INTEGER) {
-            params.height_indices.push_back(idx.as<int32_t>());
-          }
-        }
-      }
-      if (params.height_indices.empty()) {
-        params.height_indices.reserve(params.heights.size());
-        for (std::size_t i = 0; i < params.heights.size(); ++i) {
-          params.height_indices.push_back(static_cast<int32_t>(i));
-        }
-      }
-      if (const auto *count = find_msgpack_map_value(root, "num_heights");
-          count && (count->type == msgpack::type::POSITIVE_INTEGER ||
-                    count->type == msgpack::type::NEGATIVE_INTEGER)) {
-        const int parsed = count->as<int>();
-        if (parsed > 0) {
-          params.num_heights = static_cast<std::size_t>(parsed);
-        }
-      }
-      if (params.num_heights == 0) {
-        params.num_heights = params.heights.size();
-        for (int32_t idx : params.height_indices) {
-          if (idx >= 0) {
-            params.num_heights =
-                std::max(params.num_heights, static_cast<std::size_t>(idx) + 1);
-          }
-        }
-      }
-      if (const auto *bins = find_msgpack_map_value(root, "temperature_bins");
-          bins && bins->type == msgpack::type::ARRAY) {
-        params.temperature_bins.reserve(bins->via.array.size);
-        for (uint32_t i = 0; i < bins->via.array.size; ++i) {
-          append_double(bins->via.array.ptr[i], params.temperature_bins);
-        }
-      }
-      if (const auto *gamma = find_msgpack_map_value(root, "gamma");
-          gamma && (gamma->type == msgpack::type::FLOAT ||
-                    gamma->type == msgpack::type::POSITIVE_INTEGER ||
-                    gamma->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.gamma = gamma->as<double>();
-      }
-      params.covered_boxes = parse_covered_boxes_param(root);
-      return params;
-    };
+    using Params = CylindricalFluxParams;
 
     /**
      * @brief Accumulates fluxes through concentric cylindrical surfaces.
      * @par Chunk inputs Real block grids ordered as density, momentum x/y/z,
      * total energy, passive scalar, and magnetic field x/y/z; an optional tenth
      * input supplies temperature when temperature binning is enabled.
-     * @par MessagePack parameters `radius`, `heights`, `height_indices`,
+     * @par Typed parameters `radius`, `heights`, `height_indices`,
      * `num_heights`, `temperature_bins`, `gamma`, and `covered_boxes` select
      * the cylinder sections, output slots, thermodynamic bins, equation of
      * state, and AMR mask.
@@ -545,12 +377,12 @@ void register_flux_kernels(KernelRegistry &registry) {
                    .n_inputs = 9,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &level, int32_t block,
-                        std::span<const ChunkBuffer> inputs,
-                        const NeighborViews &, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
-          const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+        [](const LevelMeta &level, int32_t block,
+           std::span<const ChunkBuffer> inputs, const NeighborViews &,
+           std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
+          const auto &params = require_kernel_params<Params>(
+              kernel_params, "cylindrical_flux_surface_integral_accumulate");
 
           const bool use_temperature_bins = params.temperature_bins.size() >= 2;
           const std::size_t num_temperature_bins =
@@ -858,8 +690,7 @@ void register_flux_kernels(KernelRegistry &registry) {
             }
           }
           return hpx::make_ready_future();
-        },
-        make_covered_box_params_preparer<Params>(decode_params));
+        });
   }
 }
 

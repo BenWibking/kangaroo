@@ -68,7 +68,7 @@ def test_amr_patch_codec_roundtrips_geometry_descriptor_and_data() -> None:
 
 
 def test_amr_patch_codec_rejects_malformed_payload() -> None:
-    with pytest.raises(RuntimeError, match="root must be a map"):
+    with pytest.raises(RuntimeError, match="invalid AMR patch FlatBuffer"):
         _core.test_amr_patch_codec_rejects_malformed()
 
 

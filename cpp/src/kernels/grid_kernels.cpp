@@ -7,9 +7,12 @@
 #include "amrexpr.hpp"
 
 #include <iostream>
+#include <mutex>
+#include <unordered_map>
 #include <variant>
 
 #include <hpx/runtime_local/get_locality_id.hpp>
+#include <hpx/synchronization/mutex.hpp>
 
 namespace kangaroo {
 
@@ -19,56 +22,12 @@ void register_grid_kernels(KernelRegistry &registry) {
     return env != nullptr && *env != '\0' && *env != '0';
   }();
   {
-    struct Params {
-      int axis = 2;
-      double coord = 0.0;
-      int plane_index = 0;
-      bool has_plane_index = false;
-      std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
-      std::array<int, 2> resolution{1, 1};
-      std::shared_ptr<const CoveredBoxListIR> covered_boxes;
-    };
-
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      if (const auto *axis = find_msgpack_map_value(root, "axis");
-          axis && (axis->type == msgpack::type::POSITIVE_INTEGER ||
-                   axis->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.axis = axis->as<int>();
-      }
-      if (const auto *coord = find_msgpack_map_value(root, "coord");
-          coord && (coord->type == msgpack::type::FLOAT ||
-                    coord->type == msgpack::type::POSITIVE_INTEGER ||
-                    coord->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.coord = coord->as<double>();
-      }
-      if (const auto *plane_idx = find_msgpack_map_value(root, "plane_index");
-          plane_idx && (plane_idx->type == msgpack::type::POSITIVE_INTEGER ||
-                        plane_idx->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.plane_index = plane_idx->as<int>();
-        params.has_plane_index = true;
-      }
-      if (const auto *rect = find_msgpack_map_value(root, "rect");
-          rect && rect->type == msgpack::type::ARRAY &&
-          rect->via.array.size == 4) {
-        for (uint32_t i = 0; i < 4; ++i) {
-          params.rect[i] = rect->via.array.ptr[i].as<double>();
-        }
-      }
-      if (const auto *res = find_msgpack_map_value(root, "resolution");
-          res && res->type == msgpack::type::ARRAY &&
-          res->via.array.size == 2) {
-        params.resolution[0] = res->via.array.ptr[0].as<int>();
-        params.resolution[1] = res->via.array.ptr[1].as<int>();
-      }
-      params.covered_boxes = parse_covered_boxes_param(root);
-      return params;
-    };
+    using Params = UniformSliceCellParams;
 
     /**
      * @brief Accumulates cell averages and sampled area on a uniform slice.
      * @par Chunk inputs `inputs[0]` is a real-valued cell-centered block grid.
-     * @par MessagePack parameters `axis`, `coord`, optional `plane_index`,
+     * @par Typed parameters `axis`, `coord`, optional `plane_index`,
      * `rect`, `resolution`, and `covered_boxes` define the sampled AMR plane.
      * @par Chunk outputs `outputs[0]` and `outputs[1]` are f64 images
      * containing the area-weighted value sum and sampled area, respectively.
@@ -78,12 +37,12 @@ void register_grid_kernels(KernelRegistry &registry) {
                    .n_inputs = 1,
                    .n_outputs = 2,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &level, int32_t block,
-                        std::span<const ChunkBuffer> inputs,
-                        const NeighborViews &, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
-          const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+        [](const LevelMeta &level, int32_t block,
+           std::span<const ChunkBuffer> inputs, const NeighborViews &,
+           std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
+          const auto &params = require_kernel_params<Params>(
+              kernel_params, "uniform_slice_cellavg_accumulate");
 
           const auto out_nx = params.resolution[0];
           const auto out_ny = params.resolution[1];
@@ -263,52 +222,15 @@ void register_grid_kernels(KernelRegistry &registry) {
           });
 
           return hpx::make_ready_future();
-        },
-        make_covered_box_params_preparer<Params>(decode_params));
+        });
   }
   {
-    struct Params {
-      int axis = 2;
-      std::array<double, 2> axis_bounds{0.0, 1.0};
-      std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
-      std::array<int, 2> resolution{1, 1};
-      std::shared_ptr<const CoveredBoxListIR> covered_boxes;
-    };
-
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      if (const auto *axis = find_msgpack_map_value(root, "axis");
-          axis && (axis->type == msgpack::type::POSITIVE_INTEGER ||
-                   axis->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.axis = axis->as<int>();
-      }
-      if (const auto *bounds = find_msgpack_map_value(root, "axis_bounds");
-          bounds && bounds->type == msgpack::type::ARRAY &&
-          bounds->via.array.size == 2) {
-        params.axis_bounds[0] = bounds->via.array.ptr[0].as<double>();
-        params.axis_bounds[1] = bounds->via.array.ptr[1].as<double>();
-      }
-      if (const auto *rect = find_msgpack_map_value(root, "rect");
-          rect && rect->type == msgpack::type::ARRAY &&
-          rect->via.array.size == 4) {
-        for (uint32_t i = 0; i < 4; ++i) {
-          params.rect[i] = rect->via.array.ptr[i].as<double>();
-        }
-      }
-      if (const auto *res = find_msgpack_map_value(root, "resolution");
-          res && res->type == msgpack::type::ARRAY &&
-          res->via.array.size == 2) {
-        params.resolution[0] = res->via.array.ptr[0].as<int>();
-        params.resolution[1] = res->via.array.ptr[1].as<int>();
-      }
-      params.covered_boxes = parse_covered_boxes_param(root);
-      return params;
-    };
+    using Params = UniformProjectionParams;
 
     /**
      * @brief Projects uncovered grid cells onto a uniform image plane.
      * @par Chunk inputs `inputs[0]` is a real-valued cell-centered block grid.
-     * @par MessagePack parameters `axis`, `axis_bounds`, `rect`, `resolution`,
+     * @par Typed parameters `axis`, `axis_bounds`, `rect`, `resolution`,
      * and `covered_boxes` define the projection slab and AMR exclusion regions.
      * @par Chunk outputs `outputs[0]` is an f64 image of line-integrated
      * values.
@@ -318,12 +240,12 @@ void register_grid_kernels(KernelRegistry &registry) {
                    .n_inputs = 1,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &level, int32_t block,
-                        std::span<const ChunkBuffer> inputs,
-                        const NeighborViews &, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
-          const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+        [](const LevelMeta &level, int32_t block,
+           std::span<const ChunkBuffer> inputs, const NeighborViews &,
+           std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
+          const auto &params = require_kernel_params<Params>(
+              kernel_params, "uniform_projection_accumulate");
 
           const auto out_nx = params.resolution[0];
           const auto out_ny = params.resolution[1];
@@ -530,14 +452,10 @@ void register_grid_kernels(KernelRegistry &registry) {
               covered_skips, bounds_skips, deposited_cells, total_sum);
 
           return hpx::make_ready_future();
-        },
-        make_covered_box_params_preparer<Params>(decode_params));
+        });
   }
   {
-    struct Params {
-      std::string expression;
-      std::vector<std::string> variables;
-    };
+    using Params = FieldExprParams;
 
     using FieldExprExecutor =
         std::variant<std::monostate, amrexpr::ParserExecutor<1>,
@@ -603,30 +521,33 @@ void register_grid_kernels(KernelRegistry &registry) {
       }
     };
 
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      if (const auto *expr = find_msgpack_map_value(root, "expression");
-          expr && expr->type == msgpack::type::STR) {
-        params.expression = expr->as<std::string>();
+    struct FieldExprCache {
+      hpx::mutex mutex;
+      std::unordered_map<std::string, std::shared_ptr<const PreparedParams>>
+          entries;
+    };
+    auto cache = std::make_shared<FieldExprCache>();
+    auto prepare = [cache](const Params &params) {
+      std::string key = params.expression;
+      for (const auto &variable : params.variables) {
+        key.push_back('\0');
+        key.append(variable);
       }
-      if (const auto *vars = find_msgpack_map_value(root, "variables");
-          vars && vars->type == msgpack::type::ARRAY) {
-        params.variables.reserve(vars->via.array.size);
-        for (uint32_t i = 0; i < vars->via.array.size; ++i) {
-          const auto &v = vars->via.array.ptr[i];
-          if (v.type == msgpack::type::STR) {
-            params.variables.push_back(v.as<std::string>());
-          }
-        }
+      std::lock_guard<hpx::mutex> lock(cache->mutex);
+      if (const auto it = cache->entries.find(key);
+          it != cache->entries.end()) {
+        return it->second;
       }
-      return params;
+      auto prepared = std::make_shared<const PreparedParams>(params);
+      cache->entries.emplace(std::move(key), prepared);
+      return prepared;
     };
 
     /**
      * @brief Evaluates a scalar field expression independently in every grid
      * cell.
      * @par Chunk inputs `inputs[0..N)` are matching real-valued block grids.
-     * @par MessagePack parameters `expression` is the parser expression and
+     * @par Typed parameters `expression` is the parser expression and
      * `variables` names the inputs in order; one to eight variables are
      * supported.
      * @par Chunk outputs `outputs[0]` is the f32 or f64 expression value grid.
@@ -636,17 +557,14 @@ void register_grid_kernels(KernelRegistry &registry) {
                    .n_inputs = 1,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [](const LevelMeta &level, int32_t block,
-           std::span<const ChunkBuffer> inputs, const NeighborViews &,
-           std::span<ChunkBuffer> outputs, std::span<const std::uint8_t>) {
-          auto prepared_ptr = detail::current_prepared_params(
-              std::type_index(typeid(PreparedParams)));
-          if (!prepared_ptr) {
-            throw std::runtime_error("field_expr task was not prepared");
-          }
-          const auto &prepared =
-              *static_cast<const PreparedParams *>(prepared_ptr.get());
-          const auto &params = prepared.params;
+        [prepare](const LevelMeta &level, int32_t block,
+                  std::span<const ChunkBuffer> inputs, const NeighborViews &,
+                  std::span<ChunkBuffer> outputs,
+                  const KernelParamsIR &kernel_params) {
+          const auto &typed =
+              require_kernel_params<Params>(kernel_params, "field_expr");
+          const auto prepared = prepare(typed);
+          const auto &params = prepared->params;
 
           if (outputs.empty()) {
             return hpx::make_ready_future();
@@ -730,7 +648,7 @@ void register_grid_kernels(KernelRegistry &registry) {
 #define KANGAROO_FIELD_EXPR_CASE(N)                                            \
   case N: {                                                                    \
     const auto &executable =                                                   \
-        std::get<amrexpr::ParserExecutor<N>>(prepared.executor);               \
+        std::get<amrexpr::ParserExecutor<N>>(prepared->executor);              \
     for (std::size_t index = 0; index < cell_count; ++index) {                 \
       double vars[N];                                                          \
       for (int variable = 0; variable < N; ++variable)                         \
@@ -754,64 +672,16 @@ void register_grid_kernels(KernelRegistry &registry) {
           }
 #undef KANGAROO_FIELD_EXPR_CASE
           return hpx::make_ready_future();
-        },
-        [decode_params](const KernelParamContext &context)
-            -> KernelRegistry::PreparedParams {
-          if (context.params_msgpack.empty()) {
-            return {};
-          }
-          const auto &decoded = decode_params_cached<Params>(
-              context.params_msgpack, decode_params);
-          auto prepared = std::shared_ptr<const void>(
-              new PreparedParams(decoded), [](const void *ptr) {
-                delete static_cast<const PreparedParams *>(ptr);
-              });
-          return KernelRegistry::PreparedParams{
-              std::type_index(typeid(PreparedParams)), std::move(prepared)};
         });
   }
   {
-    struct Params {
-      int axis = 2;
-      double coord = 0.0;
-      std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
-      std::array<int, 2> resolution{1, 1};
-    };
-
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      if (const auto *axis = find_msgpack_map_value(root, "axis");
-          axis && (axis->type == msgpack::type::POSITIVE_INTEGER ||
-                   axis->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.axis = axis->as<int>();
-      }
-      if (const auto *coord = find_msgpack_map_value(root, "coord");
-          coord && (coord->type == msgpack::type::FLOAT ||
-                    coord->type == msgpack::type::POSITIVE_INTEGER ||
-                    coord->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.coord = coord->as<double>();
-      }
-      if (const auto *rect = find_msgpack_map_value(root, "rect");
-          rect && rect->type == msgpack::type::ARRAY &&
-          rect->via.array.size == 4) {
-        for (uint32_t i = 0; i < 4; ++i) {
-          params.rect[i] = rect->via.array.ptr[i].as<double>();
-        }
-      }
-      if (const auto *res = find_msgpack_map_value(root, "resolution");
-          res && res->type == msgpack::type::ARRAY &&
-          res->via.array.size == 2) {
-        params.resolution[0] = res->via.array.ptr[0].as<int>();
-        params.resolution[1] = res->via.array.ptr[1].as<int>();
-      }
-      return params;
-    };
+    using Params = UniformSliceParams;
 
     /**
      * @brief Samples a grid block onto its overlapping region of a uniform
      * slice.
      * @par Chunk inputs `inputs[0]` is a real-valued cell-centered block grid.
-     * @par MessagePack parameters `axis`, `coord`, `rect`, and `resolution`
+     * @par Typed parameters `axis`, `coord`, `rect`, and `resolution`
      * define the sampling plane and output image.
      * @par Chunk outputs `outputs[0]` is an f32 or f64 nearest-cell slice
      * image; pixels outside this block are NaN.
@@ -821,16 +691,16 @@ void register_grid_kernels(KernelRegistry &registry) {
                    .n_inputs = 1,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &level, int32_t block,
-                        std::span<const ChunkBuffer> inputs,
-                        const NeighborViews &, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+        [](const LevelMeta &level, int32_t block,
+           std::span<const ChunkBuffer> inputs, const NeighborViews &,
+           std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
           if (log_locality) {
             std::cout << "[kangaroo] uniform_slice block=" << block
                       << " locality=" << hpx::get_locality_id() << std::endl;
           }
           const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+              require_kernel_params<Params>(kernel_params, "uniform_slice");
 
           const auto out_nx = params.resolution[0];
           const auto out_ny = params.resolution[1];
@@ -962,14 +832,13 @@ void register_grid_kernels(KernelRegistry &registry) {
                 BufferContractReason::kScalarMismatch,
                 "uniform_slice output must be f32 or f64");
           return hpx::make_ready_future();
-        },
-        make_kernel_params_preparer<Params>(decode_params));
+        });
   }
   /**
    * @brief Computes the cell-centered magnitude of the velocity curl.
    * @par Chunk inputs Either one real block grid with three gradient components
    * per cell, or three such grids holding the gradients of velocity x/y/z.
-   * @par MessagePack parameters None.
+   * @par Typed parameters None.
    * @par Chunk outputs `outputs[0]` is an f64 scalar block grid containing
    * gradient magnitude for one input or velocity-curl magnitude for three
    * inputs.
@@ -981,7 +850,7 @@ void register_grid_kernels(KernelRegistry &registry) {
                  .needs_neighbors = false},
       [](const LevelMeta &level, int32_t block,
          std::span<const ChunkBuffer> inputs, const NeighborViews &,
-         std::span<ChunkBuffer> outputs, std::span<const std::uint8_t>) {
+         std::span<ChunkBuffer> outputs, const KernelParamsIR &) {
         if (outputs.empty() || block < 0 ||
             static_cast<std::size_t>(block) >= level.boxes.size()) {
           return hpx::make_ready_future();

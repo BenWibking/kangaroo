@@ -7,7 +7,8 @@ import time
 import pytest
 
 from analysis.buffer import BufferSpec, DType, FixedShape
-from analysis.plan import Domain, FieldRef, OutputRef, Plan, Stage
+from analysis.kernel_params import UniformProjectionParams
+from analysis.plan import Domain, FieldRef, GraphReduceSpec, OutputRef, Plan, Stage
 from analysis import runtime as runtime_mod
 from analysis.runtime import (
     Runtime,
@@ -127,8 +128,8 @@ def test_runtime_logs_python_prepare_phases(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert ("python_plan_to_dict", "start") in seen
     assert ("python_plan_to_dict", "end") in seen
-    assert ("python_pack_plan_msgpack", "start") in seen
-    assert ("python_pack_plan_msgpack", "end") in seen
+    assert ("python_encode_plan_flatbuffer", "start") in seen
+    assert ("python_encode_plan_flatbuffer", "end") in seen
     assert ("python_prepare_plan", "start") in seen
     assert ("python_prepare_plan", "end") in seen
 
@@ -152,7 +153,7 @@ def test_runtime_writes_dashboard_plan_only_when_configured(
 
 
 def test_plan_to_dict_hoists_shared_covered_boxes() -> None:
-    shared_boxes = [[[0, 0, 0], [3, 3, 3]], [[4, 0, 0], [7, 3, 3]]]
+    shared_boxes = (((0, 0, 0), (3, 3, 3)), ((4, 0, 0), (7, 3, 3)))
     stage = Stage(name="projection")
     domain = Domain(step=0, level=0, blocks=[0])
     for block in (0, 1):
@@ -162,20 +163,19 @@ def test_plan_to_dict_hoists_shared_covered_boxes() -> None:
             domain=Domain(step=0, level=0, blocks=[block]),
             inputs=[FieldRef(1, domain=domain)],
             outputs=[OutputRef(FieldRef(2), BufferSpec(DType.F64, FixedShape((16,))))],
-            deps={"kind": "None"},
-            params={
-                "axis": 2,
-                "resolution": [8, 8],
-                "covered_boxes": shared_boxes,
-            },
+            params=UniformProjectionParams(
+                axis=2,
+                resolution=(8, 8),
+                covered_boxes=shared_boxes,
+            ),
         )
 
     plan_dict = plan_to_dict(Plan(stages=[stage]))
 
     assert plan_dict["shared_covered_boxes"] == [shared_boxes]
-    params = [tmpl["params"] for tmpl in plan_dict["stages"][0]["templates"]]
-    assert all("covered_boxes" not in p for p in params)
-    assert all(p["covered_boxes_ref"] == 0 for p in params)
+    templates = plan_dict["stages"][0]["templates"]
+    assert all("covered_boxes" not in tmpl["params"] for tmpl in templates)
+    assert all(tmpl["covered_boxes_ref"] == 0 for tmpl in templates)
 
 
 def test_run_console_main_executes_only_on_console_locality() -> None:
@@ -212,8 +212,6 @@ def test_count_plan_tasks_counts_graph_reduce_groups_not_level_blocks() -> None:
         domain=Domain(step=0, level=0, blocks=[0, 1, 2, 3]),
         inputs=[FieldRef(1)],
         outputs=[OutputRef(FieldRef(2), BufferSpec(DType.F64, FixedShape((1,))))],
-        deps={"kind": "None"},
-        params={},
     )
 
     graph_stage = Stage(name="reduce", plane="graph", after=[chunk_stage])
@@ -223,8 +221,7 @@ def test_count_plan_tasks_counts_graph_reduce_groups_not_level_blocks() -> None:
         domain=Domain(step=0, level=0),
         inputs=[FieldRef(2)],
         outputs=[OutputRef(FieldRef(3), BufferSpec(DType.F64, FixedShape((1,))))],
-        deps={"kind": "None"},
-        params={"graph_kind": "reduce", "fan_in": 2, "num_inputs": 4, "output_base": 0},
+        graph_reduce=GraphReduceSpec(fan_in=2, num_inputs=4),
     )
 
     total = _count_plan_tasks(Plan(stages=[graph_stage]), runmeta=_FakeRunMeta(nboxes=976))

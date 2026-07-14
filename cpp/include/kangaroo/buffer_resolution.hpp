@@ -1,16 +1,15 @@
 #pragma once
 
 #include "kangaroo/data_service.hpp"
+#include "kangaroo/kernel_params.hpp"
 #include "kangaroo/runmeta.hpp"
 
 #include <cstddef>
 #include <cstdint>
 #include <functional>
-#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
-#include <typeindex>
 #include <utility>
 
 namespace kangaroo {
@@ -35,15 +34,11 @@ struct DynamicOutputBoundContext {
   int32_t block = 0;
   std::size_t output_index = 0;
   std::span<const BufferFacts> inputs;
-  std::type_index prepared_params_type{typeid(void)};
-  std::shared_ptr<const void> prepared_params;
+  const KernelParamsIR& kernel_params;
 
   template <typename Params>
   const Params& params() const {
-    if (prepared_params_type != std::type_index(typeid(Params)) || !prepared_params) {
-      throw std::runtime_error("dynamic output bound has incompatible prepared parameters");
-    }
-    return *static_cast<const Params*>(prepared_params.get());
+    return require_kernel_params<Params>(kernel_params, "dynamic output bound");
   }
 };
 
@@ -65,14 +60,6 @@ class DynamicOutputBoundEvaluator {
 struct BufferResolution {
   ResolvedBufferSpec allocation;
   BufferFacts facts;
-};
-
-struct AmrSubboxPackParams {
-  int32_t input_field = -1;
-  int32_t input_version = 0;
-  int32_t input_step = 0;
-  int16_t input_level = 0;
-  int32_t halo_cells = 1;
 };
 
 BufferFacts buffer_facts(const ChunkBuffer& buffer);

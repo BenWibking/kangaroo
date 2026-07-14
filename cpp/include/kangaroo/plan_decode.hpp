@@ -7,6 +7,6 @@
 
 namespace kangaroo {
 
-PlanIR decode_plan_msgpack(std::span<const std::uint8_t> payload);
+PlanIR decode_plan_flatbuffer(std::span<const std::uint8_t> payload);
 
-}  // namespace kangaroo
+} // namespace kangaroo

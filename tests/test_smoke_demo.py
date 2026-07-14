@@ -73,118 +73,80 @@ def _make_runtime_handles():
 
 
 def test_executor_detects_stage_cycle() -> None:
-    import analysis._core  # type: ignore # noqa: F401
+    from analysis.plan import Plan, Stage
+    from analysis.plan_codec import encode_plan
 
-    import msgpack
-
-    rt, runmeta, ds = _make_runtime_handles()
-
-    plan_dict = {
-        "stages": [
-            {"name": "a", "plane": "chunk", "after": [1], "templates": []},
-            {"name": "b", "plane": "chunk", "after": [0], "templates": []},
-        ]
-    }
-    packed = msgpack.packb(plan_dict, use_bin_type=True)
-
-    with pytest.raises(RuntimeError):
-        rt._rt.run_packed_plan(packed, runmeta._h, ds._h)
+    a = Stage("a")
+    b = Stage("b", after=[a])
+    a.after.append(b)
+    with pytest.raises(ValueError, match="dependency cycle"):
+        encode_plan(Plan([a, b]))
 
 
-def test_executor_rejects_bad_stage_dep_index() -> None:
-    import analysis._core  # type: ignore # noqa: F401
+def test_plan_encoder_derives_valid_stage_dependency_indices() -> None:
+    from analysis.plan import Plan, Stage
+    from analysis.plan_codec import encode_plan
 
-    import msgpack
-
-    rt, runmeta, ds = _make_runtime_handles()
-
-    plan_dict = {
-        "stages": [{"name": "s0", "plane": "chunk", "after": [2], "templates": []}]
-    }
-
-    packed = msgpack.packb(plan_dict, use_bin_type=True)
-    with pytest.raises(RuntimeError):
-        rt._rt.run_packed_plan(packed, runmeta._h, ds._h)
+    parent = Stage("parent")
+    child = Stage("child", after=[parent])
+    assert encode_plan(Plan([child]))[4:8] == b"KPLN"
 
 
 def test_neighbor_dep_faces_and_width() -> None:
     import analysis._core  # type: ignore # noqa: F401
 
-    import msgpack
+    from analysis.buffer import BlockShape, BufferSpec, DType
+    from analysis.kernel_params import GradStencilParams
+    from analysis.plan import DependencyRule, Domain, FieldRef, OutputRef, Plan, Stage
+    from analysis.plan_codec import encode_plan
 
     rt, runmeta, ds = _make_runtime_handles()
 
-    base_task = {
-        "name": "noop",
-        "plane": "chunk",
-        "kernel": "gradU_stencil",
-        "domain": {"step": 0, "level": 0, "blocks": None},
-        "inputs": [{"field": 1, "version": 0}],
-        "outputs": [{
-            "field": 2,
-            "version": 0,
-            "buffer": {
-                "dtype": "f64",
-                "shape": {"kind": "block", "components": 3},
-                "init": "uninitialized",
-            },
-        }],
-        "deps": {"kind": "FaceNeighbors", "width": 1, "faces": [1, 1, 1, 1, 1, 1]},
-        "params": {},
-    }
+    def packed(deps: DependencyRule) -> bytes:
+        stage = Stage("s0")
+        stage.map_blocks(
+            name="noop", kernel="gradU_stencil", domain=Domain(0, 0),
+            inputs=[FieldRef(1)],
+            outputs=[OutputRef(FieldRef(2), BufferSpec(DType.F64, BlockShape(3)))],
+            deps=deps, params=GradStencilParams(input_field=1),
+        )
+        return encode_plan(Plan([stage]))
 
     # width=0 should be allowed (no neighbors)
-    plan_dict = {"stages": [{"name": "s0", "plane": "chunk", "after": [], "templates": [
-        {**base_task, "deps": {"kind": "FaceNeighbors", "width": 0, "faces": [1, 1, 1, 1, 1, 1]}}
-    ]}]}
-    packed = msgpack.packb(plan_dict, use_bin_type=True)
-    rt._rt.run_packed_plan(packed, runmeta._h, ds._h)
+    rt._rt.run_packed_plan(
+        packed(DependencyRule(kind="FaceNeighbors", width=0)), runmeta._h, ds._h
+    )
 
     # all faces disabled should be allowed (no neighbors)
-    plan_dict = {"stages": [{"name": "s0", "plane": "chunk", "after": [], "templates": [
-        {**base_task, "deps": {"kind": "FaceNeighbors", "width": 1, "faces": [0, 0, 0, 0, 0, 0]}}
-    ]}]}
-    packed = msgpack.packb(plan_dict, use_bin_type=True)
-    rt._rt.run_packed_plan(packed, runmeta._h, ds._h)
+    rt._rt.run_packed_plan(
+        packed(DependencyRule(kind="FaceNeighbors", width=1, faces=(False,) * 6)),
+        runmeta._h,
+        ds._h,
+    )
 
 
 def test_neighbor_halo_inputs_indices() -> None:
     import analysis._core  # type: ignore # noqa: F401
 
-    import msgpack
+    from analysis.buffer import BlockShape, BufferSpec, DType
+    from analysis.kernel_params import GradStencilParams
+    from analysis.plan import DependencyRule, Domain, FieldRef, OutputRef, Plan, Stage
+    from analysis.plan_codec import encode_plan
 
     rt, runmeta, ds = _make_runtime_handles()
 
-    base_task = {
-        "name": "noop",
-        "plane": "chunk",
-        "kernel": "gradU_stencil",
-        "domain": {"step": 0, "level": 0, "blocks": None},
-        "inputs": [{"field": 1, "version": 0}, {"field": 2, "version": 0}],
-        "outputs": [{
-            "field": 3,
-            "version": 0,
-            "buffer": {
-                "dtype": "f64",
-                "shape": {"kind": "block", "components": 3},
-                "init": "uninitialized",
-            },
-        }],
-        "deps": {
-            "kind": "FaceNeighbors",
-            "width": 1,
-            "faces": [1, 1, 1, 1, 1, 1],
-            "halo_inputs": [1],
-        },
-        "params": {},
-    }
+    def packed(halo_inputs: tuple[int, ...]) -> bytes:
+        stage = Stage("s0")
+        stage.map_blocks(
+            name="noop", kernel="gradU_stencil", domain=Domain(0, 0),
+            inputs=[FieldRef(1), FieldRef(2)],
+            outputs=[OutputRef(FieldRef(3), BufferSpec(DType.F64, BlockShape(3)))],
+            deps=DependencyRule(kind="FaceNeighbors", width=1, halo_inputs=halo_inputs),
+            params=GradStencilParams(input_field=1),
+        )
+        return encode_plan(Plan([stage]))
 
-    plan_dict = {"stages": [{"name": "s0", "plane": "chunk", "after": [], "templates": [base_task]}]}
-    packed = msgpack.packb(plan_dict, use_bin_type=True)
-    rt._rt.run_packed_plan(packed, runmeta._h, ds._h)
+    rt._rt.run_packed_plan(packed((1,)), runmeta._h, ds._h)
 
-    bad_task = {**base_task, "deps": {**base_task["deps"], "halo_inputs": [2]}}
-    plan_dict = {"stages": [{"name": "s0", "plane": "chunk", "after": [], "templates": [bad_task]}]}
-    packed = msgpack.packb(plan_dict, use_bin_type=True)
     with pytest.raises(RuntimeError):
-        rt._rt.run_packed_plan(packed, runmeta._h, ds._h)
+        rt._rt.run_packed_plan(packed((2,)), runmeta._h, ds._h)

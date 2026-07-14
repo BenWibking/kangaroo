@@ -62,12 +62,12 @@ def test_uniform_projection_amr_covered_boxes() -> None:
     assert level0
     assert level1
 
-    expected_box = [[0, 0, 0], [3, 7, 7]]
+    expected_box = ((0, 0, 0), (3, 7, 7))
 
     for tmpl in level0:
-        assert tmpl.params["axis_bounds"] == [0.0, 8.0]
-        assert expected_box in tmpl.params["covered_boxes"]
+        assert tmpl.params.axis_bounds == (0.0, 8.0)
+        assert expected_box in tmpl.params.covered_boxes
 
     for tmpl in level1:
-        assert tmpl.params["axis_bounds"] == [0.0, 8.0]
-        assert tmpl.params["covered_boxes"] == []
+        assert tmpl.params.axis_bounds == (0.0, 8.0)
+        assert tmpl.params.covered_boxes == ()

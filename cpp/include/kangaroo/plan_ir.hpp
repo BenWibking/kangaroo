@@ -2,12 +2,10 @@
 
 #include "kangaroo/kernel.hpp"
 
-#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
-#include <typeindex>
 #include <vector>
 
 #include <hpx/datastructures/serialization/optional.hpp>
@@ -63,24 +61,13 @@ struct GraphReduceSpecIR {
   std::vector<int32_t> input_blocks;
   std::vector<int32_t> output_blocks;
   std::vector<int32_t> group_offsets;
-};
-
-struct CoveredBoxIR {
-  std::array<int32_t, 3> lo{0, 0, 0};
-  std::array<int32_t, 3> hi{0, 0, 0};
 
   template <typename Archive>
   void serialize(Archive& ar, unsigned) {
-    for (auto& v : lo) {
-      ar& v;
-    }
-    for (auto& v : hi) {
-      ar& v;
-    }
+    ar& fan_in& num_inputs& input_base& output_base& input_blocks& output_blocks&
+        group_offsets;
   }
 };
-
-using CoveredBoxListIR = std::vector<CoveredBoxIR>;
 
 enum class ShapeRuleKind : std::uint8_t { kBlock = 0, kFixed = 1, kLikeInput = 2, kDynamic = 3 };
 enum class DynamicUpperBoundKind : std::uint8_t {
@@ -136,17 +123,15 @@ struct TaskTemplateIR {
   std::vector<OutputRefIR> outputs;
   DepRuleIR deps;
   int32_t covered_boxes_ref = -1;
-  std::vector<std::uint8_t> params_msgpack;
+  KernelParamsIR params;
+  std::optional<GraphReduceSpecIR> graph_reduce;
   std::shared_ptr<const KernelFn> kernel_fn;           // locality-local prepared metadata
   std::shared_ptr<const DynamicOutputBoundEvaluator> dynamic_output_bound;  // locality-local
-  std::optional<GraphReduceSpecIR> graph_reduce;       // locality-local prepared metadata
-  std::shared_ptr<const void> prepared_params;         // locality-local prepared metadata
-  std::type_index prepared_params_type{typeid(void)};  // locality-local prepared metadata
 
   template <typename Archive>
   void serialize(Archive& ar, unsigned) {
     ar& name& plane& kernel& domain& inputs& outputs& deps& covered_boxes_ref&
-        params_msgpack;
+        params& graph_reduce;
   }
 };
 
