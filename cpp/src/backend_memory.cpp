@@ -31,7 +31,7 @@ std::size_t MemoryBackend::estimate_chunk_bytes(const ChunkRef& ref) const {
   return it->second.bytes();
 }
 
-DatasetMetadata MemoryBackend::get_metadata() const {
+DatasetMetadata MemoryBackend::metadata(int32_t) const {
   // TODO: Implement metadata storage for MemoryBackend
   return DatasetMetadata{};
 }
@@ -39,6 +39,11 @@ DatasetMetadata MemoryBackend::get_metadata() const {
 void MemoryBackend::set_chunk(const ChunkRef& ref, ChunkBuffer view) {
   std::lock_guard<std::mutex> lock(mutex_);
   data_[ref] = std::move(view);
+}
+
+DatasetBackendSnapshot MemoryBackend::snapshot() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return DatasetBackendSnapshot{.kind = kind(), .memory_chunks = data_};
 }
 
 }  // namespace kangaroo

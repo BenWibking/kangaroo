@@ -26,66 +26,24 @@ class Dataset:
     _h: Any = field(init=False)
     _fields: Dict[str, int] = field(default_factory=dict)
     _kind: str = field(init=False, default="unknown")
-    _path: str = field(init=False, default="")
 
     def __post_init__(self) -> None:
-        kind, path = self._parse_uri(self.uri)
-        self._kind = kind
-        self._path = path
         self._h = _core.DatasetHandle(self.uri, self.step, self.level)
+        self._kind = str(self._h.kind())
         self._auto_register()
-
-    @staticmethod
-    def _parse_uri(uri: str) -> tuple[str, str]:
-        if uri.startswith("amrex://"):
-            return "amrex", uri[8:]
-        if uri.startswith("openpmd://"):
-            return "openpmd", uri
-        if uri.startswith("parthenon://"):
-            return "parthenon", uri[12:]
-        if uri.startswith("file://"):
-            path = uri[7:]
-            import os
-
-            if os.path.isfile(path) and path.endswith((".phdf", ".h5", ".hdf5")):
-                return "parthenon", path
-            return "amrex", path
-        if uri.startswith("memory://"):
-            return "memory", uri
-        return "unknown", uri
 
     @property
     def kind(self) -> str:
         return self._kind
 
     def _auto_register(self) -> None:
-        if self._kind == "amrex":
-            path = self._path
-            import os
-            header_path = os.path.join(path, "Header")
-            if os.path.exists(header_path):
-                with open(header_path, "r") as f:
-                    lines = f.readlines()
-                    if len(lines) > 2:
-                        ncomp = int(lines[1].strip())
-                        for i in range(ncomp):
-                            name = lines[2 + i].strip()
-                            fid = self.field_id(name)
-                            self._h.register_field(fid, i)
-        elif self._kind == "openpmd":
-            meta = self.metadata
-            for name in meta.get("var_names", []):
-                fid = self.field_id(name)
-                self._h.register_field(fid, name)
-        elif self._kind == "parthenon":
-            meta = self.metadata
-            for name in meta.get("var_names", []):
-                fid = self.field_id(name)
-                self._h.register_field(fid, name)
-            for info in meta.get("variable_info", {}).values():
-                for label in info.get("component_names", []):
-                    fid = self.field_id(label)
-                    self._h.register_field(fid, label)
+        meta = self.metadata
+        names = list(meta.get("var_names", []))
+        for info in meta.get("variable_info", {}).values():
+            names.extend(info.get("component_names", []))
+        for name in dict.fromkeys(names):
+            fid = self.field_id(name)
+            self._h.register_field(fid, name)
 
     def list_meshes(self) -> list[str]:
         return list(self._h.list_meshes())
@@ -124,8 +82,7 @@ class Dataset:
 
     def register_field(self, name: str, fid: int) -> None:
         self._fields[name] = fid
-        if self._kind in {"openpmd", "parthenon"}:
-            self._h.register_field(fid, name)
+        self._h.register_field(fid, name)
 
     def field_id(self, name: str) -> int:
         if name in self._fields:
@@ -140,8 +97,7 @@ class Dataset:
             return self._h.metadata()
         except RuntimeError as exc:
             raise RuntimeError(
-                f"Failed to load dataset metadata for '{self.uri}': {exc}. "
-                "Only cell-centered openPMD mesh records are supported."
+                f"Failed to load dataset metadata for '{self.uri}': {exc}"
             ) from exc
 
     def metadata_bundle(self, periodic: Optional[tuple[bool, bool, bool]] = None) -> DatasetMetadata:

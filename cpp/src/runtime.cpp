@@ -197,7 +197,7 @@ T load_buffer_scalar(const std::uint8_t* data, std::size_t index);
 template <typename T>
 void store_buffer_scalar(std::uint8_t* data, std::size_t index, T value);
 
-void append_particle_values_as_f64(const plotfile::ParticleArrayData& data, const std::string& name,
+void append_particle_values_as_f64(const ParticleFieldChunk& data, const std::string& name,
                                    const std::string& context, std::vector<double>& out_vals) {
   const std::size_t n = static_cast<std::size_t>(std::max<int64_t>(0, data.count));
   const std::size_t start = out_vals.size();
@@ -3321,13 +3321,8 @@ void register_default_kernels(KernelRegistry& registry) {
           if (!dataset.backend) {
             throw std::runtime_error("particle_load_field_chunk_f64: missing dataset backend");
           }
-          const auto* reader = dataset.backend->get_plotfile_reader();
-          if (reader == nullptr) {
-            throw std::runtime_error(
-                "particle_load_field_chunk_f64 requires an AMReX plotfile-backed dataset");
-          }
-          auto data =
-              reader->read_particle_field_chunk(params.particle_type, params.field_name, block);
+          auto data = dataset.backend->read_particle_field_chunk(
+              params.particle_type, params.field_name, block);
           const std::size_t n = static_cast<std::size_t>(std::max<int64_t>(0, data.count));
           auto out_values = outputs[0].mutable_dynamic_array<double>();
           auto* out = out_values.byte_data();
@@ -3438,20 +3433,14 @@ void register_default_kernels(KernelRegistry& registry) {
           if (!dataset.backend) {
             throw std::runtime_error("particle_cic_grid_accumulate: missing dataset backend");
           }
-          const auto* reader = dataset.backend->get_plotfile_reader();
-          if (reader == nullptr) {
-            throw std::runtime_error(
-                "particle_cic_grid_accumulate requires an AMReX plotfile-backed dataset");
-          }
-
-          auto px =
-              reader->read_particle_field_grid(params.particle_type, "x", params.level_index, block);
-          auto py =
-              reader->read_particle_field_grid(params.particle_type, "y", params.level_index, block);
-          auto pz =
-              reader->read_particle_field_grid(params.particle_type, "z", params.level_index, block);
-          auto pm = reader->read_particle_field_grid(params.particle_type, "mass",
-                                                     params.level_index, block);
+          auto px = dataset.backend->read_particle_field_grid(
+              params.particle_type, "x", params.level_index, block);
+          auto py = dataset.backend->read_particle_field_grid(
+              params.particle_type, "y", params.level_index, block);
+          auto pz = dataset.backend->read_particle_field_grid(
+              params.particle_type, "z", params.level_index, block);
+          auto pm = dataset.backend->read_particle_field_grid(
+              params.particle_type, "mass", params.level_index, block);
 
           std::vector<double> px_vals;
           std::vector<double> py_vals;
@@ -3701,20 +3690,14 @@ void register_default_kernels(KernelRegistry& registry) {
           if (!dataset.backend) {
             throw std::runtime_error("particle_cic_projection_accumulate: missing dataset backend");
           }
-          const auto* reader = dataset.backend->get_plotfile_reader();
-          if (reader == nullptr) {
-            throw std::runtime_error(
-                "particle_cic_projection_accumulate requires an AMReX plotfile-backed dataset");
-          }
-
-          auto px =
-              reader->read_particle_field_grid(params.particle_type, "x", params.level_index, block);
-          auto py =
-              reader->read_particle_field_grid(params.particle_type, "y", params.level_index, block);
-          auto pz =
-              reader->read_particle_field_grid(params.particle_type, "z", params.level_index, block);
-          auto pm = reader->read_particle_field_grid(params.particle_type, "mass",
-                                                     params.level_index, block);
+          auto px = dataset.backend->read_particle_field_grid(
+              params.particle_type, "x", params.level_index, block);
+          auto py = dataset.backend->read_particle_field_grid(
+              params.particle_type, "y", params.level_index, block);
+          auto pz = dataset.backend->read_particle_field_grid(
+              params.particle_type, "z", params.level_index, block);
+          auto pm = dataset.backend->read_particle_field_grid(
+              params.particle_type, "mass", params.level_index, block);
 
           std::vector<double> px_vals;
           std::vector<double> py_vals;
@@ -4462,14 +4445,9 @@ void register_default_kernels(KernelRegistry& registry) {
           if (!dataset.backend) {
             throw std::runtime_error("particle_topk_modes_map: missing dataset backend");
           }
-          const auto* reader = dataset.backend->get_plotfile_reader();
-          if (reader == nullptr) {
-            throw std::runtime_error(
-                "particle_topk_modes_map requires an AMReX plotfile-backed dataset");
-          }
           std::unordered_map<double, int64_t> counts;
-          const auto data =
-              reader->read_particle_field_chunk(params.particle_type, params.field_name, block);
+          const auto data = dataset.backend->read_particle_field_chunk(
+              params.particle_type, params.field_name, block);
           std::vector<double> values;
           append_particle_values_as_f64(data, params.field_name, "particle_topk_modes_map", values);
           for (double v : values) {
@@ -6111,13 +6089,10 @@ Runtime::Runtime(const std::vector<std::string>& hpx_config,
 
 void DatasetHandle::set_chunk(const ChunkRef& ref, ChunkBuffer view) {
   if (!backend) {
-    backend = std::make_shared<MemoryBackend>();
+    uri = "memory://runtime";
+    backend = make_dataset_backend(uri);
   }
-  if (auto mem = std::dynamic_pointer_cast<MemoryBackend>(backend)) {
-    mem->set_chunk(ref, std::move(view));
-  } else {
-    throw std::runtime_error("Cannot set_chunk on read-only backend");
-  }
+  backend->set_chunk(ref, std::move(view));
 }
 
 std::optional<ChunkBuffer> DatasetHandle::get_chunk(const ChunkRef& ref) const {

@@ -184,19 +184,7 @@ std::size_t OpenPMDBackend::estimate_chunk_bytes(const ChunkRef& ref) const {
   return desc.has_value() ? static_cast<std::size_t>(desc->required_bytes()) : 0;
 }
 
-DatasetMetadata OpenPMDBackend::get_metadata() const {
-  DatasetMetadata meta;
-  const auto& cache = get_cache(0);
-  meta.prob_lo.assign(cache.prob_lo.begin(), cache.prob_lo.end());
-  meta.prob_hi.assign(cache.prob_hi.begin(), cache.prob_hi.end());
-  meta.ref_ratio.reserve(cache.ref_ratio.size());
-  for (const auto& ratio : cache.ref_ratio) {
-    meta.ref_ratio.push_back(ratio[0]);
-  }
-  return meta;
-}
-
-OpenPMDMetadata OpenPMDBackend::metadata(int32_t step) const {
+OpenPMDMetadata OpenPMDBackend::openpmd_metadata(int32_t step) const {
   const auto& cache = get_cache(step);
   OpenPMDMetadata out;
   out.selected_mesh = cache.selected_mesh;
@@ -221,6 +209,38 @@ OpenPMDMetadata OpenPMDBackend::metadata(int32_t step) const {
     out.prob_domain.push_back({level.domain_lo, level.domain_hi});
   }
 
+  return out;
+}
+
+DatasetMetadata OpenPMDBackend::metadata(int32_t step) const {
+  const auto source = openpmd_metadata(step);
+  DatasetMetadata out;
+  out.selected_mesh = source.selected_mesh;
+  out.mesh_names = source.mesh_names;
+  out.finest_level = source.finest_level;
+  out.prob_lo.assign(source.prob_lo.begin(), source.prob_lo.end());
+  out.prob_hi.assign(source.prob_hi.begin(), source.prob_hi.end());
+  for (const auto& ratio : source.ref_ratio) {
+    out.ref_ratio.push_back(ratio[0]);
+  }
+  for (const auto& size : source.cell_size) {
+    out.cell_size.emplace_back(size.begin(), size.end());
+  }
+  for (const auto& level : source.level_boxes) {
+    std::vector<DatasetBox> boxes;
+    for (const auto& [lo, hi] : level) {
+      boxes.push_back(DatasetBox{.lo = lo, .hi = hi});
+    }
+    out.level_boxes.push_back(std::move(boxes));
+  }
+  for (const auto& [lo, hi] : source.prob_domain) {
+    out.prob_domain.push_back(DatasetBox{.lo = lo, .hi = hi});
+  }
+  for (const auto& field : source.fields) {
+    out.var_names.push_back(field.name);
+    out.fields.push_back(DatasetVariableInfo{
+        .name = field.name, .num_components = field.ncomp, .type = field.type});
+  }
   return out;
 }
 

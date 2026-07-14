@@ -1,10 +1,6 @@
 #pragma once
 
 #include "kangaroo/adjacency.hpp"
-#include "kangaroo/backend_memory.hpp"
-#include "kangaroo/backend_openpmd.hpp"
-#include "kangaroo/backend_parthenon.hpp"
-#include "kangaroo/backend_plotfile.hpp"
 #include "kangaroo/data_service.hpp"
 #include "kangaroo/data_service_local.hpp"
 #include "kangaroo/dataset_backend.hpp"
@@ -47,86 +43,22 @@ struct DatasetHandle {
   template <typename Archive>
   void save(Archive& ar, unsigned) const {
     ar& uri& step& level;
-
-    bool is_memory = false;
-    bool is_plotfile = false;
-    bool is_openpmd = false;
-    bool is_parthenon = false;
-
+    DatasetBackendSnapshot snapshot;
     if (backend) {
-      if (auto mem = std::dynamic_pointer_cast<MemoryBackend>(backend)) {
-        is_memory = true;
-        ar& is_memory& is_plotfile& is_openpmd& is_parthenon;
-        ar& mem->data();
-      } else if (auto plt = std::dynamic_pointer_cast<PlotfileBackend>(backend)) {
-        is_plotfile = true;
-        ar& is_memory& is_plotfile& is_openpmd& is_parthenon;
-        auto field_map = plt->field_map();
-        ar& field_map;
-#ifdef KANGAROO_USE_OPENPMD
-      } else if (auto opmd = std::dynamic_pointer_cast<OpenPMDBackend>(backend)) {
-        is_openpmd = true;
-        ar& is_memory& is_plotfile& is_openpmd& is_parthenon;
-#endif
-#ifdef KANGAROO_USE_PARTHENON_HDF5
-      } else if (auto phdf = std::dynamic_pointer_cast<ParthenonBackend>(backend)) {
-        (void)phdf;
-        is_parthenon = true;
-        ar& is_memory& is_plotfile& is_openpmd& is_parthenon;
-#endif
-      } else {
-        ar& is_memory& is_plotfile& is_openpmd& is_parthenon;
-      }
-    } else {
-      ar& is_memory& is_plotfile& is_openpmd& is_parthenon;
+      snapshot = backend->snapshot();
     }
+    ar& snapshot.kind& snapshot.component_fields& snapshot.memory_chunks;
   }
 
   template <typename Archive>
   void load(Archive& ar, unsigned) {
     ar& uri& step& level;
-
-    bool is_memory = false;
-    bool is_plotfile = false;
-    bool is_openpmd = false;
-    bool is_parthenon = false;
-    ar& is_memory& is_plotfile& is_openpmd& is_parthenon;
-
-    if (is_memory) {
-      auto mem = std::make_shared<MemoryBackend>();
-      std::unordered_map<ChunkRef, ChunkBuffer, ChunkRefHash, ChunkRefEq> map;
-      ar& map;
-      mem->set_data(std::move(map));
-      backend = mem;
-    } else if (is_plotfile) {
-      std::string path = uri;
-      if (path.rfind("amrex://", 0) == 0) {
-        path = path.substr(8);
-      } else if (path.rfind("file://", 0) == 0) {
-        path = path.substr(7);
-      }
-      backend = std::make_shared<PlotfileBackend>(path);
-      std::map<int32_t, int32_t> field_map;
-      ar& field_map;
-      std::dynamic_pointer_cast<PlotfileBackend>(backend)->set_field_map(std::move(field_map));
-    } else if (is_openpmd) {
-#ifdef KANGAROO_USE_OPENPMD
-      backend = std::make_shared<OpenPMDBackend>(uri);
-#else
-      throw std::runtime_error("openPMD backend not enabled in this build");
-#endif
-    } else if (is_parthenon) {
-#ifdef KANGAROO_USE_PARTHENON_HDF5
-      std::string path = uri;
-      if (path.rfind("parthenon://", 0) == 0) {
-        path = path.substr(12);
-      } else if (path.rfind("file://", 0) == 0) {
-        path = path.substr(7);
-      }
-      backend = std::make_shared<ParthenonBackend>(path);
-#else
-      throw std::runtime_error("Parthenon HDF5 backend not enabled in this build");
-#endif
+    DatasetBackendSnapshot snapshot;
+    ar& snapshot.kind& snapshot.component_fields& snapshot.memory_chunks;
+    if (snapshot.kind.empty()) {
+      backend.reset();
+    } else {
+      backend = restore_dataset_backend(uri, snapshot);
     }
   }
 

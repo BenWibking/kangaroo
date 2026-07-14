@@ -42,14 +42,15 @@ class ParthenonBackend : public DatasetBackend {
   explicit ParthenonBackend(std::string path);
   ~ParthenonBackend() override;
 
+  std::string kind() const override { return "parthenon"; }
   std::optional<ChunkBuffer> get_chunk(const ChunkRef& ref) override;
   bool has_chunk(const ChunkRef& ref) const override;
   std::optional<BufferDesc> describe_chunk(const ChunkRef& ref) const override;
   std::size_t estimate_chunk_bytes(const ChunkRef& ref) const override;
-  DatasetMetadata get_metadata() const override;
+  DatasetMetadata metadata(int32_t step) const override;
 
   ParthenonMetadata metadata() const;
-  void register_field(int32_t field_id, const std::string& name);
+  void register_field(int32_t field_id, const std::string& name) override;
 
  private:
   struct FieldSpec {

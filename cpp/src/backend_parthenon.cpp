@@ -597,11 +597,33 @@ std::size_t ParthenonBackend::estimate_chunk_bytes(const ChunkRef& ref) const {
   return desc.has_value() ? static_cast<std::size_t>(desc->required_bytes()) : 0;
 }
 
-DatasetMetadata ParthenonBackend::get_metadata() const {
+DatasetMetadata ParthenonBackend::metadata(int32_t) const {
   DatasetMetadata out;
+  out.var_names = meta_.var_names;
+  out.finest_level = meta_.finest_level;
+  out.time = meta_.time;
   out.prob_lo = meta_.prob_lo;
   out.prob_hi = meta_.prob_hi;
   out.ref_ratio = meta_.ref_ratio;
+  out.cell_size = meta_.cell_size;
+  for (const auto& level : meta_.level_boxes) {
+    std::vector<DatasetBox> boxes;
+    for (const auto& [lo, hi] : level) {
+      boxes.push_back(DatasetBox{.lo = lo, .hi = hi});
+    }
+    out.level_boxes.push_back(std::move(boxes));
+  }
+  for (const auto& [lo, hi] : meta_.prob_domain) {
+    out.prob_domain.push_back(DatasetBox{.lo = lo, .hi = hi});
+  }
+  for (const auto& field : meta_.fields) {
+    out.fields.push_back(DatasetVariableInfo{
+        .name = field.name,
+        .num_components = field.num_components,
+        .component_names = field.component_names,
+        .type = field.type,
+    });
+  }
   return out;
 }
 
