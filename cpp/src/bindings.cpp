@@ -613,6 +613,29 @@ NB_MODULE(_core, m) {
     return nb::make_tuple(
         restored.desc().extents[0], restored.bytes(), restored.capacity_bytes());
   });
+  m.def("test_default_dataset_handle_roundtrip", []() {
+    kangaroo::DatasetHandle dataset;
+    const kangaroo::ChunkRef ref{0, 0, 7, 0, 0};
+    const std::array<std::uint64_t, 1> extents{1};
+    auto chunk = kangaroo::ChunkBuffer::allocate(
+        kangaroo::BufferDesc::contiguous(kangaroo::ScalarType::kF64, extents));
+    chunk.mutable_array<double>()(0) = 3.25;
+    dataset.set_chunk(ref, std::move(chunk));
+
+    std::vector<char> archive_bytes;
+    hpx::serialization::output_archive output_archive(archive_bytes);
+    output_archive << dataset;
+
+    kangaroo::DatasetHandle restored;
+    hpx::serialization::input_archive input_archive(archive_bytes, archive_bytes.size());
+    input_archive >> restored;
+    auto restored_chunk = restored.get_chunk(ref);
+    if (!restored_chunk.has_value()) {
+      throw std::runtime_error("restored default dataset handle is missing its chunk");
+    }
+    return nb::make_tuple(restored.uri, restored.backend->kind(),
+                          restored_chunk->array<double>()(0));
+  });
   m.def("test_backend_chunk_dynamic_capacity",
         [](const std::string& dtype, const std::string& kernel,
            std::uint64_t particle_records, const std::vector<std::uint64_t>& input_bytes) {

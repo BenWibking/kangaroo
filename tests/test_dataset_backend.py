@@ -29,6 +29,16 @@ def test_memory_dataset_uses_backend_capabilities() -> None:
         _core.DatasetHandle("unknown://dataset", 0, 0)
 
 
+def test_default_dataset_handle_memory_backend_roundtrips() -> None:
+    from analysis import _core
+
+    assert _core.test_default_dataset_handle_roundtrip() == (
+        "memory://runtime",
+        "memory",
+        3.25,
+    )
+
+
 def test_plotfile_dataset_metadata_and_particles_cross_backend_seam() -> None:
     if not os.path.isdir(PLOTFILE):
         pytest.skip("DiskGalaxy example plotfile not found")

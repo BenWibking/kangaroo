@@ -6089,7 +6089,8 @@ Runtime::Runtime(const std::vector<std::string>& hpx_config,
 
 void DatasetHandle::set_chunk(const ChunkRef& ref, ChunkBuffer view) {
   if (!backend) {
-    backend = make_dataset_backend("memory://runtime");
+    uri = "memory://runtime";
+    backend = make_dataset_backend(uri);
   }
   backend->set_chunk(ref, std::move(view));
 }
