@@ -468,7 +468,6 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--z-max-kpc", type=float, default=4.0)
     parser.add_argument("--z-bounds-kpc", nargs=2, type=float, metavar=("ZMIN", "ZMAX"))
     parser.add_argument("--gamma", type=float, default=5.0 / 3.0)
-    parser.add_argument("--bytes-per-value", type=int, choices=(4, 8))
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--list-fields", action="store_true")
@@ -514,18 +513,6 @@ def main(argv: list[str] | None = None) -> int:
             if z_bounds[1] <= z_bounds[0]:
                 raise ValueError("z bounds must be increasing")
 
-            bytes_per_value = (
-                int(args.bytes_per_value)
-                if args.bytes_per_value is not None
-                else int(
-                    ds.infer_bytes_per_value(
-                        runtime,
-                        field=fields["density"][1],
-                        level=0,
-                        step=ds.step,
-                    )
-                )
-            )
             print(
                 f"Toomre Q fields for {plotfile.name}: "
                 + ", ".join(f"{role}={name}" for role, (name, _) in fields.items()),
@@ -551,7 +538,6 @@ def main(argv: list[str] | None = None) -> int:
                 z_bounds=(float(z_bounds[0]), float(z_bounds[1])),
                 center=(float(center[0]), float(center[1]), float(center[2])),
                 gamma=float(args.gamma),
-                bytes_per_value=bytes_per_value,
                 out="toomre_q_profile",
             )
             profile_edges = handle.edges
@@ -562,8 +548,6 @@ def main(argv: list[str] | None = None) -> int:
                 field=handle.field,
                 version=0,
                 block=0,
-                shape=(handle.bins, NUM_MOMENTS),
-                dtype=np.float64,
                 dataset=ds,
             )
             profile = derive_toomre_profiles(

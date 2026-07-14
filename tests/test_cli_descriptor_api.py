@@ -13,6 +13,7 @@ DESCRIPTOR_MIGRATED_CLIS = (
     "scripts/plotfile_flux_surface.py",
     "scripts/plotfile_cylindrical_flux_surface.py",
     "scripts/plotfile_projection_cic_stellar.py",
+    "scripts/plotfile_toomre_q.py",
 )
 
 RESHAPED_DESCRIPTOR_CLIS = (
@@ -21,6 +22,7 @@ RESHAPED_DESCRIPTOR_CLIS = (
     "scripts/plotfile_flux_surface.py",
     "scripts/plotfile_cylindrical_flux_surface.py",
     "scripts/plotfile_projection_cic_stellar.py",
+    "scripts/plotfile_toomre_q.py",
 )
 
 RAW_CHUNK_DEMOS = ("scripts/slice_operator_demo.py",)
