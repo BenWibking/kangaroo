@@ -1,0 +1,40 @@
+namespace kangaroo.amr_fb;
+
+struct Int3 {
+  x:int;
+  y:int;
+  z:int;
+}
+
+struct Double3 {
+  x:double;
+  y:double;
+  z:double;
+}
+
+struct Bool3 {
+  x:bool;
+  y:bool;
+  z:bool;
+}
+
+table AmrPatch {
+  level:short;
+  lo:Int3;
+  hi:Int3;
+  dx:Double3;
+  x0:Double3;
+  index_origin:Int3;
+  is_periodic:Bool3;
+  scalar:ubyte;
+  extents:[ulong];
+  strides_bytes:[long];
+  data:[ubyte];
+}
+
+table AmrPatchPayload {
+  patches:[AmrPatch];
+}
+
+root_type AmrPatchPayload;
+file_identifier "KAMR";

@@ -11,7 +11,7 @@ void register_reduction_kernels(KernelRegistry &registry) {
      * @brief Adds two matching partial uniform-slice buffers elementwise.
      * @par Chunk inputs `inputs[0]` and `inputs[1]` are matching f32 or f64
      * arrays.
-     * @par MessagePack parameters None.
+     * @par Typed parameters None.
      * @par Chunk outputs `outputs[0]` is their elementwise sum with matching
      * shape.
      */
@@ -22,7 +22,7 @@ void register_reduction_kernels(KernelRegistry &registry) {
                    .needs_neighbors = false},
         [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
            const NeighborViews &, std::span<ChunkBuffer> outputs,
-           std::span<const std::uint8_t>) {
+           const KernelParamsIR &) {
           if (outputs.empty() || inputs.size() < 2) {
             return hpx::make_ready_future();
           }
@@ -31,26 +31,14 @@ void register_reduction_kernels(KernelRegistry &registry) {
         });
   }
   {
-    struct Params {
-      double pixel_area = 1.0;
-    };
+    using Params = SliceFinalizeParams;
 
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      if (const auto *area = find_msgpack_map_value(root, "pixel_area");
-          area && (area->type == msgpack::type::FLOAT ||
-                   area->type == msgpack::type::POSITIVE_INTEGER ||
-                   area->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.pixel_area = area->as<double>();
-      }
-      return params;
-    };
     /**
      * @brief Converts accumulated slice sums and areas into finalized pixel
      * values.
      * @par Chunk inputs `inputs[0]` and `inputs[1]` are matching f64 value-sum
      * and sampled-area images.
-     * @par MessagePack parameters `pixel_area` is the physical area of one
+     * @par Typed parameters `pixel_area` is the physical area of one
      * output pixel.
      * @par Chunk outputs `outputs[0]` is an f32 or f64 image of value sum
      * divided by `pixel_area`, with NaN where sampled area is zero.
@@ -60,12 +48,11 @@ void register_reduction_kernels(KernelRegistry &registry) {
                    .n_inputs = 2,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &, int32_t,
-                        std::span<const ChunkBuffer> inputs,
-                        const NeighborViews &, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
-          const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+        [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
+           const NeighborViews &, std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
+          const auto &params = require_kernel_params<Params>(
+              kernel_params, "uniform_slice_finalize");
 
           if (outputs.empty() || inputs.size() < 2 ||
               params.pixel_area == 0.0) {
@@ -108,15 +95,14 @@ void register_reduction_kernels(KernelRegistry &registry) {
                 "slice finalize output must be f32 or f64");
           }
           return hpx::make_ready_future();
-        },
-        make_kernel_params_preparer<Params>(decode_params));
+        });
   }
   {
     /**
      * @brief Reduces matching partial uniform-slice buffers by elementwise
      * addition.
      * @par Chunk inputs `inputs[0..N)` are matching f32 or f64 partial arrays.
-     * @par MessagePack parameters None.
+     * @par Typed parameters None.
      * @par Chunk outputs `outputs[0]` is their elementwise sum with matching
      * shape.
      */
@@ -127,7 +113,7 @@ void register_reduction_kernels(KernelRegistry &registry) {
                    .needs_neighbors = false},
         [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
            const NeighborViews &, std::span<ChunkBuffer> outputs,
-           std::span<const std::uint8_t>) {
+           const KernelParamsIR &) {
           if (outputs.empty() || inputs.empty()) {
             return hpx::make_ready_future();
           }

@@ -11,29 +11,12 @@ namespace kangaroo {
 
 void register_particle_kernels(KernelRegistry &registry) {
   {
-    struct Params {
-      std::string particle_type;
-      std::string field_name;
-    };
-
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      if (const auto *particle_type =
-              find_msgpack_map_value(root, "particle_type");
-          particle_type && particle_type->type == msgpack::type::STR) {
-        params.particle_type = particle_type->as<std::string>();
-      }
-      if (const auto *field_name = find_msgpack_map_value(root, "field_name");
-          field_name && field_name->type == msgpack::type::STR) {
-        params.field_name = field_name->as<std::string>();
-      }
-      return params;
-    };
+    using Params = ParticleFieldParams;
 
     /**
      * @brief Loads one particle field chunk and converts its values to double.
      * @par Chunk inputs None; the chunk is read from the dataset backend.
-     * @par MessagePack parameters `particle_type` and `field_name` identify the
+     * @par Typed parameters `particle_type` and `field_name` identify the
      * particle field.
      * @par Chunk outputs `outputs[0]` is a dynamically sized f64 particle
      * array.
@@ -43,15 +26,14 @@ void register_particle_kernels(KernelRegistry &registry) {
                    .n_inputs = 0,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &, int32_t block,
-                        std::span<const ChunkBuffer>, const NeighborViews &,
-                        std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+        [](const LevelMeta &, int32_t block, std::span<const ChunkBuffer>,
+           const NeighborViews &, std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
           if (outputs.empty()) {
             return hpx::make_ready_future();
           }
           const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+              require_kernel_params<Params>(kernel_params, "particle kernel");
           if (params.particle_type.empty() || params.field_name.empty()) {
             throw std::runtime_error("particle_load_field_chunk_f64 requires "
                                      "particle_type and field_name");
@@ -105,7 +87,6 @@ void register_particle_kernels(KernelRegistry &registry) {
           outputs[0].commit_dynamic_extent(n);
           return hpx::make_ready_future();
         },
-        make_kernel_params_preparer<Params>(decode_params),
         [](const DynamicOutputBoundContext &context)
             -> std::optional<std::uint64_t> {
           const auto &params = context.params<Params>();
@@ -116,55 +97,14 @@ void register_particle_kernels(KernelRegistry &registry) {
         });
   }
   {
-    struct Params {
-      std::string particle_type;
-      int level_index = -1;
-      int axis = 2;
-      std::array<double, 2> axis_bounds{0.0, 0.0};
-      double mass_max = std::numeric_limits<double>::quiet_NaN();
-      std::shared_ptr<const CoveredBoxListIR> covered_boxes;
-    };
-
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      if (const auto *particle_type =
-              find_msgpack_map_value(root, "particle_type");
-          particle_type && particle_type->type == msgpack::type::STR) {
-        params.particle_type = particle_type->as<std::string>();
-      }
-      if (const auto *level_index = find_msgpack_map_value(root, "level_index");
-          level_index &&
-          (level_index->type == msgpack::type::POSITIVE_INTEGER ||
-           level_index->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.level_index = level_index->as<int>();
-      }
-      if (const auto *axis = find_msgpack_map_value(root, "axis");
-          axis && (axis->type == msgpack::type::POSITIVE_INTEGER ||
-                   axis->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.axis = axis->as<int>();
-      }
-      if (const auto *axis_bounds = find_msgpack_map_value(root, "axis_bounds");
-          axis_bounds && axis_bounds->type == msgpack::type::ARRAY &&
-          axis_bounds->via.array.size == 2) {
-        params.axis_bounds[0] = axis_bounds->via.array.ptr[0].as<double>();
-        params.axis_bounds[1] = axis_bounds->via.array.ptr[1].as<double>();
-      }
-      if (const auto *mass_max = find_msgpack_map_value(root, "mass_max");
-          mass_max && (mass_max->type == msgpack::type::POSITIVE_INTEGER ||
-                       mass_max->type == msgpack::type::NEGATIVE_INTEGER ||
-                       mass_max->type == msgpack::type::FLOAT)) {
-        params.mass_max = mass_max->as<double>();
-      }
-      params.covered_boxes = parse_covered_boxes_param(root);
-      return params;
-    };
+    using Params = ParticleCicGridParams;
 
     /**
      * @brief Deposits particle mass onto an AMR grid with cloud-in-cell
      * weighting.
      * @par Chunk inputs None; particle position and mass grids are read from
      * the dataset backend.
-     * @par MessagePack parameters `particle_type`, `level_index`, `axis`,
+     * @par Typed parameters `particle_type`, `level_index`, `axis`,
      * `axis_bounds`, optional `mass_max`, and `covered_boxes` select particles
      * and excluded AMR cells.
      * @par Chunk outputs `outputs[0]` is an f64 block grid of deposited mass
@@ -175,12 +115,11 @@ void register_particle_kernels(KernelRegistry &registry) {
                    .n_inputs = 0,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &level, int32_t block,
-                        std::span<const ChunkBuffer>, const NeighborViews &,
-                        std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+        [](const LevelMeta &level, int32_t block, std::span<const ChunkBuffer>,
+           const NeighborViews &, std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
           const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+              require_kernel_params<Params>(kernel_params, "particle kernel");
 
           if (outputs.empty()) {
             return hpx::make_ready_future();
@@ -386,74 +325,17 @@ void register_particle_kernels(KernelRegistry &registry) {
           }
 
           return hpx::make_ready_future();
-        },
-        make_covered_box_params_preparer<Params>(decode_params));
+        });
   }
   {
-    struct Params {
-      std::string particle_type;
-      int level_index = -1;
-      int axis = 2;
-      std::array<double, 2> axis_bounds{0.0, 0.0};
-      std::array<double, 4> rect{0.0, 0.0, 1.0, 1.0};
-      std::array<int, 2> resolution{1, 1};
-      double mass_max = std::numeric_limits<double>::quiet_NaN();
-      std::shared_ptr<const CoveredBoxListIR> covered_boxes;
-    };
-
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      if (const auto *particle_type =
-              find_msgpack_map_value(root, "particle_type");
-          particle_type && particle_type->type == msgpack::type::STR) {
-        params.particle_type = particle_type->as<std::string>();
-      }
-      if (const auto *level_index = find_msgpack_map_value(root, "level_index");
-          level_index &&
-          (level_index->type == msgpack::type::POSITIVE_INTEGER ||
-           level_index->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.level_index = level_index->as<int>();
-      }
-      if (const auto *axis = find_msgpack_map_value(root, "axis");
-          axis && (axis->type == msgpack::type::POSITIVE_INTEGER ||
-                   axis->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.axis = axis->as<int>();
-      }
-      if (const auto *axis_bounds = find_msgpack_map_value(root, "axis_bounds");
-          axis_bounds && axis_bounds->type == msgpack::type::ARRAY &&
-          axis_bounds->via.array.size == 2) {
-        params.axis_bounds[0] = axis_bounds->via.array.ptr[0].as<double>();
-        params.axis_bounds[1] = axis_bounds->via.array.ptr[1].as<double>();
-      }
-      if (const auto *rect = find_msgpack_map_value(root, "rect");
-          rect && rect->type == msgpack::type::ARRAY &&
-          rect->via.array.size == 4) {
-        for (uint32_t j = 0; j < 4; ++j) {
-          params.rect[j] = rect->via.array.ptr[j].as<double>();
-        }
-      }
-      if (const auto *resolution = find_msgpack_map_value(root, "resolution");
-          resolution && resolution->type == msgpack::type::ARRAY &&
-          resolution->via.array.size == 2) {
-        params.resolution[0] = resolution->via.array.ptr[0].as<int>();
-        params.resolution[1] = resolution->via.array.ptr[1].as<int>();
-      }
-      if (const auto *mass_max = find_msgpack_map_value(root, "mass_max");
-          mass_max && (mass_max->type == msgpack::type::POSITIVE_INTEGER ||
-                       mass_max->type == msgpack::type::NEGATIVE_INTEGER ||
-                       mass_max->type == msgpack::type::FLOAT)) {
-        params.mass_max = mass_max->as<double>();
-      }
-      params.covered_boxes = parse_covered_boxes_param(root);
-      return params;
-    };
+    using Params = ParticleCicProjectionParams;
 
     /**
      * @brief Projects particles onto an image plane with cloud-in-cell
      * weighting.
      * @par Chunk inputs None; particle position and mass grids are read from
      * the dataset backend.
-     * @par MessagePack parameters `particle_type`, `level_index`, `axis`,
+     * @par Typed parameters `particle_type`, `level_index`, `axis`,
      * `axis_bounds`, `rect`, `resolution`, optional `mass_max`, and
      * `covered_boxes` define the selected particles, image, and excluded AMR
      * cells.
@@ -465,12 +347,11 @@ void register_particle_kernels(KernelRegistry &registry) {
                    .n_inputs = 0,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &level, int32_t block,
-                        std::span<const ChunkBuffer>, const NeighborViews &,
-                        std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+        [](const LevelMeta &level, int32_t block, std::span<const ChunkBuffer>,
+           const NeighborViews &, std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
           const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+              require_kernel_params<Params>(kernel_params, "particle kernel");
 
           if (outputs.empty()) {
             return hpx::make_ready_future();
@@ -791,26 +672,15 @@ void register_particle_kernels(KernelRegistry &registry) {
               covered_box_count(params.covered_boxes), candidates,
               covered_skips, bounds_skips, deposited_cells, total_sum);
           return hpx::make_ready_future();
-        },
-        make_covered_box_params_preparer<Params>(decode_params));
+        });
   }
   {
-    struct Params {
-      double scalar = 0.0;
-    };
-
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      if (const auto *scalar = find_msgpack_map_value(root, "scalar")) {
-        params.scalar = scalar->as<double>();
-      }
-      return params;
-    };
+    using Params = ScalarParams;
 
     /**
      * @brief Marks particle values exactly equal to a scalar.
      * @par Chunk inputs `inputs[0]` is an f64 particle array.
-     * @par MessagePack parameters `scalar` is the comparison value.
+     * @par Typed parameters `scalar` is the comparison value.
      * @par Chunk outputs `outputs[0]` is a same-length u8 mask.
      */
     registry.register_kernel(
@@ -818,12 +688,11 @@ void register_particle_kernels(KernelRegistry &registry) {
                    .n_inputs = 1,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &, int32_t,
-                        std::span<const ChunkBuffer> inputs,
-                        const NeighborViews &, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+        [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
+           const NeighborViews &, std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
           const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+              require_kernel_params<Params>(kernel_params, "particle kernel");
           if (inputs.empty() || outputs.empty()) {
             return hpx::make_ready_future();
           }
@@ -834,13 +703,12 @@ void register_particle_kernels(KernelRegistry &registry) {
             out(i) = (in(i) == params.scalar) ? 1 : 0;
           }
           return hpx::make_ready_future();
-        },
-        make_kernel_params_preparer<Params>(decode_params));
+        });
 
     /**
      * @brief Marks particle values whose absolute value is below a scalar.
      * @par Chunk inputs `inputs[0]` is an f64 particle array.
-     * @par MessagePack parameters `scalar` is the strict absolute-value
+     * @par Typed parameters `scalar` is the strict absolute-value
      * threshold.
      * @par Chunk outputs `outputs[0]` is a same-length u8 mask.
      */
@@ -849,12 +717,11 @@ void register_particle_kernels(KernelRegistry &registry) {
                    .n_inputs = 1,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &, int32_t,
-                        std::span<const ChunkBuffer> inputs,
-                        const NeighborViews &, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+        [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
+           const NeighborViews &, std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
           const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+              require_kernel_params<Params>(kernel_params, "particle kernel");
           if (inputs.empty() || outputs.empty()) {
             return hpx::make_ready_future();
           }
@@ -865,13 +732,12 @@ void register_particle_kernels(KernelRegistry &registry) {
             out(i) = (std::abs(in(i)) < params.scalar) ? 1 : 0;
           }
           return hpx::make_ready_future();
-        },
-        make_kernel_params_preparer<Params>(decode_params));
+        });
 
     /**
      * @brief Marks particle values less than or equal to a scalar.
      * @par Chunk inputs `inputs[0]` is an f64 particle array.
-     * @par MessagePack parameters `scalar` is the inclusive upper bound.
+     * @par Typed parameters `scalar` is the inclusive upper bound.
      * @par Chunk outputs `outputs[0]` is a same-length u8 mask.
      */
     registry.register_kernel(
@@ -879,12 +745,11 @@ void register_particle_kernels(KernelRegistry &registry) {
                    .n_inputs = 1,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &, int32_t,
-                        std::span<const ChunkBuffer> inputs,
-                        const NeighborViews &, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+        [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
+           const NeighborViews &, std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
           const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+              require_kernel_params<Params>(kernel_params, "particle kernel");
           if (inputs.empty() || outputs.empty()) {
             return hpx::make_ready_future();
           }
@@ -895,13 +760,12 @@ void register_particle_kernels(KernelRegistry &registry) {
             out(i) = (in(i) <= params.scalar) ? 1 : 0;
           }
           return hpx::make_ready_future();
-        },
-        make_kernel_params_preparer<Params>(decode_params));
+        });
 
     /**
      * @brief Marks particle values greater than a scalar.
      * @par Chunk inputs `inputs[0]` is an f64 particle array.
-     * @par MessagePack parameters `scalar` is the strict lower bound.
+     * @par Typed parameters `scalar` is the strict lower bound.
      * @par Chunk outputs `outputs[0]` is a same-length u8 mask.
      */
     registry.register_kernel(
@@ -909,12 +773,11 @@ void register_particle_kernels(KernelRegistry &registry) {
                    .n_inputs = 1,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &, int32_t,
-                        std::span<const ChunkBuffer> inputs,
-                        const NeighborViews &, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+        [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
+           const NeighborViews &, std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
           const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+              require_kernel_params<Params>(kernel_params, "particle kernel");
           if (inputs.empty() || outputs.empty()) {
             return hpx::make_ready_future();
           }
@@ -925,30 +788,15 @@ void register_particle_kernels(KernelRegistry &registry) {
             out(i) = (in(i) > params.scalar) ? 1 : 0;
           }
           return hpx::make_ready_future();
-        },
-        make_kernel_params_preparer<Params>(decode_params));
+        });
   }
   {
-    struct Params {
-      std::vector<double> values;
-    };
-
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      if (const auto *values = find_msgpack_map_value(root, "values");
-          values && values->type == msgpack::type::ARRAY) {
-        params.values.reserve(values->via.array.size);
-        for (uint32_t j = 0; j < values->via.array.size; ++j) {
-          params.values.push_back(values->via.array.ptr[j].as<double>());
-        }
-      }
-      return params;
-    };
+    using Params = ValuesParams;
 
     /**
      * @brief Marks particle values contained in a configured set.
      * @par Chunk inputs `inputs[0]` is an f64 particle array.
-     * @par MessagePack parameters `values` is the set of exact matches.
+     * @par Typed parameters `values` is the set of exact matches.
      * @par Chunk outputs `outputs[0]` is a same-length u8 mask.
      */
     registry.register_kernel(
@@ -956,12 +804,11 @@ void register_particle_kernels(KernelRegistry &registry) {
                    .n_inputs = 1,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &, int32_t,
-                        std::span<const ChunkBuffer> inputs,
-                        const NeighborViews &, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+        [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
+           const NeighborViews &, std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
           const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+              require_kernel_params<Params>(kernel_params, "particle kernel");
           if (inputs.empty() || outputs.empty()) {
             return hpx::make_ready_future();
           }
@@ -979,28 +826,16 @@ void register_particle_kernels(KernelRegistry &registry) {
             out(i) = found ? 1 : 0;
           }
           return hpx::make_ready_future();
-        },
-        make_kernel_params_preparer<Params>(decode_params));
+        });
   }
   {
-    struct Params {
-      bool finite_only = true;
-    };
-
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      if (const auto *finite_only =
-              find_msgpack_map_value(root, "finite_only")) {
-        params.finite_only = finite_only->as<bool>();
-      }
-      return params;
-    };
+    using Params = FiniteOnlyParams;
 
     /**
      * @brief Finds the minimum particle value, optionally ignoring non-finite
      * values.
      * @par Chunk inputs `inputs[0]` is an f64 particle array.
-     * @par MessagePack parameters `finite_only` controls whether non-finite
+     * @par Typed parameters `finite_only` controls whether non-finite
      * values are skipped.
      * @par Chunk outputs `outputs[0]` is one f64 minimum value, or positive
      * infinity when no eligible value exists.
@@ -1010,12 +845,11 @@ void register_particle_kernels(KernelRegistry &registry) {
                    .n_inputs = 1,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &, int32_t,
-                        std::span<const ChunkBuffer> inputs,
-                        const NeighborViews &, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+        [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
+           const NeighborViews &, std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
           const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+              require_kernel_params<Params>(kernel_params, "particle kernel");
           if (inputs.empty() || outputs.empty()) {
             return hpx::make_ready_future();
           }
@@ -1036,14 +870,13 @@ void register_particle_kernels(KernelRegistry &registry) {
           outputs[0].mutable_array<double>()(0) =
               any ? out_v : std::numeric_limits<double>::infinity();
           return hpx::make_ready_future();
-        },
-        make_kernel_params_preparer<Params>(decode_params));
+        });
 
     /**
      * @brief Finds the maximum particle value, optionally ignoring non-finite
      * values.
      * @par Chunk inputs `inputs[0]` is an f64 particle array.
-     * @par MessagePack parameters `finite_only` controls whether non-finite
+     * @par Typed parameters `finite_only` controls whether non-finite
      * values are skipped.
      * @par Chunk outputs `outputs[0]` is one f64 maximum value, or negative
      * infinity when no eligible value exists.
@@ -1053,12 +886,11 @@ void register_particle_kernels(KernelRegistry &registry) {
                    .n_inputs = 1,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &, int32_t,
-                        std::span<const ChunkBuffer> inputs,
-                        const NeighborViews &, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+        [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
+           const NeighborViews &, std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
           const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+              require_kernel_params<Params>(kernel_params, "particle_max");
           if (inputs.empty() || outputs.empty()) {
             return hpx::make_ready_future();
           }
@@ -1079,38 +911,18 @@ void register_particle_kernels(KernelRegistry &registry) {
           outputs[0].mutable_array<double>()(0) =
               any ? out_v : -std::numeric_limits<double>::infinity();
           return hpx::make_ready_future();
-        },
-        make_kernel_params_preparer<Params>(decode_params));
+        });
   }
   {
-    struct Params {
-      std::vector<double> edges;
-      bool density = false;
-    };
+    using Params = ParticleHistogramParams;
 
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      if (const auto *edges = find_msgpack_map_value(root, "edges");
-          edges && edges->type == msgpack::type::ARRAY) {
-        params.edges.reserve(edges->via.array.size);
-        for (uint32_t j = 0; j < edges->via.array.size; ++j) {
-          params.edges.push_back(edges->via.array.ptr[j].as<double>());
-        }
-      }
-      if (const auto *density = find_msgpack_map_value(root, "density")) {
-        params.density = density->as<bool>();
-      }
-      return params;
-    };
-
-    auto make_histogram_kernel = [decode_params](bool weighted) -> KernelFn {
-      return [decode_params,
-              weighted](const LevelMeta &, int32_t,
+    auto make_histogram_kernel = [](bool weighted) -> KernelFn {
+      return [weighted](const LevelMeta &, int32_t,
                         std::span<const ChunkBuffer> inputs,
                         const NeighborViews &, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+                        const KernelParamsIR &kernel_params) {
         const auto &params =
-            decode_params_cached<Params>(params_msgpack, decode_params);
+            require_kernel_params<Params>(kernel_params, "particle kernel");
         if (outputs.empty() || params.edges.size() < 2) {
           return hpx::make_ready_future();
         }
@@ -1183,60 +995,39 @@ void register_particle_kernels(KernelRegistry &registry) {
     /**
      * @brief Bins particle values into a one-dimensional histogram.
      * @par Chunk inputs `inputs[0]` is an f64 particle-value array.
-     * @par MessagePack parameters `edges` defines the bin edges and `density`
+     * @par Typed parameters `edges` defines the bin edges and `density`
      * requests probability-density normalization.
      * @par Chunk outputs `outputs[0]` is an f64 array with `edges.size() - 1`
      * bins.
      */
-    registry.register_kernel(
-        KernelDesc{.name = "particle_histogram1d",
-                   .n_inputs = 1,
-                   .n_outputs = 1,
-                   .needs_neighbors = false},
-        make_histogram_kernel(false),
-        make_kernel_params_preparer<Params>(decode_params));
+    registry.register_kernel(KernelDesc{.name = "particle_histogram1d",
+                                        .n_inputs = 1,
+                                        .n_outputs = 1,
+                                        .needs_neighbors = false},
+                             make_histogram_kernel(false));
     /**
      * @brief Bins particle values into a weighted one-dimensional histogram.
      * @par Chunk inputs `inputs[0]` contains f64 values and matching
      * `inputs[1]` contains f64 weights.
-     * @par MessagePack parameters `edges` defines the bin edges and `density`
+     * @par Typed parameters `edges` defines the bin edges and `density`
      * requests weighted probability-density normalization.
      * @par Chunk outputs `outputs[0]` is an f64 array with `edges.size() - 1`
      * bins.
      */
-    registry.register_kernel(
-        KernelDesc{.name = "particle_histogram1d_weighted",
-                   .n_inputs = 2,
-                   .n_outputs = 1,
-                   .needs_neighbors = false},
-        make_histogram_kernel(true),
-        make_kernel_params_preparer<Params>(decode_params));
+    registry.register_kernel(KernelDesc{.name = "particle_histogram1d_weighted",
+                                        .n_inputs = 2,
+                                        .n_outputs = 1,
+                                        .needs_neighbors = false},
+                             make_histogram_kernel(true));
   }
   {
-    struct Params {
-      std::string particle_type;
-      std::string field_name;
-    };
-
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      if (const auto *particle_type =
-              find_msgpack_map_value(root, "particle_type");
-          particle_type && particle_type->type == msgpack::type::STR) {
-        params.particle_type = particle_type->as<std::string>();
-      }
-      if (const auto *field_name = find_msgpack_map_value(root, "field_name");
-          field_name && field_name->type == msgpack::type::STR) {
-        params.field_name = field_name->as<std::string>();
-      }
-      return params;
-    };
+    using Params = ParticleFieldParams;
 
     /**
      * @brief Encodes per-chunk occurrence counts for finite particle values.
      * @par Chunk inputs None; the particle field is read from the dataset
      * backend.
-     * @par MessagePack parameters `particle_type` and `field_name` identify the
+     * @par Typed parameters `particle_type` and `field_name` identify the
      * particle field.
      * @par Chunk outputs `outputs[0]` is a dynamically sized opaque map from
      * f64 values to signed 64-bit occurrence counts.
@@ -1246,15 +1037,14 @@ void register_particle_kernels(KernelRegistry &registry) {
                    .n_inputs = 0,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &, int32_t block,
-                        std::span<const ChunkBuffer>, const NeighborViews &,
-                        std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+        [](const LevelMeta &, int32_t block, std::span<const ChunkBuffer>,
+           const NeighborViews &, std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
           if (outputs.empty()) {
             return hpx::make_ready_future();
           }
           const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+              require_kernel_params<Params>(kernel_params, "particle kernel");
           if (params.particle_type.empty() || params.field_name.empty()) {
             outputs[0].commit_dynamic_extent(0);
             return hpx::make_ready_future();
@@ -1282,7 +1072,6 @@ void register_particle_kernels(KernelRegistry &registry) {
           outputs[0].assign_dynamic_bytes(encoded);
           return hpx::make_ready_future();
         },
-        make_kernel_params_preparer<Params>(decode_params),
         [](const DynamicOutputBoundContext &context)
             -> std::optional<std::uint64_t> {
           const auto &params = context.params<Params>();
@@ -1299,25 +1088,13 @@ void register_particle_kernels(KernelRegistry &registry) {
         });
   }
   {
-    struct Params {
-      int64_t k = 0;
-    };
-
-    auto decode_params = [](const msgpack::object &root) {
-      Params params;
-      if (const auto *k = find_msgpack_map_value(root, "k");
-          k && (k->type == msgpack::type::POSITIVE_INTEGER ||
-                k->type == msgpack::type::NEGATIVE_INTEGER)) {
-        params.k = k->as<int64_t>();
-      }
-      return params;
-    };
+    using Params = TopKModesParams;
 
     /**
      * @brief Selects the most frequent particle values from merged occurrence
      * counts.
      * @par Chunk inputs `inputs[0]` is an opaque encoded value-count map.
-     * @par MessagePack parameters `k` is the number of modes to return.
+     * @par Typed parameters `k` is the number of modes to return.
      * @par Chunk outputs `outputs[0]` is an f64 array of length `2 * k`: the
      * first half contains values and the second half contains their counts.
      */
@@ -1326,15 +1103,14 @@ void register_particle_kernels(KernelRegistry &registry) {
                    .n_inputs = 1,
                    .n_outputs = 1,
                    .needs_neighbors = false},
-        [decode_params](const LevelMeta &, int32_t,
-                        std::span<const ChunkBuffer> inputs,
-                        const NeighborViews &, std::span<ChunkBuffer> outputs,
-                        std::span<const std::uint8_t> params_msgpack) {
+        [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
+           const NeighborViews &, std::span<ChunkBuffer> outputs,
+           const KernelParamsIR &kernel_params) {
           if (outputs.empty()) {
             return hpx::make_ready_future();
           }
           const auto &params =
-              decode_params_cached<Params>(params_msgpack, decode_params);
+              require_kernel_params<Params>(kernel_params, "particle kernel");
           if (inputs.empty() || params.k <= 0) {
             return hpx::make_ready_future();
           }
@@ -1364,13 +1140,12 @@ void register_particle_kernels(KernelRegistry &registry) {
             }
           }
           return hpx::make_ready_future();
-        },
-        make_kernel_params_preparer<Params>(decode_params));
+        });
   }
   /**
    * @brief Marks finite particle values.
    * @par Chunk inputs `inputs[0]` is an f64 particle array.
-   * @par MessagePack parameters None.
+   * @par Typed parameters None.
    * @par Chunk outputs `outputs[0]` is a same-length u8 mask.
    */
   registry.register_kernel(
@@ -1380,7 +1155,7 @@ void register_particle_kernels(KernelRegistry &registry) {
                  .needs_neighbors = false},
       [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
          const NeighborViews &, std::span<ChunkBuffer> outputs,
-         std::span<const std::uint8_t>) {
+         const KernelParamsIR &) {
         if (inputs.empty() || outputs.empty()) {
           return hpx::make_ready_future();
         }
@@ -1395,7 +1170,7 @@ void register_particle_kernels(KernelRegistry &registry) {
   /**
    * @brief Computes the elementwise logical conjunction of two particle masks.
    * @par Chunk inputs `inputs[0]` and `inputs[1]` are u8 masks.
-   * @par MessagePack parameters None.
+   * @par Typed parameters None.
    * @par Chunk outputs `outputs[0]` is a dynamically sized u8 mask whose length
    * is the shorter input length.
    */
@@ -1406,7 +1181,7 @@ void register_particle_kernels(KernelRegistry &registry) {
                  .needs_neighbors = false},
       [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
          const NeighborViews &, std::span<ChunkBuffer> outputs,
-         std::span<const std::uint8_t>) {
+         const KernelParamsIR &) {
         if (inputs.size() < 2 || outputs.empty()) {
           return hpx::make_ready_future();
         }
@@ -1424,7 +1199,7 @@ void register_particle_kernels(KernelRegistry &registry) {
    * @brief Compacts particle values selected by a mask.
    * @par Chunk inputs `inputs[0]` is an f64 value array and `inputs[1]` is a u8
    * mask.
-   * @par MessagePack parameters None.
+   * @par Typed parameters None.
    * @par Chunk outputs `outputs[0]` is a dynamically sized f64 array containing
    * values whose corresponding mask entry is nonzero.
    */
@@ -1435,7 +1210,7 @@ void register_particle_kernels(KernelRegistry &registry) {
                  .needs_neighbors = false},
       [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
          const NeighborViews &, std::span<ChunkBuffer> outputs,
-         std::span<const std::uint8_t>) {
+         const KernelParamsIR &) {
         if (inputs.size() < 2 || outputs.empty()) {
           return hpx::make_ready_future();
         }
@@ -1461,7 +1236,7 @@ void register_particle_kernels(KernelRegistry &registry) {
   /**
    * @brief Subtracts two particle arrays elementwise.
    * @par Chunk inputs `inputs[0]` and `inputs[1]` are f64 particle arrays.
-   * @par MessagePack parameters None.
+   * @par Typed parameters None.
    * @par Chunk outputs `outputs[0]` is their dynamically sized elementwise
    * difference, truncated to the shorter input length.
    */
@@ -1472,7 +1247,7 @@ void register_particle_kernels(KernelRegistry &registry) {
                  .needs_neighbors = false},
       [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
          const NeighborViews &, std::span<ChunkBuffer> outputs,
-         std::span<const std::uint8_t>) {
+         const KernelParamsIR &) {
         if (inputs.size() < 2 || outputs.empty()) {
           return hpx::make_ready_future();
         }
@@ -1490,7 +1265,7 @@ void register_particle_kernels(KernelRegistry &registry) {
    * @brief Computes elementwise Euclidean distances between two 3D point
    * arrays.
    * @par Chunk inputs Six f64 arrays ordered as first x/y/z then second x/y/z.
-   * @par MessagePack parameters None.
+   * @par Typed parameters None.
    * @par Chunk outputs `outputs[0]` is a dynamically sized f64 distance array,
    * truncated to the shortest input length.
    */
@@ -1501,7 +1276,7 @@ void register_particle_kernels(KernelRegistry &registry) {
                  .needs_neighbors = false},
       [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
          const NeighborViews &, std::span<ChunkBuffer> outputs,
-         std::span<const std::uint8_t>) {
+         const KernelParamsIR &) {
         if (inputs.size() < 6 || outputs.empty()) {
           return hpx::make_ready_future();
         }
@@ -1525,7 +1300,7 @@ void register_particle_kernels(KernelRegistry &registry) {
   /**
    * @brief Sums all values in a particle array.
    * @par Chunk inputs `inputs[0]` is an f64 particle array.
-   * @par MessagePack parameters None.
+   * @par Typed parameters None.
    * @par Chunk outputs `outputs[0]` is one f64 sum.
    */
   registry.register_kernel(
@@ -1535,7 +1310,7 @@ void register_particle_kernels(KernelRegistry &registry) {
                  .needs_neighbors = false},
       [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
          const NeighborViews &, std::span<ChunkBuffer> outputs,
-         std::span<const std::uint8_t>) {
+         const KernelParamsIR &) {
         if (inputs.empty() || outputs.empty()) {
           return hpx::make_ready_future();
         }
@@ -1551,7 +1326,7 @@ void register_particle_kernels(KernelRegistry &registry) {
   /**
    * @brief Counts nonzero entries in a particle mask.
    * @par Chunk inputs `inputs[0]` is a u8 particle mask.
-   * @par MessagePack parameters None.
+   * @par Typed parameters None.
    * @par Chunk outputs `outputs[0]` is one signed 64-bit count.
    */
   registry.register_kernel(
@@ -1561,7 +1336,7 @@ void register_particle_kernels(KernelRegistry &registry) {
                  .needs_neighbors = false},
       [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
          const NeighborViews &, std::span<ChunkBuffer> outputs,
-         std::span<const std::uint8_t>) {
+         const KernelParamsIR &) {
         if (inputs.empty() || outputs.empty()) {
           return hpx::make_ready_future();
         }
@@ -1579,7 +1354,7 @@ void register_particle_kernels(KernelRegistry &registry) {
   /**
    * @brief Returns the number of values in a double-precision particle array.
    * @par Chunk inputs `inputs[0]` is an f64 particle array.
-   * @par MessagePack parameters None.
+   * @par Typed parameters None.
    * @par Chunk outputs `outputs[0]` is one signed 64-bit length.
    */
   registry.register_kernel(
@@ -1589,7 +1364,7 @@ void register_particle_kernels(KernelRegistry &registry) {
                  .needs_neighbors = false},
       [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
          const NeighborViews &, std::span<ChunkBuffer> outputs,
-         std::span<const std::uint8_t>) {
+         const KernelParamsIR &) {
         if (inputs.empty() || outputs.empty()) {
           return hpx::make_ready_future();
         }
@@ -1601,7 +1376,7 @@ void register_particle_kernels(KernelRegistry &registry) {
   /**
    * @brief Merges encoded particle-value occurrence counts.
    * @par Chunk inputs `inputs[0..N)` are opaque encoded value-count maps.
-   * @par MessagePack parameters None.
+   * @par Typed parameters None.
    * @par Chunk outputs `outputs[0]` is the dynamically sized opaque merged map.
    */
   registry.register_kernel(
@@ -1611,7 +1386,7 @@ void register_particle_kernels(KernelRegistry &registry) {
                  .needs_neighbors = false},
       [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
          const NeighborViews &, std::span<ChunkBuffer> outputs,
-         std::span<const std::uint8_t>) {
+         const KernelParamsIR &) {
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }
@@ -1631,7 +1406,6 @@ void register_particle_kernels(KernelRegistry &registry) {
         outputs[0].assign_dynamic_bytes(encoded);
         return hpx::make_ready_future();
       },
-      {},
       [](const DynamicOutputBoundContext &context)
           -> std::optional<std::uint64_t> {
         std::uint64_t input_bytes = 0;
@@ -1649,7 +1423,7 @@ void register_particle_kernels(KernelRegistry &registry) {
   /**
    * @brief Sums signed 64-bit scalar partial results.
    * @par Chunk inputs `inputs[0..N)` each contain one signed 64-bit scalar.
-   * @par MessagePack parameters None.
+   * @par Typed parameters None.
    * @par Chunk outputs `outputs[0]` is one signed 64-bit total.
    */
   registry.register_kernel(
@@ -1659,7 +1433,7 @@ void register_particle_kernels(KernelRegistry &registry) {
                  .needs_neighbors = false},
       [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
          const NeighborViews &, std::span<ChunkBuffer> outputs,
-         std::span<const std::uint8_t>) {
+         const KernelParamsIR &) {
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }
@@ -1676,7 +1450,7 @@ void register_particle_kernels(KernelRegistry &registry) {
   /**
    * @brief Reduces finite scalar partial results to their minimum.
    * @par Chunk inputs `inputs[0..N)` each contain one f64 scalar.
-   * @par MessagePack parameters None.
+   * @par Typed parameters None.
    * @par Chunk outputs `outputs[0]` is the smallest finite input, or positive
    * infinity when none is finite.
    */
@@ -1687,7 +1461,7 @@ void register_particle_kernels(KernelRegistry &registry) {
                  .needs_neighbors = false},
       [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
          const NeighborViews &, std::span<ChunkBuffer> outputs,
-         std::span<const std::uint8_t>) {
+         const KernelParamsIR &) {
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }
@@ -1713,7 +1487,7 @@ void register_particle_kernels(KernelRegistry &registry) {
   /**
    * @brief Reduces finite scalar partial results to their maximum.
    * @par Chunk inputs `inputs[0..N)` each contain one f64 scalar.
-   * @par MessagePack parameters None.
+   * @par Typed parameters None.
    * @par Chunk outputs `outputs[0]` is the largest finite input, or negative
    * infinity when none is finite.
    */
@@ -1724,7 +1498,7 @@ void register_particle_kernels(KernelRegistry &registry) {
                  .needs_neighbors = false},
       [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
          const NeighborViews &, std::span<ChunkBuffer> outputs,
-         std::span<const std::uint8_t>) {
+         const KernelParamsIR &) {
         if (outputs.empty()) {
           return hpx::make_ready_future();
         }

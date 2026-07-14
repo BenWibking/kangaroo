@@ -1,7 +1,11 @@
 from __future__ import annotations
 
-import msgpack
 import struct
+
+from analysis.buffer import BlockShape, BufferSpec, DType, DynamicShape, DynamicUpperBound
+from analysis.kernel_params import AmrSubboxPackParams, GradStencilParams
+from analysis.plan import Domain, FieldRef, OutputRef, Plan, Stage, TaskTemplate
+from analysis.plan_codec import encode_plan
 
 
 def _pack_linear_field_double(box_lo, box_hi, geom, coeffs=(1.0, 2.0, 3.0), c0=0.0) -> bytes:
@@ -61,75 +65,37 @@ def test_gradU_stencil_amr_remote_fetch_linear_field() -> None:
     nx = ny = nz = 4
     out_bytes = nx * ny * nz * 3 * 8
     fetch_field = 19
-    plan_dict = {
-        "stages": [
-            {
-                "name": "fetch",
-                "plane": "chunk",
-                "after": [],
-                "templates": [
-                    {
-                        "name": "fetch_nbr",
-                        "plane": "chunk",
-                        "kernel": "amr_subbox_fetch_pack",
-                        "domain": {"step": 0, "level": 0, "blocks": [0]},
-                        "inputs": [],
-                        "outputs": [{
-                            "field": fetch_field,
-                            "version": 0,
-                            "buffer": {
-                                "dtype": "opaque",
-                                "shape": {
-                                    "kind": "dynamic",
-                                    "upper_bound": {"kind": "amr_subbox_pack"},
-                                },
-                                "init": "uninitialized",
-                            },
-                        }],
-                        "deps": {"kind": "None"},
-                        "params": {
-                            "input_field": field,
-                            "input_version": 0,
-                            "input_step": 0,
-                            "input_level": 0,
-                            "halo_cells": 1,
-                        },
-                    }
-                ],
-            },
-            {
-                "name": "grad",
-                "plane": "chunk",
-                "after": [0],
-                "templates": [
-                    {
-                        "name": "gradU",
-                        "plane": "chunk",
-                        "kernel": "gradU_stencil",
-                        "domain": {"step": 0, "level": 0, "blocks": [0]},
-                        "inputs": [{"field": field, "version": 0}, {"field": fetch_field, "version": 0}],
-                        "outputs": [{
-                            "field": out_field,
-                            "version": 0,
-                            "buffer": {
-                                "dtype": "f64",
-                                "shape": {"kind": "block", "components": 3},
-                                "init": "uninitialized",
-                            },
-                        }],
-                        "deps": {"kind": "None"},
-                        "params": {
-                            "input_field": field,
-                            "input_version": 0,
-                            "input_step": 0,
-                            "input_level": 0,
-                        },
-                    }
-                ],
-            }
-        ]
-    }
-    packed = msgpack.packb(plan_dict, use_bin_type=True)
+    fetch = Stage(
+        name="fetch",
+        templates=[TaskTemplate(
+            name="fetch_nbr",
+            plane="chunk",
+            kernel="amr_subbox_fetch_pack",
+            domain=Domain(0, 0, [0]),
+            inputs=[],
+            outputs=[OutputRef(FieldRef(fetch_field), BufferSpec(
+                DType.OPAQUE,
+                DynamicShape(DynamicUpperBound.amr_subbox_pack()),
+            ))],
+            params=AmrSubboxPackParams(field, 0, 0, 0, 1),
+        )],
+    )
+    grad = Stage(
+        name="grad",
+        after=[fetch],
+        templates=[TaskTemplate(
+            name="gradU",
+            plane="chunk",
+            kernel="gradU_stencil",
+            domain=Domain(0, 0, [0]),
+            inputs=[FieldRef(field), FieldRef(fetch_field)],
+            outputs=[OutputRef(
+                FieldRef(out_field), BufferSpec(DType.F64, BlockShape(3))
+            )],
+            params=GradStencilParams(field, 0, 0, 0),
+        )],
+    )
+    packed = encode_plan(Plan([fetch, grad]))
     rt._rt.run_packed_plan(packed, runmeta._h, ds._h)
 
     out = rt.get_task_chunk(step=0, level=0, field=out_field, version=0, block=0)

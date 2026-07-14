@@ -16,7 +16,7 @@ def test_many_graph_reduce_consumers_wait_for_later_producer_without_deadlock() 
         from analysis import Runtime
         from analysis.dataset import open_dataset
         from analysis.buffer import BufferSpec, DType, FixedShape
-        from analysis.plan import Domain, FieldRef, OutputRef, Plan, Stage
+        from analysis.plan import Domain, FieldRef, GraphReduceSpec, OutputRef, Plan, Stage
         from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
 
         rt = Runtime()
@@ -57,14 +57,11 @@ def test_many_graph_reduce_consumers_wait_for_later_producer_without_deadlock() 
             domain=Domain(step=0, level=0),
             inputs=[FieldRef(produced_field)],
             outputs=[OutputRef(FieldRef(reduced_field), BufferSpec(DType.I64, FixedShape((1,))))],
-            deps={"kind": "None"},
-            params={
-                "graph_kind": "reduce",
-                "fan_in": 1,
-                "num_inputs": consumer_count,
-                "input_blocks": [0] * consumer_count,
-                "output_base": 0,
-            },
+            graph_reduce=GraphReduceSpec(
+                fan_in=1,
+                num_inputs=consumer_count,
+                input_blocks=(0,) * consumer_count,
+            ),
         )
 
         producer = Stage(name="late_producer", plane="chunk")
@@ -74,8 +71,6 @@ def test_many_graph_reduce_consumers_wait_for_later_producer_without_deadlock() 
             domain=Domain(step=0, level=0, blocks=[0]),
             inputs=[FieldRef(source_field)],
             outputs=[OutputRef(FieldRef(produced_field), BufferSpec(DType.I64, FixedShape((1,))))],
-            deps={"kind": "None"},
-            params={},
         )
 
         rt.run(Plan(stages=[graph, producer]), runmeta=runmeta, dataset=ds)
@@ -115,7 +110,7 @@ def test_graph_reduce_group_offsets_select_variable_input_groups() -> None:
         from analysis import Runtime
         from analysis.dataset import open_dataset
         from analysis.buffer import BufferSpec, DType, FixedShape
-        from analysis.plan import Domain, FieldRef, OutputRef, Plan, Stage
+        from analysis.plan import Domain, FieldRef, GraphReduceSpec, OutputRef, Plan, Stage
         from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
 
         rt = Runtime()
@@ -155,16 +150,13 @@ def test_graph_reduce_group_offsets_select_variable_input_groups() -> None:
             domain=Domain(step=0, level=0),
             inputs=[FieldRef(source_field)],
             outputs=[OutputRef(FieldRef(reduced_field), BufferSpec(DType.I64, FixedShape((1,))))],
-            deps={"kind": "None"},
-            params={
-                "graph_kind": "reduce",
-                "fan_in": 4,
-                "num_inputs": 4,
-                "input_blocks": [0, 2, 1, 3],
-                "output_blocks": [10, 20],
-                "group_offsets": [0, 2, 4],
-                "output_base": 0,
-            },
+            graph_reduce=GraphReduceSpec(
+                fan_in=4,
+                num_inputs=4,
+                input_blocks=(0, 2, 1, 3),
+                output_blocks=(10, 20),
+                group_offsets=(0, 2, 4),
+            ),
         )
 
         rt.run(Plan(stages=[graph]), runmeta=runmeta, dataset=ds)

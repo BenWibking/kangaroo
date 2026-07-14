@@ -1668,8 +1668,8 @@ void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
     return result;
   };
 
-  PlanIR plan = timed_phase("runtime_decode_plan_msgpack", "kangaroo.runtime.setup", [&]() {
-    return decode_plan_msgpack(std::span<const std::uint8_t>(packed.data(), packed.size()));
+  PlanIR plan = timed_phase("runtime_decode_plan_flatbuffer", "kangaroo.runtime.setup", [&]() {
+    return decode_plan_flatbuffer(std::span<const std::uint8_t>(packed.data(), packed.size()));
   });
   timed_phase("runtime_validate_plan_output_bounds", "kangaroo.runtime.setup", [&]() {
     validate_plan_output_bounds(plan, global_kernels());

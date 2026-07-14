@@ -1,7 +1,6 @@
 #include "kangaroo/executor.hpp"
 
 #include "kangaroo/data_service_local.hpp"
-#include "kangaroo/param_decode.hpp"
 #include "kangaroo/runtime.hpp"
 
 #include <algorithm>
@@ -37,113 +36,6 @@ namespace {
 bool debug_dataflow_enabled() {
   static const bool enabled = std::getenv("KANGAROO_DEBUG_DATAFLOW") != nullptr;
   return enabled;
-}
-
-GraphReduceSpecIR parse_graph_reduce_params(const msgpack::object& root) {
-  if (root.type == msgpack::type::NIL) {
-    throw std::runtime_error("graph reduce params missing");
-  }
-  if (root.type != msgpack::type::MAP) {
-    throw std::runtime_error("graph reduce params must be a map");
-  }
-
-  const auto* kind = find_msgpack_map_value(root, "graph_kind");
-  if (!kind || kind->type != msgpack::type::STR || kind->as<std::string>() != "reduce") {
-    throw std::runtime_error("graph template requires graph_kind=\"reduce\"");
-  }
-
-  GraphReduceSpecIR params;
-  if (const auto* fan_in = find_msgpack_map_value(root, "fan_in"); fan_in &&
-                                                (fan_in->type == msgpack::type::POSITIVE_INTEGER ||
-                                                 fan_in->type == msgpack::type::NEGATIVE_INTEGER)) {
-    params.fan_in = fan_in->as<int32_t>();
-  }
-  if (const auto* num = find_msgpack_map_value(root, "num_inputs"); num &&
-                                                 (num->type == msgpack::type::POSITIVE_INTEGER ||
-                                                  num->type == msgpack::type::NEGATIVE_INTEGER)) {
-    params.num_inputs = num->as<int32_t>();
-  }
-  if (const auto* base = find_msgpack_map_value(root, "input_base"); base &&
-                                                 (base->type == msgpack::type::POSITIVE_INTEGER ||
-                                                  base->type == msgpack::type::NEGATIVE_INTEGER)) {
-    params.input_base = base->as<int32_t>();
-  }
-  if (const auto* base = find_msgpack_map_value(root, "output_base"); base &&
-                                                  (base->type == msgpack::type::POSITIVE_INTEGER ||
-                                                   base->type == msgpack::type::NEGATIVE_INTEGER)) {
-    params.output_base = base->as<int32_t>();
-  }
-  if (const auto* blocks = find_msgpack_map_value(root, "input_blocks");
-      blocks && blocks->type == msgpack::type::ARRAY) {
-    params.input_blocks.clear();
-    params.input_blocks.reserve(blocks->via.array.size);
-    for (uint32_t i = 0; i < blocks->via.array.size; ++i) {
-      const auto& entry = blocks->via.array.ptr[i];
-      if (entry.type == msgpack::type::POSITIVE_INTEGER ||
-          entry.type == msgpack::type::NEGATIVE_INTEGER) {
-        params.input_blocks.push_back(entry.as<int32_t>());
-      }
-    }
-  }
-  if (const auto* blocks = find_msgpack_map_value(root, "output_blocks");
-      blocks && blocks->type == msgpack::type::ARRAY) {
-    params.output_blocks.clear();
-    params.output_blocks.reserve(blocks->via.array.size);
-    for (uint32_t i = 0; i < blocks->via.array.size; ++i) {
-      const auto& entry = blocks->via.array.ptr[i];
-      if (entry.type == msgpack::type::POSITIVE_INTEGER ||
-          entry.type == msgpack::type::NEGATIVE_INTEGER) {
-        params.output_blocks.push_back(entry.as<int32_t>());
-      }
-    }
-  }
-  if (const auto* offsets = find_msgpack_map_value(root, "group_offsets");
-      offsets && offsets->type == msgpack::type::ARRAY) {
-    params.group_offsets.clear();
-    params.group_offsets.reserve(offsets->via.array.size);
-    for (uint32_t i = 0; i < offsets->via.array.size; ++i) {
-      const auto& entry = offsets->via.array.ptr[i];
-      if (entry.type == msgpack::type::POSITIVE_INTEGER ||
-          entry.type == msgpack::type::NEGATIVE_INTEGER) {
-        params.group_offsets.push_back(entry.as<int32_t>());
-      }
-    }
-  }
-
-  if (params.fan_in <= 0) {
-    params.fan_in = 1;
-  }
-  if (params.num_inputs <= 0) {
-    if (!params.input_blocks.empty()) {
-      params.num_inputs = static_cast<int32_t>(params.input_blocks.size());
-    } else {
-      throw std::runtime_error("graph reduce num_inputs must be positive");
-    }
-  }
-  if (!params.input_blocks.empty() &&
-      params.num_inputs != static_cast<int32_t>(params.input_blocks.size())) {
-    throw std::runtime_error("graph reduce num_inputs must match input_blocks size");
-  }
-  int32_t n_groups = (params.num_inputs + params.fan_in - 1) / params.fan_in;
-  if (!params.group_offsets.empty()) {
-    if (params.group_offsets.size() < 2) {
-      throw std::runtime_error("graph reduce group_offsets must include start and end");
-    }
-    if (params.group_offsets.front() != 0 || params.group_offsets.back() != params.num_inputs) {
-      throw std::runtime_error("graph reduce group_offsets must span num_inputs");
-    }
-    for (std::size_t i = 1; i < params.group_offsets.size(); ++i) {
-      if (params.group_offsets[i] <= params.group_offsets[i - 1]) {
-        throw std::runtime_error("graph reduce group_offsets must be strictly increasing");
-      }
-    }
-    n_groups = static_cast<int32_t>(params.group_offsets.size() - 1);
-  }
-  if (!params.output_blocks.empty() &&
-      n_groups != static_cast<int32_t>(params.output_blocks.size())) {
-    throw std::runtime_error("graph reduce output_blocks size must match group count");
-  }
-  return params;
 }
 
 const KernelFn& prepared_kernel(const TaskTemplateIR& tmpl) {
@@ -827,7 +719,6 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
         auto inputs_ptr = std::make_shared<std::vector<ChunkBuffer>>(std::move(inputs));
         auto nbrs_ptr = std::make_shared<NeighborViews>(std::move(nbrs));
         auto outputs_ptr = std::make_shared<std::vector<ChunkBuffer>>(std::move(outputs));
-        auto params_ptr = std::make_shared<std::vector<std::uint8_t>>(tmpl.params_msgpack);
 
         const auto& level = meta.steps.at(tmpl.domain.step).levels.at(tmpl.domain.level);
         auto& fn = prepared_kernel(tmpl);
@@ -837,20 +728,18 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
           kernel_event = start_span(base_event, "kernel");
         }
         ScopedExecutionContext active_context(plan_id);
-        ScopedPreparedParams active_params(tmpl.prepared_params_type, tmpl.prepared_params);
         return fn(level,
                   block,
                   *inputs_ptr,
                   *nbrs_ptr,
                   *outputs_ptr,
-                  std::span<const std::uint8_t>(params_ptr->data(), params_ptr->size()))
+                  tmpl.params)
             .then([&data,
                    tmpl,
                    block,
                    inputs_ptr = std::move(inputs_ptr),
                    nbrs_ptr = std::move(nbrs_ptr),
                    outputs_ptr = std::move(outputs_ptr),
-                   params_ptr = std::move(params_ptr),
                    log_enabled,
                    base_event,
                    kernel_event](auto&&) mutable {
@@ -1093,7 +982,6 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
         auto inputs_ptr = std::make_shared<std::vector<ChunkBuffer>>(std::move(inputs));
         auto nbrs_ptr = std::make_shared<NeighborViews>(std::move(nbrs));
         auto outputs_ptr = std::make_shared<std::vector<ChunkBuffer>>(std::move(outputs));
-        auto params_ptr = std::make_shared<std::vector<std::uint8_t>>(tmpl.params_msgpack);
 
         const auto& level = meta.steps.at(tmpl.domain.step).levels.at(tmpl.domain.level);
         auto& fn = prepared_kernel(tmpl);
@@ -1103,20 +991,18 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
           kernel_event = start_span(base_event, "kernel");
         }
         ScopedExecutionContext active_context(plan_id);
-        ScopedPreparedParams active_params(tmpl.prepared_params_type, tmpl.prepared_params);
         return fn(level,
                   out_block,
                   *inputs_ptr,
                   *nbrs_ptr,
                   *outputs_ptr,
-                  std::span<const std::uint8_t>(params_ptr->data(), params_ptr->size()))
+                  tmpl.params)
             .then([&data,
                    tmpl,
                    out_block,
                    inputs_ptr = std::move(inputs_ptr),
                    nbrs_ptr = std::move(nbrs_ptr),
                    outputs_ptr = std::move(outputs_ptr),
-                   params_ptr = std::move(params_ptr),
                    log_enabled,
                    base_event,
                    kernel_event](auto&&) mutable {
@@ -1638,21 +1524,16 @@ void prepare_plan(PlanIR& plan, KernelRegistry& kernels) {
         }
         covered_boxes = shared_covered_boxes[ref_idx];
       }
-      auto prepared_params = kernels.prepare_params_by_name(
-          tmpl.kernel,
-          KernelParamContext{
-              std::span<const std::uint8_t>(tmpl.params_msgpack.data(), tmpl.params_msgpack.size()),
-              std::move(covered_boxes),
-          });
-      tmpl.prepared_params = std::move(prepared_params.value);
-      tmpl.prepared_params_type = prepared_params.type;
-      if (tmpl.plane == ExecPlane::Graph) {
-        const auto& params = decode_params_cached<GraphReduceSpecIR>(
-            std::span<const std::uint8_t>(tmpl.params_msgpack.data(), tmpl.params_msgpack.size()),
-            parse_graph_reduce_params);
-        tmpl.graph_reduce = params;
-      } else {
-        tmpl.graph_reduce.reset();
+      std::visit(
+          [&](auto& params) {
+            if constexpr (requires { params.covered_boxes; }) {
+              params.covered_boxes = covered_boxes;
+            }
+          },
+          tmpl.params);
+      if (tmpl.plane == ExecPlane::Graph && !tmpl.graph_reduce) {
+        throw std::runtime_error(
+            "graph template requires graph reduction topology");
       }
     }
   }

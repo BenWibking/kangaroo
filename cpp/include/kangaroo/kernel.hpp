@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kangaroo/chunk_buffer.hpp"
+#include "kangaroo/kernel_params.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -30,7 +31,7 @@ using KernelFn = std::function<hpx::future<void>(
     std::span<const ChunkBuffer> self_inputs,
     const NeighborViews& nbr_inputs,
     std::span<ChunkBuffer> outputs,
-    std::span<const std::uint8_t> params_msgpack)>;
+    const KernelParamsIR& params)>;
 
 struct KernelDesc {
   std::string name;

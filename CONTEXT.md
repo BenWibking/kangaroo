@@ -28,6 +28,14 @@ _Avoid_: fake numeric array
 An **Opaque Payload** containing validated AMR patch geometry, level identity, and embedded **Chunk Buffers** for stencil sampling.
 _Avoid_: packed neighbor bytes
 
+**Typed Plan**:
+A schema-verified execution contract whose stages, domains, dependencies, buffer specifications, graph topology, and kernel-parameter union are explicit before runtime preparation.
+_Avoid_: plan dictionary, parameter blob
+
+**Kernel Parameters**:
+The concrete immutable record selected by a **Typed Plan** for one **Kernel Catalog** entry and consumed directly by that kernel after FlatBuffer decoding.
+_Avoid_: params map, serialized kernel options
+
 **Graph Reduction**:
 A locality-aware plan fragment that combines block-indexed intermediate fields into one published field while owning fan-in, grouping, task placement, and producer dependencies.
 _Avoid_: hand-built reduce stages in an analysis operator
@@ -41,7 +49,7 @@ The adapter that owns dataset-format selection, field registration, metadata dis
 _Avoid_: binding-level backend switches, concrete backend casts
 
 **Kernel Catalog**:
-The runtime's composed collection of scientific kernel families, where each family owns its registration, parameter preparation, storage bounds, and numerical implementation.
+The runtime's composed collection of scientific kernel families, where each family owns its registration, typed parameter consumption, storage bounds, and numerical implementation.
 _Avoid_: runtime-lifecycle kernel definitions, scattered registration calls
 
 **Kernel Support**:
@@ -56,6 +64,9 @@ _Avoid_: one umbrella kernel-helper header, unrelated support compiled into ever
 - A numeric rank-three **Chunk Buffer** exposes a **Block Grid**.
 - An **Opaque Payload** exposes bytes but cannot expose a typed **Block Grid** or numeric array.
 - An **AMR Patch Payload** transports neighboring **Chunk Buffers** without exposing its wire format to kernels.
+- A **Typed Plan** crosses the Python-to-C++ seam as a verified FlatBuffer and becomes the owning HPX-distributed plan representation.
+- Each task in a **Typed Plan** carries exactly one **Kernel Parameters** alternative validated against its **Kernel Catalog** entry.
+- Graph-reduction topology belongs to the **Typed Plan**, not to **Kernel Parameters**, because the executor consumes it before invoking a scientific kernel.
 - A **Graph Reduction** combines intermediate **Chunk Buffers** without exposing execution topology to the scientific operator.
 - Scientific operators apply **AMR Coverage** before a **Graph Reduction** to avoid coarse/fine double counting.
 - A **Dataset Backend** translates one external dataset format into dataset metadata and **Chunk Buffers** without exposing its concrete format to the runtime or Python bindings.

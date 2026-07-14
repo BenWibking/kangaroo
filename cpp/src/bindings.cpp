@@ -23,8 +23,6 @@
 
 #include <hpx/serialization/serialize.hpp>
 #include <hpx/version.hpp>
-#include <msgpack.hpp>
-
 #ifdef KANGAROO_USE_PARTHENON_HDF5
 #include <hdf5.h>
 #endif
@@ -325,34 +323,6 @@ class DynamicBoundTestData final : public kangaroo::DataService {
   std::size_t chunk_bytes_ = 0;
 };
 
-std::vector<std::uint8_t> pack_particle_bound_params() {
-  msgpack::sbuffer packed;
-  msgpack::packer<msgpack::sbuffer> pk(&packed);
-  pk.pack_map(2);
-  pk.pack(std::string("particle_type"));
-  pk.pack(std::string("particles"));
-  pk.pack(std::string("field_name"));
-  pk.pack(std::string("value"));
-  return {packed.data(), packed.data() + packed.size()};
-}
-
-std::vector<std::uint8_t> pack_amr_bound_params() {
-  msgpack::sbuffer packed;
-  msgpack::packer<msgpack::sbuffer> pk(&packed);
-  pk.pack_map(5);
-  pk.pack(std::string("input_field"));
-  pk.pack_int32(11);
-  pk.pack(std::string("input_version"));
-  pk.pack_int32(0);
-  pk.pack(std::string("input_step"));
-  pk.pack_int32(0);
-  pk.pack(std::string("input_level"));
-  pk.pack_int16(0);
-  pk.pack(std::string("halo_cells"));
-  pk.pack_int32(1);
-  return {packed.data(), packed.data() + packed.size()};
-}
-
 }  // namespace
 
 NB_MODULE(_core, m) {
@@ -650,7 +620,7 @@ NB_MODULE(_core, m) {
 
           kangaroo::TaskTemplateIR task;
           task.kernel = kernel;
-          task.params_msgpack = pack_particle_bound_params();
+          task.params = kangaroo::ParticleFieldParams{"particles", "value"};
           task.dynamic_output_bound =
               std::make_shared<const kangaroo::DynamicOutputBoundEvaluator>(
                   [kernel](const kangaroo::DynamicOutputBoundContext& context)
@@ -725,7 +695,12 @@ NB_MODULE(_core, m) {
 
     kangaroo::TaskTemplateIR task;
     task.kernel = "amr_subbox_fetch_pack";
-    task.params_msgpack = pack_amr_bound_params();
+    task.params = kangaroo::AmrSubboxPackParams{
+        .input_field = 11,
+        .input_version = 0,
+        .input_step = 0,
+        .input_level = 0,
+        .halo_cells = 1};
     task.dynamic_output_bound =
         std::make_shared<const kangaroo::DynamicOutputBoundEvaluator>(
             [](const kangaroo::DynamicOutputBoundContext& context) {

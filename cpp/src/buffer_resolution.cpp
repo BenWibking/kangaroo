@@ -120,7 +120,7 @@ std::optional<BufferResolution> try_resolve_buffer_spec(
       if (!task.dynamic_output_bound) return std::nullopt;
       capacity = (*task.dynamic_output_bound)(DynamicOutputBoundContext{
           spec.scalar, meta, data, step, level, block, output_index, inputs,
-          task.prepared_params_type, task.prepared_params});
+          task.params});
       break;
   }
   if (!capacity.has_value()) return std::nullopt;

@@ -1,0 +1,197 @@
+namespace analysis.fb;
+
+file_identifier "KPLN";
+
+enum ExecPlane : ubyte { Chunk, Graph, Mixed }
+enum DepKind : ubyte { None, FaceNeighbors }
+enum ScalarType : ubyte { Opaque, U8, I64, F32, F64 }
+enum ShapeRuleKind : ubyte { Block, Fixed, LikeInput, Dynamic }
+enum DynamicUpperBoundKind : ubyte { Literal, LikeInput, BackendChunk, AmrSubboxPack }
+enum InitPolicy : ubyte { Uninitialized, Zero }
+
+table Domain {
+  step:int;
+  level:short;
+  blocks:[int];
+  all_blocks:bool = true;
+}
+
+table FieldRef {
+  field:int;
+  version:int;
+  domain:Domain;
+}
+
+table DependencyRule {
+  kind:DepKind = None;
+  width:int;
+  faces:[bool];
+  halo_inputs:[int];
+}
+
+table DynamicUpperBound {
+  kind:DynamicUpperBoundKind = Literal;
+  value:ulong;
+  input_index:int = -1;
+}
+
+table BufferSpec {
+  scalar:ScalarType = Opaque;
+  shape_kind:ShapeRuleKind = Fixed;
+  fixed_extents:[ulong];
+  block_components:uint = 1;
+  like_input_index:int = -1;
+  dynamic_upper_bound:DynamicUpperBound;
+  init:InitPolicy = Uninitialized;
+}
+
+table OutputRef {
+  field:int;
+  version:int;
+  buffer:BufferSpec;
+}
+
+table CoveredBox {
+  lo:[int];
+  hi:[int];
+}
+
+table CoveredBoxList {
+  boxes:[CoveredBox];
+}
+
+table GraphReduceSpec {
+  fan_in:int = 1;
+  num_inputs:int;
+  input_base:int;
+  output_base:int;
+  input_blocks:[int];
+  output_blocks:[int];
+  group_offsets:[int];
+}
+
+table AmrSubboxPackParams {
+  input_field:int = -1;
+  input_version:int;
+  input_step:int;
+  input_level:short;
+  halo_cells:int = 1;
+}
+
+table GradStencilParams {
+  input_field:int = -1;
+  input_version:int;
+  input_step:int;
+  input_level:short;
+  stencil_radius:int = 1;
+}
+
+table PlotfileLoadParams { plotfile:string; level:int; comp:int; }
+table FluxSurfaceParams {
+  radii:[double];
+  radius_indices:[int];
+  temperature_bins:[double];
+  num_radii:ulong;
+  gamma:double = 1.6666666666666667;
+}
+table CylindricalFluxParams {
+  radius:double;
+  heights:[double];
+  height_indices:[int];
+  temperature_bins:[double];
+  num_heights:ulong;
+  gamma:double = 1.6666666666666667;
+}
+table UniformSliceCellParams {
+  axis:int = 2;
+  coord:double;
+  plane_index:int;
+  has_plane_index:bool;
+  rect:[double];
+  resolution:[int];
+}
+table UniformProjectionParams {
+  axis:int = 2;
+  axis_bounds:[double];
+  rect:[double];
+  resolution:[int];
+}
+table FieldExprParams { expression:string; variables:[string]; }
+table UniformSliceParams { axis:int = 2; coord:double; rect:[double]; resolution:[int]; }
+table Histogram1DParams { bounds:[double]; bins:int = 1; }
+table Histogram2DParams { x_range:[double]; y_range:[double]; bins:[int]; weight_mode:string; }
+table ParticleFieldParams { particle_type:string; field_name:string; }
+table ParticleCicGridParams {
+  particle_type:string;
+  level_index:int = -1;
+  axis:int = 2;
+  axis_bounds:[double];
+  mass_max:double;
+  has_mass_max:bool;
+}
+table ParticleCicProjectionParams {
+  particle_type:string;
+  level_index:int = -1;
+  axis:int = 2;
+  axis_bounds:[double];
+  rect:[double];
+  resolution:[int];
+  mass_max:double;
+  has_mass_max:bool;
+}
+table ScalarParams { scalar:double; }
+table ValuesParams { values:[double]; }
+table FiniteOnlyParams { finite_only:bool = true; }
+table ParticleHistogramParams { edges:[double]; density:bool; }
+table TopKModesParams { k:long; }
+table SliceFinalizeParams { pixel_area:double = 1.0; }
+
+union KernelParams {
+  AmrSubboxPackParams,
+  GradStencilParams,
+  PlotfileLoadParams,
+  FluxSurfaceParams,
+  CylindricalFluxParams,
+  UniformSliceCellParams,
+  UniformProjectionParams,
+  FieldExprParams,
+  UniformSliceParams,
+  Histogram1DParams,
+  Histogram2DParams,
+  ParticleFieldParams,
+  ParticleCicGridParams,
+  ParticleCicProjectionParams,
+  ScalarParams,
+  ValuesParams,
+  FiniteOnlyParams,
+  ParticleHistogramParams,
+  TopKModesParams,
+  SliceFinalizeParams
+}
+
+table TaskTemplate {
+  name:string (required);
+  plane:ExecPlane = Chunk;
+  kernel:string (required);
+  domain:Domain (required);
+  inputs:[FieldRef];
+  outputs:[OutputRef];
+  deps:DependencyRule (required);
+  covered_boxes_ref:int = -1;
+  graph_reduce:GraphReduceSpec;
+  params:KernelParams;
+}
+
+table Stage {
+  name:string (required);
+  plane:ExecPlane = Chunk;
+  after:[int];
+  templates:[TaskTemplate];
+}
+
+table Plan {
+  stages:[Stage] (required);
+  shared_covered_boxes:[CoveredBoxList];
+}
+
+root_type Plan;
