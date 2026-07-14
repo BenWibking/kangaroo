@@ -351,12 +351,6 @@ void register_core_kernels(KernelRegistry &registry) {
               cell_edge(step_meta.levels.front().geom, 2, domain_hi[2] + 1),
           };
 
-          auto self_index = [&](int i, int j, int k) -> std::size_t {
-            return (static_cast<std::size_t>(i) * static_cast<std::size_t>(ny) +
-                    static_cast<std::size_t>(j)) *
-                       static_cast<std::size_t>(nz) +
-                   static_cast<std::size_t>(k);
-          };
           const auto self_input = make_real_grid_accessor(inputs[0]);
 
           for (int i = 0; i < nx; ++i) {
