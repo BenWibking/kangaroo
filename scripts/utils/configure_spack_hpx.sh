@@ -96,7 +96,7 @@ SPACK_HPX_PREFIX="$(resolve_spack_hpx_prefix)" || {
   echo "Could not resolve a Spack HPX prefix. Set SPACK_HPX_PREFIX or HPX_DIR." >&2
   exit 1
 }
-HPX_DIR="${HPX_DIR:-$(find_hpx_dir_from_prefix "$SPACK_HPX_PREFIX")}" 
+HPX_DIR="${HPX_DIR:-$(find_hpx_dir_from_prefix "$SPACK_HPX_PREFIX")}"
 
 if [[ ! -d "$HPX_DIR" ]]; then
   echo "HPX_DIR does not exist: $HPX_DIR" >&2

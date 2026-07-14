@@ -50,7 +50,7 @@ if [[ -z "${SPACK_HPX_PREFIX:-}" || ! -d "$SPACK_HPX_PREFIX" ]]; then
   exit 1
 fi
 
-HPX_DIR="${HPX_DIR:-$(find_hpx_dir_from_prefix "$SPACK_HPX_PREFIX")}" 
+HPX_DIR="${HPX_DIR:-$(find_hpx_dir_from_prefix "$SPACK_HPX_PREFIX")}"
 if [[ -f "$HPX_DIR/HPXCacheVariables.cmake" ]] &&
    ! grep -Eq 'set\(HPX_WITH_PARCELPORT_MPI[[:space:]]+ON\)' "$HPX_DIR/HPXCacheVariables.cmake"; then
   echo "Selected Spack HPX does not advertise HPX_WITH_PARCELPORT_MPI=ON: $SPACK_HPX_PREFIX" >&2
