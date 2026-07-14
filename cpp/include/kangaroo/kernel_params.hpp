@@ -86,6 +86,15 @@ struct CylindricalFluxParams {
                             temperature_bins & num_heights & gamma)
 };
 
+struct ToomreProfileParams {
+  std::array<double, 2> radial_range{0.0, 1.0};
+  int32_t bins = 1;
+  std::array<double, 2> z_bounds{-1.0, 1.0};
+  std::array<double, 3> center{0.0, 0.0, 0.0};
+  std::shared_ptr<const CoveredBoxListIR> covered_boxes;
+  KANGAROO_SERIALIZE_FIELDS(radial_range & bins & z_bounds & center)
+};
+
 struct UniformSliceCellParams {
   int32_t axis = 2;
   double coord = 0.0;
@@ -203,6 +212,7 @@ struct SliceFinalizeParams {
 using KernelParamsIR =
     std::variant<NoKernelParamsIR, AmrSubboxPackParams, GradStencilParams,
                  PlotfileLoadParams, FluxSurfaceParams, CylindricalFluxParams,
+                 ToomreProfileParams,
                  UniformSliceCellParams, UniformProjectionParams,
                  FieldExprParams, UniformSliceParams, Histogram1DParams,
                  Histogram2DParams, ParticleFieldParams, ParticleCicGridParams,

@@ -102,6 +102,12 @@ table CylindricalFluxParams {
   num_heights:ulong;
   gamma:double = 1.6666666666666667;
 }
+table ToomreProfileParams {
+  radial_range:[double];
+  bins:int = 1;
+  z_bounds:[double];
+  center:[double];
+}
 table UniformSliceCellParams {
   axis:int = 2;
   coord:double;
@@ -152,6 +158,7 @@ union KernelParams {
   PlotfileLoadParams,
   FluxSurfaceParams,
   CylindricalFluxParams,
+  ToomreProfileParams,
   UniformSliceCellParams,
   UniformProjectionParams,
   FieldExprParams,

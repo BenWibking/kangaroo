@@ -32,6 +32,7 @@ from .kernel_params import (
     ParticleCicGridParams,
     ParticleCicProjectionParams,
     SliceFinalizeParams,
+    ToomreProfileParams,
     UniformProjectionParams,
     UniformSliceCellParams,
 )
@@ -954,6 +955,264 @@ class FluxSurfaceIntegral:
                 )
             ],
             outputs=[_fixed_f64_shape(out_field, out_shape)],
+            deps=DependencyRule(),
+            graph_reduce=GraphReduceSpec(fan_in=1, num_inputs=1),
+        )
+        reductions.add_stage(finalize, outputs=[out_field])
+        return ctx.fragment(reductions.stages)
+
+
+class ToomreQProfile:
+    """Accumulate cylindrical annular moments for gas Toomre-Q profiles."""
+
+    NUM_COMPONENTS = 7
+
+    def __init__(
+        self,
+        *,
+        density: int,
+        momentum: tuple[int, int],
+        internal_energy: int,
+        magnetic_field: tuple[int, int, int],
+        potential: int,
+        radial_range: tuple[float, float],
+        bins: int,
+        z_bounds: tuple[float, float],
+        center: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        out_name: str = "toomre_q_profile",
+        gamma: float = 5.0 / 3.0,
+        bytes_per_value: int | None = None,
+        reduce_fan_in: Optional[int] = None,
+    ) -> None:
+        self.density = int(density)
+        self.momentum = tuple(int(v) for v in momentum)
+        self.internal_energy = int(internal_energy)
+        self.magnetic_field = tuple(int(v) for v in magnetic_field)
+        self.potential = int(potential)
+        self.radial_range = tuple(float(v) for v in radial_range)
+        self.bins = int(bins)
+        self.z_bounds = tuple(float(v) for v in z_bounds)
+        self.center = tuple(float(v) for v in center)
+        self.out_name = str(out_name)
+        self.gamma = float(gamma)
+        self.bytes_per_value = bytes_per_value
+        self.reduce_fan_in = reduce_fan_in
+
+    def _reduce_fan_in(self, num_inputs: int) -> int:
+        return resolve_reduce_fan_in(self.reduce_fan_in, num_inputs)
+
+    def _ref_ratio_between(self, levels, coarse: int, fine: int) -> int:
+        ratio = 1
+        for level in range(coarse, fine):
+            ratio *= int(levels[level].geom.ref_ratio)
+        return ratio
+
+    def _covered_boxes_for_level(
+        self,
+        ctx: LoweringContext,
+        *,
+        level: int,
+    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
+        levels = ctx.runmeta.steps[ctx.dataset.step].levels
+        return covered_volume_boxes(levels, level=level)
+
+    def _block_intersects_profile(self, level_meta, block) -> bool:
+        geom = level_meta.geom
+        z0, z1 = _bounds_1d(
+            block.lo[2],
+            block.hi[2],
+            geom.x0[2],
+            geom.dx[2],
+            geom.index_origin[2],
+        )
+        if z1 <= self.z_bounds[0] or z0 >= self.z_bounds[1]:
+            return False
+
+        lo2 = 0.0
+        hi2 = 0.0
+        for axis in (0, 1):
+            x0, x1 = _bounds_1d(
+                block.lo[axis],
+                block.hi[axis],
+                geom.x0[axis],
+                geom.dx[axis],
+                geom.index_origin[axis],
+            )
+            x0 -= self.center[axis]
+            x1 -= self.center[axis]
+            if x1 < 0.0:
+                lo2 += x1 * x1
+            elif x0 > 0.0:
+                lo2 += x0 * x0
+            hi2 += max(abs(x0), abs(x1)) ** 2
+        rmin2 = self.radial_range[0] ** 2
+        rmax2 = self.radial_range[1] ** 2
+        return lo2 < rmax2 and hi2 >= rmin2
+
+    def lower(self, ctx: LoweringContext):
+        ds = ctx.dataset
+        if len(self.momentum) != 2:
+            raise ValueError("momentum must contain x and y fields")
+        if len(self.magnetic_field) != 3:
+            raise ValueError("magnetic_field must contain three cell-centered fields")
+        if len(self.radial_range) != 2:
+            raise ValueError("radial_range must contain two values")
+        rmin, rmax = self.radial_range
+        if not math.isfinite(rmin) or not math.isfinite(rmax) or rmin < 0.0 or rmax <= rmin:
+            raise ValueError("radial_range must be finite, non-negative, and increasing")
+        if self.bins <= 0:
+            raise ValueError("bins must be positive")
+        if len(self.z_bounds) != 2:
+            raise ValueError("z_bounds must contain two values")
+        if (
+            not math.isfinite(self.z_bounds[0])
+            or not math.isfinite(self.z_bounds[1])
+            or self.z_bounds[1] <= self.z_bounds[0]
+        ):
+            raise ValueError("z_bounds must be finite and increasing")
+        if len(self.center) != 3 or any(not math.isfinite(v) for v in self.center):
+            raise ValueError("center must contain three finite coordinates")
+        if not math.isfinite(self.gamma) or self.gamma <= 1.0:
+            raise ValueError("gamma must be finite and greater than 1")
+
+        if self.bytes_per_value is not None and self.bytes_per_value not in (4, 8):
+            raise ValueError("bytes_per_value must be 4 or 8")
+
+        levels = ctx.runmeta.steps[ds.step].levels
+        active_by_level: dict[int, list[int]] = {}
+        for level_idx, level_meta in enumerate(levels):
+            active = [
+                block_idx
+                for block_idx, block in enumerate(level_meta.boxes)
+                if self._block_intersects_profile(level_meta, block)
+            ]
+            if active:
+                active_by_level[level_idx] = active
+        if not active_by_level:
+            raise ValueError("radial_range and z_bounds do not intersect any mesh block")
+
+        output_buffer = BufferSpec(
+            DType.F64,
+            FixedShape((self.bins, self.NUM_COMPONENTS)),
+            InitPolicy.ZERO,
+        )
+        neighbor_field = ctx.temp_field(f"{self.out_name}_potential_neighbors")
+        gradient_field = ctx.temp_field(f"{self.out_name}_potential_gradient")
+        fetch_stage = ctx.stage("toomre_q_potential_fetch")
+        gradient_stage = ctx.stage("toomre_q_potential_gradient", after=[fetch_stage])
+        accumulate_stage = ctx.stage("toomre_q_profile", after=[gradient_stage])
+        reductions = GraphReductionBuilder(ctx)
+        reductions.add_stage(fetch_stage)
+        reductions.add_stage(gradient_stage)
+        reductions.add_stage(accumulate_stage)
+        profile_fields: list[ReducedField] = []
+
+        input_fields = [
+            self.density,
+            *self.momentum,
+            self.internal_energy,
+            *self.magnetic_field,
+        ]
+
+        for level_idx in range(len(levels) - 1, -1, -1):
+            blocks = active_by_level.get(level_idx, [])
+            if not blocks:
+                continue
+            level_meta = levels[level_idx]
+            covered_boxes = self._covered_boxes_for_level(ctx, level=level_idx)
+            covered_payload = _covered_boxes_payload(covered_boxes)
+            profile_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
+
+            for block in blocks:
+                dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
+                fetch_stage.map_blocks(
+                    name=f"toomre_q_potential_fetch_l{level_idx}_b{block}",
+                    kernel="amr_subbox_fetch_pack",
+                    domain=dom,
+                    inputs=[],
+                    outputs=[_amr_patch_payload(neighbor_field)],
+                    deps=DependencyRule(),
+                    params=AmrSubboxPackParams(
+                        input_field=self.potential,
+                        input_version=0,
+                        input_step=ds.step,
+                        input_level=level_idx,
+                        halo_cells=1,
+                    ),
+                )
+                gradient_stage.map_blocks(
+                    name=f"toomre_q_potential_gradient_l{level_idx}_b{block}",
+                    kernel="gradU_stencil",
+                    domain=dom,
+                    inputs=[FieldRef(self.potential), neighbor_field],
+                    outputs=[_block_f64(gradient_field, 3)],
+                    deps=DependencyRule(),
+                    params=GradStencilParams(
+                        input_field=self.potential,
+                        input_version=0,
+                        input_step=ds.step,
+                        input_level=level_idx,
+                        stencil_radius=1,
+                    ),
+                )
+                accumulate_stage.map_blocks(
+                    name=f"toomre_q_profile_l{level_idx}_b{block}",
+                    kernel="toomre_profile_accumulate",
+                    domain=dom,
+                    inputs=[FieldRef(fid) for fid in input_fields] + [gradient_field],
+                    outputs=[OutputRef(profile_field, output_buffer)],
+                    deps=DependencyRule(),
+                    params=ToomreProfileParams(
+                        radial_range=(float(rmin), float(rmax)),
+                        bins=self.bins,
+                        z_bounds=(float(self.z_bounds[0]), float(self.z_bounds[1])),
+                        center=tuple(float(v) for v in self.center),
+                        covered_boxes=covered_payload,
+                    ),
+                )
+
+            reductions.add_stage(accumulate_stage, outputs=[profile_field])
+            profile_fields.append(
+                reductions.reduce_blocks(
+                    value=ReducedField(profile_field, level_idx),
+                    input_blocks=blocks,
+                    step=ds.step,
+                    fan_in=self._reduce_fan_in(len(blocks)),
+                    kernel="uniform_slice_reduce",
+                    output_buffer=output_buffer,
+                    stage_name="toomre_q_profile_reduce",
+                    template_name="toomre_q_profile_reduce_s{round}",
+                    singleton_template_name="toomre_q_profile_reduce_single",
+                    temporary_name=f"{self.out_name}_sum_reduce_{level_idx}_{{round}}",
+                    after=accumulate_stage,
+                    normalize_single=True,
+                )
+            )
+
+        total_profile = reductions.reduce_pairwise(
+            profile_fields,
+            step=ds.step,
+            target_level=ds.level,
+            kernel="uniform_slice_add",
+            output_buffer=output_buffer,
+            stage_name="toomre_q_profile_add",
+            template_name="toomre_q_profile_add_{round}_{index}",
+            temporary_name=f"{self.out_name}_sum_add_{{round}}_{{index}}",
+        )
+        out_field = ctx.output_field(self.out_name)
+        finalize = ctx.stage("toomre_q_profile_output", plane="graph", after=reductions.dependencies([total_profile.field]))
+        finalize.map_blocks(
+            name="toomre_q_profile_output",
+            kernel="uniform_slice_reduce",
+            domain=ctx.domain(step=ds.step, level=ds.level),
+            inputs=[
+                FieldRef(
+                    total_profile.field.field,
+                    version=total_profile.field.version,
+                    domain=ctx.domain(step=ds.step, level=total_profile.level, blocks=[0]),
+                )
+            ],
+            outputs=[OutputRef(out_field, output_buffer)],
             deps=DependencyRule(),
             graph_reduce=GraphReduceSpec(fan_in=1, num_inputs=1),
         )

@@ -27,6 +27,7 @@ __all__ = [
     "Pipeline",
     "FieldHandle",
     "FluxSurfaceIntegralHandle",
+    "ToomreQProfileHandle",
     "Histogram1DHandle",
     "Histogram2DHandle",
     "ParticleArrayHandle",
@@ -93,6 +94,7 @@ def __getattr__(name):
         "Pipeline",
         "FieldHandle",
         "FluxSurfaceIntegralHandle",
+        "ToomreQProfileHandle",
         "Histogram1DHandle",
         "Histogram2DHandle",
         "ParticleArrayHandle",
@@ -107,6 +109,7 @@ def __getattr__(name):
             ParticleArrayHandle,
             ParticleMaskHandle,
             Pipeline,
+            ToomreQProfileHandle,
             pipeline,
         )
 
@@ -114,6 +117,7 @@ def __getattr__(name):
             "Pipeline": Pipeline,
             "FieldHandle": FieldHandle,
             "FluxSurfaceIntegralHandle": FluxSurfaceIntegralHandle,
+            "ToomreQProfileHandle": ToomreQProfileHandle,
             "Histogram1DHandle": Histogram1DHandle,
             "Histogram2DHandle": Histogram2DHandle,
             "ParticleArrayHandle": ParticleArrayHandle,

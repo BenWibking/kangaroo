@@ -50,6 +50,7 @@ set(KANGAROO_RUNTIME_SOURCES
   src/kernels/histogram_kernels.cpp
   src/kernels/particle_kernels.cpp
   src/kernels/reduction_kernels.cpp
+  src/kernels/toomre_kernels.cpp
   src/kernels/kernel_buffer_support.cpp
   src/kernels/kernel_param_support.cpp
   src/kernels/particle_kernel_support.cpp

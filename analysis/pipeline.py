@@ -33,6 +33,7 @@ from .ops import (
     Histogram1D,
     Histogram2D,
     ParticleCICProjection,
+    ToomreQProfile,
     UniformProjection,
     UniformSlice,
     VorticityMag,
@@ -149,6 +150,39 @@ class CylindricalFluxSurfaceIntegralHandle:
     @property
     def name(self) -> str | None:
         return self.fluxes.name
+
+
+@dataclass(frozen=True)
+class ToomreQProfileHandle:
+    """Reduced annular moments used to derive gas Toomre-Q profiles."""
+
+    moments: FieldHandle
+    radial_range: tuple[float, float]
+    bins: int
+    z_bounds: tuple[float, float]
+    center: tuple[float, float, float]
+    gamma: float
+    components: tuple[str, ...] = (
+        "mass",
+        "internal_energy",
+        "magnetic_b2_volume",
+        "radial_momentum",
+        "radial_velocity_second_moment",
+        "radial_gravity_moment",
+        "sampled_volume",
+    )
+
+    @property
+    def field(self) -> int:
+        return self.moments.field
+
+    @property
+    def name(self) -> str | None:
+        return self.moments.name
+
+    @property
+    def edges(self) -> np.ndarray:
+        return np.linspace(self.radial_range[0], self.radial_range[1], self.bins + 1)
 
 
 @dataclass(frozen=True)
@@ -782,6 +816,61 @@ class Pipeline:
             radius=op.radius,
             heights=op.heights,
             temperature_bins=op.temperature_bins,
+        )
+
+    def toomre_q_profile(
+        self,
+        density: int | FieldHandle,
+        *,
+        momentum: tuple[int | FieldHandle, int | FieldHandle],
+        internal_energy: int | FieldHandle,
+        magnetic_field: tuple[
+            int | FieldHandle,
+            int | FieldHandle,
+            int | FieldHandle,
+        ],
+        potential: int | FieldHandle,
+        radial_range: tuple[float, float],
+        bins: int,
+        z_bounds: tuple[float, float],
+        center: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        out: str | None = None,
+        gamma: float = 5.0 / 3.0,
+        bytes_per_value: int | None = None,
+        reduce_fan_in: int | None = None,
+    ) -> ToomreQProfileHandle:
+        """Accumulate AMR-aware annular moments for gas Toomre-Q profiles."""
+
+        if len(momentum) != 2:
+            raise ValueError("momentum must contain x and y fields")
+        if len(magnetic_field) != 3:
+            raise ValueError("magnetic_field must contain three cell-centered fields")
+        out_name = out or self._unique_name("toomre_q_profile")
+        op = ToomreQProfile(
+            density=self._as_field_id(density),
+            momentum=tuple(self._as_field_id(comp) for comp in momentum),
+            internal_energy=self._as_field_id(internal_energy),
+            magnetic_field=tuple(self._as_field_id(comp) for comp in magnetic_field),
+            potential=self._as_field_id(potential),
+            radial_range=radial_range,
+            bins=bins,
+            z_bounds=z_bounds,
+            center=center,
+            out_name=out_name,
+            gamma=gamma,
+            bytes_per_value=bytes_per_value,
+            reduce_fan_in=reduce_fan_in,
+        )
+        fragment = op.lower(self._ctx)
+        self._append_fragment(fragment)
+        out_field = self._sink_fields(fragment)[-1]
+        return ToomreQProfileHandle(
+            moments=FieldHandle(self, out_field, out_name),
+            radial_range=op.radial_range,
+            bins=op.bins,
+            z_bounds=op.z_bounds,
+            center=op.center,
+            gamma=op.gamma,
         )
 
     def histogram1d(
