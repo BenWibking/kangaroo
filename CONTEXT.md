@@ -40,6 +40,10 @@ _Avoid_: covered-box helpers, operator-local masks
 The adapter that owns dataset-format selection, field registration, metadata discovery, particle access, chunk access, and reconstructible state for one dataset URI.
 _Avoid_: binding-level backend switches, concrete backend casts
 
+**Kernel Catalog**:
+The runtime's composed collection of scientific kernel families, where each family owns its registration, parameter preparation, storage bounds, and numerical implementation.
+_Avoid_: runtime-lifecycle kernel definitions, scattered registration calls
+
 ## Relationships
 
 - A field and block identify one **Chunk Buffer** at a particular step, level, and version.
@@ -51,6 +55,7 @@ _Avoid_: binding-level backend switches, concrete backend casts
 - A **Graph Reduction** combines intermediate **Chunk Buffers** without exposing execution topology to the scientific operator.
 - Scientific operators apply **AMR Coverage** before a **Graph Reduction** to avoid coarse/fine double counting.
 - A **Dataset Backend** translates one external dataset format into dataset metadata and **Chunk Buffers** without exposing its concrete format to the runtime or Python bindings.
+- The **Kernel Catalog** registers scientific kernel families with the runtime without making runtime lifecycle code depend on their implementations.
 
 ## Example dialogue
 
