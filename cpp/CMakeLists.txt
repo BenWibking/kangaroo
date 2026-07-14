@@ -64,13 +64,20 @@ set(KANGAROO_RUNTIME_SOURCES
   src/chunk_buffer.cpp
   src/data_service_local.cpp
   src/dataset_backend.cpp
-  src/default_kernels.cpp
-  src/core_kernels.cpp
-  src/flux_kernels.cpp
-  src/grid_kernels.cpp
-  src/histogram_kernels.cpp
-  src/particle_kernels.cpp
-  src/reduction_kernels.cpp
+  src/kernels/default_kernels.cpp
+  src/kernels/core_kernels.cpp
+  src/kernels/flux_kernels.cpp
+  src/kernels/grid_kernels.cpp
+  src/kernels/histogram_kernels.cpp
+  src/kernels/particle_kernels.cpp
+  src/kernels/reduction_kernels.cpp
+  src/kernels/kernel_buffer_support.cpp
+  src/kernels/kernel_param_support.cpp
+  src/kernels/particle_kernel_support.cpp
+  src/kernels/projection_kernel_support.cpp
+  src/kernels/plotfile_kernel_support.cpp
+  src/kernels/amr_sampling_support.cpp
+  src/kernels/flux_geometry_support.cpp
   src/executor.cpp
   src/kernel_registry.cpp
   src/param_decode.cpp
