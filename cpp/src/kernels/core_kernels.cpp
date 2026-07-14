@@ -22,7 +22,7 @@ void register_core_kernels(KernelRegistry &registry) {
      * @par Chunk outputs `outputs[0]` is an opaque, dynamically sized packed
      * AMR sub-box payload.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "amr_subbox_fetch_pack",
                    .n_inputs = 0,
                    .n_outputs = 1,
@@ -173,7 +173,7 @@ void register_core_kernels(KernelRegistry &registry) {
      * @par Chunk outputs `outputs[0]` is an f64 block grid with three gradient
      * components per cell.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "gradU_stencil",
                    .n_inputs = 1,
                    .n_outputs = 1,
@@ -399,7 +399,7 @@ void register_core_kernels(KernelRegistry &registry) {
      * @par Chunk outputs `outputs[0]` is the selected component on the block
      * grid.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "plotfile_load",
                    .n_inputs = 0,
                    .n_outputs = 1,

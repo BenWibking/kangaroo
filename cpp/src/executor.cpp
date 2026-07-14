@@ -1504,8 +1504,18 @@ void validate_plan_output_bounds(const PlanIR& plan, const KernelRegistry& kerne
   }
 }
 
-void prepare_plan(PlanIR& plan, KernelRegistry& kernels) {
+void validate_plan_kernel_contracts(const PlanIR& plan,
+                                    const KernelRegistry& kernels) {
+  for (const auto& stage : plan.stages) {
+    for (const auto& tmpl : stage.templates) {
+      kernels.validate_params_by_name(tmpl.kernel, tmpl.params);
+    }
+  }
   validate_plan_output_bounds(plan, kernels);
+}
+
+void prepare_plan(PlanIR& plan, KernelRegistry& kernels) {
+  validate_plan_kernel_contracts(plan, kernels);
   std::vector<std::shared_ptr<const CoveredBoxListIR>> shared_covered_boxes;
   shared_covered_boxes.reserve(plan.shared_covered_boxes.size());
   for (const auto& boxes : plan.shared_covered_boxes) {

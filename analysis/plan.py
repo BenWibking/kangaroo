@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import List, Literal, Optional, Sequence
 
 from .buffer import BufferSpec
-from .kernel_params import KernelParams, NoKernelParams, validate_kernel_params
+from .kernel_params import KernelParams, NoKernelParams
 
 Plane = Literal["chunk", "graph", "mixed"]
 
@@ -97,7 +97,6 @@ class TaskTemplate:
     graph_reduce: GraphReduceSpec | None = None
 
     def __post_init__(self) -> None:
-        validate_kernel_params(self.kernel, self.params)
         if self.plane == "graph" and self.graph_reduce is None:
             raise ValueError("graph task templates require a GraphReduceSpec")
         if self.plane != "graph" and self.graph_reduce is not None:

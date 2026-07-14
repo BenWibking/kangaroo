@@ -193,44 +193,5 @@ KernelParams: TypeAlias = (
 )
 
 
-_EXPECTED_PARAMS: dict[str, type[KernelParams]] = {
-    "amr_subbox_fetch_pack": AmrSubboxPackParams,
-    "gradU_stencil": GradStencilParams,
-    "plotfile_load": PlotfileLoadParams,
-    "flux_surface_integral_accumulate": FluxSurfaceParams,
-    "cylindrical_flux_surface_integral_accumulate": CylindricalFluxParams,
-    "uniform_slice_cellavg_accumulate": UniformSliceCellParams,
-    "uniform_projection_accumulate": UniformProjectionParams,
-    "field_expr": FieldExprParams,
-    "uniform_slice": UniformSliceParams,
-    "histogram1d_accumulate": Histogram1DParams,
-    "histogram2d_accumulate": Histogram2DParams,
-    "particle_load_field_chunk_f64": ParticleFieldParams,
-    "particle_cic_grid_accumulate": ParticleCicGridParams,
-    "particle_cic_projection_accumulate": ParticleCicProjectionParams,
-    "particle_eq_mask": ScalarParams,
-    "particle_abs_lt_mask": ScalarParams,
-    "particle_le_mask": ScalarParams,
-    "particle_gt_mask": ScalarParams,
-    "particle_isin_mask": ValuesParams,
-    "particle_min": FiniteOnlyParams,
-    "particle_max": FiniteOnlyParams,
-    "particle_histogram1d": ParticleHistogramParams,
-    "particle_histogram1d_weighted": ParticleHistogramParams,
-    "particle_topk_modes_map": ParticleFieldParams,
-    "particle_topk_modes_finalize": TopKModesParams,
-    "uniform_slice_finalize": SliceFinalizeParams,
-}
-
-
-def validate_kernel_params(kernel: str, params: KernelParams) -> None:
-    expected = _EXPECTED_PARAMS.get(kernel, NoKernelParams)
-    if not isinstance(params, expected):
-        raise TypeError(
-            f"kernel {kernel!r} requires {expected.__name__}, "
-            f"got {type(params).__name__}"
-        )
-
-
 def covered_boxes(params: KernelParams) -> CoveredBoxes:
     return getattr(params, "covered_boxes", ())

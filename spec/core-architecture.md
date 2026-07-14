@@ -135,7 +135,13 @@ Requirements:
 - Registering kernels by name.
 - Lookup by kernel name.
 - Listing kernel descriptors.
+- Owning the expected typed kernel-parameter alternative for each entry.
 - Lookup of unknown kernel name MUST fail explicitly.
+- Plan preparation MUST reject parameters that do not match the selected kernel entry.
+
+The typed-plan decoder MUST decode the parameter union without maintaining a
+kernel-name-to-parameter-type table. Scientific parameter compatibility belongs
+to the kernel registry and is validated when a decoded plan is prepared.
 
 Kernel name compatibility requirements are defined in `spec/operators.md`.
 

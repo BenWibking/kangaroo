@@ -23,7 +23,7 @@ void register_flux_kernels(KernelRegistry &registry) {
      * momentum, energy, and passive-scalar flux for each radius and temperature
      * bin.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "flux_surface_integral_accumulate",
                    .n_inputs = 9,
                    .n_outputs = 1,
@@ -372,7 +372,7 @@ void register_flux_kernels(KernelRegistry &registry) {
      * momentum, energy, and passive-scalar flux for each cylindrical section
      * and temperature bin.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "cylindrical_flux_surface_integral_accumulate",
                    .n_inputs = 9,
                    .n_outputs = 1,

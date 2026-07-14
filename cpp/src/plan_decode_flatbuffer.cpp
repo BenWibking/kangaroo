@@ -331,63 +331,6 @@ KernelParamsIR decode_params(const fb::KernelParamsUnion &input) {
   throw std::runtime_error("unknown kernel parameter type");
 }
 
-template <typename Params> bool has_params(const KernelParamsIR &params) {
-  return std::holds_alternative<Params>(params);
-}
-
-void validate_kernel_params(const std::string &kernel,
-                            const KernelParamsIR &params) {
-  bool valid = false;
-  if (kernel == "amr_subbox_fetch_pack")
-    valid = has_params<AmrSubboxPackParams>(params);
-  else if (kernel == "gradU_stencil")
-    valid = has_params<GradStencilParams>(params);
-  else if (kernel == "plotfile_load")
-    valid = has_params<PlotfileLoadParams>(params);
-  else if (kernel == "flux_surface_integral_accumulate")
-    valid = has_params<FluxSurfaceParams>(params);
-  else if (kernel == "cylindrical_flux_surface_integral_accumulate")
-    valid = has_params<CylindricalFluxParams>(params);
-  else if (kernel == "uniform_slice_cellavg_accumulate")
-    valid = has_params<UniformSliceCellParams>(params);
-  else if (kernel == "uniform_projection_accumulate")
-    valid = has_params<UniformProjectionParams>(params);
-  else if (kernel == "field_expr")
-    valid = has_params<FieldExprParams>(params);
-  else if (kernel == "uniform_slice")
-    valid = has_params<UniformSliceParams>(params);
-  else if (kernel == "histogram1d_accumulate")
-    valid = has_params<Histogram1DParams>(params);
-  else if (kernel == "histogram2d_accumulate")
-    valid = has_params<Histogram2DParams>(params);
-  else if (kernel == "particle_load_field_chunk_f64" ||
-           kernel == "particle_topk_modes_map")
-    valid = has_params<ParticleFieldParams>(params);
-  else if (kernel == "particle_cic_grid_accumulate")
-    valid = has_params<ParticleCicGridParams>(params);
-  else if (kernel == "particle_cic_projection_accumulate")
-    valid = has_params<ParticleCicProjectionParams>(params);
-  else if (kernel == "particle_eq_mask" || kernel == "particle_abs_lt_mask" ||
-           kernel == "particle_le_mask" || kernel == "particle_gt_mask")
-    valid = has_params<ScalarParams>(params);
-  else if (kernel == "particle_isin_mask")
-    valid = has_params<ValuesParams>(params);
-  else if (kernel == "particle_min" || kernel == "particle_max")
-    valid = has_params<FiniteOnlyParams>(params);
-  else if (kernel == "particle_histogram1d" ||
-           kernel == "particle_histogram1d_weighted")
-    valid = has_params<ParticleHistogramParams>(params);
-  else if (kernel == "particle_topk_modes_finalize")
-    valid = has_params<TopKModesParams>(params);
-  else if (kernel == "uniform_slice_finalize")
-    valid = has_params<SliceFinalizeParams>(params);
-  else
-    valid = has_params<NoKernelParamsIR>(params);
-  if (!valid)
-    throw std::runtime_error("kernel " + kernel +
-                             " received incompatible typed parameters");
-}
-
 } // namespace
 
 PlanIR decode_plan_flatbuffer(std::span<const std::uint8_t> payload) {
@@ -462,7 +405,6 @@ PlanIR decode_plan_flatbuffer(std::span<const std::uint8_t> payload) {
         throw std::runtime_error("covered_boxes_ref out of range");
       }
       task.params = decode_params(task_in->params);
-      validate_kernel_params(task.kernel, task.params);
       if (task_in->graph_reduce)
         task.graph_reduce = decode_graph_reduce(*task_in->graph_reduce);
       if (task.plane == ExecPlane::Graph && !task.graph_reduce)
