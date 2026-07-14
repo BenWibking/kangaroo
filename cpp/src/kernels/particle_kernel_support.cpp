@@ -53,9 +53,12 @@ decode_particle_value_counts(std::span<const std::uint8_t> bytes) {
   }
   uint64_t n = 0;
   std::memcpy(&n, bytes.data(), sizeof(uint64_t));
+  constexpr std::size_t record_size = sizeof(double) + sizeof(int64_t);
+  if (n > (bytes.size() - sizeof(uint64_t)) / record_size) {
+    return counts;
+  }
   const std::size_t expected =
-      sizeof(uint64_t) +
-      static_cast<std::size_t>(n) * (sizeof(double) + sizeof(int64_t));
+      sizeof(uint64_t) + static_cast<std::size_t>(n) * record_size;
   if (bytes.size() < expected) {
     return counts;
   }

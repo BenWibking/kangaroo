@@ -3,6 +3,8 @@
 #include "kangaroo/buffer_resolution.hpp"
 #include "kangaroo/chunk_buffer.hpp"
 #include "kangaroo/data_service_local.hpp"
+#include "kernels/flux_geometry_support.hpp"
+#include "kernels/particle_kernel_support.hpp"
 
 #ifdef KANGAROO_USE_PARTHENON_HDF5
 #include "kangaroo/backend_parthenon.hpp"
@@ -698,6 +700,20 @@ NB_MODULE(_core, m) {
         spec, task, data, meta, 0, 0, 0, 0, {});
     return resolved.desc.extents[0];
   });
+  m.def("test_decode_particle_value_counts",
+        [](std::uint64_t count, std::size_t payload_bytes) {
+          std::vector<std::uint8_t> bytes(sizeof(std::uint64_t) + payload_bytes);
+          std::memcpy(bytes.data(), &count, sizeof(count));
+          return kangaroo::decode_particle_value_counts(bytes).size();
+        });
+  m.def("test_cells_intersecting_axis_band",
+        [](double band_lo, double band_hi, double x0, double dx,
+           std::int32_t index_origin, std::int32_t block_lo,
+           std::int32_t block_hi) {
+          const auto range = kangaroo::cells_intersecting_axis_band(
+              band_lo, band_hi, x0, dx, index_origin, block_lo, block_hi);
+          return nb::make_tuple(range.first, range.last);
+        });
   m.def("test_amr_subbox_dynamic_capacity", [](std::uint64_t source_chunk_bytes) {
     DynamicBoundTestData data(0, source_chunk_bytes);
     kangaroo::RunMeta meta;

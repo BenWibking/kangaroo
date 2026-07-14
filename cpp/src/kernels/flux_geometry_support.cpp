@@ -50,7 +50,8 @@ CellIndexRange cells_intersecting_axis_band(double band_lo, double band_hi,
                                             int32_t index_origin,
                                             int32_t block_lo,
                                             int32_t block_hi) {
-  if (!std::isfinite(band_lo) || !std::isfinite(band_hi) || dx <= 0.0 ||
+  if (!std::isfinite(band_lo) || !std::isfinite(band_hi) ||
+      !std::isfinite(x0) || !std::isfinite(dx) || dx <= 0.0 ||
       band_hi < band_lo || block_hi < block_lo) {
     return {};
   }
@@ -60,13 +61,17 @@ CellIndexRange cells_intersecting_axis_band(double band_lo, double band_hi,
   const double scaled_last =
       (band_hi - x0) / dx + static_cast<double>(index_origin);
   constexpr double pad = 1.0e-12;
-  const auto raw_first =
-      static_cast<int64_t>(std::ceil(scaled_first - pad)) - 1;
-  const auto raw_last = static_cast<int64_t>(std::floor(scaled_last + pad)) + 1;
-  const int64_t clamped_first =
-      std::max<int64_t>(static_cast<int64_t>(block_lo), raw_first);
-  const int64_t clamped_last =
-      std::min<int64_t>(static_cast<int64_t>(block_hi), raw_last);
+  const double raw_first = std::ceil(scaled_first - pad) - 1.0;
+  const double raw_last = std::floor(scaled_last + pad) + 1.0;
+  const double block_lo_value = static_cast<double>(block_lo);
+  const double block_hi_value = static_cast<double>(block_hi);
+  if (raw_first > block_hi_value || raw_last < block_lo_value) {
+    return {};
+  }
+  const int64_t clamped_first = static_cast<int64_t>(
+      std::max(block_lo_value, raw_first));
+  const int64_t clamped_last = static_cast<int64_t>(
+      std::min(block_hi_value, raw_last));
   if (clamped_first > clamped_last) {
     return {};
   }
