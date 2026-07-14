@@ -42,6 +42,21 @@ Each template contains:
 
 The runtime MUST interpret templates as declarative task generators, not as already-instantiated tasks.
 
+### 3.1 Packed Plan Compatibility
+
+A packed plan is an ephemeral transport between the Python front-end and native
+runtime from the same Kangaroo build. It is not a persistent or versioned wire
+format.
+
+Requirements:
+- The producer and consumer MUST use bindings generated from the same plan schema.
+- Backward and forward compatibility with packed plans from other Kangaroo builds
+  MUST NOT be assumed or preserved.
+- Schema changes MAY reorder or insert union alternatives and thereby renumber
+  FlatBuffer union discriminators.
+- A plan encoded by an older build MUST be regenerated from its source workflow,
+  not migrated or replayed as stored bytes.
+
 ## 4. Stage Dependency Graph
 
 The stage dependency graph is defined by `after` index references.
