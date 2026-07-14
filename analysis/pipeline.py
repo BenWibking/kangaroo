@@ -844,7 +844,6 @@ class Pipeline:
         center: tuple[float, float, float] = (0.0, 0.0, 0.0),
         out: str | None = None,
         gamma: float = 5.0 / 3.0,
-        bytes_per_value: int | None = None,
         reduce_fan_in: int | None = None,
     ) -> ToomreQProfileHandle:
         """Accumulate AMR-aware annular moments for gas Toomre-Q profiles."""
@@ -885,7 +884,6 @@ class Pipeline:
             center=center,
             out_name=out_name,
             gamma=gamma,
-            bytes_per_value=bytes_per_value,
             reduce_fan_in=reduce_fan_in,
         )
         fragment = op.lower(self._ctx)

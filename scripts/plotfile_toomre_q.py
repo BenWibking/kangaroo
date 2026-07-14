@@ -488,6 +488,22 @@ def main(argv: list[str] | None = None) -> int:
             output_dir.mkdir(parents=True, exist_ok=True)
 
         for plotfile in plotfiles:
+            stem = f"{plotfile.name}_toomre_q"
+            csv_path = output_dir / f"{stem}.csv"
+            png_path = output_dir / f"{stem}.png"
+            annular_png_path = output_dir / f"{stem}_annular_profiles.png"
+            if not args.list_fields and not args.overwrite:
+                existing = [
+                    str(path)
+                    for path in (csv_path, png_path, annular_png_path)
+                    if path.exists()
+                ]
+                if existing:
+                    raise FileExistsError(
+                        "Refusing to overwrite existing output(s): "
+                        + ", ".join(existing)
+                    )
+
             ds = open_dataset(str(plotfile), runtime=runtime, step=0, level=0)
             bundle = ds.metadata_bundle()
             available = _metadata_var_names(bundle.dataset)
@@ -556,20 +572,6 @@ def main(argv: list[str] | None = None) -> int:
                 gamma=float(args.gamma),
             )
             rows = profile_rows(profile_edges, profile)
-            stem = f"{plotfile.name}_toomre_q"
-            csv_path = output_dir / f"{stem}.csv"
-            png_path = output_dir / f"{stem}.png"
-            annular_png_path = output_dir / f"{stem}_annular_profiles.png"
-            if not args.overwrite:
-                existing = [
-                    str(path)
-                    for path in (csv_path, png_path, annular_png_path)
-                    if path.exists()
-                ]
-                if existing:
-                    raise FileExistsError(
-                        "Refusing to overwrite existing output(s): " + ", ".join(existing)
-                    )
             write_profile_csv(csv_path, rows)
             time_seconds = (
                 float(bundle.dataset["time"]) if "time" in bundle.dataset else None

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import csv
+import inspect
 import math
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from analysis import Runtime
 from analysis.buffer import BufferSpec, DType, FixedShape, InitPolicy
@@ -15,6 +17,7 @@ from analysis.plan import DependencyRule, Domain, FieldRef, OutputRef, Plan, Sta
 from analysis.plan_codec import encode_plan
 from analysis.pipeline import Pipeline
 from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
+import scripts.plotfile_toomre_q as toomre_script
 from scripts.plotfile_toomre_q import (
     NUM_MOMENTS,
     _find_plotfiles,
@@ -191,6 +194,10 @@ def _two_level_runmeta() -> RunMeta:
 
 
 def test_toomre_q_profile_lowering_wires_gradient_amr_mask_and_reduction() -> None:
+    assert "bytes_per_value" not in inspect.signature(
+        Pipeline.toomre_q_profile
+    ).parameters
+
     runtime = Runtime()
     runmeta = _two_level_runmeta()
     ds = open_dataset("memory://toomre-lowering", runmeta=runmeta, runtime=runtime)
@@ -205,7 +212,6 @@ def test_toomre_q_profile_lowering_wires_gradient_amr_mask_and_reduction() -> No
         radial_edges=radial_edges,
         z_bounds=(-0.75, 0.75),
         center=(0.0, 0.0, 0.0),
-        bytes_per_value=8,
         out="toomre",
     )
 
@@ -245,7 +251,6 @@ def test_toomre_q_profile_lowering_wires_gradient_amr_mask_and_reduction() -> No
         radial_range=(0.25, 2.0),
         bins=7,
         z_bounds=(-0.75, 0.75),
-        bytes_per_value=8,
         out="uniform_toomre",
     )
     np.testing.assert_allclose(
@@ -282,7 +287,32 @@ def _set_chunk(ds, field: int, values: np.ndarray) -> None:
     )
 
 
-def test_toomre_profile_accumulator_kernel_direct() -> None:
+@pytest.mark.parametrize(
+    ("x0", "radial_edges", "momentum", "gradient", "expected"),
+    [
+        (
+            (1.0, -0.5, -0.5),
+            (1.0, 2.0),
+            (0.0, 0.0),
+            (7.0, 0.0, 0.0),
+            (1.0, 1.5, 2.5, 0.0, 0.0, 7.0, 0.5),
+        ),
+        (
+            (-0.5, -0.5, -0.5),
+            (0.0, 1.0),
+            (10.0, 20.0),
+            (7.0, 11.0, 0.0),
+            (1.0, 1.5, 2.5, 0.0, 0.0, 0.0, 0.5),
+        ),
+    ],
+)
+def test_toomre_profile_accumulator_kernel_direct(
+    x0: tuple[float, float, float],
+    radial_edges: tuple[float, float],
+    momentum: tuple[float, float],
+    gradient: tuple[float, float, float],
+    expected: tuple[float, ...],
+) -> None:
     runtime = Runtime()
     runmeta = RunMeta(
         steps=[
@@ -292,7 +322,7 @@ def test_toomre_profile_accumulator_kernel_direct() -> None:
                     LevelMeta(
                         geom=LevelGeom(
                             dx=(1.0, 1.0, 1.0),
-                            x0=(1.0, -0.5, -0.5),
+                            x0=x0,
                             index_origin=(0, 0, 0),
                             ref_ratio=1,
                         ),
@@ -304,7 +334,10 @@ def test_toomre_profile_accumulator_kernel_direct() -> None:
     )
     ds = open_dataset("memory://toomre-kernel", runmeta=runmeta, runtime=runtime)
     input_fields = list(range(301, 308))
-    for field, value in zip(input_fields, (2.0, 0.0, 0.0, 3.0, 1.0, 2.0, 0.0)):
+    for field, value in zip(
+        input_fields,
+        (2.0, momentum[0], momentum[1], 3.0, 1.0, 2.0, 0.0),
+    ):
         _set_chunk(ds, field, np.array([[[value]]]))
     gradient_field = 308
     ds._h.set_chunk_ref(
@@ -313,7 +346,7 @@ def test_toomre_profile_accumulator_kernel_direct() -> None:
         gradient_field,
         0,
         0,
-        np.asarray([7.0, 0.0, 0.0], dtype=np.float64).tobytes(),
+        np.asarray(gradient, dtype=np.float64).tobytes(),
         "f64",
         [1, 1, 1, 3],
     )
@@ -345,7 +378,7 @@ def test_toomre_profile_accumulator_kernel_direct() -> None:
                             ],
                             deps=DependencyRule(),
                             params=ToomreProfileParams(
-                                radial_edges=(1.0, 2.0),
+                                radial_edges=radial_edges,
                                 z_bounds=(-0.25, 0.25),
                                 center=(0.0, 0.0, 0.0),
                             ),
@@ -365,7 +398,7 @@ def test_toomre_profile_accumulator_kernel_direct() -> None:
         dtype=np.float64,
         dataset=ds,
     )
-    np.testing.assert_allclose(values[0], [1.0, 1.5, 2.5, 0.0, 0.0, 7.0, 0.5])
+    np.testing.assert_allclose(values[0], expected)
 
 
 def test_toomre_q_profile_runtime_accumulates_expected_moments() -> None:
@@ -399,7 +432,6 @@ def test_toomre_q_profile_runtime_accumulates_expected_moments() -> None:
         potential=fields[7],
         radial_edges=radial_edges,
         z_bounds=(-1.5, 1.5),
-        bytes_per_value=8,
         out="toomre",
     )
     pipe.run()
@@ -518,3 +550,40 @@ def test_radial_edges_dr_allows_short_final_bin() -> None:
     np.testing.assert_allclose(edges[-1], 20.0)
     np.testing.assert_allclose(np.diff(edges[:-1]), 0.25)
     np.testing.assert_allclose(edges[-1] - edges[-2], 0.15)
+
+
+def test_cli_refuses_existing_output_before_opening_plotfile(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    plotfile = tmp_path / "plt00000"
+    plotfile.mkdir()
+    (plotfile / "Header").write_text("fixture\n", encoding="utf-8")
+    output_dir = tmp_path / "output"
+    output_dir.mkdir()
+    (output_dir / "plt00000_toomre_q.csv").write_text(
+        "existing\n", encoding="utf-8"
+    )
+
+    monkeypatch.setattr(
+        toomre_script,
+        "Runtime",
+        SimpleNamespace(from_parsed_args=lambda *args, **kwargs: object()),
+    )
+    monkeypatch.setattr(
+        toomre_script,
+        "run_console_main",
+        lambda runtime, callback: callback(),
+    )
+    opened: list[Path] = []
+    monkeypatch.setattr(
+        toomre_script,
+        "open_dataset",
+        lambda path, **kwargs: opened.append(Path(path)),
+    )
+
+    with pytest.raises(FileExistsError, match="Refusing to overwrite"):
+        toomre_script.main(
+            [str(plotfile), "--output-dir", str(output_dir)]
+        )
+
+    assert opened == []

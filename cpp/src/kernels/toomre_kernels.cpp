@@ -153,7 +153,7 @@ void register_toomre_kernels(KernelRegistry &registry) {
             const double y = 0.5 * (cell_edge(1, gj) + cell_edge(1, gj + 1));
             const double ry = y - params.center[1];
             const double radius = std::sqrt(rx * rx + ry * ry);
-            if (radius < rmin || radius > rmax || radius <= 0.0)
+            if (radius < rmin || radius > rmax)
               continue;
             const auto upper_edge =
                 std::upper_bound(params.radial_edges.begin(),
@@ -197,9 +197,12 @@ void register_toomre_kernels(KernelRegistry &registry) {
 
               const double volume = dx * dy * overlap;
               const double mass = rho * volume;
+              const bool at_center = radius == 0.0;
               const double radial_velocity =
-                  (rx * momx + ry * momy) / (radius * rho);
-              const double radial_gravity = (rx * grad_x + ry * grad_y) / radius;
+                  at_center ? 0.0
+                            : (rx * momx + ry * momy) / (radius * rho);
+              const double radial_gravity =
+                  at_center ? 0.0 : (rx * grad_x + ry * grad_y) / radius;
               if (!std::isfinite(radial_velocity) ||
                   !std::isfinite(radial_gravity))
                 continue;

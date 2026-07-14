@@ -980,7 +980,6 @@ class ToomreQProfile:
         center: tuple[float, float, float] = (0.0, 0.0, 0.0),
         out_name: str = "toomre_q_profile",
         gamma: float = 5.0 / 3.0,
-        bytes_per_value: int | None = None,
         reduce_fan_in: Optional[int] = None,
     ) -> None:
         self.density = int(density)
@@ -993,7 +992,6 @@ class ToomreQProfile:
         self.center = tuple(float(v) for v in center)
         self.out_name = str(out_name)
         self.gamma = float(gamma)
-        self.bytes_per_value = bytes_per_value
         self.reduce_fan_in = reduce_fan_in
 
     def _reduce_fan_in(self, num_inputs: int) -> int:
@@ -1079,9 +1077,6 @@ class ToomreQProfile:
             raise ValueError("center must contain three finite coordinates")
         if not math.isfinite(self.gamma) or self.gamma <= 1.0:
             raise ValueError("gamma must be finite and greater than 1")
-
-        if self.bytes_per_value is not None and self.bytes_per_value not in (4, 8):
-            raise ValueError("bytes_per_value must be 4 or 8")
 
         levels = ctx.runmeta.steps[ds.step].levels
         active_by_level: dict[int, list[int]] = {}
