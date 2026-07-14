@@ -56,6 +56,14 @@ void register_grid_kernels(KernelRegistry &registry) {
       return params;
     };
 
+    /**
+     * @brief Accumulates cell averages and sampled area on a uniform slice.
+     * @par Chunk inputs `inputs[0]` is a real-valued cell-centered block grid.
+     * @par MessagePack parameters `axis`, `coord`, optional `plane_index`, `rect`,
+     * `resolution`, and `covered_boxes` define the sampled AMR plane.
+     * @par Chunk outputs `outputs[0]` and `outputs[1]` are f64 images containing
+     * the area-weighted value sum and sampled area, respectively.
+     */
     registry.register_kernel(
         KernelDesc{.name = "uniform_slice_cellavg_accumulate",
                    .n_inputs = 1,
@@ -288,6 +296,13 @@ void register_grid_kernels(KernelRegistry &registry) {
       return params;
     };
 
+    /**
+     * @brief Projects uncovered grid cells onto a uniform image plane.
+     * @par Chunk inputs `inputs[0]` is a real-valued cell-centered block grid.
+     * @par MessagePack parameters `axis`, `axis_bounds`, `rect`, `resolution`, and
+     * `covered_boxes` define the projection slab and AMR exclusion regions.
+     * @par Chunk outputs `outputs[0]` is an f64 image of line-integrated values.
+     */
     registry.register_kernel(
         KernelDesc{.name = "uniform_projection_accumulate",
                    .n_inputs = 1,
@@ -597,6 +612,13 @@ void register_grid_kernels(KernelRegistry &registry) {
       return params;
     };
 
+    /**
+     * @brief Evaluates a scalar field expression independently in every grid cell.
+     * @par Chunk inputs `inputs[0..N)` are matching real-valued block grids.
+     * @par MessagePack parameters `expression` is the parser expression and
+     * `variables` names the inputs in order; one to eight variables are supported.
+     * @par Chunk outputs `outputs[0]` is the f32 or f64 expression value grid.
+     */
     registry.register_kernel(
         KernelDesc{.name = "field_expr",
                    .n_inputs = 1,
@@ -773,6 +795,14 @@ void register_grid_kernels(KernelRegistry &registry) {
       return params;
     };
 
+    /**
+     * @brief Samples a grid block onto its overlapping region of a uniform slice.
+     * @par Chunk inputs `inputs[0]` is a real-valued cell-centered block grid.
+     * @par MessagePack parameters `axis`, `coord`, `rect`, and `resolution` define
+     * the sampling plane and output image.
+     * @par Chunk outputs `outputs[0]` is an f32 or f64 nearest-cell slice image;
+     * pixels outside this block are NaN.
+     */
     registry.register_kernel(
         KernelDesc{.name = "uniform_slice",
                    .n_inputs = 1,
@@ -922,6 +952,14 @@ void register_grid_kernels(KernelRegistry &registry) {
         },
         make_kernel_params_preparer<Params>(decode_params));
   }
+  /**
+   * @brief Computes the cell-centered magnitude of the velocity curl.
+   * @par Chunk inputs Either one real block grid with three gradient components
+   * per cell, or three such grids holding the gradients of velocity x/y/z.
+   * @par MessagePack parameters None.
+   * @par Chunk outputs `outputs[0]` is an f64 scalar block grid containing gradient
+   * magnitude for one input or velocity-curl magnitude for three inputs.
+   */
   registry.register_kernel(
       KernelDesc{.name = "vorticity_mag",
                  .n_inputs = 1,

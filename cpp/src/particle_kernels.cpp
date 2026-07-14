@@ -25,6 +25,13 @@ void register_particle_kernels(KernelRegistry &registry) {
       return params;
     };
 
+    /**
+     * @brief Loads one particle field chunk and converts its values to double.
+     * @par Chunk inputs None; the chunk is read from the dataset backend.
+     * @par MessagePack parameters `particle_type` and `field_name` identify the
+     * particle field.
+     * @par Chunk outputs `outputs[0]` is a dynamically sized f64 particle array.
+     */
     registry.register_kernel(
         KernelDesc{.name = "particle_load_field_chunk_f64",
                    .n_inputs = 0,
@@ -146,6 +153,15 @@ void register_particle_kernels(KernelRegistry &registry) {
       return params;
     };
 
+    /**
+     * @brief Deposits particle mass onto an AMR grid with cloud-in-cell weighting.
+     * @par Chunk inputs None; particle position and mass grids are read from the
+     * dataset backend.
+     * @par MessagePack parameters `particle_type`, `level_index`, `axis`,
+     * `axis_bounds`, optional `mass_max`, and `covered_boxes` select particles and
+     * excluded AMR cells.
+     * @par Chunk outputs `outputs[0]` is an f64 block grid of deposited mass density.
+     */
     registry.register_kernel(
         KernelDesc{.name = "particle_cic_grid_accumulate",
                    .n_inputs = 0,
@@ -424,6 +440,15 @@ void register_particle_kernels(KernelRegistry &registry) {
       return params;
     };
 
+    /**
+     * @brief Projects particles onto an image plane with cloud-in-cell weighting.
+     * @par Chunk inputs None; particle position and mass grids are read from the
+     * dataset backend.
+     * @par MessagePack parameters `particle_type`, `level_index`, `axis`,
+     * `axis_bounds`, `rect`, `resolution`, optional `mass_max`, and `covered_boxes`
+     * define the selected particles, image, and excluded AMR cells.
+     * @par Chunk outputs `outputs[0]` is an f64 image of deposited particle mass.
+     */
     registry.register_kernel(
         KernelDesc{.name = "particle_cic_projection_accumulate",
                    .n_inputs = 0,
@@ -771,6 +796,12 @@ void register_particle_kernels(KernelRegistry &registry) {
       return params;
     };
 
+    /**
+     * @brief Marks particle values exactly equal to a scalar.
+     * @par Chunk inputs `inputs[0]` is an f64 particle array.
+     * @par MessagePack parameters `scalar` is the comparison value.
+     * @par Chunk outputs `outputs[0]` is a same-length u8 mask.
+     */
     registry.register_kernel(
         KernelDesc{.name = "particle_eq_mask",
                    .n_inputs = 1,
@@ -795,6 +826,12 @@ void register_particle_kernels(KernelRegistry &registry) {
         },
         make_kernel_params_preparer<Params>(decode_params));
 
+    /**
+     * @brief Marks particle values whose absolute value is below a scalar.
+     * @par Chunk inputs `inputs[0]` is an f64 particle array.
+     * @par MessagePack parameters `scalar` is the strict absolute-value threshold.
+     * @par Chunk outputs `outputs[0]` is a same-length u8 mask.
+     */
     registry.register_kernel(
         KernelDesc{.name = "particle_abs_lt_mask",
                    .n_inputs = 1,
@@ -819,6 +856,12 @@ void register_particle_kernels(KernelRegistry &registry) {
         },
         make_kernel_params_preparer<Params>(decode_params));
 
+    /**
+     * @brief Marks particle values less than or equal to a scalar.
+     * @par Chunk inputs `inputs[0]` is an f64 particle array.
+     * @par MessagePack parameters `scalar` is the inclusive upper bound.
+     * @par Chunk outputs `outputs[0]` is a same-length u8 mask.
+     */
     registry.register_kernel(
         KernelDesc{.name = "particle_le_mask",
                    .n_inputs = 1,
@@ -843,6 +886,12 @@ void register_particle_kernels(KernelRegistry &registry) {
         },
         make_kernel_params_preparer<Params>(decode_params));
 
+    /**
+     * @brief Marks particle values greater than a scalar.
+     * @par Chunk inputs `inputs[0]` is an f64 particle array.
+     * @par MessagePack parameters `scalar` is the strict lower bound.
+     * @par Chunk outputs `outputs[0]` is a same-length u8 mask.
+     */
     registry.register_kernel(
         KernelDesc{.name = "particle_gt_mask",
                    .n_inputs = 1,
@@ -884,6 +933,12 @@ void register_particle_kernels(KernelRegistry &registry) {
       return params;
     };
 
+    /**
+     * @brief Marks particle values contained in a configured set.
+     * @par Chunk inputs `inputs[0]` is an f64 particle array.
+     * @par MessagePack parameters `values` is the set of exact matches.
+     * @par Chunk outputs `outputs[0]` is a same-length u8 mask.
+     */
     registry.register_kernel(
         KernelDesc{.name = "particle_isin_mask",
                    .n_inputs = 1,
@@ -929,6 +984,14 @@ void register_particle_kernels(KernelRegistry &registry) {
       return params;
     };
 
+    /**
+     * @brief Finds the minimum particle value, optionally ignoring non-finite values.
+     * @par Chunk inputs `inputs[0]` is an f64 particle array.
+     * @par MessagePack parameters `finite_only` controls whether non-finite values
+     * are skipped.
+     * @par Chunk outputs `outputs[0]` is one f64 minimum value, or positive infinity
+     * when no eligible value exists.
+     */
     registry.register_kernel(
         KernelDesc{.name = "particle_min",
                    .n_inputs = 1,
@@ -963,6 +1026,14 @@ void register_particle_kernels(KernelRegistry &registry) {
         },
         make_kernel_params_preparer<Params>(decode_params));
 
+    /**
+     * @brief Finds the maximum particle value, optionally ignoring non-finite values.
+     * @par Chunk inputs `inputs[0]` is an f64 particle array.
+     * @par MessagePack parameters `finite_only` controls whether non-finite values
+     * are skipped.
+     * @par Chunk outputs `outputs[0]` is one f64 maximum value, or negative infinity
+     * when no eligible value exists.
+     */
     registry.register_kernel(
         KernelDesc{.name = "particle_max",
                    .n_inputs = 1,
@@ -1095,6 +1166,13 @@ void register_particle_kernels(KernelRegistry &registry) {
       };
     };
 
+    /**
+     * @brief Bins particle values into a one-dimensional histogram.
+     * @par Chunk inputs `inputs[0]` is an f64 particle-value array.
+     * @par MessagePack parameters `edges` defines the bin edges and `density`
+     * requests probability-density normalization.
+     * @par Chunk outputs `outputs[0]` is an f64 array with `edges.size() - 1` bins.
+     */
     registry.register_kernel(
         KernelDesc{.name = "particle_histogram1d",
                    .n_inputs = 1,
@@ -1102,6 +1180,14 @@ void register_particle_kernels(KernelRegistry &registry) {
                    .needs_neighbors = false},
         make_histogram_kernel(false),
         make_kernel_params_preparer<Params>(decode_params));
+    /**
+     * @brief Bins particle values into a weighted one-dimensional histogram.
+     * @par Chunk inputs `inputs[0]` contains f64 values and matching `inputs[1]`
+     * contains f64 weights.
+     * @par MessagePack parameters `edges` defines the bin edges and `density`
+     * requests weighted probability-density normalization.
+     * @par Chunk outputs `outputs[0]` is an f64 array with `edges.size() - 1` bins.
+     */
     registry.register_kernel(
         KernelDesc{.name = "particle_histogram1d_weighted",
                    .n_inputs = 2,
@@ -1130,6 +1216,14 @@ void register_particle_kernels(KernelRegistry &registry) {
       return params;
     };
 
+    /**
+     * @brief Encodes per-chunk occurrence counts for finite particle values.
+     * @par Chunk inputs None; the particle field is read from the dataset backend.
+     * @par MessagePack parameters `particle_type` and `field_name` identify the
+     * particle field.
+     * @par Chunk outputs `outputs[0]` is a dynamically sized opaque map from f64
+     * values to signed 64-bit occurrence counts.
+     */
     registry.register_kernel(
         KernelDesc{.name = "particle_topk_modes_map",
                    .n_inputs = 0,
@@ -1202,6 +1296,13 @@ void register_particle_kernels(KernelRegistry &registry) {
       return params;
     };
 
+    /**
+     * @brief Selects the most frequent particle values from merged occurrence counts.
+     * @par Chunk inputs `inputs[0]` is an opaque encoded value-count map.
+     * @par MessagePack parameters `k` is the number of modes to return.
+     * @par Chunk outputs `outputs[0]` is an f64 array of length `2 * k`: the first
+     * half contains values and the second half contains their counts.
+     */
     registry.register_kernel(
         KernelDesc{.name = "particle_topk_modes_finalize",
                    .n_inputs = 1,
@@ -1248,6 +1349,12 @@ void register_particle_kernels(KernelRegistry &registry) {
         },
         make_kernel_params_preparer<Params>(decode_params));
   }
+  /**
+   * @brief Marks finite particle values.
+   * @par Chunk inputs `inputs[0]` is an f64 particle array.
+   * @par MessagePack parameters None.
+   * @par Chunk outputs `outputs[0]` is a same-length u8 mask.
+   */
   registry.register_kernel(
       KernelDesc{.name = "particle_isfinite_mask",
                  .n_inputs = 1,
@@ -1267,6 +1374,13 @@ void register_particle_kernels(KernelRegistry &registry) {
         }
         return hpx::make_ready_future();
       });
+  /**
+   * @brief Computes the elementwise logical conjunction of two particle masks.
+   * @par Chunk inputs `inputs[0]` and `inputs[1]` are u8 masks.
+   * @par MessagePack parameters None.
+   * @par Chunk outputs `outputs[0]` is a dynamically sized u8 mask whose length is
+   * the shorter input length.
+   */
   registry.register_kernel(
       KernelDesc{.name = "particle_and_mask",
                  .n_inputs = 2,
@@ -1288,6 +1402,13 @@ void register_particle_kernels(KernelRegistry &registry) {
         outputs[0].commit_dynamic_extent(n);
         return hpx::make_ready_future();
       });
+  /**
+   * @brief Compacts particle values selected by a mask.
+   * @par Chunk inputs `inputs[0]` is an f64 value array and `inputs[1]` is a u8 mask.
+   * @par MessagePack parameters None.
+   * @par Chunk outputs `outputs[0]` is a dynamically sized f64 array containing
+   * values whose corresponding mask entry is nonzero.
+   */
   registry.register_kernel(
       KernelDesc{.name = "particle_filter",
                  .n_inputs = 2,
@@ -1318,6 +1439,13 @@ void register_particle_kernels(KernelRegistry &registry) {
         outputs[0].commit_dynamic_extent(count);
         return hpx::make_ready_future();
       });
+  /**
+   * @brief Subtracts two particle arrays elementwise.
+   * @par Chunk inputs `inputs[0]` and `inputs[1]` are f64 particle arrays.
+   * @par MessagePack parameters None.
+   * @par Chunk outputs `outputs[0]` is their dynamically sized elementwise
+   * difference, truncated to the shorter input length.
+   */
   registry.register_kernel(
       KernelDesc{.name = "particle_subtract",
                  .n_inputs = 2,
@@ -1339,6 +1467,13 @@ void register_particle_kernels(KernelRegistry &registry) {
         outputs[0].commit_dynamic_extent(n);
         return hpx::make_ready_future();
       });
+  /**
+   * @brief Computes elementwise Euclidean distances between two 3D point arrays.
+   * @par Chunk inputs Six f64 arrays ordered as first x/y/z then second x/y/z.
+   * @par MessagePack parameters None.
+   * @par Chunk outputs `outputs[0]` is a dynamically sized f64 distance array,
+   * truncated to the shortest input length.
+   */
   registry.register_kernel(
       KernelDesc{.name = "particle_distance3",
                  .n_inputs = 6,
@@ -1367,6 +1502,12 @@ void register_particle_kernels(KernelRegistry &registry) {
         outputs[0].commit_dynamic_extent(n);
         return hpx::make_ready_future();
       });
+  /**
+   * @brief Sums all values in a particle array.
+   * @par Chunk inputs `inputs[0]` is an f64 particle array.
+   * @par MessagePack parameters None.
+   * @par Chunk outputs `outputs[0]` is one f64 sum.
+   */
   registry.register_kernel(
       KernelDesc{.name = "particle_sum",
                  .n_inputs = 1,
@@ -1387,6 +1528,12 @@ void register_particle_kernels(KernelRegistry &registry) {
         outputs[0].mutable_array<double>()(0) = sum;
         return hpx::make_ready_future();
       });
+  /**
+   * @brief Counts nonzero entries in a particle mask.
+   * @par Chunk inputs `inputs[0]` is a u8 particle mask.
+   * @par MessagePack parameters None.
+   * @par Chunk outputs `outputs[0]` is one signed 64-bit count.
+   */
   registry.register_kernel(
       KernelDesc{.name = "particle_count",
                  .n_inputs = 1,
@@ -1409,6 +1556,12 @@ void register_particle_kernels(KernelRegistry &registry) {
         outputs[0].mutable_array<std::int64_t>()(0) = count;
         return hpx::make_ready_future();
       });
+  /**
+   * @brief Returns the number of values in a double-precision particle array.
+   * @par Chunk inputs `inputs[0]` is an f64 particle array.
+   * @par MessagePack parameters None.
+   * @par Chunk outputs `outputs[0]` is one signed 64-bit length.
+   */
   registry.register_kernel(
       KernelDesc{.name = "particle_len_f64",
                  .n_inputs = 1,
@@ -1425,6 +1578,12 @@ void register_particle_kernels(KernelRegistry &registry) {
         outputs[0].mutable_array<std::int64_t>()(0) = n;
         return hpx::make_ready_future();
       });
+  /**
+   * @brief Merges encoded particle-value occurrence counts.
+   * @par Chunk inputs `inputs[0..N)` are opaque encoded value-count maps.
+   * @par MessagePack parameters None.
+   * @par Chunk outputs `outputs[0]` is the dynamically sized opaque merged map.
+   */
   registry.register_kernel(
       KernelDesc{.name = "particle_value_counts_reduce",
                  .n_inputs = 1,
@@ -1467,6 +1626,12 @@ void register_particle_kernels(KernelRegistry &registry) {
         return output_bytes / width +
                static_cast<std::uint64_t>(output_bytes % width != 0);
       });
+  /**
+   * @brief Sums signed 64-bit scalar partial results.
+   * @par Chunk inputs `inputs[0..N)` each contain one signed 64-bit scalar.
+   * @par MessagePack parameters None.
+   * @par Chunk outputs `outputs[0]` is one signed 64-bit total.
+   */
   registry.register_kernel(
       KernelDesc{.name = "particle_int64_sum_reduce",
                  .n_inputs = 1,
@@ -1488,6 +1653,13 @@ void register_particle_kernels(KernelRegistry &registry) {
         outputs[0].mutable_array<std::int64_t>()(0) = total;
         return hpx::make_ready_future();
       });
+  /**
+   * @brief Reduces finite scalar partial results to their minimum.
+   * @par Chunk inputs `inputs[0..N)` each contain one f64 scalar.
+   * @par MessagePack parameters None.
+   * @par Chunk outputs `outputs[0]` is the smallest finite input, or positive
+   * infinity when none is finite.
+   */
   registry.register_kernel(
       KernelDesc{.name = "particle_scalar_min_reduce",
                  .n_inputs = 1,
@@ -1518,6 +1690,13 @@ void register_particle_kernels(KernelRegistry &registry) {
             any ? out_v : std::numeric_limits<double>::infinity();
         return hpx::make_ready_future();
       });
+  /**
+   * @brief Reduces finite scalar partial results to their maximum.
+   * @par Chunk inputs `inputs[0..N)` each contain one f64 scalar.
+   * @par MessagePack parameters None.
+   * @par Chunk outputs `outputs[0]` is the largest finite input, or negative
+   * infinity when none is finite.
+   */
   registry.register_kernel(
       KernelDesc{.name = "particle_scalar_max_reduce",
                  .n_inputs = 1,

@@ -92,6 +92,17 @@ void register_flux_kernels(KernelRegistry &registry) {
       return params;
     };
 
+    /**
+     * @brief Accumulates fluxes through concentric spherical surfaces.
+     * @par Chunk inputs Real block grids ordered as density, momentum x/y/z,
+     * total energy, passive scalar, and magnetic field x/y/z; an optional tenth
+     * input supplies temperature when temperature binning is enabled.
+     * @par MessagePack parameters `radii` (or `radius`), `radius_indices`,
+     * `num_radii`, `temperature_bins`, `gamma`, and `covered_boxes` select the
+     * surfaces, output slots, thermodynamic bins, equation of state, and AMR mask.
+     * @par Chunk outputs `outputs[0]` is an f64 tensor of inward/outward mass,
+     * momentum, energy, and passive-scalar flux for each radius and temperature bin.
+     */
     registry.register_kernel(
         KernelDesc{.name = "flux_surface_integral_accumulate",
                    .n_inputs = 9,
@@ -512,6 +523,19 @@ void register_flux_kernels(KernelRegistry &registry) {
       return params;
     };
 
+    /**
+     * @brief Accumulates fluxes through concentric cylindrical surfaces.
+     * @par Chunk inputs Real block grids ordered as density, momentum x/y/z,
+     * total energy, passive scalar, and magnetic field x/y/z; an optional tenth
+     * input supplies temperature when temperature binning is enabled.
+     * @par MessagePack parameters `radius`, `heights`, `height_indices`,
+     * `num_heights`, `temperature_bins`, `gamma`, and `covered_boxes` select the
+     * cylinder sections, output slots, thermodynamic bins, equation of state, and
+     * AMR mask.
+     * @par Chunk outputs `outputs[0]` is an f64 tensor of inward/outward mass,
+     * momentum, energy, and passive-scalar flux for each cylindrical section and
+     * temperature bin.
+     */
     registry.register_kernel(
         KernelDesc{.name = "cylindrical_flux_surface_integral_accumulate",
                    .n_inputs = 9,

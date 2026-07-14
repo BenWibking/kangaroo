@@ -6,6 +6,12 @@ namespace kangaroo {
 
 void register_reduction_kernels(KernelRegistry &registry) {
   {
+    /**
+     * @brief Adds two matching partial uniform-slice buffers elementwise.
+     * @par Chunk inputs `inputs[0]` and `inputs[1]` are matching f32 or f64 arrays.
+     * @par MessagePack parameters None.
+     * @par Chunk outputs `outputs[0]` is their elementwise sum with matching shape.
+     */
     registry.register_kernel(
         KernelDesc{.name = "uniform_slice_add",
                    .n_inputs = 2,
@@ -36,6 +42,15 @@ void register_reduction_kernels(KernelRegistry &registry) {
       }
       return params;
     };
+    /**
+     * @brief Converts accumulated slice sums and areas into finalized pixel values.
+     * @par Chunk inputs `inputs[0]` and `inputs[1]` are matching f64 value-sum and
+     * sampled-area images.
+     * @par MessagePack parameters `pixel_area` is the physical area of one output
+     * pixel.
+     * @par Chunk outputs `outputs[0]` is an f32 or f64 image of value sum divided
+     * by `pixel_area`, with NaN where sampled area is zero.
+     */
     registry.register_kernel(
         KernelDesc{.name = "uniform_slice_finalize",
                    .n_inputs = 2,
@@ -93,6 +108,12 @@ void register_reduction_kernels(KernelRegistry &registry) {
         make_kernel_params_preparer<Params>(decode_params));
   }
   {
+    /**
+     * @brief Reduces matching partial uniform-slice buffers by elementwise addition.
+     * @par Chunk inputs `inputs[0..N)` are matching f32 or f64 partial arrays.
+     * @par MessagePack parameters None.
+     * @par Chunk outputs `outputs[0]` is their elementwise sum with matching shape.
+     */
     registry.register_kernel(
         KernelDesc{.name = "uniform_slice_reduce",
                    .n_inputs = 1,

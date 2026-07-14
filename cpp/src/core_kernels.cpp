@@ -30,6 +30,14 @@ void register_core_kernels(KernelRegistry &registry) {
       return params;
     };
 
+    /**
+     * @brief Fetches an AMR sub-box and packs its selected cells contiguously.
+     * @par Chunk inputs None; source chunks are fetched from the data service.
+     * @par MessagePack parameters `input_field`, `input_version`, `input_step`,
+     * `input_level`, and `halo_cells` identify and expand the source region.
+     * @par Chunk outputs `outputs[0]` is an opaque, dynamically sized packed AMR
+     * sub-box payload.
+     */
     registry.register_kernel(
         KernelDesc{.name = "amr_subbox_fetch_pack",
                    .n_inputs = 0,
@@ -212,6 +220,15 @@ void register_core_kernels(KernelRegistry &registry) {
       return params;
     };
 
+    /**
+     * @brief Computes the selected velocity-gradient component on a grid block.
+     * @par Chunk inputs `inputs[0]` is the local scalar grid; `inputs[1]`, when
+     * supplied, is the opaque packed AMR halo payload.
+     * @par MessagePack parameters `input_field`, `input_version`, `input_step`,
+     * `input_level`, and `stencil_radius` identify the halo source and stencil.
+     * @par Chunk outputs `outputs[0]` is an f64 block grid with three gradient
+     * components per cell.
+     */
     registry.register_kernel(
         KernelDesc{.name = "gradU_stencil",
                    .n_inputs = 1,
@@ -460,6 +477,13 @@ void register_core_kernels(KernelRegistry &registry) {
       return params;
     };
 
+    /**
+     * @brief Loads one plotfile field component for a grid block.
+     * @par Chunk inputs None.
+     * @par MessagePack parameters `plotfile` is the source path, `level` selects
+     * the AMR level, and `comp` selects the field component.
+     * @par Chunk outputs `outputs[0]` is the selected component on the block grid.
+     */
     registry.register_kernel(
         KernelDesc{.name = "plotfile_load",
                    .n_inputs = 0,
