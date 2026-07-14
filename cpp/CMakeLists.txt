@@ -63,6 +63,7 @@ set(KANGAROO_RUNTIME_SOURCES
   src/buffer_resolution.cpp
   src/chunk_buffer.cpp
   src/data_service_local.cpp
+  src/dataset_backend.cpp
   src/executor.cpp
   src/kernel_registry.cpp
   src/param_decode.cpp

@@ -11,13 +11,15 @@ class MemoryBackend : public DatasetBackend {
  public:
   MemoryBackend() = default;
 
+  std::string kind() const override { return "memory"; }
   std::optional<ChunkBuffer> get_chunk(const ChunkRef& ref) override;
   bool has_chunk(const ChunkRef& ref) const override;
   std::optional<BufferDesc> describe_chunk(const ChunkRef& ref) const override;
   std::size_t estimate_chunk_bytes(const ChunkRef& ref) const override;
-  DatasetMetadata get_metadata() const override;
+  DatasetMetadata metadata(int32_t step) const override;
 
-  void set_chunk(const ChunkRef& ref, ChunkBuffer view);
+  void set_chunk(const ChunkRef& ref, ChunkBuffer view) override;
+  DatasetBackendSnapshot snapshot() const override;
 
   const std::unordered_map<ChunkRef, ChunkBuffer, ChunkRefHash, ChunkRefEq>& data() const {
     return data_;

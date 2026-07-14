@@ -4,6 +4,10 @@
 #include "kangaroo/chunk_buffer.hpp"
 #include "kangaroo/data_service_local.hpp"
 
+#ifdef KANGAROO_USE_PARTHENON_HDF5
+#include "kangaroo/backend_parthenon.hpp"
+#endif
+
 #ifdef KANGAROO_USE_NANOBIND
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/list.h>
@@ -1111,102 +1115,40 @@ NB_MODULE(_core, m) {
         self->step = step;
         self->level = level;
 
-        if (uri.rfind("amrex://", 0) == 0 || uri.rfind("file://", 0) == 0) {
-            std::string path = uri;
-            if (uri.rfind("amrex://", 0) == 0) {
-                path = uri.substr(8);
-            } else {
-                path = uri.substr(7);
-            }
-            bool as_parthenon = false;
-            if (path.size() >= 5) {
-              const auto suffix = path.substr(path.size() - 5);
-              as_parthenon = (suffix == ".phdf" || suffix == ".hdf5");
-            }
-            if (!as_parthenon && path.size() >= 3) {
-              const auto suffix = path.substr(path.size() - 3);
-              as_parthenon = (suffix == ".h5");
-            }
-            if (as_parthenon) {
-#ifdef KANGAROO_USE_PARTHENON_HDF5
-              self->backend = std::make_shared<kangaroo::ParthenonBackend>(path);
-#else
-              throw std::runtime_error("Parthenon backend not enabled in this build");
-#endif
-            } else {
-              self->backend = std::make_shared<kangaroo::PlotfileBackend>(path);
-            }
-        } else if (uri.rfind("parthenon://", 0) == 0) {
-#ifdef KANGAROO_USE_PARTHENON_HDF5
-            std::string path = uri.substr(12);
-            self->backend = std::make_shared<kangaroo::ParthenonBackend>(path);
-#else
-            throw std::runtime_error("Parthenon backend not enabled in this build");
-#endif
-        } else if (uri.rfind("openpmd://", 0) == 0) {
-#ifdef KANGAROO_USE_OPENPMD
-            self->backend = std::make_shared<kangaroo::OpenPMDBackend>(uri);
-#else
-            throw std::runtime_error("openPMD backend not enabled in this build");
-#endif
-        } else if (uri.rfind("memory://", 0) == 0) {
-            self->backend = std::make_shared<kangaroo::MemoryBackend>();
-        } else {
-            throw std::runtime_error("unsupported dataset URI scheme: " + uri);
-        }
+        self->backend = kangaroo::make_dataset_backend(uri);
+      })
+      .def("kind", [](const kangaroo::DatasetHandle& self) {
+        return self.backend ? self.backend->kind() : std::string("unknown");
       })
       .def("register_field", [](kangaroo::DatasetHandle& self, int32_t field_id, int32_t component) {
-          if (auto plt = std::dynamic_pointer_cast<kangaroo::PlotfileBackend>(self.backend)) {
-              plt->register_field(field_id, component);
+          if (self.backend) {
+            self.backend->register_field_component(field_id, component);
           }
       })
       .def("register_field", [](kangaroo::DatasetHandle& self, int32_t field_id,
                                 const std::string& name) {
-#ifdef KANGAROO_USE_OPENPMD
-          if (auto opmd = std::dynamic_pointer_cast<kangaroo::OpenPMDBackend>(self.backend)) {
-              opmd->register_field(field_id, name);
-              return;
+          if (self.backend) {
+            self.backend->register_field(field_id, name);
           }
-#else
-          (void)self;
-          (void)field_id;
-          (void)name;
-#endif
-#ifdef KANGAROO_USE_PARTHENON_HDF5
-          if (auto phdf = std::dynamic_pointer_cast<kangaroo::ParthenonBackend>(self.backend)) {
-              phdf->register_field(field_id, name);
-          }
-#endif
       })
       .def("list_meshes", [](kangaroo::DatasetHandle& self) -> nb::list {
-#ifdef KANGAROO_USE_OPENPMD
-          if (auto opmd = std::dynamic_pointer_cast<kangaroo::OpenPMDBackend>(self.backend)) {
-              nb::list out;
-              for (const auto& name : opmd->list_meshes(self.step)) {
-                  out.append(name);
-              }
-              return out;
+          nb::list out;
+          if (self.backend) {
+            for (const auto& name : self.backend->list_meshes(self.step)) {
+              out.append(name);
+            }
           }
-#endif
-          return nb::list();
+          return out;
       })
       .def("select_mesh", [](kangaroo::DatasetHandle& self, const std::string& name) {
-#ifdef KANGAROO_USE_OPENPMD
-          if (auto opmd = std::dynamic_pointer_cast<kangaroo::OpenPMDBackend>(self.backend)) {
-              opmd->select_mesh(name);
+          if (self.backend) {
+            self.backend->select_mesh(name);
           }
-#else
-          (void)self;
-          (void)name;
-#endif
       })
       .def("list_particle_types", [](kangaroo::DatasetHandle& self) -> nb::list {
           nb::list out;
-          if (!self.backend) {
-            return out;
-          }
-          if (auto* reader = self.backend->get_plotfile_reader()) {
-            for (const auto& name : reader->particle_types()) {
+          if (self.backend) {
+            for (const auto& name : self.backend->list_particle_types()) {
               out.append(name);
             }
           }
@@ -1217,10 +1159,8 @@ NB_MODULE(_core, m) {
           if (!self.backend) {
             return out;
           }
-          if (auto* reader = self.backend->get_plotfile_reader()) {
-            for (const auto& name : reader->particle_fields(particle_type)) {
-              out.append(name);
-            }
+          for (const auto& name : self.backend->list_particle_fields(particle_type)) {
+            out.append(name);
           }
           return out;
       }, nb::arg("particle_type"))
@@ -1229,12 +1169,7 @@ NB_MODULE(_core, m) {
              if (!self.backend) {
                throw std::runtime_error("dataset backend is not initialized");
              }
-             auto* reader = self.backend->get_plotfile_reader();
-             if (!reader) {
-               throw std::runtime_error(
-                   "particle chunk metadata is only supported for AMReX plotfiles");
-             }
-             return reader->particle_chunk_count(particle_type);
+             return self.backend->particle_chunk_count(particle_type);
            },
            nb::arg("particle_type"))
       .def("read_particle_field_chunk",
@@ -1243,12 +1178,8 @@ NB_MODULE(_core, m) {
              if (!self.backend) {
                throw std::runtime_error("dataset backend is not initialized");
              }
-             auto* reader = self.backend->get_plotfile_reader();
-             if (!reader) {
-               throw std::runtime_error(
-                   "particle chunked field access is only supported for AMReX plotfiles");
-             }
-             auto data = reader->read_particle_field_chunk(particle_type, field_name, chunk_index);
+             auto data = self.backend->read_particle_field_chunk(
+                 particle_type, field_name, chunk_index);
              nb::dict out;
              out["count"] = data.count;
              out["dtype"] = data.dtype;
@@ -1261,142 +1192,55 @@ NB_MODULE(_core, m) {
            nb::arg("chunk_index"))
       .def("metadata", [](kangaroo::DatasetHandle& self) -> nb::dict {
           if (!self.backend) return nb::dict();
-          auto* reader = self.backend->get_plotfile_reader();
-          if (reader) {
-
-            const auto& hdr = reader->header();
-            nb::dict d;
-            d["var_names"] = hdr.var_names;
-            d["finest_level"] = hdr.finest_level;
-            d["time"] = hdr.time;
-            d["prob_lo"] = hdr.prob_lo;
-            d["prob_hi"] = hdr.prob_hi;
-            d["ref_ratio"] = hdr.ref_ratio;
-            d["cell_size"] = hdr.cell_size;
-            
-            auto to_tuple = [](const kangaroo::plotfile::IntVect& iv) {
-              return nb::make_tuple(iv.x, iv.y, iv.z);
-            };
-            auto box_to_tuple = [&](const kangaroo::plotfile::Box& box) {
-              return nb::make_tuple(to_tuple(box.lo), to_tuple(box.hi));
-            };
-
-            nb::list levels;
-            for (int level = 0; level <= hdr.finest_level; ++level) {
-              nb::list boxes;
-              const auto& vismf = reader->vismf_header(level);
-              for (const auto& box : vismf.box_array.boxes) {
-                boxes.append(box_to_tuple(box));
-              }
-              levels.append(boxes);
-            }
-            d["level_boxes"] = levels;
-
-            nb::list prob_domains;
-            for (const auto& box : hdr.prob_domain) {
-              prob_domains.append(box_to_tuple(box));
-            }
-            d["prob_domain"] = prob_domains;
-
-            return d;
+          const auto meta = self.backend->metadata(self.step);
+          if (meta.finest_level < 0 && meta.var_names.empty() && meta.level_boxes.empty()) {
+            return nb::dict();
           }
 
-#ifdef KANGAROO_USE_OPENPMD
-          if (auto opmd = std::dynamic_pointer_cast<kangaroo::OpenPMDBackend>(self.backend)) {
-            auto meta = opmd->metadata(self.step);
-            nb::dict d;
-            nb::list var_names;
-            for (const auto& field : meta.fields) {
-              var_names.append(field.name);
-            }
-            d["var_names"] = var_names;
-            d["mesh_names"] = meta.mesh_names;
-            d["selected_mesh"] = meta.selected_mesh;
-            d["finest_level"] = meta.finest_level;
-            d["prob_lo"] = nb::make_tuple(meta.prob_lo[0], meta.prob_lo[1], meta.prob_lo[2]);
-            d["prob_hi"] = nb::make_tuple(meta.prob_hi[0], meta.prob_hi[1], meta.prob_hi[2]);
+          nb::dict out;
+          out["var_names"] = meta.var_names;
+          out["mesh_names"] = meta.mesh_names;
+          out["selected_mesh"] = meta.selected_mesh;
+          out["finest_level"] = meta.finest_level;
+          out["time"] = meta.time;
+          out["prob_lo"] = meta.prob_lo;
+          out["prob_hi"] = meta.prob_hi;
+          out["ref_ratio"] = meta.ref_ratio;
+          out["cell_size"] = meta.cell_size;
 
-            nb::list ref_ratio;
-            for (const auto& ratio : meta.ref_ratio) {
-              ref_ratio.append(ratio[0]);
+          auto box_to_tuple = [](const kangaroo::DatasetBox& box) {
+            auto lo = nb::make_tuple(box.lo[0], box.lo[1], box.lo[2]);
+            auto hi = nb::make_tuple(box.hi[0], box.hi[1], box.hi[2]);
+            return nb::make_tuple(lo, hi);
+          };
+          nb::list levels;
+          for (const auto& level : meta.level_boxes) {
+            nb::list boxes;
+            for (const auto& box : level) {
+              boxes.append(box_to_tuple(box));
             }
-            d["ref_ratio"] = ref_ratio;
-
-            nb::list cell_size;
-            for (const auto& size : meta.cell_size) {
-              cell_size.append(nb::make_tuple(size[0], size[1], size[2]));
-            }
-            d["cell_size"] = cell_size;
-
-            nb::list levels;
-            for (const auto& level_boxes : meta.level_boxes) {
-              nb::list boxes;
-              for (const auto& box : level_boxes) {
-                auto lo = nb::make_tuple(box.first[0], box.first[1], box.first[2]);
-                auto hi = nb::make_tuple(box.second[0], box.second[1], box.second[2]);
-                boxes.append(nb::make_tuple(lo, hi));
-              }
-              levels.append(boxes);
-            }
-            d["level_boxes"] = levels;
-
-            nb::list prob_domains;
-            for (const auto& box : meta.prob_domain) {
-              auto lo = nb::make_tuple(box.first[0], box.first[1], box.first[2]);
-              auto hi = nb::make_tuple(box.second[0], box.second[1], box.second[2]);
-              prob_domains.append(nb::make_tuple(lo, hi));
-            }
-            d["prob_domain"] = prob_domains;
-
-            return d;
+            levels.append(boxes);
           }
-#endif
-#ifdef KANGAROO_USE_PARTHENON_HDF5
-          if (auto phdf = std::dynamic_pointer_cast<kangaroo::ParthenonBackend>(self.backend)) {
-            auto meta = phdf->metadata();
-            nb::dict d;
-            d["var_names"] = meta.var_names;
-            d["finest_level"] = meta.finest_level;
-            d["prob_lo"] = meta.prob_lo;
-            d["prob_hi"] = meta.prob_hi;
-            d["ref_ratio"] = meta.ref_ratio;
-            d["cell_size"] = meta.cell_size;
-            d["time"] = meta.time;
+          out["level_boxes"] = levels;
 
-            nb::dict vinfo;
-            for (const auto& field : meta.fields) {
-              nb::dict entry;
-              entry["num_components"] = field.num_components;
-              entry["component_names"] = field.component_names;
-              entry["type"] = field.type;
-              vinfo[field.name.c_str()] = entry;
-            }
-            d["variable_info"] = vinfo;
-
-            nb::list levels;
-            nb::list prob_domains;
-            for (size_t i = 0; i < meta.level_boxes.size(); ++i) {
-              nb::list boxes;
-              for (const auto& box : meta.level_boxes[i]) {
-                auto lo = nb::make_tuple(box.first[0], box.first[1], box.first[2]);
-                auto hi = nb::make_tuple(box.second[0], box.second[1], box.second[2]);
-                boxes.append(nb::make_tuple(lo, hi));
-              }
-              levels.append(boxes);
-
-              auto dom_lo = nb::make_tuple(meta.prob_domain[i].first[0], meta.prob_domain[i].first[1],
-                                           meta.prob_domain[i].first[2]);
-              auto dom_hi = nb::make_tuple(meta.prob_domain[i].second[0], meta.prob_domain[i].second[1],
-                                           meta.prob_domain[i].second[2]);
-              prob_domains.append(nb::make_tuple(dom_lo, dom_hi));
-            }
-            d["level_boxes"] = levels;
-            d["prob_domain"] = prob_domains;
-            return d;
+          nb::list prob_domains;
+          for (const auto& box : meta.prob_domain) {
+            prob_domains.append(box_to_tuple(box));
           }
-#endif
+          out["prob_domain"] = prob_domains;
 
-          return nb::dict();
+          nb::dict variable_info;
+          for (const auto& field : meta.fields) {
+            nb::dict entry;
+            entry["num_components"] = field.num_components;
+            entry["component_names"] = field.component_names;
+            entry["type"] = field.type;
+            variable_info[field.name.c_str()] = entry;
+          }
+          if (!meta.fields.empty()) {
+            out["variable_info"] = variable_info;
+          }
+          return out;
       })
       .def("set_chunk",
            [](kangaroo::DatasetHandle& self, int32_t field, int32_t version, int32_t block,

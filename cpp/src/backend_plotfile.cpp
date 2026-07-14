@@ -290,13 +290,81 @@ std::optional<std::uint64_t> PlotfileBackend::estimate_particle_chunk_records(
   return static_cast<std::uint64_t>(std::max<std::int64_t>(0, records));
 }
 
-DatasetMetadata PlotfileBackend::get_metadata() const {
+DatasetMetadata PlotfileBackend::metadata(int32_t) const {
   DatasetMetadata meta;
   const auto& h = reader_.header();
+  meta.var_names = h.var_names;
+  meta.finest_level = h.finest_level;
+  meta.time = h.time;
   meta.prob_lo = h.prob_lo;
   meta.prob_hi = h.prob_hi;
   meta.ref_ratio = h.ref_ratio;
+  meta.cell_size = h.cell_size;
+  meta.prob_domain.reserve(h.prob_domain.size());
+  for (const auto& box : h.prob_domain) {
+    meta.prob_domain.push_back(DatasetBox{
+        .lo = {box.lo.x, box.lo.y, box.lo.z},
+        .hi = {box.hi.x, box.hi.y, box.hi.z},
+    });
+  }
+  meta.level_boxes.reserve(static_cast<std::size_t>(h.finest_level + 1));
+  for (int level = 0; level <= h.finest_level; ++level) {
+    std::vector<DatasetBox> boxes;
+    for (const auto& box : reader_.vismf_header(level).box_array.boxes) {
+      boxes.push_back(DatasetBox{
+          .lo = {box.lo.x, box.lo.y, box.lo.z},
+          .hi = {box.hi.x, box.hi.y, box.hi.z},
+      });
+    }
+    meta.level_boxes.push_back(std::move(boxes));
+  }
   return meta;
+}
+
+void PlotfileBackend::register_field(int32_t field_id, const std::string& name) {
+  const auto& names = reader_.header().var_names;
+  const auto it = std::find(names.begin(), names.end(), name);
+  if (it == names.end()) {
+    throw std::runtime_error("plotfile field not found: " + name);
+  }
+  register_field(field_id, static_cast<int32_t>(std::distance(names.begin(), it)));
+}
+
+void PlotfileBackend::register_field_component(int32_t field_id, int32_t component_index) {
+  register_field(field_id, component_index);
+}
+
+std::vector<std::string> PlotfileBackend::list_particle_types() const {
+  return reader_.particle_types();
+}
+
+std::vector<std::string> PlotfileBackend::list_particle_fields(
+    const std::string& particle_type) const {
+  return reader_.particle_fields(particle_type);
+}
+
+int64_t PlotfileBackend::particle_chunk_count(const std::string& particle_type) const {
+  return reader_.particle_chunk_count(particle_type);
+}
+
+ParticleFieldChunk PlotfileBackend::read_particle_field_chunk(
+    const std::string& particle_type, const std::string& field_name,
+    int64_t chunk_index) const {
+  auto data = reader_.read_particle_field_chunk(particle_type, field_name, chunk_index);
+  return ParticleFieldChunk{
+      .bytes = std::move(data.bytes), .dtype = std::move(data.dtype), .count = data.count};
+}
+
+ParticleFieldChunk PlotfileBackend::read_particle_field_grid(
+    const std::string& particle_type, const std::string& field_name,
+    int level, int grid_index) const {
+  auto data = reader_.read_particle_field_grid(particle_type, field_name, level, grid_index);
+  return ParticleFieldChunk{
+      .bytes = std::move(data.bytes), .dtype = std::move(data.dtype), .count = data.count};
+}
+
+DatasetBackendSnapshot PlotfileBackend::snapshot() const {
+  return DatasetBackendSnapshot{.kind = kind(), .component_fields = field_map()};
 }
 
 void PlotfileBackend::register_field(int32_t field_id, int32_t component_index) {
