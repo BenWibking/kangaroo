@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import struct
 
+import pytest
+
 from analysis.buffer import (
     BufferSpec,
     DType,
@@ -37,6 +39,39 @@ def _runmeta(nblocks: int) -> RunMeta:
             )
         ]
     )
+
+
+def test_plan_preparation_rejects_missing_dynamic_bound_evaluator() -> None:
+    rt = Runtime()
+    runmeta = _runmeta(1)
+    ds = open_dataset(
+        "memory://missing-dynamic-bound",
+        runmeta=runmeta,
+        step=0,
+        level=0,
+        runtime=rt,
+    )
+    stage = Stage(name="invalid_dynamic_bound")
+    stage.map_blocks(
+        name="field_expr_with_backend_bound",
+        kernel="field_expr",
+        domain=Domain(step=0, level=0),
+        inputs=[FieldRef(1)],
+        outputs=[
+            OutputRef(
+                FieldRef(2),
+                BufferSpec(
+                    DType.F64,
+                    DynamicShape(DynamicUpperBound.backend_chunk()),
+                ),
+            )
+        ],
+        deps={"kind": "None"},
+        params={"expression": "value", "variables": ["value"]},
+    )
+
+    with pytest.raises(RuntimeError, match="does not define its dynamic output bound"):
+        rt.run(Plan(stages=[stage]), runmeta=runmeta, dataset=ds)
 
 
 def _set_scalar(ds, *, field: int, block: int, value: float) -> None:

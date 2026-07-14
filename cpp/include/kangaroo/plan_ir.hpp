@@ -14,6 +14,8 @@
 
 namespace kangaroo {
 
+class DynamicOutputBoundEvaluator;
+
 enum class ExecPlane : uint8_t { Chunk = 0, Graph = 1, Mixed = 2 };
 
 struct DomainIR {
@@ -136,6 +138,7 @@ struct TaskTemplateIR {
   int32_t covered_boxes_ref = -1;
   std::vector<std::uint8_t> params_msgpack;
   std::shared_ptr<const KernelFn> kernel_fn;           // locality-local prepared metadata
+  std::shared_ptr<const DynamicOutputBoundEvaluator> dynamic_output_bound;  // locality-local
   std::optional<GraphReduceSpecIR> graph_reduce;       // locality-local prepared metadata
   std::shared_ptr<const void> prepared_params;         // locality-local prepared metadata
   std::type_index prepared_params_type{typeid(void)};  // locality-local prepared metadata

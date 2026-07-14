@@ -1,5 +1,6 @@
 #include "kangaroo/runtime.hpp"
 #include "kangaroo/amr_patch_codec.hpp"
+#include "kangaroo/buffer_resolution.hpp"
 #include "kangaroo/chunk_buffer.hpp"
 #include "kangaroo/data_service_local.hpp"
 
@@ -12,6 +13,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <limits>
 
 #include <hpx/serialization/serialize.hpp>
 #include <hpx/version.hpp>
@@ -283,23 +285,34 @@ nb::dict subbox_view_dict(const kangaroo::SubboxView& view) {
   return d;
 }
 
-class DynamicBoundTestBackend final : public kangaroo::DatasetBackend {
+class DynamicBoundTestData final : public kangaroo::DataService {
  public:
-  DynamicBoundTestBackend(std::uint64_t particle_records, std::size_t chunk_bytes)
+  DynamicBoundTestData(std::uint64_t particle_records, std::size_t chunk_bytes)
       : particle_records_(particle_records), chunk_bytes_(chunk_bytes) {}
 
-  std::optional<kangaroo::ChunkBuffer> get_chunk(const kangaroo::ChunkRef&) override {
-    return std::nullopt;
-  }
-  bool has_chunk(const kangaroo::ChunkRef&) const override { return true; }
-  std::size_t estimate_chunk_bytes(const kangaroo::ChunkRef& ref) const override {
+  int home_rank(const kangaroo::ChunkRef&) const override { return 0; }
+  std::size_t estimate_host_bytes(const kangaroo::ChunkRef& ref) const override {
     return ref.block == 1 ? chunk_bytes_ : sizeof(double);
   }
   std::optional<std::uint64_t> estimate_particle_chunk_records(
       const std::string&, std::int64_t) const override {
     return particle_records_;
   }
-  kangaroo::DatasetMetadata get_metadata() const override { return {}; }
+  kangaroo::ChunkBuffer alloc_host(
+      const kangaroo::ChunkRef&, const kangaroo::ResolvedBufferSpec&) override {
+    throw std::runtime_error("test data store does not allocate");
+  }
+  hpx::future<kangaroo::ChunkBuffer> get_host(const kangaroo::ChunkRef&) override {
+    return hpx::make_exceptional_future<kangaroo::ChunkBuffer>(
+        std::runtime_error("test data store does not load"));
+  }
+  hpx::future<kangaroo::SubboxView> get_subbox(const kangaroo::ChunkSubboxRef&) override {
+    return hpx::make_exceptional_future<kangaroo::SubboxView>(
+        std::runtime_error("test data store does not load subboxes"));
+  }
+  hpx::future<void> put_host(const kangaroo::ChunkRef&, kangaroo::ChunkBuffer) override {
+    return hpx::make_ready_future();
+  }
 
  private:
   std::uint64_t particle_records_ = 0;
@@ -599,8 +612,7 @@ NB_MODULE(_core, m) {
   m.def("test_backend_chunk_dynamic_capacity",
         [](const std::string& dtype, const std::string& kernel,
            std::uint64_t particle_records, const std::vector<std::uint64_t>& input_bytes) {
-          kangaroo::DatasetHandle dataset;
-          dataset.backend = std::make_shared<DynamicBoundTestBackend>(particle_records, 0);
+          DynamicBoundTestData data(particle_records, 0);
           kangaroo::RunMeta meta;
           kangaroo::LevelMeta level;
           level.geom.dx[0] = level.geom.dx[1] = level.geom.dx[2] = 1.0;
@@ -610,6 +622,26 @@ NB_MODULE(_core, m) {
           kangaroo::TaskTemplateIR task;
           task.kernel = kernel;
           task.params_msgpack = pack_particle_bound_params();
+          task.dynamic_output_bound =
+              std::make_shared<const kangaroo::DynamicOutputBoundEvaluator>(
+                  [kernel](const kangaroo::DynamicOutputBoundContext& context)
+                      -> std::optional<std::uint64_t> {
+                    if (kernel == "particle_value_counts_reduce") {
+                      std::uint64_t bytes = 0;
+                      for (const auto& input : context.inputs) {
+                        bytes = kangaroo::checked_add(bytes, input.payload_bytes);
+                      }
+                      return bytes;
+                    }
+                    const auto records = context.data.estimate_particle_chunk_records(
+                        "particles", context.block);
+                    if (!records.has_value()) return std::nullopt;
+                    if (kernel == "particle_load_field_chunk_f64") return *records;
+                    return kangaroo::checked_add(
+                        sizeof(std::uint64_t),
+                        kangaroo::checked_multiply(
+                            *records, sizeof(double) + sizeof(std::int64_t)));
+                  });
           kangaroo::BufferSpecIR spec;
           spec.scalar = parse_scalar_type(dtype);
           spec.shape_kind = kangaroo::ShapeRuleKind::kDynamic;
@@ -621,12 +653,26 @@ NB_MODULE(_core, m) {
                 std::vector<std::uint8_t>(static_cast<std::size_t>(bytes))));
           }
           const auto resolved = kangaroo::resolve_output_spec_for_task(
-              spec, task, dataset, meta, 0, 0, 0, inputs);
+              spec, task, data, meta, 0, 0, 0, 0, inputs);
           return *resolved.dynamic_capacity_elements;
         });
+  m.def("test_block_shape_extent", [](std::int32_t lo, std::int32_t hi) {
+    DynamicBoundTestData data(0, 0);
+    kangaroo::RunMeta meta;
+    kangaroo::LevelMeta level;
+    level.boxes.push_back(kangaroo::BlockBox{{lo, 0, 0}, {hi, 0, 0}});
+    meta.steps.push_back(kangaroo::StepMeta{0, {level}});
+
+    kangaroo::TaskTemplateIR task;
+    kangaroo::BufferSpecIR spec;
+    spec.scalar = kangaroo::ScalarType::kU8;
+    spec.shape_kind = kangaroo::ShapeRuleKind::kBlock;
+    const auto resolved = kangaroo::resolve_output_spec_for_task(
+        spec, task, data, meta, 0, 0, 0, 0, {});
+    return resolved.desc.extents[0];
+  });
   m.def("test_amr_subbox_dynamic_capacity", [](std::uint64_t source_chunk_bytes) {
-    kangaroo::DatasetHandle dataset;
-    dataset.backend = std::make_shared<DynamicBoundTestBackend>(0, source_chunk_bytes);
+    DynamicBoundTestData data(0, source_chunk_bytes);
     kangaroo::RunMeta meta;
     kangaroo::LevelMeta level;
     level.geom.dx[0] = level.geom.dx[1] = level.geom.dx[2] = 1.0;
@@ -637,14 +683,70 @@ NB_MODULE(_core, m) {
     kangaroo::TaskTemplateIR task;
     task.kernel = "amr_subbox_fetch_pack";
     task.params_msgpack = pack_amr_bound_params();
+    task.dynamic_output_bound =
+        std::make_shared<const kangaroo::DynamicOutputBoundEvaluator>(
+            [](const kangaroo::DynamicOutputBoundContext& context) {
+              return kangaroo::estimate_amr_subbox_pack_capacity(
+                  context,
+                  kangaroo::AmrSubboxPackParams{
+                      .input_field = 11,
+                      .input_version = 0,
+                      .input_step = 0,
+                      .input_level = 0,
+                      .halo_cells = 1});
+            });
     kangaroo::BufferSpecIR spec;
     spec.scalar = kangaroo::ScalarType::kOpaque;
     spec.shape_kind = kangaroo::ShapeRuleKind::kDynamic;
     spec.dynamic_upper_bound.kind = kangaroo::DynamicUpperBoundKind::kAmrSubboxPack;
     const auto resolved = kangaroo::resolve_output_spec_for_task(
-        spec, task, dataset, meta, 0, 0, 0, {});
+        spec, task, data, meta, 0, 0, 0, 0, {});
     return *resolved.dynamic_capacity_elements;
   });
+  m.def("test_amr_subbox_dynamic_capacity_wide_coordinates",
+        [](std::uint64_t source_chunk_bytes, bool wide_source) {
+          DynamicBoundTestData data(0, source_chunk_bytes);
+          kangaroo::RunMeta meta;
+          kangaroo::LevelMeta level;
+          level.geom.dx[0] = level.geom.dx[1] = level.geom.dx[2] = 1.0;
+          if (wide_source) {
+            level.boxes.push_back(kangaroo::BlockBox{{0, 0, 0}, {0, 0, 0}});
+            level.boxes.push_back(kangaroo::BlockBox{
+                {std::numeric_limits<std::int32_t>::min(), 0, 0},
+                {std::numeric_limits<std::int32_t>::max(), 0, 0}});
+          } else {
+            level.geom.index_origin[0] = std::numeric_limits<std::int32_t>::max();
+            constexpr std::int32_t kTargetIndex =
+                std::numeric_limits<std::int32_t>::min() + 2;
+            level.boxes.push_back(
+                kangaroo::BlockBox{{kTargetIndex, 0, 0}, {kTargetIndex, 0, 0}});
+            level.boxes.push_back(kangaroo::BlockBox{
+                {kTargetIndex + 1, 0, 0}, {kTargetIndex + 1, 0, 0}});
+          }
+          meta.steps.push_back(kangaroo::StepMeta{0, {level}});
+
+          kangaroo::TaskTemplateIR task;
+          task.dynamic_output_bound =
+              std::make_shared<const kangaroo::DynamicOutputBoundEvaluator>(
+                  [](const kangaroo::DynamicOutputBoundContext& context) {
+                    return kangaroo::estimate_amr_subbox_pack_capacity(
+                        context,
+                        kangaroo::AmrSubboxPackParams{
+                            .input_field = 11,
+                            .input_version = 0,
+                            .input_step = 0,
+                            .input_level = 0,
+                            .halo_cells = 1});
+                  });
+          kangaroo::BufferSpecIR spec;
+          spec.scalar = kangaroo::ScalarType::kOpaque;
+          spec.shape_kind = kangaroo::ShapeRuleKind::kDynamic;
+          spec.dynamic_upper_bound.kind =
+              kangaroo::DynamicUpperBoundKind::kAmrSubboxPack;
+          const auto resolved = kangaroo::resolve_output_spec_for_task(
+              spec, task, data, meta, 0, 0, 0, 0, {});
+          return *resolved.dynamic_capacity_elements;
+        });
   m.def("hpx_configuration_string", []() { return hpx::configuration_string(); });
   m.def("set_event_log_path", &kangaroo::set_event_log_path);
   m.def("set_perfetto_trace_path", &kangaroo::set_perfetto_trace_path);

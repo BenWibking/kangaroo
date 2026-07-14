@@ -60,6 +60,7 @@ set(KANGAROO_RUNTIME_SOURCES
   src/backend_parthenon.cpp
   src/backend_memory.cpp
   src/backend_plotfile.cpp
+  src/buffer_resolution.cpp
   src/chunk_buffer.cpp
   src/data_service_local.cpp
   src/executor.cpp

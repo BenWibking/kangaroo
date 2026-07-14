@@ -297,301 +297,6 @@ InputLocation resolve_input_location(const TaskTemplateIR& tmpl,
   throw std::runtime_error("task block not in input domain blocks");
 }
 
-std::size_t checked_positive_extent(int32_t lo, int32_t hi) {
-  if (hi < lo) {
-    return 0;
-  }
-  return static_cast<std::size_t>(hi - lo + 1);
-}
-
-std::size_t block_cell_count(const RunMeta& meta, int32_t step, int16_t level, int32_t block) {
-  const auto& box = meta.steps.at(static_cast<std::size_t>(step))
-                        .levels.at(static_cast<std::size_t>(level))
-                        .boxes.at(static_cast<std::size_t>(block));
-  const std::size_t nx = checked_positive_extent(box.lo.x, box.hi.x);
-  const std::size_t ny = checked_positive_extent(box.lo.y, box.hi.y);
-  const std::size_t nz = checked_positive_extent(box.lo.z, box.hi.z);
-  return nx * ny * nz;
-}
-
-std::array<std::uint64_t, 3> block_extents(const RunMeta& meta,
-                                           int32_t step,
-                                           int16_t level,
-                                           int32_t block) {
-  const auto& box = meta.steps.at(static_cast<std::size_t>(step))
-                        .levels.at(static_cast<std::size_t>(level))
-                        .boxes.at(static_cast<std::size_t>(block));
-  return {checked_positive_extent(box.lo.x, box.hi.x),
-          checked_positive_extent(box.lo.y, box.hi.y),
-          checked_positive_extent(box.lo.z, box.hi.z)};
-}
-
-std::optional<BufferDesc> resolve_static_output_desc(const BufferSpecIR& spec,
-                                                     const RunMeta& meta,
-                                                     int32_t step,
-                                                     int16_t level,
-                                                     int32_t block) {
-  if (spec.shape_kind == ShapeRuleKind::kFixed) {
-    return BufferDesc::contiguous(spec.scalar, spec.fixed_extents);
-  }
-  if (spec.shape_kind == ShapeRuleKind::kBlock) {
-    const auto xyz = block_extents(meta, step, level, block);
-    if (spec.block_components == 1) return BufferDesc::runtime_grid(spec.scalar, xyz);
-    const std::array<std::uint64_t, 4> extents{
-        xyz[0], xyz[1], xyz[2], spec.block_components};
-    return BufferDesc::contiguous(spec.scalar, extents);
-  }
-  if (spec.shape_kind == ShapeRuleKind::kDynamic &&
-      spec.dynamic_upper_bound.kind == DynamicUpperBoundKind::kLiteral) {
-    const std::array<std::uint64_t, 1> extents{spec.dynamic_upper_bound.value};
-    return BufferDesc::contiguous(spec.scalar, extents);
-  }
-  return std::nullopt;
-}
-
-ResolvedBufferSpec make_dynamic_output_spec(const BufferSpecIR& spec, std::uint64_t capacity) {
-  ResolvedBufferSpec resolved;
-  resolved.init = spec.init;
-  const std::array<std::uint64_t, 1> capacity_extent{capacity};
-  resolved.desc = BufferDesc::contiguous(spec.scalar, capacity_extent);
-  resolved.desc.extents[0] = 0;
-  resolved.dynamic_capacity_elements = capacity;
-  return resolved;
-}
-
-std::uint64_t derive_backend_chunk_capacity(const BufferSpecIR& spec,
-                                            const TaskTemplateIR& task,
-                                            const DatasetHandle& dataset,
-                                            int32_t block,
-                                            std::span<const ChunkBuffer> inputs) {
-  if (task.kernel == "particle_value_counts_reduce") {
-    std::uint64_t input_bytes = 0;
-    for (const auto& input : inputs) {
-      input_bytes = checked_add(input_bytes, input.bytes());
-    }
-    const auto output_bytes = std::max<std::uint64_t>(sizeof(std::uint64_t), input_bytes);
-    const auto width = scalar_size(spec.scalar);
-    return output_bytes / width + static_cast<std::uint64_t>(output_bytes % width != 0);
-  }
-
-  if (task.kernel != "particle_load_field_chunk_f64" &&
-      task.kernel != "particle_topk_modes_map") {
-    throw BufferContractError(BufferContractReason::kInvalidExtent,
-                              "backend-chunk bound is not defined for kernel " + task.kernel);
-  }
-  if (!dataset.backend) {
-    throw BufferContractError(BufferContractReason::kInvalidExtent,
-                              "backend-chunk bound requires an initialized dataset backend");
-  }
-  const auto& root = cached_params_root(task.params_msgpack);
-  const auto* particle_type = find_msgpack_map_value(root, "particle_type");
-  if (!particle_type || particle_type->type != msgpack::type::STR) {
-    throw BufferContractError(BufferContractReason::kInvalidExtent,
-                              "backend-chunk bound requires particle_type");
-  }
-  const auto records = dataset.backend->estimate_particle_chunk_records(
-      particle_type->as<std::string>(), block);
-  if (!records.has_value()) {
-    throw BufferContractError(BufferContractReason::kInvalidExtent,
-                              "dataset backend cannot estimate particle chunk records");
-  }
-  if (task.kernel == "particle_load_field_chunk_f64") {
-    return *records;
-  }
-  return checked_add(
-      sizeof(std::uint64_t),
-      checked_multiply(*records, sizeof(double) + sizeof(std::int64_t)));
-}
-
-struct AmrSubboxPackParams {
-  int32_t input_field = -1;
-  int32_t input_version = 0;
-  int32_t input_step = 0;
-  int16_t input_level = 0;
-  int32_t halo_cells = 1;
-};
-
-AmrSubboxPackParams parse_amr_subbox_pack_params(const TaskTemplateIR& task) {
-  const auto& root = cached_params_root(task.params_msgpack);
-  AmrSubboxPackParams params;
-  if (const auto* value = find_msgpack_map_value(root, "input_field")) {
-    params.input_field = value->as<int32_t>();
-  }
-  if (const auto* value = find_msgpack_map_value(root, "input_version")) {
-    params.input_version = value->as<int32_t>();
-  }
-  if (const auto* value = find_msgpack_map_value(root, "input_step")) {
-    params.input_step = value->as<int32_t>();
-  }
-  if (const auto* value = find_msgpack_map_value(root, "input_level")) {
-    params.input_level = value->as<int16_t>();
-  }
-  if (const auto* value = find_msgpack_map_value(root, "halo_cells")) {
-    params.halo_cells = value->as<int32_t>();
-  }
-  return params;
-}
-
-template <typename EstimateChunkBytes>
-std::uint64_t derive_amr_subbox_pack_capacity(const TaskTemplateIR& task,
-                                              const RunMeta& meta,
-                                              int32_t step,
-                                              int16_t level,
-                                              int32_t block,
-                                              EstimateChunkBytes&& estimate_chunk_bytes) {
-  // Covers the fixed MessagePack map, keys, rank-four descriptor metadata,
-  // and container headers used by amr_subbox_fetch_pack; payload bytes are
-  // added separately from the intersecting source chunks below.
-  constexpr std::uint64_t kPackedRootMetadataMaxBytes = 64;
-  constexpr std::uint64_t kPackedPatchMetadataMaxBytes = 512;
-  const auto params = parse_amr_subbox_pack_params(task);
-  if (params.input_field < 0) {
-    return 0;
-  }
-
-  const auto& target_level = meta.steps.at(static_cast<std::size_t>(step))
-                                 .levels.at(static_cast<std::size_t>(level));
-  const auto& target_box = target_level.boxes.at(static_cast<std::size_t>(block));
-  const auto box_lo = [](const BlockBox& box, int axis) {
-    return axis == 0 ? box.lo.x : (axis == 1 ? box.lo.y : box.lo.z);
-  };
-  const auto box_hi = [](const BlockBox& box, int axis) {
-    return axis == 0 ? box.hi.x : (axis == 1 ? box.hi.y : box.hi.z);
-  };
-  const auto cell_edge_at = [](const LevelGeom& geom, int axis, int32_t index) {
-    return geom.x0[axis] +
-        static_cast<double>(index - geom.index_origin[axis]) * geom.dx[axis];
-  };
-  const auto coord_to_index_at = [](const LevelGeom& geom, int axis, double coordinate) {
-    if (!(geom.dx[axis] > 0.0)) {
-      throw BufferContractError(BufferContractReason::kInvalidExtent,
-                                "AMR subbox bound requires positive cell spacing");
-    }
-    return static_cast<int32_t>(std::floor(
-               (coordinate - geom.x0[axis]) / geom.dx[axis])) +
-        geom.index_origin[axis];
-  };
-
-  const int halo = std::max(1, params.halo_cells);
-  double query_lo[3] = {0.0, 0.0, 0.0};
-  double query_hi[3] = {0.0, 0.0, 0.0};
-  for (int axis = 0; axis < 3; ++axis) {
-    query_lo[axis] = cell_edge_at(target_level.geom, axis, box_lo(target_box, axis)) -
-        static_cast<double>(halo) * target_level.geom.dx[axis];
-    query_hi[axis] = cell_edge_at(target_level.geom, axis, box_hi(target_box, axis) + 1) +
-        static_cast<double>(halo) * target_level.geom.dx[axis];
-  }
-
-  const auto& source_step = meta.steps.at(static_cast<std::size_t>(params.input_step));
-  std::uint64_t capacity = kPackedRootMetadataMaxBytes;
-  for (int16_t source_level_index = 0;
-       source_level_index < static_cast<int16_t>(source_step.levels.size());
-       ++source_level_index) {
-    const auto& source_level = source_step.levels.at(
-        static_cast<std::size_t>(source_level_index));
-    int32_t request_lo[3] = {0, 0, 0};
-    int32_t request_hi[3] = {-1, -1, -1};
-    for (int axis = 0; axis < 3; ++axis) {
-      request_lo[axis] = coord_to_index_at(source_level.geom, axis, query_lo[axis]);
-      request_hi[axis] = coord_to_index_at(source_level.geom, axis, query_hi[axis]);
-    }
-    for (int32_t source_block = 0;
-         source_block < static_cast<int32_t>(source_level.boxes.size());
-         ++source_block) {
-      if (source_level_index == params.input_level && source_block == block) {
-        continue;
-      }
-      const auto& source_box = source_level.boxes.at(static_cast<std::size_t>(source_block));
-      std::uint64_t requested_cells = 1;
-      std::uint64_t source_cells = 1;
-      bool intersects = true;
-      for (int axis = 0; axis < 3; ++axis) {
-        const int32_t intersection_lo = std::max(box_lo(source_box, axis), request_lo[axis]);
-        const int32_t intersection_hi = std::min(box_hi(source_box, axis), request_hi[axis]);
-        if (intersection_hi < intersection_lo) {
-          intersects = false;
-          break;
-        }
-        requested_cells = checked_multiply(
-            requested_cells,
-            static_cast<std::uint64_t>(intersection_hi - intersection_lo + 1));
-        source_cells = checked_multiply(
-            source_cells,
-            static_cast<std::uint64_t>(box_hi(source_box, axis) - box_lo(source_box, axis) + 1));
-      }
-      if (!intersects) {
-        continue;
-      }
-
-      const ChunkRef source_ref{params.input_step, source_level_index, params.input_field,
-                                params.input_version, source_block};
-      const std::uint64_t source_bytes = estimate_chunk_bytes(source_ref);
-      if (source_bytes == 0 || source_cells == 0) {
-        throw BufferContractError(BufferContractReason::kInvalidExtent,
-                                  "dataset backend cannot estimate AMR source chunk bytes");
-      }
-      const auto bytes_per_cell = source_bytes / source_cells +
-          static_cast<std::uint64_t>(source_bytes % source_cells != 0);
-      const auto payload_bytes = checked_multiply(requested_cells, bytes_per_cell);
-      capacity = checked_add(capacity, kPackedPatchMetadataMaxBytes);
-      capacity = checked_add(capacity, payload_bytes);
-    }
-  }
-  return capacity;
-}
-
-ResolvedBufferSpec resolve_output_spec(const BufferSpecIR& spec,
-                                       const RunMeta& meta,
-                                       int32_t step,
-                                       int16_t level,
-                                       int32_t block,
-                                       std::span<const ChunkBuffer> inputs) {
-  ResolvedBufferSpec resolved;
-  resolved.init = spec.init;
-  if (const auto desc = resolve_static_output_desc(spec, meta, step, level, block);
-      desc.has_value() && spec.shape_kind != ShapeRuleKind::kDynamic) {
-    resolved.desc = *desc;
-    return resolved;
-  }
-  if (spec.shape_kind == ShapeRuleKind::kLikeInput) {
-    const auto index = static_cast<std::size_t>(spec.like_input_index);
-    if (index >= inputs.size()) {
-      throw BufferContractError(BufferContractReason::kInvalidExtent,
-                                "like-input output index is out of range");
-    }
-    const auto& source = inputs[index].desc();
-    std::vector<std::uint64_t> extents(
-        source.extents.begin(), source.extents.begin() + source.rank);
-    resolved.desc = BufferDesc::contiguous(spec.scalar, extents);
-    return resolved;
-  }
-  if (spec.shape_kind != ShapeRuleKind::kDynamic) {
-    throw BufferContractError(BufferContractReason::kInvalidExtent,
-                              "unable to resolve static output buffer specification");
-  }
-
-  std::uint64_t capacity = 0;
-  switch (spec.dynamic_upper_bound.kind) {
-    case DynamicUpperBoundKind::kLiteral:
-      capacity = spec.dynamic_upper_bound.value;
-      break;
-    case DynamicUpperBoundKind::kLikeInput: {
-      const auto index = static_cast<std::size_t>(spec.dynamic_upper_bound.input_index);
-      if (index >= inputs.size()) {
-        throw BufferContractError(BufferContractReason::kInvalidExtent,
-                                  "dynamic like-input index is out of range");
-      }
-      capacity = inputs[index].desc().element_count();
-      break;
-    }
-    case DynamicUpperBoundKind::kBackendChunk:
-    case DynamicUpperBoundKind::kAmrSubboxPack:
-      throw BufferContractError(BufferContractReason::kInvalidExtent,
-                                "dynamic output bound requires task and dataset context");
-  }
-  return make_dynamic_output_spec(spec, capacity);
-}
-
 void finalize_output_buffer(ChunkBuffer& buffer, const BufferSpecIR& spec,
                             std::string_view kernel) {
   if (spec.shape_kind == ShapeRuleKind::kDynamic) {
@@ -605,23 +310,17 @@ void finalize_output_buffer(ChunkBuffer& buffer, const BufferSpecIR& spec,
   buffer.desc().validate(buffer.bytes());
 }
 
-struct BufferEstimate {
-  std::size_t storage_bytes = 0;
-  bool storage_known = false;
-  std::optional<BufferDesc> desc;
-  std::optional<std::uint64_t> element_capacity;
-};
-
 using ChunkEstimateMap =
-    std::unordered_map<ChunkRef, BufferEstimate, ChunkRefHash, ChunkRefEq>;
+    std::unordered_map<ChunkRef, BufferFacts, ChunkRefHash, ChunkRefEq>;
 
-BufferEstimate estimate_input_ref(const ChunkEstimateMap& known_outputs,
-                                  const DataService& data,
-                                  const ChunkRef& ref) {
+BufferFacts estimate_input_ref(const ChunkEstimateMap& known_outputs,
+                               const DataService& data,
+                               const ChunkRef& ref) {
   const auto known = known_outputs.find(ref);
   if (known != known_outputs.end()) return known->second;
-  BufferEstimate estimate;
+  BufferFacts estimate;
   estimate.storage_bytes = data.estimate_host_bytes(ref);
+  estimate.payload_bytes = estimate.storage_bytes;
   estimate.storage_known = estimate.storage_bytes > 0;
   estimate.desc = data.describe_host(ref);
   if (estimate.desc.has_value()) {
@@ -629,102 +328,25 @@ BufferEstimate estimate_input_ref(const ChunkEstimateMap& known_outputs,
     if (estimate.storage_bytes == 0) {
       estimate.storage_bytes = static_cast<std::size_t>(estimate.desc->required_bytes());
     }
+    estimate.payload_bytes = estimate.storage_bytes;
     estimate.storage_known = true;
   }
   return estimate;
 }
 
-std::optional<BufferEstimate> estimate_output_spec(
+std::optional<BufferFacts> estimate_output_spec(
     const BufferSpecIR& spec,
     const TaskTemplateIR& tmpl,
     const DataService& data,
     const RunMeta& meta,
     int32_t block,
-    std::span<const BufferEstimate> inputs) {
-  BufferEstimate estimate;
-  if (const auto desc = resolve_static_output_desc(
-          spec, meta, tmpl.domain.step, tmpl.domain.level, block);
-      desc.has_value()) {
-    estimate.desc = *desc;
-    estimate.element_capacity = desc->element_count();
-    estimate.storage_bytes = static_cast<std::size_t>(desc->required_bytes());
-    estimate.storage_known = true;
-    return estimate;
-  }
-
-  if (spec.shape_kind == ShapeRuleKind::kLikeInput) {
-    const auto index = static_cast<std::size_t>(spec.like_input_index);
-    if (index >= inputs.size() || !inputs[index].element_capacity.has_value()) {
-      return std::nullopt;
-    }
-    estimate.element_capacity = inputs[index].element_capacity;
-    estimate.storage_bytes = static_cast<std::size_t>(checked_multiply(
-        *estimate.element_capacity, scalar_size(spec.scalar)));
-    estimate.storage_known = true;
-    if (inputs[index].desc.has_value()) {
-      const auto& source = *inputs[index].desc;
-      std::vector<std::uint64_t> extents(
-          source.extents.begin(), source.extents.begin() + source.rank);
-      estimate.desc = BufferDesc::contiguous(spec.scalar, extents);
-    }
-    return estimate;
-  }
-  if (spec.shape_kind != ShapeRuleKind::kDynamic) return std::nullopt;
-
-  std::uint64_t capacity = 0;
-  switch (spec.dynamic_upper_bound.kind) {
-    case DynamicUpperBoundKind::kLiteral:
-      capacity = spec.dynamic_upper_bound.value;
-      break;
-    case DynamicUpperBoundKind::kLikeInput: {
-      const auto index = static_cast<std::size_t>(spec.dynamic_upper_bound.input_index);
-      if (index >= inputs.size() || !inputs[index].element_capacity.has_value()) {
-        return std::nullopt;
-      }
-      capacity = *inputs[index].element_capacity;
-      break;
-    }
-    case DynamicUpperBoundKind::kBackendChunk: {
-      if (tmpl.kernel == "particle_value_counts_reduce") {
-        std::uint64_t input_bytes = 0;
-        for (const auto& input : inputs) {
-          if (!input.storage_known) return std::nullopt;
-          input_bytes = checked_add(input_bytes, input.storage_bytes);
-        }
-        const auto output_bytes = std::max<std::uint64_t>(sizeof(std::uint64_t), input_bytes);
-        const auto width = scalar_size(spec.scalar);
-        capacity = output_bytes / width + static_cast<std::uint64_t>(output_bytes % width != 0);
-        break;
-      }
-      if (tmpl.kernel != "particle_load_field_chunk_f64" &&
-          tmpl.kernel != "particle_topk_modes_map") {
-        return std::nullopt;
-      }
-      const auto& root = cached_params_root(tmpl.params_msgpack);
-      const auto* particle_type = find_msgpack_map_value(root, "particle_type");
-      if (!particle_type || particle_type->type != msgpack::type::STR) return std::nullopt;
-      const auto records = data.estimate_particle_chunk_records(
-          particle_type->as<std::string>(), block);
-      if (!records.has_value()) return std::nullopt;
-      capacity = tmpl.kernel == "particle_load_field_chunk_f64"
-          ? *records
-          : checked_add(sizeof(std::uint64_t),
-                        checked_multiply(*records, sizeof(double) + sizeof(std::int64_t)));
-      break;
-    }
-    case DynamicUpperBoundKind::kAmrSubboxPack:
-      capacity = derive_amr_subbox_pack_capacity(
-          tmpl, meta, tmpl.domain.step, tmpl.domain.level, block,
-          [&](const ChunkRef& ref) { return data.estimate_host_bytes(ref); });
-      break;
-  }
-  const std::array<std::uint64_t, 1> capacity_extent{capacity};
-  estimate.desc = BufferDesc::contiguous(spec.scalar, capacity_extent);
-  estimate.element_capacity = capacity;
-  estimate.storage_bytes = static_cast<std::size_t>(
-      checked_multiply(capacity, scalar_size(spec.scalar)));
-  estimate.storage_known = true;
-  return estimate;
+    std::size_t output_index,
+    std::span<const BufferFacts> inputs) {
+  auto resolved = try_resolve_buffer_spec(
+      spec, tmpl, data, meta, tmpl.domain.step, tmpl.domain.level, block,
+      output_index, inputs);
+  return resolved.has_value() ? std::optional<BufferFacts>(std::move(resolved->facts))
+                              : std::nullopt;
 }
 
 std::optional<std::size_t> template_output_storage_bytes(
@@ -734,16 +356,18 @@ std::optional<std::size_t> template_output_storage_bytes(
     int32_t block,
     const std::vector<ChunkRef>& input_refs,
     const ChunkEstimateMap& known_outputs) {
-  std::vector<BufferEstimate> inputs;
+  std::vector<BufferFacts> inputs;
   inputs.reserve(input_refs.size());
   for (const auto& ref : input_refs) {
     inputs.push_back(estimate_input_ref(known_outputs, data, ref));
   }
   std::size_t bytes = 0;
-  for (const auto& output : tmpl.outputs) {
-    std::optional<BufferEstimate> estimate;
+  for (std::size_t output_index = 0; output_index < tmpl.outputs.size(); ++output_index) {
+    const auto& output = tmpl.outputs[output_index];
+    std::optional<BufferFacts> estimate;
     try {
-      estimate = estimate_output_spec(output.buffer, tmpl, data, meta, block, inputs);
+      estimate = estimate_output_spec(
+          output.buffer, tmpl, data, meta, block, output_index, inputs);
     } catch (...) {
       return std::nullopt;
     }
@@ -776,17 +400,20 @@ ChunkEstimateMap build_known_output_estimates(const PlanIR& plan,
           }
         }
         for (int32_t block : blocks) {
-          std::vector<BufferEstimate> inputs;
+          std::vector<BufferFacts> inputs;
           inputs.reserve(tmpl.inputs.size());
           for (const auto& input : tmpl.inputs) {
             const auto loc = resolve_input_location(tmpl, input, block);
             inputs.push_back(estimate_input_ref(
                 known, data, ChunkRef{loc.step, loc.level, input.field, input.version, loc.block}));
           }
-          for (const auto& out : tmpl.outputs) {
-            std::optional<BufferEstimate> estimate;
+          for (std::size_t output_index = 0; output_index < tmpl.outputs.size();
+               ++output_index) {
+            const auto& out = tmpl.outputs[output_index];
+            std::optional<BufferFacts> estimate;
             try {
-              estimate = estimate_output_spec(out.buffer, tmpl, data, meta, block, inputs);
+              estimate = estimate_output_spec(
+                  out.buffer, tmpl, data, meta, block, output_index, inputs);
             } catch (...) {
               estimate = std::nullopt;
             }
@@ -803,7 +430,7 @@ ChunkEstimateMap build_known_output_estimates(const PlanIR& plan,
           const int32_t out_block = graph_reduce_output_block(params, group_idx);
           const int32_t start = graph_reduce_group_start(params, group_idx);
           const int32_t end = graph_reduce_group_end(params, group_idx);
-          std::vector<BufferEstimate> inputs;
+          std::vector<BufferFacts> inputs;
           for (const auto& input : tmpl.inputs) {
             for (int32_t idx = start; idx < end; ++idx) {
               const int32_t block_id = params.input_blocks.empty()
@@ -816,11 +443,13 @@ ChunkEstimateMap build_known_output_estimates(const PlanIR& plan,
                   known, data, ChunkRef{step, level, input.field, input.version, block_id}));
             }
           }
-          for (const auto& out : tmpl.outputs) {
-            std::optional<BufferEstimate> estimate;
+          for (std::size_t output_index = 0; output_index < tmpl.outputs.size();
+               ++output_index) {
+            const auto& out = tmpl.outputs[output_index];
+            std::optional<BufferFacts> estimate;
             try {
               estimate = estimate_output_spec(
-                  out.buffer, tmpl, data, meta, out_block, inputs);
+                  out.buffer, tmpl, data, meta, out_block, output_index, inputs);
             } catch (...) {
               estimate = std::nullopt;
             }
@@ -1188,8 +817,8 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
           outputs.push_back(data.alloc_host(
               cref,
               resolve_output_spec_for_task(
-                  out.buffer, tmpl, execution_context(plan_id).dataset, meta,
-                  tmpl.domain.step, tmpl.domain.level, block, inputs)));
+                  out.buffer, tmpl, data, meta, tmpl.domain.step, tmpl.domain.level,
+                  block, i, inputs)));
         }
         if (log_enabled) {
           end_span(alloc_outputs_event);
@@ -1453,8 +1082,8 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
           outputs.push_back(data.alloc_host(
               cref,
               resolve_output_spec_for_task(
-                  out.buffer, tmpl, execution_context(plan_id).dataset, meta,
-                  tmpl.domain.step, tmpl.domain.level, out_block, inputs)));
+                  out.buffer, tmpl, data, meta, tmpl.domain.step, tmpl.domain.level,
+                  out_block, i, inputs)));
         }
         if (log_enabled) {
           end_span(alloc_outputs_event);
@@ -1970,31 +1599,27 @@ HPX_PLAIN_ACTION(kangaroo::run_stage_partition_remote, kangaroo_run_stage_partit
 
 namespace kangaroo {
 
-ResolvedBufferSpec resolve_output_spec_for_task(
-    const BufferSpecIR& spec,
-    const TaskTemplateIR& task,
-    const DatasetHandle& dataset,
-    const RunMeta& meta,
-    int32_t step,
-    int16_t level,
-    int32_t block,
-    std::span<const ChunkBuffer> inputs) {
-  if (spec.shape_kind == ShapeRuleKind::kDynamic) {
-    if (spec.dynamic_upper_bound.kind == DynamicUpperBoundKind::kBackendChunk) {
-      return make_dynamic_output_spec(
-          spec, derive_backend_chunk_capacity(spec, task, dataset, block, inputs));
-    }
-    if (spec.dynamic_upper_bound.kind == DynamicUpperBoundKind::kAmrSubboxPack) {
-      return make_dynamic_output_spec(
-          spec, derive_amr_subbox_pack_capacity(
-                    task, meta, step, level, block,
-                    [&](const ChunkRef& ref) { return dataset.estimate_chunk_bytes(ref); }));
+void validate_plan_output_bounds(const PlanIR& plan, const KernelRegistry& kernels) {
+  for (const auto& stage : plan.stages) {
+    for (const auto& tmpl : stage.templates) {
+      const auto evaluator = kernels.get_dynamic_output_bound_by_name(tmpl.kernel);
+      for (const auto& output : tmpl.outputs) {
+        const bool needs_kernel_bound =
+            output.buffer.shape_kind == ShapeRuleKind::kDynamic &&
+            (output.buffer.dynamic_upper_bound.kind == DynamicUpperBoundKind::kBackendChunk ||
+             output.buffer.dynamic_upper_bound.kind == DynamicUpperBoundKind::kAmrSubboxPack);
+        if (needs_kernel_bound && !evaluator) {
+          throw std::runtime_error(
+              "kernel " + tmpl.kernel +
+              " does not define its dynamic output bound");
+        }
+      }
     }
   }
-  return resolve_output_spec(spec, meta, step, level, block, inputs);
 }
 
 void prepare_plan(PlanIR& plan, KernelRegistry& kernels) {
+  validate_plan_output_bounds(plan, kernels);
   std::vector<std::shared_ptr<const CoveredBoxListIR>> shared_covered_boxes;
   shared_covered_boxes.reserve(plan.shared_covered_boxes.size());
   for (const auto& boxes : plan.shared_covered_boxes) {
@@ -2004,6 +1629,7 @@ void prepare_plan(PlanIR& plan, KernelRegistry& kernels) {
   for (auto& stage : plan.stages) {
     for (auto& tmpl : stage.templates) {
       tmpl.kernel_fn = kernels.get_shared_by_name(tmpl.kernel);
+      tmpl.dynamic_output_bound = kernels.get_dynamic_output_bound_by_name(tmpl.kernel);
       std::shared_ptr<const CoveredBoxListIR> covered_boxes;
       if (tmpl.covered_boxes_ref >= 0) {
         const auto ref_idx = static_cast<std::size_t>(tmpl.covered_boxes_ref);

@@ -146,6 +146,10 @@ allocated by the executor from a resolved descriptor. Dynamic rank-one outputs M
 declare a conservative upper-bound rule and may commit one final extent within that
 capacity. Kernels MUST NOT resize statically specified outputs.
 
+Allocation and scheduler storage accounting MUST use the same buffer-resolution rules.
+Any kernel using a backend-derived dynamic upper bound MUST register its bound evaluator
+during plan preparation; the executor MUST NOT infer bounds from kernel names or parameters.
+
 Kernel parameters contain scientific configuration only; storage dtype, shape, layout,
 and allocation policy belong to chunk descriptors and buffer specifications.
 
