@@ -1075,7 +1075,7 @@ NB_MODULE(_core, m) {
            nb::arg("hpx_args") = nb::none())
       .def("alloc_field_id", &kangaroo::Runtime::alloc_field_id)
       .def("mark_field_persistent", &kangaroo::Runtime::mark_field_persistent)
-      .def("kernels", &kangaroo::Runtime::kernels, nb::rv_policy::reference)
+      .def("kernels", &kangaroo::Runtime::kernels, nb::rv_policy::reference_internal)
       .def("set_event_log_path", &kangaroo::Runtime::set_event_log_path)
       .def("set_perfetto_trace_path", &kangaroo::Runtime::set_perfetto_trace_path)
       .def("locality_id", &kangaroo::Runtime::locality_id)
@@ -1120,6 +1120,13 @@ NB_MODULE(_core, m) {
              nb::gil_scoped_release release;
              self.run_packed_plan(buffer, runmeta, dataset);
            });
+
+  nb::class_<kangaroo::KernelDesc>(m, "KernelDesc")
+      .def_ro("name", &kangaroo::KernelDesc::name)
+      .def_ro("n_inputs", &kangaroo::KernelDesc::n_inputs)
+      .def_ro("n_outputs", &kangaroo::KernelDesc::n_outputs)
+      .def_ro("needs_neighbors", &kangaroo::KernelDesc::needs_neighbors)
+      .def_ro("param_schema_json", &kangaroo::KernelDesc::param_schema_json);
 
   nb::class_<kangaroo::KernelRegistry>(m, "KernelRegistry")
       .def("list", &kangaroo::KernelRegistry::list_kernel_descs);
