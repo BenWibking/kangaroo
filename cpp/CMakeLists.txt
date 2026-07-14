@@ -70,6 +70,12 @@ set(KANGAROO_FLATBUFFER_HEADERS
   "${CMAKE_CURRENT_BINARY_DIR}/generated/plan_generated.h"
   "${CMAKE_CURRENT_BINARY_DIR}/generated/amr_patch_generated.h"
 )
+set(KANGAROO_FLATBUFFER_PYTHON_DIR
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/python"
+)
+set(KANGAROO_FLATBUFFER_PYTHON_STAMP
+  "${KANGAROO_FLATBUFFER_PYTHON_DIR}/flatbuffers.stamp"
+)
 add_custom_command(
   OUTPUT ${KANGAROO_FLATBUFFER_HEADERS}
   COMMAND flatbuffers::flatc
@@ -82,12 +88,34 @@ add_custom_command(
   COMMENT "Generating typed Kangaroo FlatBuffer schemas"
   VERBATIM
 )
+add_custom_command(
+  OUTPUT "${KANGAROO_FLATBUFFER_PYTHON_STAMP}"
+  COMMAND "${CMAKE_COMMAND}" -E rm -rf
+          "${KANGAROO_FLATBUFFER_PYTHON_DIR}/analysis"
+  COMMAND "${CMAKE_COMMAND}" -E make_directory
+          "${KANGAROO_FLATBUFFER_PYTHON_DIR}"
+  COMMAND flatbuffers::flatc
+          --python
+          --python-typing
+          --gen-object-api
+          -o "${KANGAROO_FLATBUFFER_PYTHON_DIR}"
+          ${KANGAROO_FLATBUFFER_SCHEMAS}
+  COMMAND "${CMAKE_COMMAND}" -E touch
+          "${KANGAROO_FLATBUFFER_PYTHON_STAMP}"
+  DEPENDS flatbuffers::flatc ${KANGAROO_FLATBUFFER_SCHEMAS}
+  COMMENT "Generating typed Kangaroo Python FlatBuffer bindings"
+  VERBATIM
+)
+add_custom_target(kangaroo_flatbuffer_python_codegen
+  DEPENDS "${KANGAROO_FLATBUFFER_PYTHON_STAMP}"
+)
 if(KANGAROO_USE_OPENPMD)
   list(APPEND KANGAROO_RUNTIME_SOURCES src/backend_openpmd.cpp)
 endif()
 
 add_library(kangaroo_runtime STATIC ${KANGAROO_RUNTIME_SOURCES})
 target_sources(kangaroo_runtime PRIVATE ${KANGAROO_FLATBUFFER_HEADERS})
+add_dependencies(kangaroo_runtime kangaroo_flatbuffer_python_codegen)
 set_target_properties(kangaroo_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set(KANGAROO_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
@@ -258,3 +286,6 @@ install(TARGETS _core _plotfile LIBRARY DESTINATION "${KANGAROO_PYTHON_SITE}/ana
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../analysis/"
         DESTINATION "${KANGAROO_PYTHON_SITE}/analysis"
         FILES_MATCHING PATTERN "*.py")
+install(DIRECTORY "${KANGAROO_FLATBUFFER_PYTHON_DIR}/analysis/"
+        DESTINATION "${KANGAROO_PYTHON_SITE}/analysis"
+        FILES_MATCHING PATTERN "*.py" PATTERN "*.pyi")
