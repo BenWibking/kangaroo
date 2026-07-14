@@ -188,6 +188,23 @@ def test_amr_subbox_bound_follows_requested_source_payload() -> None:
     assert capacity > 64 << 20
 
 
+def test_buffer_resolution_handles_full_int32_extent() -> None:
+    assert _core.test_block_shape_extent(-(2**31), 2**31 - 1) == 2**32
+
+
+def test_amr_subbox_bound_handles_wide_coordinate_arithmetic() -> None:
+    source_bytes = 1 << 20
+    capacity = _core.test_amr_subbox_dynamic_capacity_wide_coordinates(
+        source_bytes, False
+    )
+    assert capacity > source_bytes
+
+
+def test_amr_subbox_bound_handles_full_int32_source_extent() -> None:
+    capacity = _core.test_amr_subbox_dynamic_capacity_wide_coordinates(2**32, True)
+    assert capacity == 64 + 512 + 4
+
+
 def test_buffer_specs_encode_closed_shape_language() -> None:
     assert BufferSpec(DType.F64, BlockShape(3)).to_dict() == {
         "dtype": "f64",

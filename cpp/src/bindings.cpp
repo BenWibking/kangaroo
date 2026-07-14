@@ -13,6 +13,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <limits>
 
 #include <hpx/serialization/serialize.hpp>
 #include <hpx/version.hpp>
@@ -655,6 +656,21 @@ NB_MODULE(_core, m) {
               spec, task, data, meta, 0, 0, 0, 0, inputs);
           return *resolved.dynamic_capacity_elements;
         });
+  m.def("test_block_shape_extent", [](std::int32_t lo, std::int32_t hi) {
+    DynamicBoundTestData data(0, 0);
+    kangaroo::RunMeta meta;
+    kangaroo::LevelMeta level;
+    level.boxes.push_back(kangaroo::BlockBox{{lo, 0, 0}, {hi, 0, 0}});
+    meta.steps.push_back(kangaroo::StepMeta{0, {level}});
+
+    kangaroo::TaskTemplateIR task;
+    kangaroo::BufferSpecIR spec;
+    spec.scalar = kangaroo::ScalarType::kU8;
+    spec.shape_kind = kangaroo::ShapeRuleKind::kBlock;
+    const auto resolved = kangaroo::resolve_output_spec_for_task(
+        spec, task, data, meta, 0, 0, 0, 0, {});
+    return resolved.desc.extents[0];
+  });
   m.def("test_amr_subbox_dynamic_capacity", [](std::uint64_t source_chunk_bytes) {
     DynamicBoundTestData data(0, source_chunk_bytes);
     kangaroo::RunMeta meta;
@@ -687,6 +703,50 @@ NB_MODULE(_core, m) {
         spec, task, data, meta, 0, 0, 0, 0, {});
     return *resolved.dynamic_capacity_elements;
   });
+  m.def("test_amr_subbox_dynamic_capacity_wide_coordinates",
+        [](std::uint64_t source_chunk_bytes, bool wide_source) {
+          DynamicBoundTestData data(0, source_chunk_bytes);
+          kangaroo::RunMeta meta;
+          kangaroo::LevelMeta level;
+          level.geom.dx[0] = level.geom.dx[1] = level.geom.dx[2] = 1.0;
+          if (wide_source) {
+            level.boxes.push_back(kangaroo::BlockBox{{0, 0, 0}, {0, 0, 0}});
+            level.boxes.push_back(kangaroo::BlockBox{
+                {std::numeric_limits<std::int32_t>::min(), 0, 0},
+                {std::numeric_limits<std::int32_t>::max(), 0, 0}});
+          } else {
+            level.geom.index_origin[0] = std::numeric_limits<std::int32_t>::max();
+            constexpr std::int32_t kTargetIndex =
+                std::numeric_limits<std::int32_t>::min() + 2;
+            level.boxes.push_back(
+                kangaroo::BlockBox{{kTargetIndex, 0, 0}, {kTargetIndex, 0, 0}});
+            level.boxes.push_back(kangaroo::BlockBox{
+                {kTargetIndex + 1, 0, 0}, {kTargetIndex + 1, 0, 0}});
+          }
+          meta.steps.push_back(kangaroo::StepMeta{0, {level}});
+
+          kangaroo::TaskTemplateIR task;
+          task.dynamic_output_bound =
+              std::make_shared<const kangaroo::DynamicOutputBoundEvaluator>(
+                  [](const kangaroo::DynamicOutputBoundContext& context) {
+                    return kangaroo::estimate_amr_subbox_pack_capacity(
+                        context,
+                        kangaroo::AmrSubboxPackParams{
+                            .input_field = 11,
+                            .input_version = 0,
+                            .input_step = 0,
+                            .input_level = 0,
+                            .halo_cells = 1});
+                  });
+          kangaroo::BufferSpecIR spec;
+          spec.scalar = kangaroo::ScalarType::kOpaque;
+          spec.shape_kind = kangaroo::ShapeRuleKind::kDynamic;
+          spec.dynamic_upper_bound.kind =
+              kangaroo::DynamicUpperBoundKind::kAmrSubboxPack;
+          const auto resolved = kangaroo::resolve_output_spec_for_task(
+              spec, task, data, meta, 0, 0, 0, 0, {});
+          return *resolved.dynamic_capacity_elements;
+        });
   m.def("hpx_configuration_string", []() { return hpx::configuration_string(); });
   m.def("set_event_log_path", &kangaroo::set_event_log_path);
   m.def("set_perfetto_trace_path", &kangaroo::set_perfetto_trace_path);

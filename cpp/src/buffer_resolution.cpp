@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -13,9 +14,10 @@ namespace kangaroo {
 
 namespace {
 
-std::size_t checked_positive_extent(int32_t lo, int32_t hi) {
+std::uint64_t checked_positive_extent(int32_t lo, int32_t hi) {
   if (hi < lo) return 0;
-  return static_cast<std::size_t>(hi - lo + 1);
+  return static_cast<std::uint64_t>(static_cast<std::int64_t>(hi) -
+                                    static_cast<std::int64_t>(lo) + 1);
 }
 
 std::array<std::uint64_t, 3> block_extents(const RunMeta& meta,
@@ -163,18 +165,26 @@ std::optional<std::uint64_t> estimate_amr_subbox_pack_capacity(
   const auto box_hi = [](const BlockBox& box, int axis) {
     return axis == 0 ? box.hi.x : (axis == 1 ? box.hi.y : box.hi.z);
   };
-  const auto cell_edge_at = [](const LevelGeom& geom, int axis, int32_t index) {
+  const auto cell_edge_at = [](const LevelGeom& geom, int axis, std::int64_t index) {
     return geom.x0[axis] +
-        static_cast<double>(index - geom.index_origin[axis]) * geom.dx[axis];
+        (static_cast<double>(index) - static_cast<double>(geom.index_origin[axis])) *
+        geom.dx[axis];
   };
   const auto coord_to_index_at = [](const LevelGeom& geom, int axis, double coordinate) {
     if (!(geom.dx[axis] > 0.0)) {
       throw BufferContractError(BufferContractReason::kInvalidExtent,
                                 "AMR subbox bound requires positive cell spacing");
     }
-    return static_cast<int32_t>(
-               std::floor((coordinate - geom.x0[axis]) / geom.dx[axis])) +
-        geom.index_origin[axis];
+    const double index =
+        std::floor((coordinate - geom.x0[axis]) / geom.dx[axis]) +
+        static_cast<double>(geom.index_origin[axis]);
+    if (!std::isfinite(index) ||
+        index < static_cast<double>(std::numeric_limits<std::int32_t>::min()) ||
+        index > static_cast<double>(std::numeric_limits<std::int32_t>::max())) {
+      throw BufferContractError(BufferContractReason::kInvalidExtent,
+                                "AMR subbox bound coordinate is outside the index range");
+    }
+    return static_cast<std::int32_t>(index);
   };
 
   const int halo = std::max(1, params.halo_cells);
@@ -183,7 +193,8 @@ std::optional<std::uint64_t> estimate_amr_subbox_pack_capacity(
   for (int axis = 0; axis < 3; ++axis) {
     query_lo[axis] = cell_edge_at(target_level.geom, axis, box_lo(target_box, axis)) -
         static_cast<double>(halo) * target_level.geom.dx[axis];
-    query_hi[axis] = cell_edge_at(target_level.geom, axis, box_hi(target_box, axis) + 1) +
+    query_hi[axis] = cell_edge_at(target_level.geom, axis,
+                                  static_cast<std::int64_t>(box_hi(target_box, axis)) + 1) +
         static_cast<double>(halo) * target_level.geom.dx[axis];
   }
 
@@ -216,10 +227,10 @@ std::optional<std::uint64_t> estimate_amr_subbox_pack_capacity(
         }
         requested_cells = checked_multiply(
             requested_cells,
-            static_cast<std::uint64_t>(intersection_hi - intersection_lo + 1));
+            checked_positive_extent(intersection_lo, intersection_hi));
         source_cells = checked_multiply(
             source_cells,
-            static_cast<std::uint64_t>(box_hi(source_box, axis) - box_lo(source_box, axis) + 1));
+            checked_positive_extent(box_lo(source_box, axis), box_hi(source_box, axis)));
       }
       if (!intersects) continue;
 

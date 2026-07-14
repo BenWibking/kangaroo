@@ -1564,9 +1564,7 @@ KernelRegistry::KernelParamsPrepareFn make_kernel_params_preparer(DecodeFn decod
       return {};
     }
     auto decoded = decode_fn(cached_params_root(context.params_msgpack));
-    auto prepared = std::shared_ptr<const void>(
-        new Params(std::move(decoded)),
-        [](const void* ptr) { delete static_cast<const Params*>(ptr); });
+    auto prepared = std::make_shared<const Params>(std::move(decoded));
     return KernelRegistry::PreparedParams{std::type_index(typeid(Params)), std::move(prepared)};
   };
 }
@@ -1585,9 +1583,7 @@ KernelRegistry::KernelParamsPrepareFn make_covered_box_params_preparer(DecodeFn 
     if (context.covered_boxes) {
       decoded.covered_boxes = context.covered_boxes;
     }
-    auto prepared = std::shared_ptr<const void>(
-        new Params(std::move(decoded)),
-        [](const void* ptr) { delete static_cast<const Params*>(ptr); });
+    auto prepared = std::make_shared<const Params>(std::move(decoded));
     return KernelRegistry::PreparedParams{std::type_index(typeid(Params)), std::move(prepared)};
   };
 }
