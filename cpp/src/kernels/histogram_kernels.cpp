@@ -1,6 +1,7 @@
 #include "default_kernel_families.hpp"
 
-#include "default_kernel_support.hpp"
+#include "kernel_buffer_support.hpp"
+#include "kernel_param_support.hpp"
 
 namespace kangaroo {
 
@@ -30,13 +31,14 @@ void register_histogram_kernels(KernelRegistry &registry) {
     };
 
     /**
-     * @brief Accumulates uncovered grid-cell values into a one-dimensional histogram.
+     * @brief Accumulates uncovered grid-cell values into a one-dimensional
+     * histogram.
      * @par Chunk inputs `inputs[0]` is a real-valued block grid; optional
      * `inputs[1]` is a matching real-valued weight grid.
-     * @par MessagePack parameters `range`, `bins`, and `covered_boxes` define the
-     * histogram interval, bin count, and excluded AMR cells.
-     * @par Chunk outputs `outputs[0]` is an f64 array of `bins` accumulated counts
-     * or weights.
+     * @par MessagePack parameters `range`, `bins`, and `covered_boxes` define
+     * the histogram interval, bin count, and excluded AMR cells.
+     * @par Chunk outputs `outputs[0]` is an f64 array of `bins` accumulated
+     * counts or weights.
      */
     registry.register_kernel(
         KernelDesc{.name = "histogram1d_accumulate",
@@ -170,11 +172,12 @@ void register_histogram_kernels(KernelRegistry &registry) {
     };
 
     /**
-     * @brief Accumulates uncovered grid-cell samples into a two-dimensional histogram.
-     * @par Chunk inputs `inputs[0]` and `inputs[1]` are matching real-valued x and
-     * y block grids; optional `inputs[2]` is a matching weight grid.
-     * @par MessagePack parameters `x_range`, `y_range`, `bins`, `weight_mode`, and
-     * `covered_boxes` define binning, weighting, and excluded AMR cells.
+     * @brief Accumulates uncovered grid-cell samples into a two-dimensional
+     * histogram.
+     * @par Chunk inputs `inputs[0]` and `inputs[1]` are matching real-valued x
+     * and y block grids; optional `inputs[2]` is a matching weight grid.
+     * @par MessagePack parameters `x_range`, `y_range`, `bins`, `weight_mode`,
+     * and `covered_boxes` define binning, weighting, and excluded AMR cells.
      * @par Chunk outputs `outputs[0]` is an f64 two-dimensional histogram.
      */
     registry.register_kernel(

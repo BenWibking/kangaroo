@@ -1,6 +1,8 @@
 #include "default_kernel_families.hpp"
 
-#include "default_kernel_support.hpp"
+#include "flux_geometry_support.hpp"
+#include "kernel_buffer_support.hpp"
+#include "kernel_param_support.hpp"
 
 namespace kangaroo {
 
@@ -99,9 +101,11 @@ void register_flux_kernels(KernelRegistry &registry) {
      * input supplies temperature when temperature binning is enabled.
      * @par MessagePack parameters `radii` (or `radius`), `radius_indices`,
      * `num_radii`, `temperature_bins`, `gamma`, and `covered_boxes` select the
-     * surfaces, output slots, thermodynamic bins, equation of state, and AMR mask.
+     * surfaces, output slots, thermodynamic bins, equation of state, and AMR
+     * mask.
      * @par Chunk outputs `outputs[0]` is an f64 tensor of inward/outward mass,
-     * momentum, energy, and passive-scalar flux for each radius and temperature bin.
+     * momentum, energy, and passive-scalar flux for each radius and temperature
+     * bin.
      */
     registry.register_kernel(
         KernelDesc{.name = "flux_surface_integral_accumulate",
@@ -529,12 +533,12 @@ void register_flux_kernels(KernelRegistry &registry) {
      * total energy, passive scalar, and magnetic field x/y/z; an optional tenth
      * input supplies temperature when temperature binning is enabled.
      * @par MessagePack parameters `radius`, `heights`, `height_indices`,
-     * `num_heights`, `temperature_bins`, `gamma`, and `covered_boxes` select the
-     * cylinder sections, output slots, thermodynamic bins, equation of state, and
-     * AMR mask.
+     * `num_heights`, `temperature_bins`, `gamma`, and `covered_boxes` select
+     * the cylinder sections, output slots, thermodynamic bins, equation of
+     * state, and AMR mask.
      * @par Chunk outputs `outputs[0]` is an f64 tensor of inward/outward mass,
-     * momentum, energy, and passive-scalar flux for each cylindrical section and
-     * temperature bin.
+     * momentum, energy, and passive-scalar flux for each cylindrical section
+     * and temperature bin.
      */
     registry.register_kernel(
         KernelDesc{.name = "cylindrical_flux_surface_integral_accumulate",

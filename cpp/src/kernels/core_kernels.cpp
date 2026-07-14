@@ -1,6 +1,12 @@
 #include "default_kernel_families.hpp"
 
-#include "default_kernel_support.hpp"
+#include "amr_sampling_support.hpp"
+#include "kernel_buffer_support.hpp"
+#include "kernel_param_support.hpp"
+#include "plotfile_kernel_support.hpp"
+
+#include "kangaroo/amr_patch_codec.hpp"
+#include "kangaroo/runtime.hpp"
 
 namespace kangaroo {
 
@@ -35,8 +41,8 @@ void register_core_kernels(KernelRegistry &registry) {
      * @par Chunk inputs None; source chunks are fetched from the data service.
      * @par MessagePack parameters `input_field`, `input_version`, `input_step`,
      * `input_level`, and `halo_cells` identify and expand the source region.
-     * @par Chunk outputs `outputs[0]` is an opaque, dynamically sized packed AMR
-     * sub-box payload.
+     * @par Chunk outputs `outputs[0]` is an opaque, dynamically sized packed
+     * AMR sub-box payload.
      */
     registry.register_kernel(
         KernelDesc{.name = "amr_subbox_fetch_pack",
@@ -474,9 +480,10 @@ void register_core_kernels(KernelRegistry &registry) {
     /**
      * @brief Loads one plotfile field component for a grid block.
      * @par Chunk inputs None.
-     * @par MessagePack parameters `plotfile` is the source path, `level` selects
-     * the AMR level, and `comp` selects the field component.
-     * @par Chunk outputs `outputs[0]` is the selected component on the block grid.
+     * @par MessagePack parameters `plotfile` is the source path, `level`
+     * selects the AMR level, and `comp` selects the field component.
+     * @par Chunk outputs `outputs[0]` is the selected component on the block
+     * grid.
      */
     registry.register_kernel(
         KernelDesc{.name = "plotfile_load",
