@@ -30,7 +30,7 @@ class KernelRegistry {
     register_kernel_impl(
         desc, std::move(fn), std::move(dynamic_output_bound),
         [](const KernelParamsIR& params) {
-          return std::holds_alternative<Params>(params);
+          return std::holds_alternative<std::decay_t<Params>>(params);
         });
   }
 
