@@ -1,7 +1,6 @@
 #include "kangaroo/executor.hpp"
 
 #include "kangaroo/data_service_local.hpp"
-#include "kangaroo/param_decode.hpp"
 #include "kangaroo/runtime.hpp"
 
 #include <algorithm>
@@ -37,113 +36,6 @@ namespace {
 bool debug_dataflow_enabled() {
   static const bool enabled = std::getenv("KANGAROO_DEBUG_DATAFLOW") != nullptr;
   return enabled;
-}
-
-GraphReduceSpecIR parse_graph_reduce_params(const msgpack::object& root) {
-  if (root.type == msgpack::type::NIL) {
-    throw std::runtime_error("graph reduce params missing");
-  }
-  if (root.type != msgpack::type::MAP) {
-    throw std::runtime_error("graph reduce params must be a map");
-  }
-
-  const auto* kind = find_msgpack_map_value(root, "graph_kind");
-  if (!kind || kind->type != msgpack::type::STR || kind->as<std::string>() != "reduce") {
-    throw std::runtime_error("graph template requires graph_kind=\"reduce\"");
-  }
-
-  GraphReduceSpecIR params;
-  if (const auto* fan_in = find_msgpack_map_value(root, "fan_in"); fan_in &&
-                                                (fan_in->type == msgpack::type::POSITIVE_INTEGER ||
-                                                 fan_in->type == msgpack::type::NEGATIVE_INTEGER)) {
-    params.fan_in = fan_in->as<int32_t>();
-  }
-  if (const auto* num = find_msgpack_map_value(root, "num_inputs"); num &&
-                                                 (num->type == msgpack::type::POSITIVE_INTEGER ||
-                                                  num->type == msgpack::type::NEGATIVE_INTEGER)) {
-    params.num_inputs = num->as<int32_t>();
-  }
-  if (const auto* base = find_msgpack_map_value(root, "input_base"); base &&
-                                                 (base->type == msgpack::type::POSITIVE_INTEGER ||
-                                                  base->type == msgpack::type::NEGATIVE_INTEGER)) {
-    params.input_base = base->as<int32_t>();
-  }
-  if (const auto* base = find_msgpack_map_value(root, "output_base"); base &&
-                                                  (base->type == msgpack::type::POSITIVE_INTEGER ||
-                                                   base->type == msgpack::type::NEGATIVE_INTEGER)) {
-    params.output_base = base->as<int32_t>();
-  }
-  if (const auto* blocks = find_msgpack_map_value(root, "input_blocks");
-      blocks && blocks->type == msgpack::type::ARRAY) {
-    params.input_blocks.clear();
-    params.input_blocks.reserve(blocks->via.array.size);
-    for (uint32_t i = 0; i < blocks->via.array.size; ++i) {
-      const auto& entry = blocks->via.array.ptr[i];
-      if (entry.type == msgpack::type::POSITIVE_INTEGER ||
-          entry.type == msgpack::type::NEGATIVE_INTEGER) {
-        params.input_blocks.push_back(entry.as<int32_t>());
-      }
-    }
-  }
-  if (const auto* blocks = find_msgpack_map_value(root, "output_blocks");
-      blocks && blocks->type == msgpack::type::ARRAY) {
-    params.output_blocks.clear();
-    params.output_blocks.reserve(blocks->via.array.size);
-    for (uint32_t i = 0; i < blocks->via.array.size; ++i) {
-      const auto& entry = blocks->via.array.ptr[i];
-      if (entry.type == msgpack::type::POSITIVE_INTEGER ||
-          entry.type == msgpack::type::NEGATIVE_INTEGER) {
-        params.output_blocks.push_back(entry.as<int32_t>());
-      }
-    }
-  }
-  if (const auto* offsets = find_msgpack_map_value(root, "group_offsets");
-      offsets && offsets->type == msgpack::type::ARRAY) {
-    params.group_offsets.clear();
-    params.group_offsets.reserve(offsets->via.array.size);
-    for (uint32_t i = 0; i < offsets->via.array.size; ++i) {
-      const auto& entry = offsets->via.array.ptr[i];
-      if (entry.type == msgpack::type::POSITIVE_INTEGER ||
-          entry.type == msgpack::type::NEGATIVE_INTEGER) {
-        params.group_offsets.push_back(entry.as<int32_t>());
-      }
-    }
-  }
-
-  if (params.fan_in <= 0) {
-    params.fan_in = 1;
-  }
-  if (params.num_inputs <= 0) {
-    if (!params.input_blocks.empty()) {
-      params.num_inputs = static_cast<int32_t>(params.input_blocks.size());
-    } else {
-      throw std::runtime_error("graph reduce num_inputs must be positive");
-    }
-  }
-  if (!params.input_blocks.empty() &&
-      params.num_inputs != static_cast<int32_t>(params.input_blocks.size())) {
-    throw std::runtime_error("graph reduce num_inputs must match input_blocks size");
-  }
-  int32_t n_groups = (params.num_inputs + params.fan_in - 1) / params.fan_in;
-  if (!params.group_offsets.empty()) {
-    if (params.group_offsets.size() < 2) {
-      throw std::runtime_error("graph reduce group_offsets must include start and end");
-    }
-    if (params.group_offsets.front() != 0 || params.group_offsets.back() != params.num_inputs) {
-      throw std::runtime_error("graph reduce group_offsets must span num_inputs");
-    }
-    for (std::size_t i = 1; i < params.group_offsets.size(); ++i) {
-      if (params.group_offsets[i] <= params.group_offsets[i - 1]) {
-        throw std::runtime_error("graph reduce group_offsets must be strictly increasing");
-      }
-    }
-    n_groups = static_cast<int32_t>(params.group_offsets.size() - 1);
-  }
-  if (!params.output_blocks.empty() &&
-      n_groups != static_cast<int32_t>(params.output_blocks.size())) {
-    throw std::runtime_error("graph reduce output_blocks size must match group count");
-  }
-  return params;
 }
 
 const KernelFn& prepared_kernel(const TaskTemplateIR& tmpl) {
@@ -202,17 +94,17 @@ struct ViewSummary {
   std::size_t nonzero = 0;
 };
 
-ViewSummary summarize_view_f64(const HostView& view) {
+ViewSummary summarize_view_f64(const ChunkBuffer& view) {
   ViewSummary summary;
-  summary.bytes = view.data.size();
-  if (view.data.empty() || (view.data.size() % sizeof(double)) != 0) {
+  summary.bytes = view.bytes();
+  if (view.empty() || view.desc().scalar != ScalarType::kF64 || view.desc().rank != 1) {
     return summary;
   }
   summary.interpreted_as_f64 = true;
-  const std::size_t n = view.data.size() / sizeof(double);
-  const auto* ptr = reinterpret_cast<const double*>(view.data.data());
+  const auto values = view.array<double>();
+  const std::size_t n = values.extent(0);
   for (std::size_t i = 0; i < n; ++i) {
-    const double value = ptr[i];
+    const double value = values(i);
     summary.sum += value;
     if (std::isfinite(value)) {
       summary.min = std::min(summary.min, value);
@@ -234,7 +126,7 @@ ViewSummary summarize_view_f64(const HostView& view) {
 void log_projection_output_summary(const TaskTemplateIR& tmpl,
                                    int32_t block,
                                    std::size_t output_idx,
-                                   const HostView& view) {
+                                   const ChunkBuffer& view) {
   if (!debug_dataflow_enabled()) {
     return;
   }
@@ -297,88 +189,93 @@ InputLocation resolve_input_location(const TaskTemplateIR& tmpl,
   throw std::runtime_error("task block not in input domain blocks");
 }
 
-std::size_t checked_positive_extent(int32_t lo, int32_t hi) {
-  if (hi < lo) {
-    return 0;
-  }
-  return static_cast<std::size_t>(hi - lo + 1);
-}
-
-std::size_t block_cell_count(const RunMeta& meta, int32_t step, int16_t level, int32_t block) {
-  const auto& box = meta.steps.at(static_cast<std::size_t>(step))
-                        .levels.at(static_cast<std::size_t>(level))
-                        .boxes.at(static_cast<std::size_t>(block));
-  const std::size_t nx = checked_positive_extent(box.lo.x, box.hi.x);
-  const std::size_t ny = checked_positive_extent(box.lo.y, box.hi.y);
-  const std::size_t nz = checked_positive_extent(box.lo.z, box.hi.z);
-  return nx * ny * nz;
-}
-
-std::size_t estimate_block_bytes(const RunMeta& meta, const ChunkRef& ref, int32_t bytes_per_value) {
-  if (bytes_per_value <= 0) {
-    return 0;
-  }
-  return block_cell_count(meta, ref.step, ref.level, ref.block) *
-         static_cast<std::size_t>(bytes_per_value);
-}
-
-std::vector<int32_t> input_bytes_per_value_from_params(const TaskTemplateIR& tmpl) {
-  std::vector<int32_t> values;
-  try {
-    const auto& root = cached_params_root(std::span<const std::uint8_t>(
-        tmpl.params_msgpack.data(), tmpl.params_msgpack.size()));
-    if (const auto* input_bpvs = find_msgpack_map_value(root, "input_bytes_per_value");
-        input_bpvs != nullptr && input_bpvs->type == msgpack::type::ARRAY) {
-      values.reserve(input_bpvs->via.array.size);
-      for (uint32_t i = 0; i < input_bpvs->via.array.size; ++i) {
-        const auto& value = input_bpvs->via.array.ptr[i];
-        if (value.type == msgpack::type::POSITIVE_INTEGER ||
-            value.type == msgpack::type::NEGATIVE_INTEGER) {
-          values.push_back(value.as<int32_t>());
-        } else {
-          values.push_back(0);
-        }
-      }
-      return values;
+void finalize_output_buffer(ChunkBuffer& buffer, const BufferSpecIR& spec,
+                            std::string_view kernel) {
+  if (spec.shape_kind == ShapeRuleKind::kDynamic) {
+    if (buffer.awaiting_dynamic_extent_commit()) {
+      throw BufferContractError(BufferContractReason::kInvalidDynamicResize,
+                                "dynamic kernel output was not committed: " +
+                                    std::string(kernel));
     }
-    if (const auto* bpv = find_msgpack_map_value(root, "bytes_per_value");
-        bpv != nullptr && (bpv->type == msgpack::type::POSITIVE_INTEGER ||
-                           bpv->type == msgpack::type::NEGATIVE_INTEGER)) {
-      values.assign(tmpl.inputs.size(), bpv->as<int32_t>());
-    }
-  } catch (...) {
-    values.clear();
+    return;
   }
-  return values;
+  buffer.desc().validate(buffer.bytes());
 }
 
-std::size_t template_output_bytes(const TaskTemplateIR& tmpl) {
+using ChunkEstimateMap =
+    std::unordered_map<ChunkRef, BufferFacts, ChunkRefHash, ChunkRefEq>;
+
+BufferFacts estimate_input_ref(const ChunkEstimateMap& known_outputs,
+                               const DataService& data,
+                               const ChunkRef& ref) {
+  const auto known = known_outputs.find(ref);
+  if (known != known_outputs.end()) return known->second;
+  BufferFacts estimate;
+  estimate.storage_bytes = data.estimate_host_bytes(ref);
+  estimate.payload_bytes = estimate.storage_bytes;
+  estimate.storage_known = estimate.storage_bytes > 0;
+  estimate.desc = data.describe_host(ref);
+  if (estimate.desc.has_value()) {
+    estimate.element_capacity = estimate.desc->element_count();
+    if (estimate.storage_bytes == 0) {
+      estimate.storage_bytes = static_cast<std::size_t>(estimate.desc->required_bytes());
+    }
+    estimate.payload_bytes = estimate.storage_bytes;
+    estimate.storage_known = true;
+  }
+  return estimate;
+}
+
+std::optional<BufferFacts> estimate_output_spec(
+    const BufferSpecIR& spec,
+    const TaskTemplateIR& tmpl,
+    const DataService& data,
+    const RunMeta& meta,
+    int32_t block,
+    std::size_t output_index,
+    std::span<const BufferFacts> inputs) {
+  auto resolved = try_resolve_buffer_spec(
+      spec, tmpl, data, meta, tmpl.domain.step, tmpl.domain.level, block,
+      output_index, inputs);
+  return resolved.has_value() ? std::optional<BufferFacts>(std::move(resolved->facts))
+                              : std::nullopt;
+}
+
+std::optional<std::size_t> template_output_storage_bytes(
+    const TaskTemplateIR& tmpl,
+    const DataService& data,
+    const RunMeta& meta,
+    int32_t block,
+    const std::vector<ChunkRef>& input_refs,
+    const ChunkEstimateMap& known_outputs) {
+  std::vector<BufferFacts> inputs;
+  inputs.reserve(input_refs.size());
+  for (const auto& ref : input_refs) {
+    inputs.push_back(estimate_input_ref(known_outputs, data, ref));
+  }
   std::size_t bytes = 0;
-  for (int64_t value : tmpl.output_bytes) {
-    if (value > 0) {
-      bytes += static_cast<std::size_t>(value);
+  for (std::size_t output_index = 0; output_index < tmpl.outputs.size(); ++output_index) {
+    const auto& output = tmpl.outputs[output_index];
+    std::optional<BufferFacts> estimate;
+    try {
+      estimate = estimate_output_spec(
+          output.buffer, tmpl, data, meta, block, output_index, inputs);
+    } catch (...) {
+      return std::nullopt;
     }
+    if (!estimate.has_value()) return std::nullopt;
+    bytes = static_cast<std::size_t>(checked_add(bytes, estimate->storage_bytes));
   }
   return bytes;
 }
 
-using ChunkByteMap = std::unordered_map<ChunkRef, std::size_t, ChunkRefHash, ChunkRefEq>;
-
-void add_known_output_bytes(ChunkByteMap& known,
-                            const ChunkRef& ref,
-                            std::size_t bytes) {
-  if (bytes == 0) {
-    return;
-  }
-  known[ref] = bytes;
-}
-
-ChunkByteMap build_known_output_bytes(const PlanIR& plan, const RunMeta& meta) {
-  ChunkByteMap known;
+ChunkEstimateMap build_known_output_estimates(const PlanIR& plan,
+                                              const RunMeta& meta,
+                                              const DataService& data) {
+  ChunkEstimateMap known;
   for (const auto& stage : plan.stages) {
     for (const auto& tmpl : stage.templates) {
-      const std::size_t bytes = template_output_bytes(tmpl);
-      if (bytes == 0 || tmpl.outputs.empty()) {
+      if (tmpl.outputs.empty()) {
         continue;
       }
       if (tmpl.plane == ExecPlane::Chunk) {
@@ -395,11 +292,27 @@ ChunkByteMap build_known_output_bytes(const PlanIR& plan, const RunMeta& meta) {
           }
         }
         for (int32_t block : blocks) {
-          for (const auto& out : tmpl.outputs) {
-            add_known_output_bytes(
-                known,
-                ChunkRef{tmpl.domain.step, tmpl.domain.level, out.field, out.version, block},
-                bytes);
+          std::vector<BufferFacts> inputs;
+          inputs.reserve(tmpl.inputs.size());
+          for (const auto& input : tmpl.inputs) {
+            const auto loc = resolve_input_location(tmpl, input, block);
+            inputs.push_back(estimate_input_ref(
+                known, data, ChunkRef{loc.step, loc.level, input.field, input.version, loc.block}));
+          }
+          for (std::size_t output_index = 0; output_index < tmpl.outputs.size();
+               ++output_index) {
+            const auto& out = tmpl.outputs[output_index];
+            std::optional<BufferFacts> estimate;
+            try {
+              estimate = estimate_output_spec(
+                  out.buffer, tmpl, data, meta, block, output_index, inputs);
+            } catch (...) {
+              estimate = std::nullopt;
+            }
+            if (estimate.has_value()) {
+              known[ChunkRef{tmpl.domain.step, tmpl.domain.level,
+                             out.field.field, out.field.version, block}] = *estimate;
+            }
           }
         }
       } else if (tmpl.plane == ExecPlane::Graph) {
@@ -407,11 +320,35 @@ ChunkByteMap build_known_output_bytes(const PlanIR& plan, const RunMeta& meta) {
         const int32_t n_groups = graph_reduce_group_count(params);
         for (int32_t group_idx = 0; group_idx < n_groups; ++group_idx) {
           const int32_t out_block = graph_reduce_output_block(params, group_idx);
-          for (const auto& out : tmpl.outputs) {
-            add_known_output_bytes(
-                known,
-                ChunkRef{tmpl.domain.step, tmpl.domain.level, out.field, out.version, out_block},
-                bytes);
+          const int32_t start = graph_reduce_group_start(params, group_idx);
+          const int32_t end = graph_reduce_group_end(params, group_idx);
+          std::vector<BufferFacts> inputs;
+          for (const auto& input : tmpl.inputs) {
+            for (int32_t idx = start; idx < end; ++idx) {
+              const int32_t block_id = params.input_blocks.empty()
+                  ? params.input_base + idx
+                  : params.input_blocks.at(static_cast<std::size_t>(idx));
+              const int32_t step = input.domain.has_value() ? input.domain->step : tmpl.domain.step;
+              const int16_t level =
+                  input.domain.has_value() ? input.domain->level : tmpl.domain.level;
+              inputs.push_back(estimate_input_ref(
+                  known, data, ChunkRef{step, level, input.field, input.version, block_id}));
+            }
+          }
+          for (std::size_t output_index = 0; output_index < tmpl.outputs.size();
+               ++output_index) {
+            const auto& out = tmpl.outputs[output_index];
+            std::optional<BufferFacts> estimate;
+            try {
+              estimate = estimate_output_spec(
+                  out.buffer, tmpl, data, meta, out_block, output_index, inputs);
+            } catch (...) {
+              estimate = std::nullopt;
+            }
+            if (estimate.has_value()) {
+              known[ChunkRef{tmpl.domain.step, tmpl.domain.level,
+                             out.field.field, out.field.version, out_block}] = *estimate;
+            }
           }
         }
       }
@@ -420,19 +357,10 @@ ChunkByteMap build_known_output_bytes(const PlanIR& plan, const RunMeta& meta) {
   return known;
 }
 
-std::size_t estimate_task_input_ref_bytes(const RunMeta& meta,
-                                          const ChunkByteMap& known_outputs,
-                                          const ChunkRef& ref,
-                                          int32_t bytes_per_value) {
-  auto it = known_outputs.find(ref);
-  if (it != known_outputs.end()) {
-    return it->second;
-  }
-  try {
-    return estimate_block_bytes(meta, ref, bytes_per_value);
-  } catch (...) {
-    return 0;
-  }
+std::size_t estimate_task_input_ref_bytes(const ChunkEstimateMap& known_outputs,
+                                          const DataService& data,
+                                          const ChunkRef& ref) {
+  return estimate_input_ref(known_outputs, data, ref).storage_bytes;
 }
 
 TaskEvent base_task_event(const TaskTemplateIR& tmpl,
@@ -580,7 +508,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
     end_span(resolve_inputs_event);
   }
 
-  std::vector<hpx::future<HostView>> input_futures;
+  std::vector<hpx::future<ChunkBuffer>> input_futures;
   input_futures.reserve(input_refs.size());
   TaskEvent issue_inputs_event;
   if (log_enabled) {
@@ -595,16 +523,16 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
                         int32_t field,
                         int32_t ver,
                         int32_t step,
-                        int16_t level) -> hpx::future<std::vector<HostView>> {
+                        int16_t level) -> hpx::future<std::vector<ChunkBuffer>> {
     if (tmpl.deps.kind != "FaceNeighbors") {
-      return hpx::make_ready_future(std::vector<HostView>{});
+      return hpx::make_ready_future(std::vector<ChunkBuffer>{});
     }
     const int32_t face_idx = static_cast<int32_t>(face);
     if (!tmpl.deps.faces[face_idx]) {
-      return hpx::make_ready_future(std::vector<HostView>{});
+      return hpx::make_ready_future(std::vector<ChunkBuffer>{});
     }
     if (tmpl.deps.width <= 0) {
-      return hpx::make_ready_future(std::vector<HostView>{});
+      return hpx::make_ready_future(std::vector<ChunkBuffer>{});
     }
 
     std::unordered_set<int32_t> visited;
@@ -639,11 +567,11 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
       refs.push_back(std::move(cref));
     }
     if (refs.empty()) {
-      return hpx::make_ready_future(std::vector<HostView>{});
+      return hpx::make_ready_future(std::vector<ChunkBuffer>{});
     }
     auto host_futures = data.get_hosts(refs);
     return hpx::when_all(host_futures).then([](auto&& all) {
-      std::vector<HostView> out;
+      std::vector<ChunkBuffer> out;
       out.reserve(all.get().size());
       for (auto& f : all.get()) {
         out.push_back(f.get());
@@ -657,7 +585,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
     Face face;
   };
 
-  std::vector<hpx::future<std::vector<HostView>>> neighbor_futures;
+  std::vector<hpx::future<std::vector<ChunkBuffer>>> neighbor_futures;
   std::vector<NeighborSlot> neighbor_slots;
   neighbor_futures.reserve(halo_inputs.size() * 6);
   neighbor_slots.reserve(halo_inputs.size() * 6);
@@ -725,7 +653,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
         auto input_pack = hpx::get<0>(results).get();
         auto neighbor_pack = hpx::get<1>(results).get();
 
-        std::vector<HostView> inputs;
+        std::vector<ChunkBuffer> inputs;
         inputs.reserve(input_pack.size());
         for (auto& f : input_pack) {
           inputs.push_back(f.get());
@@ -736,7 +664,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
         nbrs.inputs.resize(halo_inputs.size());
 
         auto assign_face = [](NeighborViews::FieldNeighbors& field, Face face,
-                              std::vector<HostView>&& views) {
+                              std::vector<ChunkBuffer>&& views) {
           switch (face) {
             case Face::Xm:
               field.xm = std::move(views);
@@ -772,28 +700,25 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
         if (log_enabled) {
           alloc_outputs_event = start_span(base_event, "alloc_outputs");
         }
-        std::vector<HostView> outputs;
+        std::vector<ChunkBuffer> outputs;
         outputs.reserve(tmpl.outputs.size());
-        if (!tmpl.output_bytes.empty() && tmpl.output_bytes.size() != tmpl.outputs.size()) {
-          throw std::runtime_error("output_bytes size must match outputs");
-        }
         for (std::size_t i = 0; i < tmpl.outputs.size(); ++i) {
-          std::size_t bytes = 0;
-          if (!tmpl.output_bytes.empty()) {
-            bytes = static_cast<std::size_t>(tmpl.output_bytes[i]);
-          }
           const auto& out = tmpl.outputs[i];
-          ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version, block};
-          outputs.push_back(data.alloc_host(cref, bytes));
+          ChunkRef cref{tmpl.domain.step, tmpl.domain.level,
+                        out.field.field, out.field.version, block};
+          outputs.push_back(data.alloc_host(
+              cref,
+              resolve_output_spec_for_task(
+                  out.buffer, tmpl, data, meta, tmpl.domain.step, tmpl.domain.level,
+                  block, i, inputs)));
         }
         if (log_enabled) {
           end_span(alloc_outputs_event);
         }
 
-        auto inputs_ptr = std::make_shared<std::vector<HostView>>(std::move(inputs));
+        auto inputs_ptr = std::make_shared<std::vector<ChunkBuffer>>(std::move(inputs));
         auto nbrs_ptr = std::make_shared<NeighborViews>(std::move(nbrs));
-        auto outputs_ptr = std::make_shared<std::vector<HostView>>(std::move(outputs));
-        auto params_ptr = std::make_shared<std::vector<std::uint8_t>>(tmpl.params_msgpack);
+        auto outputs_ptr = std::make_shared<std::vector<ChunkBuffer>>(std::move(outputs));
 
         const auto& level = meta.steps.at(tmpl.domain.step).levels.at(tmpl.domain.level);
         auto& fn = prepared_kernel(tmpl);
@@ -803,20 +728,18 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
           kernel_event = start_span(base_event, "kernel");
         }
         ScopedExecutionContext active_context(plan_id);
-        ScopedPreparedParams active_params(tmpl.prepared_params_type, tmpl.prepared_params);
         return fn(level,
                   block,
                   *inputs_ptr,
                   *nbrs_ptr,
                   *outputs_ptr,
-                  std::span<const std::uint8_t>(params_ptr->data(), params_ptr->size()))
+                  tmpl.params)
             .then([&data,
                    tmpl,
                    block,
                    inputs_ptr = std::move(inputs_ptr),
                    nbrs_ptr = std::move(nbrs_ptr),
                    outputs_ptr = std::move(outputs_ptr),
-                   params_ptr = std::move(params_ptr),
                    log_enabled,
                    base_event,
                    kernel_event](auto&&) mutable {
@@ -830,9 +753,11 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
               std::vector<hpx::future<void>> puts;
               puts.reserve(tmpl.outputs.size());
               for (std::size_t i = 0; i < tmpl.outputs.size(); ++i) {
+                finalize_output_buffer((*outputs_ptr)[i], tmpl.outputs[i].buffer, tmpl.kernel);
                 log_projection_output_summary(tmpl, block, i, (*outputs_ptr)[i]);
                 const auto& out = tmpl.outputs[i];
-                ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version, block};
+                ChunkRef cref{tmpl.domain.step, tmpl.domain.level,
+                              out.field.field, out.field.version, block};
                 puts.push_back(data.put_host(cref, std::move((*outputs_ptr)[i])));
               }
               if (log_enabled) {
@@ -973,7 +898,7 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
     end_span(resolve_inputs_event);
   }
 
-  std::vector<hpx::future<HostView>> input_futures;
+  std::vector<hpx::future<ChunkBuffer>> input_futures;
   input_futures.reserve(input_refs.size());
   TaskEvent issue_inputs_event;
   if (log_enabled) {
@@ -1008,7 +933,7 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
           collect_inputs_event = start_span(base_event, "collect_inputs");
         }
         auto input_pack = all.get();
-        std::vector<HostView> inputs;
+        std::vector<ChunkBuffer> inputs;
         inputs.reserve(input_pack.size());
         for (auto& f : input_pack) {
           inputs.push_back(f.get());
@@ -1028,39 +953,35 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
             if (i > 0) {
               oss << ",";
             }
-            oss << inputs[i].data.size();
+            oss << inputs[i].bytes();
           }
           std::cout << oss.str() << std::endl;
-        }
-
-        if (!tmpl.output_bytes.empty() && tmpl.output_bytes.size() != tmpl.outputs.size()) {
-          throw std::runtime_error("output_bytes size must match outputs");
         }
 
         TaskEvent alloc_outputs_event;
         if (log_enabled) {
           alloc_outputs_event = start_span(base_event, "alloc_outputs");
         }
-        std::vector<HostView> outputs;
+        std::vector<ChunkBuffer> outputs;
         outputs.reserve(tmpl.outputs.size());
         for (std::size_t i = 0; i < tmpl.outputs.size(); ++i) {
-          std::size_t bytes = 0;
-          if (!tmpl.output_bytes.empty()) {
-            bytes = static_cast<std::size_t>(tmpl.output_bytes[i]);
-          }
           const auto& out = tmpl.outputs[i];
-          ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version, out_block};
-          outputs.push_back(data.alloc_host(cref, bytes));
+          ChunkRef cref{tmpl.domain.step, tmpl.domain.level,
+                        out.field.field, out.field.version, out_block};
+          outputs.push_back(data.alloc_host(
+              cref,
+              resolve_output_spec_for_task(
+                  out.buffer, tmpl, data, meta, tmpl.domain.step, tmpl.domain.level,
+                  out_block, i, inputs)));
         }
         if (log_enabled) {
           end_span(alloc_outputs_event);
         }
 
         NeighborViews nbrs;
-        auto inputs_ptr = std::make_shared<std::vector<HostView>>(std::move(inputs));
+        auto inputs_ptr = std::make_shared<std::vector<ChunkBuffer>>(std::move(inputs));
         auto nbrs_ptr = std::make_shared<NeighborViews>(std::move(nbrs));
-        auto outputs_ptr = std::make_shared<std::vector<HostView>>(std::move(outputs));
-        auto params_ptr = std::make_shared<std::vector<std::uint8_t>>(tmpl.params_msgpack);
+        auto outputs_ptr = std::make_shared<std::vector<ChunkBuffer>>(std::move(outputs));
 
         const auto& level = meta.steps.at(tmpl.domain.step).levels.at(tmpl.domain.level);
         auto& fn = prepared_kernel(tmpl);
@@ -1070,20 +991,18 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
           kernel_event = start_span(base_event, "kernel");
         }
         ScopedExecutionContext active_context(plan_id);
-        ScopedPreparedParams active_params(tmpl.prepared_params_type, tmpl.prepared_params);
         return fn(level,
                   out_block,
                   *inputs_ptr,
                   *nbrs_ptr,
                   *outputs_ptr,
-                  std::span<const std::uint8_t>(params_ptr->data(), params_ptr->size()))
+                  tmpl.params)
             .then([&data,
                    tmpl,
                    out_block,
                    inputs_ptr = std::move(inputs_ptr),
                    nbrs_ptr = std::move(nbrs_ptr),
                    outputs_ptr = std::move(outputs_ptr),
-                   params_ptr = std::move(params_ptr),
                    log_enabled,
                    base_event,
                    kernel_event](auto&&) mutable {
@@ -1097,9 +1016,11 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
               std::vector<hpx::future<void>> puts;
               puts.reserve(tmpl.outputs.size());
               for (std::size_t i = 0; i < tmpl.outputs.size(); ++i) {
+                finalize_output_buffer((*outputs_ptr)[i], tmpl.outputs[i].buffer, tmpl.kernel);
                 log_projection_output_summary(tmpl, out_block, i, (*outputs_ptr)[i]);
                 const auto& out = tmpl.outputs[i];
-                ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version,
+                ChunkRef cref{tmpl.domain.step, tmpl.domain.level,
+                              out.field.field, out.field.version,
                               out_block};
                 puts.push_back(data.put_host(cref, std::move((*outputs_ptr)[i])));
               }
@@ -1187,7 +1108,7 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
                                            std::size_t max_active_tasks,
                                            std::size_t max_active_storage_units,
                                            std::size_t max_input_bytes,
-                                           std::size_t max_output_bytes) {
+                                           std::size_t max_output_storage_bytes) {
   if (tasks.empty()) {
     return hpx::make_ready_future();
   }
@@ -1197,7 +1118,7 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
     std::vector<StorageUnitKey> storage_units;
     std::vector<ChunkRef> input_refs;
     std::size_t input_bytes = 0;
-    std::size_t output_bytes = 0;
+    std::size_t output_storage_bytes = 0;
   };
 
   struct Runner : std::enable_shared_from_this<Runner> {
@@ -1210,12 +1131,12 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
     std::size_t max_active_tasks = 1;
     std::size_t max_active_storage_units = 0;
     std::size_t max_input_bytes = 0;
-    std::size_t max_output_bytes = 0;
+    std::size_t max_output_storage_bytes = 0;
     std::vector<ActiveTask> active;
     std::unordered_map<StorageUnitKey, int32_t, StorageUnitKeyHash> active_storage_units;
     std::size_t active_storage_unit_count = 0;
     std::size_t active_input_bytes = 0;
-    std::size_t active_output_bytes = 0;
+    std::size_t active_output_storage_bytes = 0;
     hpx::promise<void> done;
 
     void log_partition_state(const char* reason,
@@ -1346,8 +1267,8 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
           active_input_bytes + task.estimated_input_bytes > max_input_bytes) {
         return false;
       }
-      if (max_output_bytes > 0 && task.estimated_output_bytes > 0 &&
-          active_output_bytes + task.estimated_output_bytes > max_output_bytes) {
+      if (max_output_storage_bytes > 0 && task.estimated_output_storage_bytes > 0 &&
+          active_output_storage_bytes + task.estimated_output_storage_bytes > max_output_storage_bytes) {
         return false;
       }
       return true;
@@ -1355,16 +1276,16 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
 
     void add_task_bytes(const TaskInstance& task) {
       active_input_bytes += task.estimated_input_bytes;
-      active_output_bytes += task.estimated_output_bytes;
+      active_output_storage_bytes += task.estimated_output_storage_bytes;
     }
 
     void remove_task_bytes(const ActiveTask& task) {
       active_input_bytes = task.input_bytes > active_input_bytes
                                ? 0
                                : active_input_bytes - task.input_bytes;
-      active_output_bytes = task.output_bytes > active_output_bytes
+      active_output_storage_bytes = task.output_storage_bytes > active_output_storage_bytes
                                 ? 0
-                                : active_output_bytes - task.output_bytes;
+                                : active_output_storage_bytes - task.output_storage_bytes;
     }
 
     void add_storage_units(const std::vector<StorageUnitKey>& units) {
@@ -1425,7 +1346,7 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
                                       std::move(units),
                                       std::move(input_refs),
                                       task.estimated_input_bytes,
-                                      task.estimated_output_bytes});
+                                      task.estimated_output_storage_bytes});
           ++admitted_total;
           log_partition_state("launch", admitted_total, scanned_total);
           admitted = true;
@@ -1498,7 +1419,7 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
   runner->max_active_tasks = std::max<std::size_t>(1, max_active_tasks);
   runner->max_active_storage_units = max_active_storage_units;
   runner->max_input_bytes = max_input_bytes;
-  runner->max_output_bytes = max_output_bytes;
+  runner->max_output_storage_bytes = max_output_storage_bytes;
   return runner->start();
 }
 
@@ -1532,7 +1453,7 @@ hpx::future<void> run_stage_partition_remote(int32_t plan_id,
                                              int32_t max_active_tasks,
                                              int32_t max_active_storage_units,
                                              std::uint64_t max_input_bytes,
-                                             std::uint64_t max_output_bytes) {
+                                             std::uint64_t max_output_storage_bytes) {
   auto ctx = execution_context_shared(plan_id);
   auto data = std::make_shared<DataServiceLocal>(plan_id);
   const std::size_t task_limit =
@@ -1548,7 +1469,7 @@ hpx::future<void> run_stage_partition_remote(int32_t plan_id,
                                   task_limit,
                                   storage_unit_limit,
                                   static_cast<std::size_t>(max_input_bytes),
-                                  static_cast<std::size_t>(max_output_bytes))
+                                  static_cast<std::size_t>(max_output_storage_bytes))
       .then([ctx = std::move(ctx), data = std::move(data)](auto&& done) mutable {
         done.get();
       });
@@ -1564,7 +1485,37 @@ HPX_PLAIN_ACTION(kangaroo::run_stage_partition_remote, kangaroo_run_stage_partit
 
 namespace kangaroo {
 
+void validate_plan_output_bounds(const PlanIR& plan, const KernelRegistry& kernels) {
+  for (const auto& stage : plan.stages) {
+    for (const auto& tmpl : stage.templates) {
+      const auto evaluator = kernels.get_dynamic_output_bound_by_name(tmpl.kernel);
+      for (const auto& output : tmpl.outputs) {
+        const bool needs_kernel_bound =
+            output.buffer.shape_kind == ShapeRuleKind::kDynamic &&
+            (output.buffer.dynamic_upper_bound.kind == DynamicUpperBoundKind::kBackendChunk ||
+             output.buffer.dynamic_upper_bound.kind == DynamicUpperBoundKind::kAmrSubboxPack);
+        if (needs_kernel_bound && !evaluator) {
+          throw std::runtime_error(
+              "kernel " + tmpl.kernel +
+              " does not define its dynamic output bound");
+        }
+      }
+    }
+  }
+}
+
+void validate_plan_kernel_contracts(const PlanIR& plan,
+                                    const KernelRegistry& kernels) {
+  for (const auto& stage : plan.stages) {
+    for (const auto& tmpl : stage.templates) {
+      kernels.validate_params_by_name(tmpl.kernel, tmpl.params);
+    }
+  }
+  validate_plan_output_bounds(plan, kernels);
+}
+
 void prepare_plan(PlanIR& plan, KernelRegistry& kernels) {
+  validate_plan_kernel_contracts(plan, kernels);
   std::vector<std::shared_ptr<const CoveredBoxListIR>> shared_covered_boxes;
   shared_covered_boxes.reserve(plan.shared_covered_boxes.size());
   for (const auto& boxes : plan.shared_covered_boxes) {
@@ -1574,6 +1525,7 @@ void prepare_plan(PlanIR& plan, KernelRegistry& kernels) {
   for (auto& stage : plan.stages) {
     for (auto& tmpl : stage.templates) {
       tmpl.kernel_fn = kernels.get_shared_by_name(tmpl.kernel);
+      tmpl.dynamic_output_bound = kernels.get_dynamic_output_bound_by_name(tmpl.kernel);
       std::shared_ptr<const CoveredBoxListIR> covered_boxes;
       if (tmpl.covered_boxes_ref >= 0) {
         const auto ref_idx = static_cast<std::size_t>(tmpl.covered_boxes_ref);
@@ -1582,21 +1534,16 @@ void prepare_plan(PlanIR& plan, KernelRegistry& kernels) {
         }
         covered_boxes = shared_covered_boxes[ref_idx];
       }
-      auto prepared_params = kernels.prepare_params_by_name(
-          tmpl.kernel,
-          KernelParamContext{
-              std::span<const std::uint8_t>(tmpl.params_msgpack.data(), tmpl.params_msgpack.size()),
-              std::move(covered_boxes),
-          });
-      tmpl.prepared_params = std::move(prepared_params.value);
-      tmpl.prepared_params_type = prepared_params.type;
-      if (tmpl.plane == ExecPlane::Graph) {
-        const auto& params = decode_params_cached<GraphReduceSpecIR>(
-            std::span<const std::uint8_t>(tmpl.params_msgpack.data(), tmpl.params_msgpack.size()),
-            parse_graph_reduce_params);
-        tmpl.graph_reduce = params;
-      } else {
-        tmpl.graph_reduce.reset();
+      std::visit(
+          [&](auto& params) {
+            if constexpr (requires { params.covered_boxes; }) {
+              params.covered_boxes = covered_boxes;
+            }
+          },
+          tmpl.params);
+      if (tmpl.plane == ExecPlane::Graph && !tmpl.graph_reduce) {
+        throw std::runtime_error(
+            "graph template requires graph reduction topology");
       }
     }
   }
@@ -1661,9 +1608,9 @@ ExecutorOptions executor_options_from_environment() {
   options.max_input_bytes_per_locality = positive_env_size(
       "KANGAROO_EXECUTOR_MAX_INPUT_BYTES_PER_LOCALITY",
       options.max_input_bytes_per_locality);
-  options.max_output_bytes_per_locality = positive_env_size(
+  options.max_output_storage_bytes_per_locality = positive_env_size(
       "KANGAROO_EXECUTOR_MAX_OUTPUT_BYTES_PER_LOCALITY",
-      options.max_output_bytes_per_locality);
+      options.max_output_storage_bytes_per_locality);
   return options;
 }
 
@@ -1876,12 +1823,12 @@ std::vector<TaskInstance> Executor::expand_stage_tasks(int32_t stage_idx,
   if (current_plan_ == nullptr) {
     throw std::runtime_error("executor expand_stage_tasks requires active plan");
   }
-  const ChunkByteMap known_outputs = build_known_output_bytes(*current_plan_, meta_);
+  const ChunkEstimateMap known_outputs =
+      build_known_output_estimates(*current_plan_, meta_, data_);
   std::vector<TaskInstance> tasks;
   for (std::size_t tmpl_idx_size = 0; tmpl_idx_size < stage.templates.size(); ++tmpl_idx_size) {
     const int32_t tmpl_idx = static_cast<int32_t>(tmpl_idx_size);
     const auto& tmpl = stage.templates[tmpl_idx_size];
-    const std::vector<int32_t> input_bpvs = input_bytes_per_value_from_params(tmpl);
     if (stage.plane == ExecPlane::Chunk) {
       if (tmpl.plane != ExecPlane::Chunk) {
         throw std::runtime_error("chunk stage requires chunk templates");
@@ -1910,16 +1857,22 @@ std::vector<TaskInstance> Executor::expand_stage_tasks(int32_t stage_idx,
           const auto loc = resolve_input_location(tmpl, input, block);
           ChunkRef ref{loc.step, loc.level, input.field, input.version, loc.block};
           task.input_refs.push_back(ref);
-          const int32_t bpv = input_idx < input_bpvs.size() ? input_bpvs[input_idx] : 0;
           task.estimated_input_bytes +=
-              estimate_task_input_ref_bytes(meta_, known_outputs, ref, bpv);
+              estimate_task_input_ref_bytes(known_outputs, data_, ref);
         }
         task.output_refs.reserve(tmpl.outputs.size());
         for (const auto& out : tmpl.outputs) {
           task.output_refs.push_back(
-              ChunkRef{tmpl.domain.step, tmpl.domain.level, out.field, out.version, block});
+              ChunkRef{tmpl.domain.step, tmpl.domain.level,
+                       out.field.field, out.field.version, block});
         }
-        task.estimated_output_bytes = template_output_bytes(tmpl);
+        const auto output_bytes = template_output_storage_bytes(
+            tmpl, data_, meta_, block, task.input_refs, known_outputs);
+        if (!output_bytes.has_value() && options_.max_output_storage_bytes_per_locality > 0) {
+          throw std::runtime_error(
+              "unable to derive output storage bound while output memory capping is enabled");
+        }
+        task.estimated_output_storage_bytes = output_bytes.value_or(0);
         ChunkRef target_ref;
         if (task.input_refs.empty()) {
           if (task.output_refs.empty()) {
@@ -1963,17 +1916,23 @@ std::vector<TaskInstance> Executor::expand_stage_tasks(int32_t stage_idx,
             }
             ChunkRef ref{step, level, input.field, input.version, block_id};
             task.input_refs.push_back(ref);
-            const int32_t bpv = input_idx < input_bpvs.size() ? input_bpvs[input_idx] : 0;
             task.estimated_input_bytes +=
-                estimate_task_input_ref_bytes(meta_, known_outputs, ref, bpv);
+                estimate_task_input_ref_bytes(known_outputs, data_, ref);
           }
         }
         task.output_refs.reserve(tmpl.outputs.size());
         for (const auto& out : tmpl.outputs) {
           task.output_refs.push_back(
-              ChunkRef{tmpl.domain.step, tmpl.domain.level, out.field, out.version, out_block});
+              ChunkRef{tmpl.domain.step, tmpl.domain.level,
+                       out.field.field, out.field.version, out_block});
         }
-        task.estimated_output_bytes = template_output_bytes(tmpl);
+        const auto output_bytes = template_output_storage_bytes(
+            tmpl, data_, meta_, out_block, task.input_refs, known_outputs);
+        if (!output_bytes.has_value() && options_.max_output_storage_bytes_per_locality > 0) {
+          throw std::runtime_error(
+              "unable to derive output storage bound while output memory capping is enabled");
+        }
+        task.estimated_output_storage_bytes = output_bytes.value_or(0);
         if (task.output_refs.empty()) {
           throw std::runtime_error("graph templates must specify outputs");
         }
@@ -2036,7 +1995,7 @@ hpx::future<void> Executor::run_stage_streaming(int32_t stage_idx, const StageIR
   const std::uint64_t action_input_byte_limit =
       static_cast<std::uint64_t>(options_.max_input_bytes_per_locality);
   const std::uint64_t action_output_byte_limit =
-      static_cast<std::uint64_t>(options_.max_output_bytes_per_locality);
+      static_cast<std::uint64_t>(options_.max_output_storage_bytes_per_locality);
 
   std::vector<hpx::future<void>> partition_futures;
   partition_futures.reserve(locality_count);
@@ -2054,7 +2013,7 @@ hpx::future<void> Executor::run_stage_streaming(int32_t stage_idx, const StageIR
                                                            task_limit,
                                                            storage_unit_limit,
                                                            options_.max_input_bytes_per_locality,
-                                                           options_.max_output_bytes_per_locality));
+                                                           options_.max_output_storage_bytes_per_locality));
       continue;
     }
     partition_futures.push_back(
@@ -2101,8 +2060,9 @@ hpx::future<void> Executor::run_block_task(const TaskTemplateIR& tmpl, int32_t s
   }
   ChunkRef target_ref;
   if (tmpl.inputs.empty()) {
-    target_ref = ChunkRef{tmpl.domain.step, tmpl.domain.level, tmpl.outputs.front().field,
-                          tmpl.outputs.front().version, block};
+    target_ref = ChunkRef{tmpl.domain.step, tmpl.domain.level,
+                          tmpl.outputs.front().field.field,
+                          tmpl.outputs.front().field.version, block};
   } else {
     const auto& first_input = tmpl.inputs.front();
     const auto loc = resolve_input_location(tmpl, first_input, block);
@@ -2156,7 +2116,8 @@ hpx::future<void> Executor::run_graph_task(const TaskTemplateIR& tmpl, int32_t s
     resolve_target_event = start_span(dispatch_event, "dispatch_resolve_target");
   }
   const auto& out = tmpl.outputs.front();
-  ChunkRef cref{tmpl.domain.step, tmpl.domain.level, out.field, out.version, out_block};
+  ChunkRef cref{tmpl.domain.step, tmpl.domain.level,
+                out.field.field, out.field.version, out_block};
 
   int target = data_.home_rank(cref);
   if (log_enabled) {

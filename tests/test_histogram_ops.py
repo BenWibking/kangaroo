@@ -9,8 +9,18 @@ from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
 
 
 def _set_block_double(ds, *, step: int, level: int, field: int, block: int, values: np.ndarray) -> None:
-    arr = np.asarray(values, dtype=np.float64)
-    ds._h.set_chunk_ref(step, level, field, 0, block, arr.tobytes(order="C"))
+    arr = np.ascontiguousarray(values)
+    dtype = "f32" if arr.dtype == np.float32 else "f64"
+    ds._h.set_chunk_ref(
+        step,
+        level,
+        field,
+        0,
+        block,
+        arr.tobytes(order="C"),
+        dtype,
+        list(arr.shape),
+    )
 
 
 def _runmeta_with_step_index(step: int, levels: list[LevelMeta]) -> RunMeta:
@@ -198,6 +208,50 @@ def test_histogram2d_runtime_cell_volume_weight_mode() -> None:
     )
     # 8 cells each with cell volume 8.
     assert np.allclose(raw, np.array([[64.0]]))
+
+
+def test_histogram2d_mixed_input_and_weight_dtypes() -> None:
+    rt = Runtime()
+    step = 22
+    levels = [
+        LevelMeta(
+            geom=LevelGeom(dx=(1.0, 1.0, 1.0), x0=(0.0, 0.0, 0.0), ref_ratio=1),
+            boxes=[BlockBox((0, 0, 0), (1, 1, 1))],
+        )
+    ]
+    runmeta = _runmeta_with_step_index(step, levels)
+    ds = open_dataset("memory://mixed-histogram", runmeta=runmeta, step=step, level=0, runtime=rt)
+    x_field, y_field, weight_field = 22021, 22022, 22023
+    for name, field in (("x", x_field), ("y", y_field), ("weight", weight_field)):
+        ds.register_field(name, field)
+    x = np.array([0.1, 0.2, 0.6, 0.7, 1.1, 1.2, 1.6, 1.7], dtype=np.float32).reshape(2, 2, 2)
+    y = np.array([0.1, 1.1, 0.1, 1.1, 0.1, 1.1, 0.1, 1.1], dtype=np.float64).reshape(2, 2, 2)
+    weights = np.arange(1, 9, dtype=np.float32).reshape(2, 2, 2)
+    _set_block_double(ds, step=step, level=0, field=x_field, block=0, values=x)
+    _set_block_double(ds, step=step, level=0, field=y_field, block=0, values=y)
+    _set_block_double(ds, step=step, level=0, field=weight_field, block=0, values=weights)
+
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    hist = pipe.histogram2d(
+        pipe.field(x_field),
+        pipe.field(y_field),
+        x_range=(0.0, 2.0),
+        y_range=(0.0, 2.0),
+        bins=(2, 2),
+        weights=pipe.field(weight_field),
+        out="mixed_hist2d",
+    )
+    pipe.run()
+    got = rt.get_task_chunk_array(
+        step=step,
+        level=0,
+        field=hist.counts.field,
+        block=0,
+        dataset=ds,
+    )
+    expected, _, _ = np.histogram2d(x.ravel(), y.ravel(), bins=(2, 2), range=((0, 2), (0, 2)), weights=weights.ravel())
+    assert got.dtype == np.float64
+    assert np.allclose(got, expected)
 
 
 def test_histogram1d_amr_covered_boxes_masking() -> None:

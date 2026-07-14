@@ -79,7 +79,8 @@ pixi run python scripts/plotfile_projection.py /path/to/plotfile \
 
 Notes:
 - projection always uses AMR cell-average semantics.
-- byte width is inferred from dataset chunks via `Dataset.infer_bytes_per_value(...)`.
+- chunk dtype, shape, and physical strides travel with each chunk; projection output is `float64`.
+- `Runtime.get_task_chunk_array(...)` materializes typed outputs without caller-provided shape or dtype.
 
 ### 3) Per-FAB min/max inspection
 

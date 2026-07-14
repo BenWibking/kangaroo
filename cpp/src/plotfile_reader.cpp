@@ -808,6 +808,23 @@ int64_t PlotfileReader::particle_chunk_count(const std::string& particle_type) c
   return chunks;
 }
 
+int64_t PlotfileReader::particle_chunk_records(const std::string& particle_type,
+                                               int64_t chunk_index) const {
+  const auto& species = get_particle_species(particle_type);
+  if (chunk_index < 0) {
+    throw std::runtime_error("particle chunk index out of range");
+  }
+  int64_t cursor = 0;
+  for (const auto& level_counts : species.header.particle_counts) {
+    const auto level_size = static_cast<int64_t>(level_counts.size());
+    if (chunk_index < cursor + level_size) {
+      return level_counts.at(static_cast<std::size_t>(chunk_index - cursor));
+    }
+    cursor += level_size;
+  }
+  throw std::runtime_error("particle chunk index out of range");
+}
+
 int64_t PlotfileReader::particle_chunk_index(const std::string& particle_type,
                                              int level,
                                              int grid_index) const {

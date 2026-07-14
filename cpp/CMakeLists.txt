@@ -6,15 +6,10 @@ option(KANGAROO_ASAN "Enable AddressSanitizer for kangaroo targets" OFF)
 option(KANGAROO_USE_OPENPMD "Enable openPMD reader support" OFF)
 option(KANGAROO_USE_PARTHENON_HDF5 "Enable Parthenon HDF5 reader support" ON)
 
-# msgpack-cxx's CMake config can still rely on FindBoost; keep legacy behavior
-# under CMake 4.x to avoid noisy developer warnings.
-if(POLICY CMP0167)
-  cmake_policy(SET CMP0167 OLD)
-endif()
-
 find_package(HPX REQUIRED)
 find_package(Python REQUIRED COMPONENTS Interpreter Development)
 find_package(nanobind CONFIG REQUIRED)
+find_package(flatbuffers CONFIG REQUIRED)
 find_package(protobuf CONFIG QUIET)
 if(protobuf_FOUND)
   set(KANGAROO_PROTOBUF_FOUND TRUE)
@@ -28,22 +23,6 @@ elseif(NOT protobuf_FOUND)
   endif()
 endif()
 find_package(amrexpr CONFIG QUIET)
-find_package(msgpack-cxx CONFIG QUIET)
-if(NOT msgpack-cxx_FOUND)
-  # CMake 4.x requires a policy minimum for older subprojects like msgpack.
-  set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
-  include(FetchContent)
-  FetchContent_Declare(
-    msgpack
-    GIT_REPOSITORY https://github.com/msgpack/msgpack-c.git
-    GIT_TAG cpp-6.1.0
-  )
-  FetchContent_MakeAvailable(msgpack)
-  if(NOT TARGET msgpackc-cxx AND TARGET msgpack-cxx)
-    add_library(msgpackc-cxx ALIAS msgpack-cxx)
-  endif()
-endif()
-
 if(NOT amrexpr_FOUND)
   include(FetchContent)
   FetchContent_Declare(
@@ -56,21 +35,88 @@ endif()
 
 set(KANGAROO_RUNTIME_SOURCES
   src/adjacency.cpp
+  src/amr_patch_codec.cpp
   src/backend_parthenon.cpp
   src/backend_memory.cpp
   src/backend_plotfile.cpp
+  src/buffer_resolution.cpp
+  src/chunk_buffer.cpp
   src/data_service_local.cpp
+  src/dataset_backend.cpp
+  src/kernels/default_kernels.cpp
+  src/kernels/core_kernels.cpp
+  src/kernels/flux_kernels.cpp
+  src/kernels/grid_kernels.cpp
+  src/kernels/histogram_kernels.cpp
+  src/kernels/particle_kernels.cpp
+  src/kernels/reduction_kernels.cpp
+  src/kernels/toomre_kernels.cpp
+  src/kernels/kernel_buffer_support.cpp
+  src/kernels/kernel_param_support.cpp
+  src/kernels/particle_kernel_support.cpp
+  src/kernels/projection_kernel_support.cpp
+  src/kernels/plotfile_kernel_support.cpp
+  src/kernels/amr_sampling_support.cpp
+  src/kernels/flux_geometry_support.cpp
   src/executor.cpp
   src/kernel_registry.cpp
-  src/param_decode.cpp
-  src/plan_decode_msgpack.cpp
+  src/plan_decode_flatbuffer.cpp
 )
 
+set(KANGAROO_FLATBUFFER_SCHEMAS
+  "${CMAKE_CURRENT_SOURCE_DIR}/schema/plan.fbs"
+  "${CMAKE_CURRENT_SOURCE_DIR}/schema/amr_patch.fbs"
+)
+set(KANGAROO_FLATBUFFER_HEADERS
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/plan_generated.h"
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/amr_patch_generated.h"
+)
+set(KANGAROO_FLATBUFFER_PYTHON_DIR
+  "${CMAKE_CURRENT_BINARY_DIR}/generated/python"
+)
+set(KANGAROO_FLATBUFFER_PYTHON_STAMP
+  "${KANGAROO_FLATBUFFER_PYTHON_DIR}/flatbuffers.stamp"
+)
+add_custom_command(
+  OUTPUT ${KANGAROO_FLATBUFFER_HEADERS}
+  COMMAND flatbuffers::flatc
+          --cpp
+          --cpp-std c++17
+          --gen-object-api
+          -o "${CMAKE_CURRENT_BINARY_DIR}/generated"
+          ${KANGAROO_FLATBUFFER_SCHEMAS}
+  DEPENDS flatbuffers::flatc ${KANGAROO_FLATBUFFER_SCHEMAS}
+  COMMENT "Generating typed Kangaroo FlatBuffer schemas"
+  VERBATIM
+)
+add_custom_command(
+  OUTPUT "${KANGAROO_FLATBUFFER_PYTHON_STAMP}"
+  COMMAND "${CMAKE_COMMAND}" -E rm -rf
+          "${KANGAROO_FLATBUFFER_PYTHON_DIR}/analysis"
+  COMMAND "${CMAKE_COMMAND}" -E make_directory
+          "${KANGAROO_FLATBUFFER_PYTHON_DIR}"
+  COMMAND flatbuffers::flatc
+          --python
+          --python-typing
+          --gen-object-api
+          -o "${KANGAROO_FLATBUFFER_PYTHON_DIR}"
+          ${KANGAROO_FLATBUFFER_SCHEMAS}
+  COMMAND "${CMAKE_COMMAND}" -E touch
+          "${KANGAROO_FLATBUFFER_PYTHON_STAMP}"
+  DEPENDS flatbuffers::flatc ${KANGAROO_FLATBUFFER_SCHEMAS}
+  COMMENT "Generating typed Kangaroo Python FlatBuffer bindings"
+  VERBATIM
+)
+add_custom_target(kangaroo_flatbuffer_python_codegen
+  DEPENDS "${KANGAROO_FLATBUFFER_PYTHON_STAMP}"
+)
 if(KANGAROO_USE_OPENPMD)
   list(APPEND KANGAROO_RUNTIME_SOURCES src/backend_openpmd.cpp)
 endif()
 
 add_library(kangaroo_runtime STATIC ${KANGAROO_RUNTIME_SOURCES})
+target_sources(kangaroo_runtime PRIVATE ${KANGAROO_FLATBUFFER_HEADERS})
+add_dependencies(kangaroo_runtime kangaroo_flatbuffer_python_codegen)
 set_target_properties(kangaroo_runtime PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 set(KANGAROO_PROTO_DIR "${CMAKE_CURRENT_SOURCE_DIR}/proto")
@@ -96,7 +142,7 @@ target_include_directories(kangaroo_runtime PUBLIC
   ${KANGAROO_PROTO_GEN_DIR}
 )
 
-target_link_libraries(kangaroo_runtime PUBLIC HPX::hpx)
+target_link_libraries(kangaroo_runtime PUBLIC HPX::hpx flatbuffers::flatbuffers)
 
 function(kangaroo_collect_target_library_dirs target out_var)
   set(_dirs "")
@@ -189,13 +235,7 @@ if(KANGAROO_USE_OPENPMD)
   target_link_libraries(kangaroo_runtime PUBLIC openPMD::openPMD)
 endif()
 
-if(NOT msgpack-cxx_FOUND AND msgpack_SOURCE_DIR)
-  target_include_directories(kangaroo_runtime PUBLIC "${msgpack_SOURCE_DIR}/include")
-endif()
-
 target_compile_features(kangaroo_runtime PUBLIC cxx_std_20)
-
-target_compile_definitions(kangaroo_runtime PUBLIC KANGAROO_USE_MSGPACK)
 
 nanobind_add_module(_core src/bindings.cpp src/runtime.cpp)
 target_link_libraries(_core PRIVATE kangaroo_runtime)
@@ -247,3 +287,6 @@ install(TARGETS _core _plotfile LIBRARY DESTINATION "${KANGAROO_PYTHON_SITE}/ana
 install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../analysis/"
         DESTINATION "${KANGAROO_PYTHON_SITE}/analysis"
         FILES_MATCHING PATTERN "*.py")
+install(DIRECTORY "${KANGAROO_FLATBUFFER_PYTHON_DIR}/analysis/"
+        DESTINATION "${KANGAROO_PYTHON_SITE}/analysis"
+        FILES_MATCHING PATTERN "*.py" PATTERN "*.pyi")

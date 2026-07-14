@@ -6,9 +6,17 @@ import numpy as np
 import pytest
 
 from analysis import Runtime
+from analysis.buffer import FixedShape, numpy_dtype
 from analysis.dataset import open_dataset
+from analysis.kernel_params import NoKernelParams
 from analysis.pipeline import Pipeline
 from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
+
+
+def _output_bytes(template) -> int:
+    spec = template.outputs[0].buffer
+    assert isinstance(spec.shape, FixedShape)
+    return int(np.prod(spec.shape.extents)) * numpy_dtype(spec.dtype).itemsize
 
 
 class _FakeCoreRuntime:
@@ -83,8 +91,11 @@ def _set_block_double(
     block: int,
     values: np.ndarray,
 ) -> None:
-    arr = np.asarray(values, dtype=np.float64)
-    ds._h.set_chunk_ref(step, level, field, 0, block, arr.tobytes(order="C"))
+    arr = np.ascontiguousarray(values)
+    dtype = "f32" if arr.dtype == np.float32 else "f64"
+    ds._h.set_chunk_ref(
+        step, level, field, 0, block, arr.tobytes(order="C"), dtype, list(arr.shape)
+    )
 
 
 def _runmeta_with_step_index(step: int, levels: list[LevelMeta]) -> RunMeta:
@@ -145,7 +156,6 @@ def test_flux_surface_integral_lowering_wires_accumulate_reduce_and_covered_boxe
         magnetic_field=(7, 8, 9),
         radius=2.5,
         out="flux",
-        bytes_per_value=8,
         reduce_fan_in=2,
     )
     plan = pipe.plan()
@@ -173,19 +183,19 @@ def test_flux_surface_integral_lowering_wires_accumulate_reduce_and_covered_boxe
     assert len(accum) == 3
     assert accum_stages[0].templates == accum
     assert all(len(tmpl.inputs) == 9 for tmpl in accum)
-    assert all(tmpl.output_bytes == [64] for tmpl in accum)
+    assert all(_output_bytes(tmpl) == 64 for tmpl in accum)
 
     coarse = [tmpl for tmpl in accum if tmpl.domain.level == 0]
     fine = [tmpl for tmpl in accum if tmpl.domain.level == 1]
     assert coarse
     assert fine
-    assert [[0, 0, 0], [0, 1, 1]] in coarse[0].params["covered_boxes"]
-    assert fine[0].params["covered_boxes"] == []
+    assert ((0, 0, 0), (0, 1, 1)) in coarse[0].params.covered_boxes
+    assert fine[0].params.covered_boxes == ()
 
     reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
     assert reducers
-    assert all(tmpl.params["bytes_per_value"] == 8 for tmpl in reducers)
-    assert all(tmpl.output_bytes == [64] for tmpl in reducers)
+    assert all(isinstance(tmpl.params, NoKernelParams) for tmpl in reducers)
+    assert all(_output_bytes(tmpl) == 64 for tmpl in reducers)
     first_reduce_stages = [
         stage
         for stage in plan.stages
@@ -225,7 +235,6 @@ def test_flux_surface_integral_lowering_accepts_radius_array() -> None:
         magnetic_field=(7, 8, 9),
         radius=np.array([0.25, 0.5, 0.75]),
         out="flux",
-        bytes_per_value=8,
     )
     plan = pipe.plan()
 
@@ -233,11 +242,11 @@ def test_flux_surface_integral_lowering_accepts_radius_array() -> None:
     templates = [tmpl for stage in plan.stages for tmpl in stage.templates]
     accum = [tmpl for tmpl in templates if tmpl.kernel == "flux_surface_integral_accumulate"]
     assert len(accum) == 1
-    assert accum[0].params["radii"] == [0.25, 0.5, 0.75]
-    assert accum[0].output_bytes == [192]
+    assert accum[0].params.radii == (0.25, 0.5, 0.75)
+    assert _output_bytes(accum[0]) == 192
     reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
     assert reducers
-    assert all(tmpl.output_bytes == [192] for tmpl in reducers)
+    assert all(_output_bytes(tmpl) == 192 for tmpl in reducers)
 
 
 def test_flux_surface_integral_lowering_accepts_temperature_bins() -> None:
@@ -271,7 +280,6 @@ def test_flux_surface_integral_lowering_accepts_temperature_bins() -> None:
         temperature=10,
         temperature_bins=np.array([1.0, 10.0, 100.0]),
         out="flux",
-        bytes_per_value=8,
     )
     plan = pipe.plan()
 
@@ -280,11 +288,11 @@ def test_flux_surface_integral_lowering_accepts_temperature_bins() -> None:
     accum = [tmpl for tmpl in templates if tmpl.kernel == "flux_surface_integral_accumulate"]
     assert len(accum) == 1
     assert len(accum[0].inputs) == 10
-    assert accum[0].params["temperature_bins"] == [1.0, 10.0, 100.0]
-    assert accum[0].output_bytes == [128]
+    assert accum[0].params.temperature_bins == (1.0, 10.0, 100.0)
+    assert _output_bytes(accum[0]) == 128
     reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
     assert reducers
-    assert all(tmpl.output_bytes == [128] for tmpl in reducers)
+    assert all(_output_bytes(tmpl) == 128 for tmpl in reducers)
 
 
 def test_cylindrical_flux_surface_integral_lowering_accepts_height_array() -> None:
@@ -317,7 +325,6 @@ def test_cylindrical_flux_surface_integral_lowering_accepts_height_array() -> No
         radius=0.5,
         height=np.array([0.5, 1.5]),
         out="flux",
-        bytes_per_value=8,
     )
     plan = pipe.plan()
 
@@ -341,12 +348,12 @@ def test_cylindrical_flux_surface_integral_lowering_accepts_height_array() -> No
         if tmpl.kernel == "cylindrical_flux_surface_integral_accumulate"
     ]
     assert len(accum) == 1
-    assert accum[0].params["radius"] == 0.5
-    assert accum[0].params["heights"] == [0.5, 1.5]
-    assert accum[0].output_bytes == [256]
+    assert accum[0].params.radius == 0.5
+    assert accum[0].params.heights == (0.5, 1.5)
+    assert _output_bytes(accum[0]) == 256
     reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
     assert reducers
-    assert all(tmpl.output_bytes == [256] for tmpl in reducers)
+    assert all(_output_bytes(tmpl) == 256 for tmpl in reducers)
 
 
 def test_flux_surface_integral_rejects_temperature_bins_without_temperature_field() -> None:
@@ -379,7 +386,6 @@ def test_flux_surface_integral_rejects_temperature_bins_without_temperature_fiel
             magnetic_field=(7, 8, 9),
             radius=0.5,
             temperature_bins=[1.0, 10.0],
-            bytes_per_value=8,
         )
 
 
@@ -415,7 +421,6 @@ def test_flux_surface_integral_lowering_uses_per_block_radius_subsets() -> None:
         magnetic_field=(7, 8, 9),
         radius=[0.5, 3.5],
         out="flux",
-        bytes_per_value=8,
     )
     plan = pipe.plan()
 
@@ -423,12 +428,12 @@ def test_flux_surface_integral_lowering_uses_per_block_radius_subsets() -> None:
     accum = [tmpl for tmpl in templates if tmpl.kernel == "flux_surface_integral_accumulate"]
     assert len(accum) == 2
     by_block = {tmpl.domain.blocks[0]: tmpl for tmpl in accum}
-    assert by_block[0].params["radii"] == [0.5]
-    assert by_block[0].params["radius_indices"] == [0]
-    assert by_block[1].params["radii"] == [3.5]
-    assert by_block[1].params["radius_indices"] == [1]
-    assert all(tmpl.params["num_radii"] == 2 for tmpl in accum)
-    assert all(tmpl.output_bytes == [128] for tmpl in accum)
+    assert by_block[0].params.radii == (0.5,)
+    assert by_block[0].params.radius_indices == (0,)
+    assert by_block[1].params.radii == (3.5,)
+    assert by_block[1].params.radius_indices == (1,)
+    assert all(tmpl.params.num_radii == 2 for tmpl in accum)
+    assert all(_output_bytes(tmpl) == 128 for tmpl in accum)
 
 
 def test_flux_surface_integral_lowering_normalizes_single_nonzero_block() -> None:
@@ -463,7 +468,6 @@ def test_flux_surface_integral_lowering_normalizes_single_nonzero_block() -> Non
         magnetic_field=(7, 8, 9),
         radius=0.5,
         out="flux",
-        bytes_per_value=8,
     )
     plan = pipe.plan()
 
@@ -479,9 +483,9 @@ def test_flux_surface_integral_lowering_normalizes_single_nonzero_block() -> Non
         and tmpl.name == "flux_surface_integral_reduce_single"
     ]
     assert len(reductions) == 1
-    assert reductions[0].params["input_blocks"] == [1]
-    assert reductions[0].params["output_blocks"] == [0]
-    assert reductions[0].params["group_offsets"] == [0, 1]
+    assert reductions[0].graph_reduce.input_blocks == (1,)
+    assert reductions[0].graph_reduce.output_blocks == (0,)
+    assert reductions[0].graph_reduce.group_offsets == (0, 1)
 
 
 def test_flux_surface_integral_rejects_invalid_radius() -> None:
@@ -513,7 +517,6 @@ def test_flux_surface_integral_rejects_invalid_radius() -> None:
             passive_scalar=6,
             magnetic_field=(7, 8, 9),
             radius=0.0,
-            bytes_per_value=8,
         )
 
 
@@ -546,7 +549,6 @@ def test_flux_surface_integral_rejects_invalid_radius_array_value() -> None:
             passive_scalar=6,
             magnetic_field=(7, 8, 9),
             radius=[0.5, 0.0],
-            bytes_per_value=8,
         )
 
 
@@ -579,7 +581,6 @@ def test_flux_surface_integral_rejects_radius_with_no_intersecting_blocks() -> N
             passive_scalar=6,
             magnetic_field=(7, 8, 9),
             radius=10.0,
-            bytes_per_value=8,
         )
 
 
@@ -612,7 +613,6 @@ def test_flux_surface_integral_rejects_radius_array_with_missing_intersection() 
             passive_scalar=6,
             magnetic_field=(7, 8, 9),
             radius=[0.5, 10.0],
-            bytes_per_value=8,
         )
 
 
@@ -658,7 +658,6 @@ def test_flux_surface_integral_runtime_one_cell_mhd_energy_term() -> None:
         magnetic_field=(pipe.field(7), pipe.field(8), pipe.field(9)),
         radius=0.5,
         out="flux",
-        bytes_per_value=8,
     )
     pipe.run()
 
@@ -713,7 +712,6 @@ def test_cylindrical_flux_surface_integral_runtime_outputs_endcaps_and_walls() -
         radius=0.5,
         height=0.25,
         out="flux",
-        bytes_per_value=8,
     )
     pipe.run()
 
@@ -761,7 +759,6 @@ def test_flux_surface_integral_runtime_radius_array() -> None:
         passive_scalar=6,
         magnetic_field=(7, 8, 9),
         radius=[0.25, 0.5, 0.75],
-        bytes_per_value=8,
     )
     pipe.run()
 
@@ -812,7 +809,6 @@ def test_cylindrical_flux_surface_integral_runtime_one_cell_mhd_energy_term() ->
         radius=0.5,
         height=0.5,
         out="flux",
-        bytes_per_value=8,
     )
     pipe.run()
 
@@ -871,15 +867,13 @@ def test_flux_surface_integral_runtime_sparse_radius_slots() -> None:
             passive_scalar=6,
             magnetic_field=(7, 8, 9),
             radius=radii,
-            bytes_per_value=8,
         )
         pipe.run()
         return rt.get_task_chunk_array(
             step=step,
             level=0,
             field=flux.field,
-            shape=(len(radii), 2, 4),
-            dtype=np.float64,
+                dtype=np.float64,
             dataset=ds,
             block=0,
         )
@@ -888,8 +882,8 @@ def test_flux_surface_integral_runtime_sparse_radius_slots() -> None:
     first = run_flux([0.5], uri_suffix="first")
     second = run_flux([3.5], uri_suffix="second")
 
-    assert np.allclose(combined[0], first[0])
-    assert np.allclose(combined[1], second[0])
+    assert np.allclose(combined[0], first)
+    assert np.allclose(combined[1], second)
 
 
 def test_flux_surface_integral_runtime_single_nonzero_block() -> None:
@@ -930,7 +924,6 @@ def test_flux_surface_integral_runtime_single_nonzero_block() -> None:
         passive_scalar=6,
         magnetic_field=(7, 8, 9),
         radius=0.5,
-        bytes_per_value=8,
     )
     pipe.run()
 
@@ -983,7 +976,6 @@ def test_flux_surface_integral_runtime_multiblock_reduction() -> None:
         magnetic_field=(7, 8, 9),
         radius=0.5,
         reduce_fan_in=2,
-        bytes_per_value=8,
     )
     pipe.run()
 
@@ -1034,7 +1026,6 @@ def test_flux_surface_integral_runtime_outputs_negative_and_positive_bins() -> N
         magnetic_field=(7, 8, 9),
         radius=0.5,
         reduce_fan_in=2,
-        bytes_per_value=8,
     )
     pipe.run()
 
@@ -1105,7 +1096,6 @@ def test_flux_surface_integral_runtime_outputs_temperature_bins() -> None:
         temperature=10,
         temperature_bins=[0.0, 10.0, 20.0],
         reduce_fan_in=2,
-        bytes_per_value=8,
     )
     pipe.run()
 
@@ -1168,7 +1158,6 @@ def test_flux_surface_integral_runtime_amr_covered_cells_are_excluded() -> None:
         passive_scalar=6,
         magnetic_field=(7, 8, 9),
         radius=0.5,
-        bytes_per_value=8,
     )
     pipe.run()
 

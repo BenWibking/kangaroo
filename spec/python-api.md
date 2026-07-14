@@ -4,7 +4,8 @@
 
 The `analysis` package MUST expose the following public symbols (directly or via lazy attribute loading):
 - Runtime: `Runtime`, runtime configuration string helper.
-- Plan model: `Plan`, `Stage`, `TaskTemplate`, `Domain`, `FieldRef`.
+- Plan model: `Plan`, `Stage`, `TaskTemplate`, `Domain`, `FieldRef`, `OutputRef`.
+- Buffer model: `BufferSpec`, dtype/init enums, and closed shape-rule types.
 - Lowering context: `LoweringContext`.
 - Dataset: `Dataset`, `open_dataset`.
 - Run metadata model: `RunMeta`, `StepMeta`, `LevelMeta`, `LevelGeom`, `BlockBox`, metadata loader helper.
@@ -34,8 +35,8 @@ Unknown attribute access MUST raise `AttributeError`.
 - `mark_field_persistent(fid, name)` marks field for persistent output identity.
 - `run(plan, runmeta, dataset)` executes the plan.
 - `preload(runmeta, dataset, fields)` preloads selected field chunks where available.
-- `get_task_chunk(step, level, field, version, block, dataset=None)` returns raw bytes.
-- `get_task_chunk_array(...)` converts returned bytes to ndarray with provided or inferred dtype.
+- `get_task_chunk_bytes(...)` returns raw bytes for debugging and opaque payloads.
+- `get_task_chunk_array(...)` materializes a numeric ndarray from its runtime descriptor.
 - `set_event_log_path(path)` updates runtime event sink path.
 - `kernels` property exposes registry/list API.
 
@@ -48,11 +49,9 @@ Execution visibility rules:
 ### 2.3 `get_task_chunk_array` Semantics
 
 Required behavior:
-- `shape` MUST define positive total element count.
-- If `dtype` is provided, use it directly.
-- If `dtype` is absent, infer from `bytes_per_value` (explicit or inferred from raw bytes/shape).
-- Supported inferred widths: 4 and 8 only.
-- Unsupported width MUST raise explicit error.
+- The runtime descriptor is authoritative for dtype, shape, and strides.
+- Optional caller-provided `dtype` or `shape` values are assertions and mismatches MUST fail.
+- Opaque payloads MUST fail numeric materialization and use raw-byte retrieval instead.
 
 ## 3. Plan Model API
 
@@ -147,8 +146,7 @@ Validation:
 
 ### 4.9 Chunk Utilities
 
-- `infer_bytes_per_value(...)` infers element width from chunk size and level box cell count.
-- `set_chunk(...)` writes chunk payload to mutable backend.
+- `set_chunk(...)` accepts NumPy arrays, explicitly typed/shaped raw bytes, or explicitly opaque bytes.
 
 ## 5. `PlotfileReader` API
 
@@ -185,7 +183,7 @@ If runtime provides dataset-binding hook, pipeline MUST bind dataset on construc
 
 Pipeline MUST support:
 - `field(name_or_id)`
-- `field_expr(expression, variables, out=None, bytes_per_value=None)`
+- `field_expr(expression, variables, out=None, dtype="f64")`
 - Arithmetic helpers (`field_add`, `field_subtract`, `field_multiply`, `field_divide`)
 - Derived field registration and retrieval with caching controls.
 

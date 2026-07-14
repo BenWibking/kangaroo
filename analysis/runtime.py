@@ -6,13 +6,17 @@ import sys
 import tempfile
 import threading
 import time
+from dataclasses import asdict
 from typing import Any
 
 import importlib.util
 from pathlib import Path
 
-import msgpack
 import numpy as np
+
+from .buffer import materialize_payload
+from .kernel_params import NoKernelParams
+from .plan_codec import encode_plan
 
 from .plan import Plan
 
@@ -152,9 +156,9 @@ class Runtime:
             phase_end = time.time()
             _log_phase_span("python_write_dashboard_plan", phase_start, phase_end)
         phase_start = time.time()
-        packed = msgpack.packb(plan_ir, use_bin_type=True)
+        packed = encode_plan(plan)
         phase_end = time.time()
-        _log_phase_span("python_pack_plan_msgpack", phase_start, phase_end)
+        _log_phase_span("python_encode_plan_flatbuffer", phase_start, phase_end)
         _log_phase_span("python_prepare_plan", prepare_start, phase_end)
         self._run_in_progress = True
         try:
@@ -255,24 +259,18 @@ class Runtime:
         dataset_h = dataset._h if dataset is not None and hasattr(dataset, "_h") else None
         return self._rt.get_task_chunk(step, level, field, version, block, dataset_h)
 
-    def get_task_chunk_array(
+    def get_task_chunk_bytes(
         self,
         *,
         step: int,
         level: int,
         field: int,
-        shape: tuple[int, ...],
         version: int = 0,
         block: int,
-        dtype: Any | None = None,
-        bytes_per_value: int | None = None,
         dataset: Any | None = None,
-    ) -> np.ndarray:
-        count = int(np.prod(shape))
-        if count <= 0:
-            raise ValueError("shape must have a positive number of elements")
-
-        raw = self.get_task_chunk(
+    ) -> bytes:
+        """Return the raw visible bytes for a numeric chunk or opaque payload."""
+        return self.get_task_chunk(
             step=step,
             level=level,
             field=field,
@@ -280,16 +278,30 @@ class Runtime:
             block=block,
             dataset=dataset,
         )
-        if dtype is None:
-            if bytes_per_value is None:
-                bytes_per_value = len(raw) // count
-            if bytes_per_value == 8:
-                dtype = np.float64
-            elif bytes_per_value == 4:
-                dtype = np.float32
-            else:
-                raise ValueError(f"unsupported bytes_per_value: {bytes_per_value}")
-        return np.frombuffer(raw, dtype=dtype, count=count).reshape(shape)
+
+    def get_task_chunk_array(
+        self,
+        *,
+        step: int,
+        level: int,
+        field: int,
+        shape: tuple[int, ...] | None = None,
+        version: int = 0,
+        block: int,
+        dtype: Any | None = None,
+        dataset: Any | None = None,
+    ) -> np.ndarray:
+        if self._run_in_progress:
+            raise RuntimeError("output retrieval is not allowed while a plan run is in progress")
+        dataset_h = dataset._h if dataset is not None and hasattr(dataset, "_h") else None
+        info = self._rt.get_task_chunk_info(
+            step, level, field, version, block, dataset_h
+        )
+        return materialize_payload(
+            info,
+            expected_shape=shape,
+            expected_dtype=dtype,
+        )
 
 
 def plan_to_dict(plan: Plan) -> dict:
@@ -307,10 +319,14 @@ def plan_to_dict(plan: Plan) -> dict:
             "blocks": list(domain.blocks) if domain.blocks is not None else None,
         }
 
-    def params_to_dict(params: dict[str, Any]) -> dict[str, Any]:
-        if "covered_boxes" not in params:
-            return params
-        covered_boxes = params["covered_boxes"]
+    def params_to_dict(params: Any) -> tuple[dict[str, Any], int]:
+        if isinstance(params, NoKernelParams):
+            return {}, -1
+        out = asdict(params)
+        covered_boxes = getattr(params, "covered_boxes", ())
+        out.pop("covered_boxes", None)
+        if not covered_boxes:
+            return out, -1
         shared_idx = shared_covered_boxes_by_objid.get(id(covered_boxes))
         if shared_idx is None:
             key = json.dumps(covered_boxes, separators=(",", ":"))
@@ -320,10 +336,7 @@ def plan_to_dict(plan: Plan) -> dict:
                 shared_covered_boxes.append(covered_boxes)
                 shared_covered_boxes_by_key[key] = shared_idx
             shared_covered_boxes_by_objid[id(covered_boxes)] = shared_idx
-        out = dict(params)
-        out.pop("covered_boxes", None)
-        out["covered_boxes_ref"] = shared_idx
-        return out
+        return out, shared_idx
 
     for stage in topo:
         stages.append(
@@ -348,12 +361,21 @@ def plan_to_dict(plan: Plan) -> dict:
                             for ref in tmpl.inputs
                         ],
                         "outputs": [
-                            {"field": ref.field, "version": ref.version}
+                            {
+                                "field": ref.field.field,
+                                "version": ref.field.version,
+                                "buffer": ref.buffer.to_dict(),
+                            }
                             for ref in tmpl.outputs
                         ],
-                        "output_bytes": list(tmpl.output_bytes),
-                        "deps": tmpl.deps,
-                        "params": params_to_dict(tmpl.params),
+                        "deps": asdict(tmpl.deps),
+                        "params": params_to_dict(tmpl.params)[0],
+                        "covered_boxes_ref": params_to_dict(tmpl.params)[1],
+                        "graph_reduce": (
+                            asdict(tmpl.graph_reduce)
+                            if tmpl.graph_reduce is not None
+                            else None
+                        ),
                     }
                     for tmpl in stage.templates
                 ],
@@ -382,26 +404,15 @@ def _count_plan_tasks(plan: Plan, *, runmeta: Any) -> int:
             return 1
 
     def _graph_groups_for_template(tmpl: Any) -> int:
-        params = getattr(tmpl, "params", None)
-        if not isinstance(params, dict):
+        spec = getattr(tmpl, "graph_reduce", None)
+        if spec is None:
             return 1
-        if str(params.get("graph_kind", "")) != "reduce":
-            return 1
-        try:
-            fan_in = max(1, int(params.get("fan_in", 1)))
-        except Exception:
-            fan_in = 1
-        try:
-            num_inputs = int(params.get("num_inputs", 0))
-        except Exception:
-            num_inputs = 0
+        if spec.group_offsets:
+            return max(1, len(spec.group_offsets) - 1)
+        fan_in = max(1, int(spec.fan_in))
+        num_inputs = int(spec.num_inputs)
         if num_inputs <= 0:
-            input_blocks = params.get("input_blocks")
-            if input_blocks is not None:
-                try:
-                    num_inputs = len(input_blocks)
-                except Exception:
-                    num_inputs = 0
+            num_inputs = len(spec.input_blocks)
         if num_inputs <= 0:
             return 1
         return max(1, (num_inputs + fan_in - 1) // fan_in)

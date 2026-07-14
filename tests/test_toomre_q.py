@@ -5,11 +5,14 @@ import math
 from pathlib import Path
 from types import SimpleNamespace
 
-import msgpack
 import numpy as np
 
 from analysis import Runtime
+from analysis.buffer import BufferSpec, DType, FixedShape, InitPolicy
 from analysis.dataset import open_dataset
+from analysis.kernel_params import ToomreProfileParams
+from analysis.plan import DependencyRule, Domain, FieldRef, OutputRef, Plan, Stage, TaskTemplate
+from analysis.plan_codec import encode_plan
 from analysis.pipeline import Pipeline
 from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
 from scripts.plotfile_toomre_q import (
@@ -223,11 +226,11 @@ def test_toomre_q_profile_lowering_wires_gradient_amr_mask_and_reduction() -> No
     gradients = [template for template in templates if template.kernel == "gradU_stencil"]
     assert len(accumulators) == 2
     assert len(fetch) == len(gradients) == len(accumulators)
-    assert all(template.params["input_field"] == 108 for template in fetch)
+    assert all(template.params.input_field == 108 for template in fetch)
     assert all(len(template.inputs) == 8 for template in accumulators)
-    assert all(template.output_bytes == [7 * NUM_MOMENTS * 8] for template in accumulators)
+    assert all(template.outputs[0].buffer.shape == FixedShape((7, NUM_MOMENTS)) for template in accumulators)
     coarse = next(template for template in accumulators if template.domain.level == 0)
-    assert [[[1, 1, 0], [2, 2, 1]]] == coarse.params["covered_boxes"]
+    assert (((1, 1, 0), (2, 2, 1)),) == coarse.params.covered_boxes
     assert any(template.kernel == "uniform_slice_add" for template in templates)
     assert any(template.name == "toomre_q_profile_output" for template in templates)
 
@@ -254,7 +257,10 @@ def _single_level_runmeta() -> RunMeta:
 
 
 def _set_chunk(ds, field: int, values: np.ndarray) -> None:
-    ds._h.set_chunk_ref(0, 0, field, 0, 0, np.asarray(values, dtype=np.float64).tobytes())
+    array = np.asarray(values, dtype=np.float64)
+    ds._h.set_chunk_ref(
+        0, 0, field, 0, 0, array.tobytes(), "f64", list(array.shape)
+    )
 
 
 def test_toomre_profile_accumulator_kernel_direct() -> None:
@@ -289,42 +295,47 @@ def test_toomre_profile_accumulator_kernel_direct() -> None:
         0,
         0,
         np.asarray([7.0, 0.0, 0.0], dtype=np.float64).tobytes(),
+        "f64",
+        [1, 1, 1, 3],
     )
     output_field = 309
-    packed = msgpack.packb(
-        {
-            "stages": [
-                {
-                    "name": "toomre",
-                    "plane": "chunk",
-                    "after": [],
-                    "templates": [
-                        {
-                            "name": "toomre_profile_accumulate",
-                            "plane": "chunk",
-                            "kernel": "toomre_profile_accumulate",
-                            "domain": {"step": 0, "level": 0, "blocks": [0]},
-                            "inputs": [
-                                {"field": field, "version": 0}
+    packed = encode_plan(
+        Plan(
+            [
+                Stage(
+                    name="toomre",
+                    templates=[
+                        TaskTemplate(
+                            name="toomre_profile_accumulate",
+                            plane="chunk",
+                            kernel="toomre_profile_accumulate",
+                            domain=Domain(step=0, level=0, blocks=[0]),
+                            inputs=[
+                                FieldRef(field)
                                 for field in (*input_fields, gradient_field)
                             ],
-                            "outputs": [{"field": output_field, "version": 0}],
-                            "output_bytes": [NUM_MOMENTS * 8],
-                            "deps": {"kind": "None"},
-                            "params": {
-                                "radial_range": [1.0, 2.0],
-                                "bins": 1,
-                                "z_bounds": [-0.25, 0.25],
-                                "center": [0.0, 0.0, 0.0],
-                                "bytes_per_value": 8,
-                                "covered_boxes": [],
-                            },
-                        }
+                            outputs=[
+                                OutputRef(
+                                    FieldRef(output_field),
+                                    BufferSpec(
+                                        DType.F64,
+                                        FixedShape((1, NUM_MOMENTS)),
+                                        InitPolicy.ZERO,
+                                    ),
+                                )
+                            ],
+                            deps=DependencyRule(),
+                            params=ToomreProfileParams(
+                                radial_range=(1.0, 2.0),
+                                bins=1,
+                                z_bounds=(-0.25, 0.25),
+                                center=(0.0, 0.0, 0.0),
+                            ),
+                        )
                     ],
-                }
+                )
             ]
-        },
-        use_bin_type=True,
+        )
     )
     runtime._rt.run_packed_plan(packed, runmeta._h, ds._h)
     values = runtime.get_task_chunk_array(
@@ -332,11 +343,11 @@ def test_toomre_profile_accumulator_kernel_direct() -> None:
         level=0,
         field=output_field,
         block=0,
-        shape=(NUM_MOMENTS,),
+        shape=(1, NUM_MOMENTS),
         dtype=np.float64,
         dataset=ds,
     )
-    np.testing.assert_allclose(values, [1.0, 1.5, 2.5, 0.0, 0.0, 7.0, 0.5])
+    np.testing.assert_allclose(values[0], [1.0, 1.5, 2.5, 0.0, 0.0, 7.0, 0.5])
 
 
 def test_toomre_q_profile_runtime_accumulates_expected_moments() -> None:
