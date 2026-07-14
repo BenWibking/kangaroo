@@ -32,7 +32,7 @@ void register_grid_kernels(KernelRegistry &registry) {
      * @par Chunk outputs `outputs[0]` and `outputs[1]` are f64 images
      * containing the area-weighted value sum and sampled area, respectively.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "uniform_slice_cellavg_accumulate",
                    .n_inputs = 1,
                    .n_outputs = 2,
@@ -235,7 +235,7 @@ void register_grid_kernels(KernelRegistry &registry) {
      * @par Chunk outputs `outputs[0]` is an f64 image of line-integrated
      * values.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "uniform_projection_accumulate",
                    .n_inputs = 1,
                    .n_outputs = 1,
@@ -552,7 +552,7 @@ void register_grid_kernels(KernelRegistry &registry) {
      * supported.
      * @par Chunk outputs `outputs[0]` is the f32 or f64 expression value grid.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "field_expr",
                    .n_inputs = 1,
                    .n_outputs = 1,
@@ -686,7 +686,7 @@ void register_grid_kernels(KernelRegistry &registry) {
      * @par Chunk outputs `outputs[0]` is an f32 or f64 nearest-cell slice
      * image; pixels outside this block are NaN.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "uniform_slice",
                    .n_inputs = 1,
                    .n_outputs = 1,

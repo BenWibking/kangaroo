@@ -74,6 +74,38 @@ def test_plan_preparation_rejects_missing_dynamic_bound_evaluator() -> None:
         rt.run(Plan(stages=[stage]), runmeta=runmeta, dataset=ds)
 
 
+def test_plan_preparation_rejects_kernel_parameter_mismatch() -> None:
+    rt = Runtime()
+    runmeta = _runmeta(1)
+    ds = open_dataset(
+        "memory://kernel-parameter-mismatch",
+        runmeta=runmeta,
+        step=0,
+        level=0,
+        runtime=rt,
+    )
+    stage = Stage(name="invalid_kernel_parameters")
+    stage.map_blocks(
+        name="field_expr_with_scalar_parameters",
+        kernel="field_expr",
+        domain=Domain(step=0, level=0),
+        inputs=[FieldRef(1)],
+        outputs=[
+            OutputRef(
+                FieldRef(2),
+                BufferSpec(DType.F64, FixedShape((1,))),
+            )
+        ],
+        params=ScalarParams(1.0),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="kernel field_expr received incompatible typed parameters",
+    ):
+        rt.run(Plan(stages=[stage]), runmeta=runmeta, dataset=ds)
+
+
 def _set_scalar(ds, *, field: int, block: int, value: float) -> None:
     arr = np.asarray([[[value]]], dtype=np.float64)
     ds._h.set_chunk_ref(0, 0, field, 0, block, arr.tobytes(order="C"), "f64", [1, 1, 1])

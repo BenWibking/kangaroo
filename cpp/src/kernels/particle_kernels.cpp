@@ -21,7 +21,7 @@ void register_particle_kernels(KernelRegistry &registry) {
      * @par Chunk outputs `outputs[0]` is a dynamically sized f64 particle
      * array.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "particle_load_field_chunk_f64",
                    .n_inputs = 0,
                    .n_outputs = 1,
@@ -110,7 +110,7 @@ void register_particle_kernels(KernelRegistry &registry) {
      * @par Chunk outputs `outputs[0]` is an f64 block grid of deposited mass
      * density.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "particle_cic_grid_accumulate",
                    .n_inputs = 0,
                    .n_outputs = 1,
@@ -342,7 +342,7 @@ void register_particle_kernels(KernelRegistry &registry) {
      * @par Chunk outputs `outputs[0]` is an f64 image of deposited particle
      * mass.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "particle_cic_projection_accumulate",
                    .n_inputs = 0,
                    .n_outputs = 1,
@@ -683,7 +683,7 @@ void register_particle_kernels(KernelRegistry &registry) {
      * @par Typed parameters `scalar` is the comparison value.
      * @par Chunk outputs `outputs[0]` is a same-length u8 mask.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "particle_eq_mask",
                    .n_inputs = 1,
                    .n_outputs = 1,
@@ -712,7 +712,7 @@ void register_particle_kernels(KernelRegistry &registry) {
      * threshold.
      * @par Chunk outputs `outputs[0]` is a same-length u8 mask.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "particle_abs_lt_mask",
                    .n_inputs = 1,
                    .n_outputs = 1,
@@ -740,7 +740,7 @@ void register_particle_kernels(KernelRegistry &registry) {
      * @par Typed parameters `scalar` is the inclusive upper bound.
      * @par Chunk outputs `outputs[0]` is a same-length u8 mask.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "particle_le_mask",
                    .n_inputs = 1,
                    .n_outputs = 1,
@@ -768,7 +768,7 @@ void register_particle_kernels(KernelRegistry &registry) {
      * @par Typed parameters `scalar` is the strict lower bound.
      * @par Chunk outputs `outputs[0]` is a same-length u8 mask.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "particle_gt_mask",
                    .n_inputs = 1,
                    .n_outputs = 1,
@@ -799,7 +799,7 @@ void register_particle_kernels(KernelRegistry &registry) {
      * @par Typed parameters `values` is the set of exact matches.
      * @par Chunk outputs `outputs[0]` is a same-length u8 mask.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "particle_isin_mask",
                    .n_inputs = 1,
                    .n_outputs = 1,
@@ -840,7 +840,7 @@ void register_particle_kernels(KernelRegistry &registry) {
      * @par Chunk outputs `outputs[0]` is one f64 minimum value, or positive
      * infinity when no eligible value exists.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "particle_min",
                    .n_inputs = 1,
                    .n_outputs = 1,
@@ -881,7 +881,7 @@ void register_particle_kernels(KernelRegistry &registry) {
      * @par Chunk outputs `outputs[0]` is one f64 maximum value, or negative
      * infinity when no eligible value exists.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "particle_max",
                    .n_inputs = 1,
                    .n_outputs = 1,
@@ -1000,7 +1000,7 @@ void register_particle_kernels(KernelRegistry &registry) {
      * @par Chunk outputs `outputs[0]` is an f64 array with `edges.size() - 1`
      * bins.
      */
-    registry.register_kernel(KernelDesc{.name = "particle_histogram1d",
+    registry.register_typed_kernel<Params>(KernelDesc{.name = "particle_histogram1d",
                                         .n_inputs = 1,
                                         .n_outputs = 1,
                                         .needs_neighbors = false},
@@ -1014,7 +1014,7 @@ void register_particle_kernels(KernelRegistry &registry) {
      * @par Chunk outputs `outputs[0]` is an f64 array with `edges.size() - 1`
      * bins.
      */
-    registry.register_kernel(KernelDesc{.name = "particle_histogram1d_weighted",
+    registry.register_typed_kernel<Params>(KernelDesc{.name = "particle_histogram1d_weighted",
                                         .n_inputs = 2,
                                         .n_outputs = 1,
                                         .needs_neighbors = false},
@@ -1032,7 +1032,7 @@ void register_particle_kernels(KernelRegistry &registry) {
      * @par Chunk outputs `outputs[0]` is a dynamically sized opaque map from
      * f64 values to signed 64-bit occurrence counts.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "particle_topk_modes_map",
                    .n_inputs = 0,
                    .n_outputs = 1,
@@ -1098,7 +1098,7 @@ void register_particle_kernels(KernelRegistry &registry) {
      * @par Chunk outputs `outputs[0]` is an f64 array of length `2 * k`: the
      * first half contains values and the second half contains their counts.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "particle_topk_modes_finalize",
                    .n_inputs = 1,
                    .n_outputs = 1,

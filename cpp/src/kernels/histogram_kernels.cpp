@@ -19,7 +19,7 @@ void register_histogram_kernels(KernelRegistry &registry) {
      * @par Chunk outputs `outputs[0]` is an f64 array of `bins` accumulated
      * counts or weights.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "histogram1d_accumulate",
                    .n_inputs = 1,
                    .n_outputs = 1,
@@ -122,7 +122,7 @@ void register_histogram_kernels(KernelRegistry &registry) {
      * and `covered_boxes` define binning, weighting, and excluded AMR cells.
      * @par Chunk outputs `outputs[0]` is an f64 two-dimensional histogram.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "histogram2d_accumulate",
                    .n_inputs = 2,
                    .n_outputs = 1,

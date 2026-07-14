@@ -18,6 +18,8 @@ namespace kangaroo {
 struct DatasetHandle;
 
 void prepare_plan(PlanIR& plan, KernelRegistry& kernels);
+void validate_plan_kernel_contracts(const PlanIR& plan,
+                                    const KernelRegistry& kernels);
 void validate_plan_output_bounds(const PlanIR& plan, const KernelRegistry& kernels);
 
 struct ExecutorOptions {

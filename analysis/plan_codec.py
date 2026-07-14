@@ -222,7 +222,6 @@ def encode_plan(plan: model_plan.Plan) -> bytes:
     for stage in topo:
         templates: list[TaskTemplate.TaskTemplateT] = []
         for template in stage.templates:
-            model_params.validate_kernel_params(template.kernel, template.params)
             boxes = model_params.covered_boxes(template.params)
             covered_ref = -1
             if boxes:

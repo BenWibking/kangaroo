@@ -43,7 +43,7 @@ void register_reduction_kernels(KernelRegistry &registry) {
      * @par Chunk outputs `outputs[0]` is an f32 or f64 image of value sum
      * divided by `pixel_area`, with NaN where sampled area is zero.
      */
-    registry.register_kernel(
+    registry.register_typed_kernel<Params>(
         KernelDesc{.name = "uniform_slice_finalize",
                    .n_inputs = 2,
                    .n_outputs = 1,
