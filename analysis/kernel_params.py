@@ -62,8 +62,7 @@ class CylindricalFluxParams:
 
 @dataclass(frozen=True)
 class ToomreProfileParams:
-    radial_range: tuple[float, float] = (0.0, 1.0)
-    bins: int = 1
+    radial_edges: tuple[float, ...] = (0.0, 1.0)
     z_bounds: tuple[float, float] = (-1.0, 1.0)
     center: tuple[float, float, float] = (0.0, 0.0, 0.0)
     covered_boxes: CoveredBoxes = ()

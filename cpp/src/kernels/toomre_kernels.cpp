@@ -18,7 +18,7 @@ void register_toomre_kernels(KernelRegistry &registry) {
    * @brief Accumulates AMR-aware annular moments used by gas Toomre-Q profiles.
    * @par Chunk inputs Density, x/y momentum, internal energy, three magnetic
    * field components, and a three-component potential-gradient grid.
-   * @par Typed parameters Radial and vertical bounds, center, bin count, and
+   * @par Typed parameters Radial bin edges, vertical bounds, center, and
    * covered coarse cells.
    * @par Chunk outputs An f64 `(bins, 7)` array of annular moments.
    */
@@ -34,24 +34,32 @@ void register_toomre_kernels(KernelRegistry &registry) {
         constexpr std::size_t num_components = 7;
         const auto &params = require_kernel_params<Params>(
             kernel_params, "toomre_profile_accumulate");
-        if (outputs.empty() || inputs.size() < 8 || params.bins <= 0) {
+        if (outputs.empty() || inputs.size() < 8 ||
+            params.radial_edges.size() < 2) {
           return hpx::make_ready_future();
         }
 
+        const int bins = static_cast<int>(params.radial_edges.size() - 1);
         auto out = outputs[0].mutable_view<double, 2>();
-        for (int bin = 0; bin < params.bins; ++bin)
+        for (int bin = 0; bin < bins; ++bin)
           for (std::size_t component = 0; component < num_components;
                ++component)
             out(bin, component) = 0.0;
 
-        const double rmin = params.radial_range[0];
-        const double rmax = params.radial_range[1];
+        const double rmin = params.radial_edges.front();
+        const double rmax = params.radial_edges.back();
         const double zmin = params.z_bounds[0];
         const double zmax = params.z_bounds[1];
         if (block < 0 || static_cast<std::size_t>(block) >= level.boxes.size() ||
             !std::isfinite(rmin) || !std::isfinite(rmax) || rmin < 0.0 ||
             rmax <= rmin || !std::isfinite(zmin) || !std::isfinite(zmax) ||
             zmax <= zmin ||
+            std::adjacent_find(
+                params.radial_edges.begin(), params.radial_edges.end(),
+                [](double left, double right) {
+                  return !std::isfinite(left) || !std::isfinite(right) ||
+                         right <= left;
+                }) != params.radial_edges.end() ||
             std::any_of(params.center.begin(), params.center.end(),
                         [](double value) { return !std::isfinite(value); })) {
           return hpx::make_ready_future();
@@ -133,7 +141,6 @@ void register_toomre_kernels(KernelRegistry &registry) {
                                      level.geom.index_origin[axis]) *
                      level.geom.dx[axis];
         };
-        const double inv_dr = static_cast<double>(params.bins) / (rmax - rmin);
         const double dx = std::abs(level.geom.dx[0]);
         const double dy = std::abs(level.geom.dx[1]);
 
@@ -148,11 +155,16 @@ void register_toomre_kernels(KernelRegistry &registry) {
             const double radius = std::sqrt(rx * rx + ry * ry);
             if (radius < rmin || radius > rmax || radius <= 0.0)
               continue;
+            const auto upper_edge =
+                std::upper_bound(params.radial_edges.begin(),
+                                 params.radial_edges.end(), radius);
+            const auto upper_index =
+                std::distance(params.radial_edges.begin(), upper_edge);
             const int radial_bin =
                 radius == rmax
-                    ? params.bins - 1
-                    : static_cast<int>(std::floor((radius - rmin) * inv_dr));
-            if (radial_bin < 0 || radial_bin >= params.bins)
+                    ? bins - 1
+                    : static_cast<int>(upper_index) - 1;
+            if (radial_bin < 0 || radial_bin >= bins)
               continue;
 
             for (int k = 0; k < nz; ++k) {

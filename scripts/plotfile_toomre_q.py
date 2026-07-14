@@ -547,14 +547,14 @@ def main(argv: list[str] | None = None) -> int:
                     pipe.field(fields["bz"][1]),
                 ),
                 potential=pipe.field(fields["potential"][1]),
-                radial_range=(float(radial_edges[0]), float(radial_edges[-1])),
-                bins=len(radial_edges) - 1,
+                radial_edges=radial_edges,
                 z_bounds=(float(z_bounds[0]), float(z_bounds[1])),
                 center=(float(center[0]), float(center[1]), float(center[2])),
                 gamma=float(args.gamma),
                 bytes_per_value=bytes_per_value,
                 out="toomre_q_profile",
             )
+            profile_edges = handle.edges
             pipe.run(progress_bar=bool(args.progress))
             moments = runtime.get_task_chunk_array(
                 step=ds.step,
@@ -567,11 +567,11 @@ def main(argv: list[str] | None = None) -> int:
                 dataset=ds,
             )
             profile = derive_toomre_profiles(
-                radial_edges,
+                profile_edges,
                 moments,
                 gamma=float(args.gamma),
             )
-            rows = profile_rows(radial_edges, profile)
+            rows = profile_rows(profile_edges, profile)
             stem = f"{plotfile.name}_toomre_q"
             csv_path = output_dir / f"{stem}.csv"
             png_path = output_dir / f"{stem}.png"

@@ -975,8 +975,7 @@ class ToomreQProfile:
         internal_energy: int,
         magnetic_field: tuple[int, int, int],
         potential: int,
-        radial_range: tuple[float, float],
-        bins: int,
+        radial_edges: Sequence[float],
         z_bounds: tuple[float, float],
         center: tuple[float, float, float] = (0.0, 0.0, 0.0),
         out_name: str = "toomre_q_profile",
@@ -989,8 +988,7 @@ class ToomreQProfile:
         self.internal_energy = int(internal_energy)
         self.magnetic_field = tuple(int(v) for v in magnetic_field)
         self.potential = int(potential)
-        self.radial_range = tuple(float(v) for v in radial_range)
-        self.bins = int(bins)
+        self.radial_edges = tuple(float(v) for v in radial_edges)
         self.z_bounds = tuple(float(v) for v in z_bounds)
         self.center = tuple(float(v) for v in center)
         self.out_name = str(out_name)
@@ -1045,8 +1043,8 @@ class ToomreQProfile:
             elif x0 > 0.0:
                 lo2 += x0 * x0
             hi2 += max(abs(x0), abs(x1)) ** 2
-        rmin2 = self.radial_range[0] ** 2
-        rmax2 = self.radial_range[1] ** 2
+        rmin2 = self.radial_edges[0] ** 2
+        rmax2 = self.radial_edges[-1] ** 2
         return lo2 < rmax2 and hi2 >= rmin2
 
     def lower(self, ctx: LoweringContext):
@@ -1055,13 +1053,20 @@ class ToomreQProfile:
             raise ValueError("momentum must contain x and y fields")
         if len(self.magnetic_field) != 3:
             raise ValueError("magnetic_field must contain three cell-centered fields")
-        if len(self.radial_range) != 2:
-            raise ValueError("radial_range must contain two values")
-        rmin, rmax = self.radial_range
-        if not math.isfinite(rmin) or not math.isfinite(rmax) or rmin < 0.0 or rmax <= rmin:
-            raise ValueError("radial_range must be finite, non-negative, and increasing")
-        if self.bins <= 0:
-            raise ValueError("bins must be positive")
+        if len(self.radial_edges) < 2:
+            raise ValueError("radial_edges must contain at least two values")
+        if (
+            any(not math.isfinite(value) for value in self.radial_edges)
+            or self.radial_edges[0] < 0.0
+            or any(
+                right <= left
+                for left, right in zip(self.radial_edges, self.radial_edges[1:])
+            )
+        ):
+            raise ValueError(
+                "radial_edges must be finite, non-negative, and strictly increasing"
+            )
+        bins = len(self.radial_edges) - 1
         if len(self.z_bounds) != 2:
             raise ValueError("z_bounds must contain two values")
         if (
@@ -1089,11 +1094,11 @@ class ToomreQProfile:
             if active:
                 active_by_level[level_idx] = active
         if not active_by_level:
-            raise ValueError("radial_range and z_bounds do not intersect any mesh block")
+            raise ValueError("radial_edges and z_bounds do not intersect any mesh block")
 
         output_buffer = BufferSpec(
             DType.F64,
-            FixedShape((self.bins, self.NUM_COMPONENTS)),
+            FixedShape((bins, self.NUM_COMPONENTS)),
             InitPolicy.ZERO,
         )
         neighbor_field = ctx.temp_field(f"{self.out_name}_potential_neighbors")
@@ -1163,8 +1168,7 @@ class ToomreQProfile:
                     outputs=[OutputRef(profile_field, output_buffer)],
                     deps=DependencyRule(),
                     params=ToomreProfileParams(
-                        radial_range=(float(rmin), float(rmax)),
-                        bins=self.bins,
+                        radial_edges=self.radial_edges,
                         z_bounds=(float(self.z_bounds[0]), float(self.z_bounds[1])),
                         center=tuple(float(v) for v in self.center),
                         covered_boxes=covered_payload,

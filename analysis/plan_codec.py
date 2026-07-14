@@ -157,7 +157,7 @@ def _params(value: model_params.KernelParams) -> tuple[int, Any]:
         )
     if isinstance(value, p.ToomreProfileParams):
         return KernelParams.KernelParams.ToomreProfileParams, ToomreProfileParams.ToomreProfileParamsT(
-            list(value.radial_range), value.bins, list(value.z_bounds), list(value.center)
+            list(value.radial_edges), list(value.z_bounds), list(value.center)
         )
     if isinstance(value, p.UniformSliceCellParams):
         return KernelParams.KernelParams.UniformSliceCellParams, UniformSliceCellParams.UniformSliceCellParamsT(

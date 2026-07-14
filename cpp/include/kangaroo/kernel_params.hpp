@@ -87,12 +87,11 @@ struct CylindricalFluxParams {
 };
 
 struct ToomreProfileParams {
-  std::array<double, 2> radial_range{0.0, 1.0};
-  int32_t bins = 1;
+  std::vector<double> radial_edges{0.0, 1.0};
   std::array<double, 2> z_bounds{-1.0, 1.0};
   std::array<double, 3> center{0.0, 0.0, 0.0};
   std::shared_ptr<const CoveredBoxListIR> covered_boxes;
-  KANGAROO_SERIALIZE_FIELDS(radial_range & bins & z_bounds & center)
+  KANGAROO_SERIALIZE_FIELDS(radial_edges & z_bounds & center)
 };
 
 struct UniformSliceCellParams {

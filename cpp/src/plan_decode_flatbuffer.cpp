@@ -234,9 +234,7 @@ KernelParamsIR decode_params(const fb::KernelParamsUnion &input) {
   case fb::KernelParams::ToomreProfileParams: {
     const auto &p = *input.AsToomreProfileParams();
     ToomreProfileParams out;
-    out.radial_range =
-        copy_array<double, 2>(p.radial_range, "Toomre radial range");
-    out.bins = p.bins;
+    out.radial_edges = p.radial_edges;
     out.z_bounds = copy_array<double, 2>(p.z_bounds, "Toomre z bounds");
     out.center = copy_array<double, 3>(p.center, "Toomre center");
     return out;

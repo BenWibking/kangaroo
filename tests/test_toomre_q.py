@@ -195,14 +195,14 @@ def test_toomre_q_profile_lowering_wires_gradient_amr_mask_and_reduction() -> No
     runmeta = _two_level_runmeta()
     ds = open_dataset("memory://toomre-lowering", runmeta=runmeta, runtime=runtime)
     pipe = Pipeline(runtime=runtime, runmeta=runmeta, dataset=ds)
+    radial_edges = (0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 1.75, 1.9)
     handle = pipe.toomre_q_profile(
         101,
         momentum=(102, 103),
         internal_energy=104,
         magnetic_field=(105, 106, 107),
         potential=108,
-        radial_range=(0.25, 2.0),
-        bins=7,
+        radial_edges=radial_edges,
         z_bounds=(-0.75, 0.75),
         center=(0.0, 0.0, 0.0),
         bytes_per_value=8,
@@ -229,10 +229,29 @@ def test_toomre_q_profile_lowering_wires_gradient_amr_mask_and_reduction() -> No
     assert all(template.params.input_field == 108 for template in fetch)
     assert all(len(template.inputs) == 8 for template in accumulators)
     assert all(template.outputs[0].buffer.shape == FixedShape((7, NUM_MOMENTS)) for template in accumulators)
+    assert all(template.params.radial_edges == radial_edges for template in accumulators)
+    np.testing.assert_array_equal(handle.edges, radial_edges)
     coarse = next(template for template in accumulators if template.domain.level == 0)
     assert (((1, 1, 0), (2, 2, 1)),) == coarse.params.covered_boxes
     assert any(template.kernel == "uniform_slice_add" for template in templates)
     assert any(template.name == "toomre_q_profile_output" for template in templates)
+
+    uniform_handle = pipe.toomre_q_profile(
+        101,
+        momentum=(102, 103),
+        internal_energy=104,
+        magnetic_field=(105, 106, 107),
+        potential=108,
+        radial_range=(0.25, 2.0),
+        bins=7,
+        z_bounds=(-0.75, 0.75),
+        bytes_per_value=8,
+        out="uniform_toomre",
+    )
+    np.testing.assert_allclose(
+        uniform_handle.edges,
+        np.linspace(0.25, 2.0, 8),
+    )
 
 
 def _single_level_runmeta() -> RunMeta:
@@ -326,8 +345,7 @@ def test_toomre_profile_accumulator_kernel_direct() -> None:
                             ],
                             deps=DependencyRule(),
                             params=ToomreProfileParams(
-                                radial_range=(1.0, 2.0),
-                                bins=1,
+                                radial_edges=(1.0, 2.0),
                                 z_bounds=(-0.25, 0.25),
                                 center=(0.0, 0.0, 0.0),
                             ),
@@ -372,14 +390,14 @@ def test_toomre_q_profile_runtime_accumulates_expected_moments() -> None:
         _set_chunk(ds, field, values)
 
     pipe = Pipeline(runtime=runtime, runmeta=runmeta, dataset=ds)
+    radial_edges = (0.5, 1.6, 2.7, 3.5)
     handle = pipe.toomre_q_profile(
         fields[0],
         momentum=(fields[1], fields[2]),
         internal_energy=fields[3],
         magnetic_field=(fields[4], fields[5], fields[6]),
         potential=fields[7],
-        radial_range=(0.5, 3.5),
-        bins=3,
+        radial_edges=radial_edges,
         z_bounds=(-1.5, 1.5),
         bytes_per_value=8,
         out="toomre",
