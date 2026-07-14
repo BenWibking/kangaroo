@@ -100,7 +100,7 @@ def _buffer_spec(value: model_buffer.BufferSpec) -> BufferSpec.BufferSpecT:
         bound = shape.upper_bound
         dynamic_bound = DynamicUpperBound.DynamicUpperBoundT(
             kind=_DYNAMIC_KIND[bound.kind],
-            value=bound.value or 0,
+            value=bound.value if bound.value is not None else 0,
             inputIndex=bound.input_index if bound.input_index is not None else -1,
         )
     else:
@@ -116,7 +116,7 @@ def _buffer_spec(value: model_buffer.BufferSpec) -> BufferSpec.BufferSpecT:
     )
 
 
-def _graph_reduce(value: model_plan.GraphReduceSpec | None):
+def _graph_reduce(value: model_plan.GraphReduceSpec | None) -> GraphReduceSpec.GraphReduceSpecT | None:
     if value is None:
         return None
     return GraphReduceSpec.GraphReduceSpecT(
@@ -156,7 +156,8 @@ def _params(value: model_params.KernelParams) -> tuple[int, Any]:
         )
     if isinstance(value, p.UniformSliceCellParams):
         return KernelParams.KernelParams.UniformSliceCellParams, UniformSliceCellParams.UniformSliceCellParamsT(
-            value.axis, value.coord, value.plane_index or 0, value.plane_index is not None,
+            value.axis, value.coord,
+            value.plane_index if value.plane_index is not None else 0, value.plane_index is not None,
             list(value.rect), list(value.resolution)
         )
     if isinstance(value, p.UniformProjectionParams):
