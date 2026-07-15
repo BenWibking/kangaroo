@@ -101,6 +101,29 @@ pixi run python scripts/plotfile_slice_yt.py /path/to/plotfile \
 
 This is useful for comparison/benchmarking against Kangaroo slice behavior.
 
+### 5) Gas Toomre-Q radial profiles
+
+```bash
+pixi run python scripts/plotfile_toomre_q.py /path/to/run/outputs \
+  --output-dir /path/to/toomre_q
+```
+
+This workflow reads either one full 3D Quokka plotfile or the immediate
+`plt*` children of an output directory. It writes one shared-axis PNG and one
+CSV per plotfile for three gas stability measures:
+
+- thermal + magnetic support,
+- thermal + resolved radial turbulence,
+- thermal + resolved radial turbulence + magnetic support.
+
+The defaults target the MW_Gen1 Phase0 disk: `0.5 <= R <= 16 kpc` in
+`0.25 kpc` bins and `|z| <= 4 kpc`. The epicyclic frequency is derived from
+the gas-mass-weighted annular radial gradient of `gpot`. Full plotfiles are
+required because the configured Quokka projection products do not contain the
+momentum, internal energy, magnetic-field, and potential fields needed by the
+calculation. Run with `--help` for field overrides, alternate geometry, and HPX
+options.
+
 ## Pipeline API Example (Recommended)
 
 ```python

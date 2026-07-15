@@ -33,6 +33,7 @@ from .ops import (
     Histogram1D,
     Histogram2D,
     ParticleCICProjection,
+    ToomreQProfile,
     UniformProjection,
     UniformSlice,
     VorticityMag,
@@ -149,6 +150,46 @@ class CylindricalFluxSurfaceIntegralHandle:
     @property
     def name(self) -> str | None:
         return self.fluxes.name
+
+
+@dataclass(frozen=True)
+class ToomreQProfileHandle:
+    """Reduced annular moments used to derive gas Toomre-Q profiles."""
+
+    moments: FieldHandle
+    radial_edges: tuple[float, ...]
+    z_bounds: tuple[float, float]
+    center: tuple[float, float, float]
+    gamma: float
+    components: tuple[str, ...] = (
+        "mass",
+        "internal_energy",
+        "magnetic_b2_volume",
+        "radial_momentum",
+        "radial_velocity_second_moment",
+        "radial_gravity_moment",
+        "sampled_volume",
+    )
+
+    @property
+    def field(self) -> int:
+        return self.moments.field
+
+    @property
+    def name(self) -> str | None:
+        return self.moments.name
+
+    @property
+    def radial_range(self) -> tuple[float, float]:
+        return (self.radial_edges[0], self.radial_edges[-1])
+
+    @property
+    def bins(self) -> int:
+        return len(self.radial_edges) - 1
+
+    @property
+    def edges(self) -> np.ndarray:
+        return np.asarray(self.radial_edges, dtype=np.float64)
 
 
 @dataclass(frozen=True)
@@ -782,6 +823,78 @@ class Pipeline:
             radius=op.radius,
             heights=op.heights,
             temperature_bins=op.temperature_bins,
+        )
+
+    def toomre_q_profile(
+        self,
+        density: int | FieldHandle,
+        *,
+        momentum: tuple[int | FieldHandle, int | FieldHandle],
+        internal_energy: int | FieldHandle,
+        magnetic_field: tuple[
+            int | FieldHandle,
+            int | FieldHandle,
+            int | FieldHandle,
+        ],
+        potential: int | FieldHandle,
+        z_bounds: tuple[float, float],
+        radial_range: tuple[float, float] | None = None,
+        bins: int | None = None,
+        radial_edges: Sequence[float] | None = None,
+        center: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        out: str | None = None,
+        gamma: float = 5.0 / 3.0,
+        reduce_fan_in: int | None = None,
+    ) -> ToomreQProfileHandle:
+        """Accumulate AMR-aware annular moments for gas Toomre-Q profiles."""
+
+        if len(momentum) != 2:
+            raise ValueError("momentum must contain x and y fields")
+        if len(magnetic_field) != 3:
+            raise ValueError("magnetic_field must contain three cell-centered fields")
+        if radial_edges is None:
+            if radial_range is None or bins is None:
+                raise ValueError(
+                    "provide radial_edges or both radial_range and bins"
+                )
+            if len(radial_range) != 2:
+                raise ValueError("radial_range must contain two values")
+            if int(bins) <= 0:
+                raise ValueError("bins must be positive")
+            edges = np.linspace(
+                float(radial_range[0]), float(radial_range[1]), int(bins) + 1
+            )
+        else:
+            if radial_range is not None or bins is not None:
+                raise ValueError(
+                    "radial_edges cannot be combined with radial_range or bins"
+                )
+            edges = np.asarray(radial_edges, dtype=np.float64)
+            if edges.ndim != 1:
+                raise ValueError("radial_edges must be one-dimensional")
+        out_name = out or self._unique_name("toomre_q_profile")
+        op = ToomreQProfile(
+            density=self._as_field_id(density),
+            momentum=tuple(self._as_field_id(comp) for comp in momentum),
+            internal_energy=self._as_field_id(internal_energy),
+            magnetic_field=tuple(self._as_field_id(comp) for comp in magnetic_field),
+            potential=self._as_field_id(potential),
+            radial_edges=tuple(float(value) for value in edges),
+            z_bounds=z_bounds,
+            center=center,
+            out_name=out_name,
+            gamma=gamma,
+            reduce_fan_in=reduce_fan_in,
+        )
+        fragment = op.lower(self._ctx)
+        self._append_fragment(fragment)
+        out_field = self._sink_fields(fragment)[-1]
+        return ToomreQProfileHandle(
+            moments=FieldHandle(self, out_field, out_name),
+            radial_edges=op.radial_edges,
+            z_bounds=op.z_bounds,
+            center=op.center,
+            gamma=op.gamma,
         )
 
     def histogram1d(

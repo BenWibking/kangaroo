@@ -38,6 +38,7 @@ from .fb import (
     Stage,
     TaskTemplate,
     TopKModesParams,
+    ToomreProfileParams,
     UniformProjectionParams,
     UniformSliceCellParams,
     UniformSliceParams,
@@ -153,6 +154,10 @@ def _params(value: model_params.KernelParams) -> tuple[int, Any]:
     if isinstance(value, p.CylindricalFluxParams):
         return KernelParams.KernelParams.CylindricalFluxParams, CylindricalFluxParams.CylindricalFluxParamsT(
             value.radius, list(value.heights), list(value.height_indices), list(value.temperature_bins), value.num_heights, value.gamma
+        )
+    if isinstance(value, p.ToomreProfileParams):
+        return KernelParams.KernelParams.ToomreProfileParams, ToomreProfileParams.ToomreProfileParamsT(
+            list(value.radial_edges), list(value.z_bounds), list(value.center)
         )
     if isinstance(value, p.UniformSliceCellParams):
         return KernelParams.KernelParams.UniformSliceCellParams, UniformSliceCellParams.UniformSliceCellParamsT(

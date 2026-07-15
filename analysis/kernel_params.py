@@ -61,6 +61,14 @@ class CylindricalFluxParams:
 
 
 @dataclass(frozen=True)
+class ToomreProfileParams:
+    radial_edges: tuple[float, ...] = (0.0, 1.0)
+    z_bounds: tuple[float, float] = (-1.0, 1.0)
+    center: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    covered_boxes: CoveredBoxes = ()
+
+
+@dataclass(frozen=True)
 class UniformSliceCellParams:
     axis: int = 2
     coord: float = 0.0
@@ -175,6 +183,7 @@ KernelParams: TypeAlias = (
     | PlotfileLoadParams
     | FluxSurfaceParams
     | CylindricalFluxParams
+    | ToomreProfileParams
     | UniformSliceCellParams
     | UniformProjectionParams
     | FieldExprParams
