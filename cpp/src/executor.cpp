@@ -260,8 +260,12 @@ std::optional<std::size_t> template_output_storage_bytes(
     try {
       estimate = estimate_output_spec(
           output.buffer, tmpl, data, meta, block, output_index, inputs);
-    } catch (...) {
-      return std::nullopt;
+    } catch (const std::exception& exc) {
+      std::ostringstream message;
+      message << "failed to derive output storage bound for template '" << tmpl.name
+              << "' kernel '" << tmpl.kernel << "' block " << block
+              << " output " << output_index << ": " << exc.what();
+      throw std::runtime_error(message.str());
     }
     if (!estimate.has_value()) return std::nullopt;
     bytes = static_cast<std::size_t>(checked_add(bytes, estimate->storage_bytes));
