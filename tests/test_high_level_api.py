@@ -257,6 +257,64 @@ def test_bounded_followup_uses_selected_level(operation: str) -> None:
         assert result.counts.sum() == 16.0
 
 
+@pytest.mark.parametrize(
+    "result_type",
+    ("spherical-flux", "cylindrical-flux", "toomre-q"),
+)
+def test_reduced_result_materialization_uses_selected_level(result_type: str) -> None:
+    class _SelectedLevelRuntime:
+        def get_task_chunk_array(self, **kwargs):
+            assert kwargs["level"] == 1
+            return np.ones(1, dtype=np.float64)
+
+    dataset = SimpleNamespace(
+        step=0,
+        level=1,
+        client=SimpleNamespace(runtime=_SelectedLevelRuntime(), progress=False),
+        _backend=object(),
+        _pipeline=SimpleNamespace(run_for=lambda **_kwargs: None),
+    )
+    if result_type == "spherical-flux":
+        value = kr.FluxSurfaceIntegral(
+            dataset,
+            SimpleNamespace(
+                name="flux",
+                field=62001,
+                radii=(1.0,),
+                components=("mass_flux",),
+                temperature_bins=None,
+            ),
+        )
+    elif result_type == "cylindrical-flux":
+        value = kr.CylindricalFluxSurfaceIntegral(
+            dataset,
+            SimpleNamespace(
+                name="cylindrical_flux",
+                field=62002,
+                radius=1.0,
+                heights=(1.0,),
+                geometric_sections=("walls",),
+                components=("mass_flux",),
+                temperature_bins=None,
+            ),
+        )
+    else:
+        value = kr.ToomreQProfile(
+            dataset,
+            SimpleNamespace(
+                name="toomre_q",
+                field=62003,
+                edges=np.array([0.0, 1.0]),
+                components=("mass",),
+                z_bounds=(-1.0, 1.0),
+                center=(0.0, 0.0, 0.0),
+                gamma=5.0 / 3.0,
+            ),
+        )
+
+    value.compute()
+
+
 def test_arithmetic_after_bounded_slice_preserves_domain_and_shape() -> None:
     ds = kr.open_dataset(_plotfile())
     sliced = ds["gasDensity"].slice(axis="z", resolution=(8, 8))

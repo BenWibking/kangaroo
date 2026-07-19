@@ -1277,7 +1277,7 @@ class FluxSurfaceIntegral(LazyValue):
             raise TypeError(f"unexpected compute options: {', '.join(sorted(kwargs))}")
         values = self.dataset.client.runtime.get_task_chunk_array(
             step=self.dataset.step,
-            level=0,
+            level=self.dataset.level,
             field=self._handle.field,
             block=0,
             dataset=self.dataset._backend,
@@ -1302,7 +1302,7 @@ class CylindricalFluxSurfaceIntegral(LazyValue):
             raise TypeError(f"unexpected compute options: {', '.join(sorted(kwargs))}")
         values = self.dataset.client.runtime.get_task_chunk_array(
             step=self.dataset.step,
-            level=0,
+            level=self.dataset.level,
             field=self._handle.field,
             block=0,
             dataset=self.dataset._backend,
@@ -1332,7 +1332,7 @@ class ToomreQProfile(LazyValue):
             raise TypeError(f"unexpected compute options: {', '.join(sorted(kwargs))}")
         moments = self.dataset.client.runtime.get_task_chunk_array(
             step=self.dataset.step,
-            level=0,
+            level=self.dataset.level,
             field=self._handle.field,
             block=0,
             dataset=self.dataset._backend,
