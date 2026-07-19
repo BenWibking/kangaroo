@@ -36,7 +36,7 @@ from .kernel_params import (
     UniformProjectionParams,
     UniformSliceCellParams,
 )
-from .plan import DependencyRule, FieldRef, GraphReduceSpec, OutputRef
+from .plan import DependencyRule, Domain, FieldRef, GraphReduceSpec, OutputRef
 from .reduction import (
     GraphReductionBuilder,
     ReducedField,
@@ -1487,6 +1487,7 @@ class Histogram1D:
         bins: int,
         out_name: str = "histogram1d",
         weight_field: int | None = None,
+        domain: Domain | None = None,
         reduce_fan_in: Optional[int] = None,
     ) -> None:
         self.field = field
@@ -1494,6 +1495,7 @@ class Histogram1D:
         self.bins = bins
         self.out_name = out_name
         self.weight_field = weight_field
+        self.domain = domain
         self.reduce_fan_in = reduce_fan_in
 
     def lower(self, ctx: LoweringContext):
@@ -1510,13 +1512,26 @@ class Histogram1D:
         hist_fields: list[ReducedField] = []
         reductions = GraphReductionBuilder(ctx)
 
-        for level_idx in range(len(levels) - 1, -1, -1):
+        level_indices = (
+            range(len(levels) - 1, -1, -1)
+            if self.domain is None
+            else (self.domain.level,)
+        )
+        for level_idx in level_indices:
             level_meta = levels[level_idx]
-            blocks = list(range(len(level_meta.boxes)))
+            blocks = (
+                list(range(len(level_meta.boxes)))
+                if self.domain is None or self.domain.blocks is None
+                else list(self.domain.blocks)
+            )
             if not blocks:
                 continue
 
-            covered_boxes = covered_volume_boxes(levels, level=level_idx)
+            covered_boxes = (
+                covered_volume_boxes(levels, level=level_idx)
+                if self.domain is None
+                else []
+            )
             covered_payload = _covered_boxes_payload(covered_boxes)
             hist_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 
@@ -1606,6 +1621,7 @@ class Histogram2D:
         out_name: str = "histogram2d",
         weight_field: int | None = None,
         weight_mode: str = "input",
+        domain: Domain | None = None,
         reduce_fan_in: Optional[int] = None,
     ) -> None:
         self.x_field = x_field
@@ -1616,6 +1632,7 @@ class Histogram2D:
         self.out_name = out_name
         self.weight_field = weight_field
         self.weight_mode = weight_mode
+        self.domain = domain
         self.reduce_fan_in = reduce_fan_in
 
     def lower(self, ctx: LoweringContext):
@@ -1634,13 +1651,26 @@ class Histogram2D:
         hist_fields: list[ReducedField] = []
         reductions = GraphReductionBuilder(ctx)
 
-        for level_idx in range(len(levels) - 1, -1, -1):
+        level_indices = (
+            range(len(levels) - 1, -1, -1)
+            if self.domain is None
+            else (self.domain.level,)
+        )
+        for level_idx in level_indices:
             level_meta = levels[level_idx]
-            blocks = list(range(len(level_meta.boxes)))
+            blocks = (
+                list(range(len(level_meta.boxes)))
+                if self.domain is None or self.domain.blocks is None
+                else list(self.domain.blocks)
+            )
             if not blocks:
                 continue
 
-            covered_boxes = covered_volume_boxes(levels, level=level_idx)
+            covered_boxes = (
+                covered_volume_boxes(levels, level=level_idx)
+                if self.domain is None
+                else []
+            )
             covered_payload = _covered_boxes_payload(covered_boxes)
             hist_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 

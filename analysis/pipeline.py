@@ -1143,6 +1143,7 @@ class Pipeline:
         bins: int,
         out: str | None = None,
         weights: int | FieldHandle | None = None,
+        domain: Domain | None = None,
         reduce_fan_in: int | None = None,
     ) -> Histogram1DHandle:
         out_name = out or self._unique_name("histogram1d")
@@ -1153,6 +1154,7 @@ class Pipeline:
             bins=bins,
             out_name=out_name,
             weight_field=weight_field,
+            domain=domain,
             reduce_fan_in=reduce_fan_in,
         ).lower(self._ctx)
         self._append_fragment(fragment)
@@ -1174,6 +1176,7 @@ class Pipeline:
         out: str | None = None,
         weights: int | FieldHandle | None = None,
         weight_mode: str = "input",
+        domain: Domain | None = None,
         reduce_fan_in: int | None = None,
     ) -> Histogram2DHandle:
         out_name = out or self._unique_name("histogram2d")
@@ -1187,6 +1190,7 @@ class Pipeline:
             out_name=out_name,
             weight_field=weight_field,
             weight_mode=weight_mode,
+            domain=domain,
             reduce_fan_in=reduce_fan_in,
         ).lower(self._ctx)
         self._append_fragment(fragment)

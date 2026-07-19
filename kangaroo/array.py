@@ -456,6 +456,7 @@ class Array(LazyValue):
             rect=output_rect,
             resolution=geometry.resolution,
             out=f"{self.name or 'field'}_slice",
+            dtype=self._field_expr_dtype(self.dtype),
             reduce_fan_in=config.get("reduction.fan_in"),
         )
         return Array._from_handle(
@@ -515,6 +516,7 @@ class Array(LazyValue):
             hist_range=range,
             bins=bins,
             weights=None if weights is None else weights._field_handle,
+            domain=self._expression_domain(),
             reduce_fan_in=config.get("reduction.fan_in"),
         )
         return Histogram(self.dataset, handle)
@@ -539,6 +541,7 @@ class Array(LazyValue):
             y_range=range[1],
             bins=bins,
             weights=None if weights is None else weights._field_handle,
+            domain=self._expression_domain(),
             reduce_fan_in=config.get("reduction.fan_in"),
         )
         return Histogram2D(self.dataset, handle)

@@ -59,6 +59,51 @@ def _memory_mesh_array() -> kr.Array:
     )
 
 
+def _memory_amr_array() -> kr.Array:
+    runmeta = RunMeta(
+        steps=[
+            StepMeta(
+                step=0,
+                levels=[
+                    LevelMeta(
+                        geom=LevelGeom(
+                            dx=(1.0, 1.0, 1.0),
+                            x0=(0.0, 0.0, 0.0),
+                            ref_ratio=1,
+                        ),
+                        boxes=[
+                            BlockBox((0, 0, 0), (1, 1, 1)),
+                            BlockBox((2, 0, 0), (3, 1, 1)),
+                        ],
+                    )
+                ],
+            )
+        ]
+    )
+    ds = kr.open_dataset("memory://high-level-amr", runmeta=runmeta)
+    ds.geometry = SimpleNamespace(
+        plane=lambda **kwargs: SimpleNamespace(
+            coord=0.5,
+            rect=(0.0, 0.0, 4.0, 2.0),
+            resolution=kwargs["resolution"],
+            axis_bounds=(0.0, 2.0),
+        )
+    )
+    field = 61002
+    ds._backend.register_field("image", field)
+    ds._backend.set_chunk(
+        field=field,
+        block=0,
+        data=np.arange(8, dtype=np.float64).reshape(2, 2, 2),
+    )
+    ds._backend.set_chunk(
+        field=field,
+        block=1,
+        data=np.arange(8, 16, dtype=np.float64).reshape(2, 2, 2),
+    )
+    return kr.Array._from_handle(ds, ds._pipeline.field(field), name="image")
+
+
 class _ParticleLineagePipeline:
     def __init__(self) -> None:
         self._next_field = 1
@@ -127,6 +172,30 @@ def test_mesh_float32_arithmetic_preserves_runtime_dtype() -> None:
     result = (image.astype("float32") * 2).compute()
 
     assert result.dtype == np.float32
+
+
+def test_float32_slice_preserves_runtime_dtype() -> None:
+    image = _memory_amr_array()
+
+    sliced = image.astype("float32").slice(axis="z", resolution=(4, 4))
+    result = sliced.compute()
+
+    assert sliced.dtype == "float32"
+    assert result.dtype == np.float32
+
+
+@pytest.mark.parametrize("operation", ["slice", "project"])
+def test_histogram_of_bounded_array_uses_bounded_domain(operation: str) -> None:
+    image = _memory_amr_array()
+    bounded = (
+        image.slice(axis="z", resolution=(4, 4))
+        if operation == "slice"
+        else image.project(axis="z", resolution=(4, 4))
+    )
+
+    result = bounded.histogram(bins=4, range=(0.0, 32.0)).compute()
+
+    assert result.counts.sum() == 16.0
 
 
 @pytest.mark.parametrize("symbol", ["eq", "ne"])
