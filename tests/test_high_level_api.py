@@ -8,6 +8,7 @@ import pytest
 
 import kangaroo as kr
 from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
+from kangaroo.dataset import ParticleSpecies
 
 
 PLOTFILE = os.getenv(
@@ -104,6 +105,65 @@ def _memory_amr_array() -> kr.Array:
     return kr.Array._from_handle(ds, ds._pipeline.field(field), name="image")
 
 
+def _memory_amr_array_at_level_one() -> kr.Array:
+    runmeta = RunMeta(
+        steps=[
+            StepMeta(
+                step=0,
+                levels=[
+                    LevelMeta(
+                        geom=LevelGeom(
+                            dx=(1.0, 1.0, 1.0),
+                            x0=(0.0, 0.0, 0.0),
+                            ref_ratio=2,
+                        ),
+                        boxes=[BlockBox((0, 0, 0), (1, 1, 1))],
+                    ),
+                    LevelMeta(
+                        geom=LevelGeom(
+                            dx=(0.5, 0.5, 0.5),
+                            x0=(0.0, 0.0, 0.0),
+                            ref_ratio=1,
+                        ),
+                        boxes=[BlockBox((0, 0, 0), (3, 3, 3))],
+                    ),
+                ],
+            )
+        ]
+    )
+    ds = kr.open_dataset(
+        "memory://high-level-amr-level-one",
+        runmeta=runmeta,
+        level=1,
+    )
+    ds.geometry = SimpleNamespace(
+        plane=lambda **kwargs: SimpleNamespace(
+            coord=0.5,
+            rect=(0.0, 0.0, 2.0, 2.0),
+            resolution=kwargs["resolution"],
+            axis_bounds=(0.0, 2.0),
+        )
+    )
+    field = 61003
+    ds._backend.register_field("image", field)
+    for level, values in (
+        (0, np.arange(8, dtype=np.float64).reshape(2, 2, 2)),
+        (1, np.arange(64, dtype=np.float64).reshape(4, 4, 4)),
+    ):
+        array = np.ascontiguousarray(values)
+        ds._backend._h.set_chunk_ref(
+            0,
+            level,
+            field,
+            0,
+            0,
+            array.tobytes(order="C"),
+            "f64",
+            list(array.shape),
+        )
+    return kr.Array._from_handle(ds, ds._pipeline.field(field), name="image")
+
+
 class _ParticleLineagePipeline:
     def __init__(self) -> None:
         self._next_field = 1
@@ -153,6 +213,48 @@ def test_four_line_slice_workflow_returns_numpy_array() -> None:
     assert isinstance(result, np.ndarray)
     assert result.shape == (8, 8)
     assert image.is_materialized
+
+
+@pytest.mark.parametrize("operation", ["slice", "project"])
+def test_non_square_bounded_mesh_shape_uses_descriptor_order(operation: str) -> None:
+    image = _memory_amr_array()
+
+    bounded = getattr(image, operation)(axis="z", resolution=(6, 4))
+
+    assert bounded.shape == (4, 6)
+    assert bounded.compute().shape == (4, 6)
+
+
+def test_non_square_particle_projection_shape_uses_descriptor_order() -> None:
+    image = _memory_amr_array()
+
+    projected = ParticleSpecies(image.dataset, "stars").project(
+        axis="z", resolution=(6, 4)
+    )
+
+    assert projected.shape == (4, 6)
+
+
+@pytest.mark.parametrize("operation", ["slice", "project"])
+def test_bounded_array_compute_uses_selected_level(operation: str) -> None:
+    image = _memory_amr_array_at_level_one()
+
+    result = getattr(image, operation)(axis="z", resolution=(4, 4)).compute()
+
+    assert result.shape == (4, 4)
+
+
+@pytest.mark.parametrize("operation", ["arithmetic", "histogram"])
+def test_bounded_followup_uses_selected_level(operation: str) -> None:
+    image = _memory_amr_array_at_level_one()
+    bounded = image.slice(axis="z", resolution=(4, 4))
+
+    if operation == "arithmetic":
+        result = (bounded * 2.0).compute()
+        assert result.shape == (4, 4)
+    else:
+        result = bounded.histogram(bins=4, range=(0.0, 64.0)).compute()
+        assert result.counts.sum() == 16.0
 
 
 def test_arithmetic_after_bounded_slice_preserves_domain_and_shape() -> None:

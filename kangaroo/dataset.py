@@ -139,7 +139,7 @@ class ParticleSpecies:
             handle,
             name=handle.name,
             dtype="float64",
-            shape=geometry.resolution,
+            shape=geometry.resolution[::-1],
         )
 
     def __repr__(self) -> str:

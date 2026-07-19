@@ -274,7 +274,7 @@ class Array(LazyValue):
     def _expression_domain(self) -> Domain | None:
         if self._shape is None:
             return None
-        return Domain(step=self.dataset.step, level=0, blocks=[0])
+        return Domain(step=self.dataset.step, level=self.dataset.level, blocks=[0])
 
     @staticmethod
     def _field_expr_dtype(dtype: str) -> DType:
@@ -464,7 +464,7 @@ class Array(LazyValue):
             handle,
             name=handle.name,
             dtype=self.dtype,
-            shape=geometry.resolution,
+            shape=geometry.resolution[::-1],
         )
 
     def project(
@@ -497,7 +497,7 @@ class Array(LazyValue):
             handle,
             name=handle.name,
             dtype="float64",
-            shape=geometry.resolution,
+            shape=geometry.resolution[::-1],
         )
 
     def histogram(
@@ -676,7 +676,7 @@ class Array(LazyValue):
         if self._shape is not None:
             return runtime.get_task_chunk_array(
                 step=self.dataset.step,
-                level=0,
+                level=self.dataset.level,
                 field=self._field_handle.field,
                 block=0,
                 shape=self._shape,
@@ -1202,7 +1202,7 @@ class Histogram(LazyValue):
         else:
             counts = self.dataset.client.runtime.get_task_chunk_array(
                 step=self.dataset.step,
-                level=0,
+                level=self.dataset.level,
                 field=self._histogram_handle.counts.field,
                 block=0,
                 shape=(self._histogram_handle.bins,),
@@ -1232,7 +1232,7 @@ class Histogram2D(LazyValue):
             raise TypeError(f"unexpected compute options: {', '.join(sorted(kwargs))}")
         counts = self.dataset.client.runtime.get_task_chunk_array(
             step=self.dataset.step,
-            level=0,
+            level=self.dataset.level,
             field=self._handle.counts.field,
             block=0,
             shape=self._handle.bins,
