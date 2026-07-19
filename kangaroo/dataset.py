@@ -96,7 +96,12 @@ class ParticleSpecies:
     def _field(self, name: str) -> ParticleArray:
         handle = self.dataset._pipeline.particle_field(self.name, name)
         return ParticleArray._from_handle(
-            self.dataset, handle, name=f"{self.name}/{name}", dtype=handle.dtype
+            self.dataset,
+            handle,
+            name=f"{self.name}/{name}",
+            dtype=handle.dtype,
+            species=self.name,
+            backend_field=(self.name, name),
         )
 
     def __getitem__(self, name: str) -> ParticleArray:

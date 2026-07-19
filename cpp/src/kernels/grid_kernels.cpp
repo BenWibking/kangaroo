@@ -573,54 +573,21 @@ void register_grid_kernels(KernelRegistry &registry) {
             throw std::runtime_error(
                 "field_expr variables/input size mismatch");
           }
-          int nx = 0;
-          int ny = 0;
-          int nz = 0;
-          if (block >= 0 &&
-              static_cast<std::size_t>(block) < level.boxes.size()) {
-            const auto &box = level.boxes.at(static_cast<std::size_t>(block));
-            nx = box.hi.x - box.lo.x + 1;
-            ny = box.hi.y - box.lo.y + 1;
-            nz = box.hi.z - box.lo.z + 1;
+          const auto &input_desc = inputs.front().desc();
+          for (const auto &input : inputs.subspan(1)) {
+            const auto &desc = input.desc();
+            if (desc.rank != input_desc.rank ||
+                !std::equal(input_desc.extents.begin(),
+                            input_desc.extents.begin() + input_desc.rank,
+                            desc.extents.begin())) {
+              throw BufferContractError(
+                  BufferContractReason::kInvalidExtent,
+                  "field_expr inputs must have matching shapes");
+            }
           }
-
-          std::array<RealGridAccessor, 8> input_views{};
-          auto bind_inputs = [&](auto... typed_inputs) {
-            std::size_t input_index = 0;
-            ((input_views[input_index++] =
-                  make_real_grid_accessor(typed_inputs.grid())),
-             ...);
-          };
-
-          switch (inputs.size()) {
-          case 1:
-            visit_real_buffers_exact<1>(inputs, bind_inputs);
-            break;
-          case 2:
-            visit_real_buffers_exact<2>(inputs, bind_inputs);
-            break;
-          case 3:
-            visit_real_buffers_exact<3>(inputs, bind_inputs);
-            break;
-          case 4:
-            visit_real_buffers_exact<4>(inputs, bind_inputs);
-            break;
-          case 5:
-            visit_real_buffers_exact<5>(inputs, bind_inputs);
-            break;
-          case 6:
-            visit_real_buffers_exact<6>(inputs, bind_inputs);
-            break;
-          case 7:
-            visit_real_buffers_exact<7>(inputs, bind_inputs);
-            break;
-          case 8:
-            visit_real_buffers_exact<8>(inputs, bind_inputs);
-            break;
-          default:
-            throw std::runtime_error(
-                "field_expr variable count is out of range");
-          }
+          std::array<RealBufferAccessor, 8> input_views{};
+          for (std::size_t index = 0; index < inputs.size(); ++index)
+            input_views[index] = make_real_buffer_accessor(inputs[index]);
 
           auto out = outputs[0].mutable_byte_view();
           const bool output_f64 = outputs[0].desc().scalar == ScalarType::kF64;
@@ -629,14 +596,9 @@ void register_grid_kernels(KernelRegistry &registry) {
                 BufferContractReason::kScalarMismatch,
                 "field expression output must be f32 or f64");
           }
-          const std::size_t cell_count = static_cast<std::size_t>(nx) * ny * nz;
+          const std::size_t cell_count = input_desc.element_count();
           auto read_value = [&](int variable, std::size_t index) {
-            const int i =
-                static_cast<int>(index / (static_cast<std::size_t>(ny) * nz));
-            const auto remainder = index % (static_cast<std::size_t>(ny) * nz);
-            const int j = static_cast<int>(remainder / nz);
-            const int k = static_cast<int>(remainder % nz);
-            return input_views[static_cast<std::size_t>(variable)](i, j, k);
+            return input_views[static_cast<std::size_t>(variable)](index);
           };
           auto write_value = [&](std::size_t index, double value) {
             if (output_f64)

@@ -64,4 +64,42 @@ RealGridAccessor make_real_grid_accessor(const ChunkBuffer &buffer) {
   return accessor;
 }
 
+RealBufferAccessor make_real_buffer_accessor(const ChunkBuffer &buffer) {
+  RealBufferAccessor accessor;
+  const auto &desc = buffer.desc();
+  accessor.data = buffer.byte_view().data();
+  accessor.rank = desc.rank;
+  accessor.extents = desc.extents;
+  accessor.strides = desc.strides_bytes;
+
+  auto bind = [&]<typename T>() {
+    accessor.load = [](const RealBufferAccessor &self, std::size_t index) {
+      std::int64_t offset = 0;
+      for (std::size_t axis = self.rank; axis-- > 0;) {
+        const auto extent = self.extents[axis];
+        const auto coordinate = index % extent;
+        index /= extent;
+        offset += static_cast<std::int64_t>(coordinate) * self.strides[axis];
+      }
+      T value;
+      std::memcpy(&value, self.data + offset, sizeof(T));
+      return static_cast<double>(value);
+    };
+  };
+
+  switch (desc.scalar) {
+  case ScalarType::kF32:
+    bind.template operator()<float>();
+    break;
+  case ScalarType::kF64:
+    bind.template operator()<double>();
+    break;
+  default:
+    throw BufferContractError(
+        BufferContractReason::kUnsupportedRealVisitationDtype,
+        "real-buffer accessor accepts only f32 and f64 inputs");
+  }
+  return accessor;
+}
+
 } // namespace kangaroo

@@ -22,6 +22,7 @@ from analysis.pipeline import (
     ParticleTopKHandle,
     ToomreQProfileHandle,
 )
+from analysis.plan import Domain
 
 from .results import (
     ChunkedArray,
@@ -264,6 +265,16 @@ class Array(LazyValue):
                 "cannot combine arrays from different dataset contexts "
                 f"({self.dataset!r} and {other.dataset!r})"
             )
+        if other._shape != self._shape:
+            raise ValueError(
+                "cannot combine mesh arrays with different domains or shapes "
+                f"({self._shape!r} and {other._shape!r})"
+            )
+
+    def _expression_domain(self) -> Domain | None:
+        if self._shape is None:
+            return None
+        return Domain(step=self.dataset.step, level=0, blocks=[0])
 
     @staticmethod
     def _literal(value: int | float) -> str:
@@ -283,12 +294,20 @@ class Array(LazyValue):
                 f"a {symbol} b",
                 {"a": left._field_handle, "b": right._field_handle},
                 out=name,
+                domain=self._expression_domain(),
             )
         else:
             literal = self._literal(other)
             expression = f"{literal} {symbol} a" if reverse else f"a {symbol} {literal}"
-            handle = pipe.field_expr(expression, {"a": self._field_handle}, out=name)
-        return Array._from_handle(self.dataset, handle, name=name, dtype=self.dtype)
+            handle = pipe.field_expr(
+                expression,
+                {"a": self._field_handle},
+                out=name,
+                domain=self._expression_domain(),
+            )
+        return Array._from_handle(
+            self.dataset, handle, name=name, dtype=self.dtype, shape=self._shape
+        )
 
     def __add__(self, other: Any) -> "Array":
         return self._binary(other, "+", "add")
@@ -321,14 +340,22 @@ class Array(LazyValue):
                 "pow(a, b)",
                 {"a": self._field_handle, "b": other._field_handle},
                 out="power",
+                domain=self._expression_domain(),
             )
         else:
             handle = self.dataset._pipeline.field_expr(
                 f"pow(a, {self._literal(other)})",
                 {"a": self._field_handle},
                 out="power",
+                domain=self._expression_domain(),
             )
-        return Array._from_handle(self.dataset, handle, name="power", dtype=self.dtype)
+        return Array._from_handle(
+            self.dataset,
+            handle,
+            name="power",
+            dtype=self.dtype,
+            shape=self._shape,
+        )
 
     def __neg__(self) -> "Array":
         return self * -1.0
@@ -372,7 +399,11 @@ class Array(LazyValue):
             raise TypeError("mesh astype currently supports float32 and float64")
         tag = DType.F32 if target == np.dtype("float32") else DType.F64
         handle = self.dataset._pipeline.field_expr(
-            "a", {"a": self._field_handle}, out=f"astype_{target.name}", dtype=tag
+            "a",
+            {"a": self._field_handle},
+            out=f"astype_{target.name}",
+            dtype=tag,
+            domain=self._expression_domain(),
         )
         return Array._from_handle(
             self.dataset, handle, name=self.name, dtype=target.name, shape=self._shape
@@ -652,15 +683,40 @@ class Array(LazyValue):
 class ParticleArray(LazyValue):
     """Lazy chunked particle field or filtered particle expression."""
 
-    def __init__(self, dataset: Any, handle: ParticleArrayHandle, *, name: str, dtype: str) -> None:
+    def __init__(
+        self,
+        dataset: Any,
+        handle: ParticleArrayHandle,
+        *,
+        name: str,
+        dtype: str,
+        species: str | None = None,
+        backend_field: tuple[str, str] | None = None,
+    ) -> None:
         super().__init__(dataset, name=name, dtype=dtype)
         self._particle_handle = handle
+        self._particle_species = species
+        self._backend_field = backend_field
 
     @classmethod
     def _from_handle(
-        cls, dataset: Any, handle: ParticleArrayHandle, *, name: str, dtype: str
+        cls,
+        dataset: Any,
+        handle: ParticleArrayHandle,
+        *,
+        name: str,
+        dtype: str,
+        species: str | None = None,
+        backend_field: tuple[str, str] | None = None,
     ) -> "ParticleArray":
-        return cls(dataset, handle, name=name, dtype=dtype)
+        return cls(
+            dataset,
+            handle,
+            name=name,
+            dtype=dtype,
+            species=species,
+            backend_field=backend_field,
+        )
 
     def _domain_description(self) -> str:
         return f"Particles(chunks={self._particle_handle.chunk_count})"
@@ -676,36 +732,66 @@ class ParticleArray(LazyValue):
             raise TypeError(f"expected a particle value, got {type(other).__name__}")
         if other.dataset is not self.dataset:
             raise ValueError("cannot combine particle values from different dataset contexts")
+        if other._particle_species != self._particle_species:
+            raise ValueError(
+                "cannot combine values from different particle species "
+                f"({self._particle_species!r} and {other._particle_species!r})"
+            )
 
     def isfinite(self) -> "ParticleMask":
         """Return a lazy mask selecting finite values."""
 
         handle = self.dataset._pipeline.particle_isfinite(self._particle_handle)
-        return ParticleMask(self.dataset, handle, name=f"isfinite({self.name})")
+        return ParticleMask(
+            self.dataset,
+            handle,
+            name=f"isfinite({self.name})",
+            species=self._particle_species,
+        )
 
     def __gt__(self, scalar: float) -> "ParticleMask":
         handle = self.dataset._pipeline.particle_compare_scalar(
             self._particle_handle, scalar, comparison="gt"
         )
-        return ParticleMask(self.dataset, handle, name=f"{self.name}>scalar")
+        return ParticleMask(
+            self.dataset,
+            handle,
+            name=f"{self.name}>scalar",
+            species=self._particle_species,
+        )
 
     def __le__(self, scalar: float) -> "ParticleMask":
         handle = self.dataset._pipeline.particle_compare_scalar(
             self._particle_handle, scalar, comparison="le"
         )
-        return ParticleMask(self.dataset, handle, name=f"{self.name}<=scalar")
+        return ParticleMask(
+            self.dataset,
+            handle,
+            name=f"{self.name}<=scalar",
+            species=self._particle_species,
+        )
 
     def __lt__(self, scalar: float) -> "ParticleMask":
         handle = self.dataset._pipeline.particle_compare_scalar(
             self._particle_handle, scalar, comparison="lt"
         )
-        return ParticleMask(self.dataset, handle, name=f"{self.name}<scalar")
+        return ParticleMask(
+            self.dataset,
+            handle,
+            name=f"{self.name}<scalar",
+            species=self._particle_species,
+        )
 
     def __ge__(self, scalar: float) -> "ParticleMask":
         handle = self.dataset._pipeline.particle_compare_scalar(
             self._particle_handle, scalar, comparison="ge"
         )
-        return ParticleMask(self.dataset, handle, name=f"{self.name}>=scalar")
+        return ParticleMask(
+            self.dataset,
+            handle,
+            name=f"{self.name}>=scalar",
+            species=self._particle_species,
+        )
 
     def __eq__(self, scalar: object) -> "ParticleMask":  # type: ignore[override]
         if not isinstance(scalar, (int, float, np.integer, np.floating)):
@@ -713,7 +799,12 @@ class ParticleArray(LazyValue):
         handle = self.dataset._pipeline.particle_compare_scalar(
             self._particle_handle, float(scalar), comparison="eq"
         )
-        return ParticleMask(self.dataset, handle, name=f"{self.name}==scalar")
+        return ParticleMask(
+            self.dataset,
+            handle,
+            name=f"{self.name}==scalar",
+            species=self._particle_species,
+        )
 
     def __ne__(self, scalar: object) -> "ParticleMask":  # type: ignore[override]
         if not isinstance(scalar, (int, float, np.integer, np.floating)):
@@ -721,7 +812,12 @@ class ParticleArray(LazyValue):
         handle = self.dataset._pipeline.particle_compare_scalar(
             self._particle_handle, float(scalar), comparison="ne"
         )
-        return ParticleMask(self.dataset, handle, name=f"{self.name}!=scalar")
+        return ParticleMask(
+            self.dataset,
+            handle,
+            name=f"{self.name}!=scalar",
+            species=self._particle_species,
+        )
 
     def _binary_particle(
         self, other: Any, operation: str, *, reverse: bool = False
@@ -742,7 +838,11 @@ class ParticleArray(LazyValue):
         else:
             return NotImplemented
         return ParticleArray(
-            self.dataset, handle, name=f"particle_{operation}", dtype="float64"
+            self.dataset,
+            handle,
+            name=f"particle_{operation}",
+            dtype="float64",
+            species=self._particle_species,
         )
 
     def __add__(self, other: Any) -> "ParticleArray":
@@ -783,7 +883,14 @@ class ParticleArray(LazyValue):
 
         if not name:
             raise ValueError("name must be non-empty")
-        return ParticleArray(self.dataset, self._particle_handle, name=name, dtype=self.dtype)
+        return ParticleArray(
+            self.dataset,
+            self._particle_handle,
+            name=name,
+            dtype=self.dtype,
+            species=self._particle_species,
+            backend_field=self._backend_field,
+        )
 
     def astype(self, dtype: Any) -> "ParticleArray":
         """Lazily select the local floating dtype used when materializing chunks."""
@@ -792,7 +899,11 @@ class ParticleArray(LazyValue):
         if target not in (np.dtype("float32"), np.dtype("float64")):
             raise TypeError("particle astype currently supports float32 and float64")
         return ParticleArray(
-            self.dataset, self._particle_handle, name=self.name or "particle", dtype=target.name
+            self.dataset,
+            self._particle_handle,
+            name=self.name or "particle",
+            dtype=target.name,
+            species=self._particle_species,
         )
 
     def __getitem__(self, mask: "ParticleMask") -> "ParticleArray":
@@ -802,7 +913,13 @@ class ParticleArray(LazyValue):
         handle = self.dataset._pipeline.particle_filter(
             self._particle_handle, mask._mask_handle
         )
-        return ParticleArray(self.dataset, handle, name=self.name or "filtered", dtype=self.dtype)
+        return ParticleArray(
+            self.dataset,
+            handle,
+            name=self.name or "filtered",
+            dtype=self.dtype,
+            species=self._particle_species,
+        )
 
     def sum(self) -> "Scalar":
         """Return a lazy sum reduction."""
@@ -866,9 +983,9 @@ class ParticleArray(LazyValue):
     def topk(self, k: int) -> "TopK":
         """Return lazy top-k modes for a backend particle field."""
 
-        if not self.name or "/" not in self.name:
-            raise ValueError("topk requires an unmodified backend particle field")
-        particle_type, field = self.name.split("/", 1)
+        if self._backend_field is None:
+            raise ValueError("topk requires a backend particle field")
+        particle_type, field = self._backend_field
         handle = self.dataset._pipeline.particle_topk_modes_lazy(
             particle_type, field, k=k
         )
@@ -904,9 +1021,17 @@ class ParticleArray(LazyValue):
 class ParticleMask(LazyValue):
     """Lazy chunked boolean mask over a particle species."""
 
-    def __init__(self, dataset: Any, handle: ParticleMaskHandle, *, name: str) -> None:
+    def __init__(
+        self,
+        dataset: Any,
+        handle: ParticleMaskHandle,
+        *,
+        name: str,
+        species: str | None = None,
+    ) -> None:
         super().__init__(dataset, name=name, dtype="bool")
         self._mask_handle = handle
+        self._particle_species = species
 
     def _domain_description(self) -> str:
         return f"ParticleMask(chunks={self._mask_handle.chunk_count})"
@@ -914,10 +1039,17 @@ class ParticleMask(LazyValue):
     def __and__(self, other: "ParticleMask") -> "ParticleMask":
         if not isinstance(other, ParticleMask) or other.dataset is not self.dataset:
             raise ValueError("particle mask operands must share a dataset context")
+        if other._particle_species != self._particle_species:
+            raise ValueError(
+                "cannot combine masks from different particle species "
+                f"({self._particle_species!r} and {other._particle_species!r})"
+            )
         handle = self.dataset._pipeline.particle_and(
             self._mask_handle, other._mask_handle
         )
-        return ParticleMask(self.dataset, handle, name="mask_and")
+        return ParticleMask(
+            self.dataset, handle, name="mask_and", species=self._particle_species
+        )
 
     def count(self) -> "Scalar":
         """Return a lazy count of selected particles."""

@@ -30,6 +30,17 @@ def test_four_line_slice_workflow_returns_numpy_array() -> None:
     assert image.is_materialized
 
 
+def test_arithmetic_after_bounded_slice_preserves_domain_and_shape() -> None:
+    ds = kr.open_dataset(_plotfile())
+    sliced = ds["gasDensity"].slice(axis="z", resolution=(8, 8))
+
+    result = (sliced * 2.0).compute()
+
+    assert isinstance(result, np.ndarray)
+    assert result.shape == (8, 8)
+    np.testing.assert_allclose(result, sliced.compute() * 2.0)
+
+
 def test_multi_output_compute_returns_typed_results() -> None:
     ds = kr.open_dataset(_plotfile())
     density = ds["gasDensity"]
@@ -76,6 +87,40 @@ def test_particle_operator_syntax_and_lazy_histogram() -> None:
     result = histogram.compute()
     assert isinstance(result, kr.HistogramResult)
     assert result.counts.shape == (4,)
+
+
+@pytest.mark.parametrize("operation", ["arithmetic", "filter", "mask", "weights"])
+def test_cross_species_particle_position_operations_fail(operation: str) -> None:
+    ds = kr.open_dataset(_plotfile())
+    cic_mass = ds.particles["CIC_particles"]["mass"]
+    stellar_mass = ds.particles["StochasticStellarPop_particles"]["mass"]
+
+    with pytest.raises(ValueError, match="different particle species"):
+        if operation == "arithmetic":
+            _ = cic_mass + stellar_mass
+        elif operation == "filter":
+            _ = cic_mass[stellar_mass > 0.0]
+        elif operation == "mask":
+            _ = (cic_mass > 0.0) & (stellar_mass > 0.0)
+        else:
+            _ = cic_mass.histogram(
+                bins=4, range=(0.0, 1.0e40), weights=stellar_mass
+            )
+
+
+def test_particle_topk_uses_backend_provenance_not_display_name() -> None:
+    ds = kr.open_dataset(_plotfile())
+    raw = ds.particles["StochasticStellarPop_particles"]["evolution_stage"]
+
+    renamed_result = raw.rename("stage").topk(3).compute()
+    raw_result = raw.topk(3).compute()
+
+    np.testing.assert_array_equal(renamed_result.values, raw_result.values)
+    np.testing.assert_array_equal(renamed_result.counts, raw_result.counts)
+
+    disguised_expression = (raw + 1.0).rename("CIC_particles/mass")
+    with pytest.raises(ValueError, match="backend particle field"):
+        disguised_expression.topk(3)
 
 
 def test_cross_dataset_expressions_fail_at_construction() -> None:

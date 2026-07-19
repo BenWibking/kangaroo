@@ -725,6 +725,7 @@ class Pipeline:
         *,
         out: str | None = None,
         dtype: DType | str = DType.F64,
+        domain: Domain | None = None,
     ) -> FieldHandle:
         expr = str(expression).strip()
         if not expr:
@@ -745,6 +746,18 @@ class Pipeline:
 
         ds = self.dataset
         stage = Stage(name=self._unique_name("field_expr"))
+        if domain is not None:
+            stage.map_blocks(
+                name="field_expr_bounded",
+                kernel="field_expr",
+                domain=domain,
+                inputs=[FieldRef(fid) for fid in input_fields],
+                outputs=[_like_output(out_fid, output_dtype)],
+                deps=DependencyRule(),
+                params=FieldExprParams(expr, tuple(var_names)),
+            )
+            self._append_fragment([stage])
+            return FieldHandle(self, out_fid, out_name)
         for level_idx, level_meta in enumerate(self.runmeta.steps[ds.step].levels):
             for block_idx, box in enumerate(level_meta.boxes):
                 stage.map_blocks(
