@@ -53,10 +53,20 @@ def test_cli_uses_resolved_output_shape(relative_path: str) -> None:
         and isinstance(node.func, ast.Attribute)
         and node.func.attr == "get_task_chunk_array"
     ]
-    assert chunk_reads
-    assert all(
-        keyword.arg != "shape" for call in chunk_reads for keyword in call.keywords
-    )
+    if chunk_reads:
+        assert all(
+            keyword.arg != "shape" for call in chunk_reads for keyword in call.keywords
+        )
+    else:
+        compute_calls = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "compute"
+        ]
+        assert "import kangaroo as kr" in source
+        assert compute_calls
 
 
 @pytest.mark.parametrize("relative_path", FLUX_SURFACE_CLIS)

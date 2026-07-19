@@ -226,6 +226,51 @@ def test_pipeline_imperative_chaining_adds_cross_fragment_edge() -> None:
     assert vort_stage in slice_stage.after
 
 
+def test_pipeline_independent_fragments_do_not_gain_definition_order_edges() -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_two_block_runmeta()
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+
+    derived = pipe.field_expr(
+        "a * 2", {"a": pipe.field("density")}, out="derived"
+    )
+    first = pipe.histogram1d(
+        derived, hist_range=(0.0, 1.0), bins=4, out="first"
+    )
+    second = pipe.histogram1d(
+        derived, hist_range=(0.0, 2.0), bins=8, out="second"
+    )
+
+    first_stage = pipe._field_producers[first.counts.field][-1]
+    second_stage = pipe._field_producers[second.counts.field][-1]
+    derived_stage = pipe._field_producers[derived.field][-1]
+    assert first_stage is not second_stage
+    assert first_stage not in second_stage.after
+    assert second_stage not in first_stage.after
+    assert derived_stage in pipe.plan().topo_stages()
+
+
+def test_pipeline_run_for_selects_only_requested_branch() -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_two_block_runmeta()
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+
+    source = pipe.field("density")
+    first = pipe.histogram1d(
+        source, hist_range=(0.0, 1.0), bins=4, out="first"
+    )
+    second = pipe.histogram1d(
+        source, hist_range=(0.0, 2.0), bins=8, out="second"
+    )
+    pipe.run_for(mesh_fields=(first.counts.field,))
+
+    submitted = rt.submitted[0][0].topo_stages()
+    assert pipe._field_producers[first.counts.field][-1] in submitted
+    assert pipe._field_producers[second.counts.field][-1] not in submitted
+
+
 def test_pipeline_histogram1d_lowering_and_result_shape() -> None:
     rt = _FakeRuntime()
     runmeta = _single_level_two_block_runmeta()

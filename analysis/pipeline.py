@@ -76,6 +76,19 @@ class FieldHandle:
     field: int
     name: str | None = None
 
+    def iter_chunks(self) -> list[np.ndarray]:
+        """Execute producer ancestry and return descriptor-materialized chunks."""
+
+        return self.pipeline._materialize_mesh_field(self.field)
+
+    def compute(self) -> Any:
+        """Execute and return one bounded array or a chunked AMR result."""
+
+        from kangaroo.results import ChunkedArray
+
+        chunks = tuple(self.iter_chunks())
+        return chunks[0] if len(chunks) == 1 else ChunkedArray(chunks)
+
 
 @dataclass(frozen=True)
 class Histogram1DHandle:
@@ -86,6 +99,14 @@ class Histogram1DHandle:
     @property
     def edges(self) -> list[float]:
         return histogram_edges_1d(self.hist_range, self.bins)
+
+    def compute(self) -> Any:
+        """Execute and return typed histogram counts and edges."""
+
+        from kangaroo.results import HistogramResult
+
+        counts = self.counts.compute()
+        return HistogramResult(np.asarray(counts), np.asarray(self.edges))
 
 
 @dataclass(frozen=True)
@@ -98,6 +119,17 @@ class Histogram2DHandle:
     @property
     def edges(self) -> tuple[list[float], list[float]]:
         return histogram_edges_2d(self.x_range, self.y_range, self.bins)
+
+    def compute(self) -> Any:
+        """Execute and return typed 2D histogram counts and edges."""
+
+        from kangaroo.results import Histogram2DResult
+
+        counts = self.counts.compute()
+        x_edges, y_edges = self.edges
+        return Histogram2DResult(
+            np.asarray(counts), np.asarray(x_edges), np.asarray(y_edges)
+        )
 
 
 @dataclass(frozen=True)
@@ -123,6 +155,18 @@ class FluxSurfaceIntegralHandle:
     @property
     def name(self) -> str | None:
         return self.fluxes.name
+
+    def compute(self) -> Any:
+        """Execute and return a typed flux-surface result."""
+
+        from kangaroo.results import FluxSurfaceIntegralResult
+
+        return FluxSurfaceIntegralResult(
+            np.asarray(self.fluxes.compute()),
+            self.radii,
+            self.components,
+            self.temperature_bins,
+        )
 
 
 @dataclass(frozen=True)
@@ -150,6 +194,20 @@ class CylindricalFluxSurfaceIntegralHandle:
     @property
     def name(self) -> str | None:
         return self.fluxes.name
+
+    def compute(self) -> Any:
+        """Execute and return a typed cylindrical flux result."""
+
+        from kangaroo.results import CylindricalFluxSurfaceIntegralResult
+
+        return CylindricalFluxSurfaceIntegralResult(
+            np.asarray(self.fluxes.compute()),
+            self.radius,
+            self.heights,
+            self.geometric_sections,
+            self.components,
+            self.temperature_bins,
+        )
 
 
 @dataclass(frozen=True)
@@ -191,6 +249,20 @@ class ToomreQProfileHandle:
     def edges(self) -> np.ndarray:
         return np.asarray(self.radial_edges, dtype=np.float64)
 
+    def compute(self) -> Any:
+        """Execute and return typed annular moments and coordinates."""
+
+        from kangaroo.results import ToomreQProfileResult
+
+        return ToomreQProfileResult(
+            np.asarray(self.moments.compute()),
+            self.edges,
+            self.components,
+            self.z_bounds,
+            self.center,
+            self.gamma,
+        )
+
 
 @dataclass(frozen=True)
 class ParticleArrayHandle:
@@ -212,6 +284,14 @@ class ParticleArrayHandle:
             self.field, chunk_count=self.chunk_count, dtype=dtype
         )
 
+    def compute(self, *, gather: bool = False, max_bytes: int | None = None) -> Any:
+        """Return chunked values, or explicitly gather them with a byte limit."""
+
+        from kangaroo.results import ChunkedArray
+
+        result = ChunkedArray(tuple(self.iter_chunks()))
+        return result.gather(max_bytes=max_bytes) if gather else result
+
 
 @dataclass(frozen=True)
 class ParticleMaskHandle:
@@ -231,6 +311,85 @@ class ParticleMaskHandle:
             self.field, chunk_count=self.chunk_count, dtype="mask_u8"
         )
 
+    def compute(self, *, gather: bool = False, max_bytes: int | None = None) -> Any:
+        """Return chunked mask values, or explicitly gather them with a limit."""
+
+        from kangaroo.results import ChunkedArray
+
+        result = ChunkedArray(tuple(self.iter_chunks()))
+        return result.gather(max_bytes=max_bytes) if gather else result
+
+
+@dataclass(frozen=True)
+class ParticleScalarHandle:
+    """Lazy scalar produced by a particle reduction."""
+
+    pipeline: "Pipeline"
+    field: int
+    dtype: str
+
+    def compute(self) -> float | int:
+        """Execute the particle graph and return the local Python scalar."""
+
+        return self.pipeline._particle_scalar_from_field(self.field, dtype=self.dtype)
+
+    def __bool__(self) -> bool:
+        raise TypeError("a lazy scalar has no truth value; call compute() first")
+
+    def __float__(self) -> float:
+        raise TypeError("a lazy scalar cannot be converted implicitly; call compute() first")
+
+    def __int__(self) -> int:
+        raise TypeError("a lazy scalar cannot be converted implicitly; call compute() first")
+
+
+@dataclass(frozen=True)
+class ParticleHistogram1DHandle:
+    """Lazy particle histogram with statically known bin edges."""
+
+    counts: ParticleArrayHandle
+    edges: np.ndarray
+    density: bool = False
+
+    def compute(self) -> tuple[np.ndarray, np.ndarray]:
+        """Execute and materialize histogram counts and edges."""
+
+        counts = self.counts.iter_chunks()[0]
+        if self.density:
+            total = float(np.sum(counts))
+            if total > 0.0:
+                widths = np.diff(self.edges)
+                valid = widths > 0.0
+                counts = counts.astype(np.float64, copy=True)
+                counts[valid] /= total * widths[valid]
+        return counts, self.edges.copy()
+
+
+@dataclass(frozen=True)
+class ParticleTopKHandle:
+    """Lazy top-k particle modes and their counts."""
+
+    pipeline: "Pipeline"
+    field: int
+    k: int
+
+    def compute(self) -> tuple[np.ndarray, np.ndarray]:
+        """Execute and split the packed values/counts output."""
+
+        self.pipeline._ensure_particle_executed()
+        raw = self.pipeline.runtime.get_task_chunk(
+            step=0,
+            level=0,
+            field=self.field,
+            version=0,
+            block=0,
+            dataset=self.pipeline.dataset,
+        )
+        arr = np.frombuffer(raw, dtype=np.float64)
+        if arr.size < 2 * self.k:
+            return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+        return arr[: self.k].copy(), arr[self.k : 2 * self.k].copy()
+
 
 class Pipeline:
     """Imperative facade that records a DAG and lowers to the existing Plan IR."""
@@ -245,10 +404,10 @@ class Pipeline:
         core_runtime = getattr(runtime, "_rt", runtime)
         self._ctx = LoweringContext(runtime=core_runtime, runmeta=runmeta, dataset=dataset)
         self._stages: list[Stage] = []
-        self._frontier: list[Stage] = []
+        self._field_producers: dict[int, list[Stage]] = {}
         self._name_counters: dict[str, int] = {}
         self._particle_stages: list[Stage] = []
-        self._particle_frontier: list[Stage] = []
+        self._particle_producers: dict[int, list[Stage]] = {}
         self._particle_max_chunks: int = 1
         self._particle_executed: bool = False
         self._particle_cache: dict[int, list[np.ndarray]] = {}
@@ -303,12 +462,15 @@ class Pipeline:
         raise RuntimeError("runtime does not provide alloc_field_id")
 
     def _append_particle_stage(self, stage: Stage, *, chunk_count: int) -> None:
-        if self._particle_frontier:
-            for parent in self._particle_frontier:
-                if parent not in stage.after:
-                    stage.after.append(parent)
+        for tmpl in stage.templates:
+            for input_ref in tmpl.inputs:
+                for parent in self._particle_producers.get(input_ref.field, ()):
+                    if parent is not stage and parent not in stage.after:
+                        stage.after.append(parent)
         self._particle_stages.append(stage)
-        self._particle_frontier = [stage]
+        for tmpl in stage.templates:
+            for output_ref in tmpl.outputs:
+                self._particle_producers.setdefault(output_ref.field.field, []).append(stage)
         self._particle_max_chunks = max(self._particle_max_chunks, int(chunk_count))
         self._particle_executed = False
         self._particle_cache.clear()
@@ -324,12 +486,13 @@ class Pipeline:
     ) -> int:
         if chunk_count <= 1:
             return int(input_field)
-        if not self._particle_frontier:
+        source_producers = self._particle_producers.get(int(input_field), [])
+        if not source_producers:
             raise RuntimeError("particle reduction requires a producer stage")
 
         reductions = GraphReductionBuilder(self._ctx)
         source = FieldRef(int(input_field))
-        source_stage = self._particle_frontier[-1]
+        source_stage = source_producers[-1]
         reductions.add_stage(source_stage, outputs=[source])
         reduced = reductions.reduce_blocks(
             value=ReducedField(source, level=0),
@@ -451,6 +614,64 @@ class Pipeline:
             return int(arr[0]) if arr.size else 0
         raise ValueError(f"unsupported scalar dtype '{dtype}'")
 
+    def _mesh_field_coordinates(self, field: int) -> list[tuple[int, int, int]]:
+        producers = self._field_producers.get(int(field), [])
+        if not producers:
+            coordinates: list[tuple[int, int, int]] = []
+            for level, level_meta in enumerate(
+                self.runmeta.steps[self.dataset.step].levels
+            ):
+                coordinates.extend(
+                    (self.dataset.step, level, block)
+                    for block in range(len(level_meta.boxes))
+                )
+            return coordinates
+        coordinates = []
+        for tmpl in producers[-1].templates:
+            if not any(output.field.field == int(field) for output in tmpl.outputs):
+                continue
+            if tmpl.graph_reduce is not None:
+                if tmpl.graph_reduce.output_blocks:
+                    blocks = tmpl.graph_reduce.output_blocks
+                else:
+                    group_count = (
+                        tmpl.graph_reduce.num_inputs
+                        + tmpl.graph_reduce.fan_in
+                        - 1
+                    ) // tmpl.graph_reduce.fan_in
+                    blocks = range(
+                        tmpl.graph_reduce.output_base,
+                        tmpl.graph_reduce.output_base + group_count,
+                    )
+            elif tmpl.domain.blocks is not None:
+                blocks = tmpl.domain.blocks
+            else:
+                blocks = range(
+                    len(
+                        self.runmeta.steps[tmpl.domain.step]
+                        .levels[tmpl.domain.level]
+                        .boxes
+                    )
+                )
+            coordinates.extend(
+                (tmpl.domain.step, tmpl.domain.level, int(block))
+                for block in blocks
+            )
+        return list(dict.fromkeys(coordinates))
+
+    def _materialize_mesh_field(self, field: int) -> list[np.ndarray]:
+        self.run_for(mesh_fields=(int(field),))
+        return [
+            self.runtime.get_task_chunk_array(
+                step=step,
+                level=level,
+                field=int(field),
+                block=block,
+                dataset=self.dataset,
+            ).copy()
+            for step, level, block in self._mesh_field_coordinates(field)
+        ]
+
     def _root_stages(self, fragment: list[Stage]) -> list[Stage]:
         fragment_ids = {id(stage) for stage in fragment}
         roots: list[Stage] = []
@@ -483,15 +704,19 @@ class Pipeline:
         if not fragment:
             return
 
-        roots = self._root_stages(fragment)
-        if self._frontier:
-            for stage in roots:
-                for parent in self._frontier:
-                    if parent not in stage.after:
-                        stage.after.append(parent)
+        fragment_ids = {id(stage) for stage in fragment}
+        for stage in fragment:
+            for tmpl in stage.templates:
+                for input_ref in tmpl.inputs:
+                    for parent in self._field_producers.get(input_ref.field, ()):
+                        if id(parent) not in fragment_ids and parent not in stage.after:
+                            stage.after.append(parent)
 
         self._stages.extend(fragment)
-        self._frontier = self._leaf_stages(fragment)
+        for stage in fragment:
+            for tmpl in stage.templates:
+                for output_ref in tmpl.outputs:
+                    self._field_producers.setdefault(output_ref.field.field, []).append(stage)
 
     def field_expr(
         self,
@@ -1082,6 +1307,42 @@ class Pipeline:
         self._append_particle_stage(stage, chunk_count=in_h.chunk_count)
         return ParticleMaskHandle(self, out_fid, in_h.chunk_count)
 
+    def particle_compare_scalar(
+        self,
+        values: ParticleArrayHandle | np.ndarray,
+        scalar: float,
+        *,
+        comparison: str,
+    ) -> ParticleMaskHandle:
+        """Build a lazy scalar comparison for the supported comparison names."""
+
+        kernels = {
+            "lt": "particle_lt_mask",
+            "le": "particle_le_mask",
+            "gt": "particle_gt_mask",
+            "ge": "particle_ge_mask",
+            "eq": "particle_eq_mask",
+            "ne": "particle_ne_mask",
+        }
+        try:
+            kernel = kernels[comparison]
+        except KeyError as exc:
+            raise ValueError(f"unsupported particle comparison '{comparison}'") from exc
+        in_h = self._coerce_particle_array_handle(values)
+        out_fid = self._alloc_runtime_field(f"particle_{comparison}")
+        stage = Stage(name=self._unique_name(f"particle_{comparison}"))
+        stage.map_blocks(
+            name=kernel,
+            kernel=kernel,
+            domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
+            inputs=[FieldRef(in_h.field)],
+            outputs=[_like_output(out_fid, DType.U8)],
+            deps=DependencyRule(),
+            params=ScalarParams(float(scalar)),
+        )
+        self._append_particle_stage(stage, chunk_count=in_h.chunk_count)
+        return ParticleMaskHandle(self, out_fid, in_h.chunk_count)
+
     def particle_and(self, *masks: ParticleMaskHandle | np.ndarray) -> ParticleMaskHandle:
         if not masks:
             raise ValueError("particle_and requires at least one mask")
@@ -1189,7 +1450,92 @@ class Pipeline:
         self._append_particle_stage(stage, chunk_count=chunk_count)
         return ParticleArrayHandle(self, fid, chunk_count, "float64")
 
-    def particle_sum(self, values: ParticleArrayHandle | np.ndarray) -> float:
+    def particle_binary(
+        self,
+        left: ParticleArrayHandle | np.ndarray,
+        right: ParticleArrayHandle | np.ndarray,
+        *,
+        operation: str,
+    ) -> ParticleArrayHandle:
+        """Build a lazy elementwise binary particle operation."""
+
+        kernels = {
+            "add": "particle_add",
+            "subtract": "particle_subtract",
+            "multiply": "particle_multiply",
+            "divide": "particle_divide",
+            "power": "particle_power",
+        }
+        try:
+            kernel = kernels[operation]
+        except KeyError as exc:
+            raise ValueError(f"unsupported particle operation '{operation}'") from exc
+        left_h = self._coerce_particle_array_handle(left)
+        right_h = self._coerce_particle_array_handle(
+            right, chunk_count=left_h.chunk_count
+        )
+        if left_h.chunk_count != right_h.chunk_count:
+            raise ValueError("particle operands must have matching chunk_count")
+        fid = self._alloc_runtime_field(f"particle_{operation}")
+        stage = Stage(name=self._unique_name(f"particle_{operation}"))
+        stage.map_blocks(
+            name=kernel,
+            kernel=kernel,
+            domain=Domain(
+                step=0, level=0, blocks=list(range(left_h.chunk_count))
+            ),
+            inputs=[FieldRef(left_h.field), FieldRef(right_h.field)],
+            outputs=[
+                _dynamic_output(fid, DType.F64, DynamicUpperBound.like_input(0))
+            ],
+            deps=DependencyRule(),
+        )
+        self._append_particle_stage(stage, chunk_count=left_h.chunk_count)
+        return ParticleArrayHandle(self, fid, left_h.chunk_count, "float64")
+
+    def particle_scalar(
+        self,
+        values: ParticleArrayHandle | np.ndarray,
+        scalar: float,
+        *,
+        operation: str,
+    ) -> ParticleArrayHandle:
+        """Build a lazy scalar particle arithmetic operation."""
+
+        kernels = {
+            "add": "particle_add_scalar",
+            "subtract": "particle_subtract_scalar",
+            "rsubtract": "particle_rsubtract_scalar",
+            "multiply": "particle_multiply_scalar",
+            "divide": "particle_divide_scalar",
+            "rdivide": "particle_rdivide_scalar",
+            "power": "particle_power_scalar",
+            "rpower": "particle_rpower_scalar",
+        }
+        try:
+            kernel = kernels[operation]
+        except KeyError as exc:
+            raise ValueError(f"unsupported particle scalar operation '{operation}'") from exc
+        in_h = self._coerce_particle_array_handle(values)
+        fid = self._alloc_runtime_field(f"particle_{operation}")
+        stage = Stage(name=self._unique_name(f"particle_{operation}"))
+        stage.map_blocks(
+            name=kernel,
+            kernel=kernel,
+            domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
+            inputs=[FieldRef(in_h.field)],
+            outputs=[
+                _dynamic_output(fid, DType.F64, DynamicUpperBound.like_input(0))
+            ],
+            deps=DependencyRule(),
+            params=ScalarParams(float(scalar)),
+        )
+        self._append_particle_stage(stage, chunk_count=in_h.chunk_count)
+        return ParticleArrayHandle(self, fid, in_h.chunk_count, "float64")
+
+    def particle_sum_lazy(self, values: ParticleArrayHandle | np.ndarray) -> ParticleScalarHandle:
+        """Build a lazy sum reduction without starting execution."""
+
         in_h = self._coerce_particle_array_handle(values)
         fid = self._alloc_runtime_field("particle_sum")
         stage = Stage(name=self._unique_name("particle_sum"))
@@ -1208,9 +1554,16 @@ class Pipeline:
             kernel="uniform_slice_reduce",
             output_buffer=BufferSpec(DType.F64, FixedShape((1,)), InitPolicy.ZERO),
         )
-        return float(self._particle_scalar_from_field(reduced, dtype="float64"))
+        return ParticleScalarHandle(self, reduced, "float64")
 
-    def particle_len(self, values: ParticleArrayHandle | np.ndarray) -> int:
+    def particle_sum(self, values: ParticleArrayHandle | np.ndarray) -> float:
+        """Compatibility eager sum; high-level callers should use lazy values."""
+
+        return float(self.particle_sum_lazy(values).compute())
+
+    def particle_len_lazy(self, values: ParticleArrayHandle | np.ndarray) -> ParticleScalarHandle:
+        """Build a lazy particle length reduction without starting execution."""
+
         in_h = self._coerce_particle_array_handle(values)
         fid = self._alloc_runtime_field("particle_len")
         stage = Stage(name=self._unique_name("particle_len"))
@@ -1229,9 +1582,18 @@ class Pipeline:
             kernel="particle_int64_sum_reduce",
             output_buffer=BufferSpec(DType.I64, FixedShape((1,)), InitPolicy.ZERO),
         )
-        return int(self._particle_scalar_from_field(reduced, dtype="int64"))
+        return ParticleScalarHandle(self, reduced, "int64")
 
-    def particle_min(self, values: ParticleArrayHandle | np.ndarray, *, finite_only: bool = True) -> float:
+    def particle_len(self, values: ParticleArrayHandle | np.ndarray) -> int:
+        """Compatibility eager length; high-level callers should use lazy values."""
+
+        return int(self.particle_len_lazy(values).compute())
+
+    def particle_min_lazy(
+        self, values: ParticleArrayHandle | np.ndarray, *, finite_only: bool = True
+    ) -> ParticleScalarHandle:
+        """Build a lazy minimum reduction without starting execution."""
+
         in_h = self._coerce_particle_array_handle(values)
         fid = self._alloc_runtime_field("particle_min")
         stage = Stage(name=self._unique_name("particle_min"))
@@ -1251,9 +1613,18 @@ class Pipeline:
             kernel="particle_scalar_min_reduce",
             output_buffer=BufferSpec(DType.F64, FixedShape((1,)), InitPolicy.ZERO),
         )
-        return float(self._particle_scalar_from_field(reduced, dtype="float64"))
+        return ParticleScalarHandle(self, reduced, "float64")
 
-    def particle_max(self, values: ParticleArrayHandle | np.ndarray, *, finite_only: bool = True) -> float:
+    def particle_min(self, values: ParticleArrayHandle | np.ndarray, *, finite_only: bool = True) -> float:
+        """Compatibility eager minimum; high-level callers should use lazy values."""
+
+        return float(self.particle_min_lazy(values, finite_only=finite_only).compute())
+
+    def particle_max_lazy(
+        self, values: ParticleArrayHandle | np.ndarray, *, finite_only: bool = True
+    ) -> ParticleScalarHandle:
+        """Build a lazy maximum reduction without starting execution."""
+
         in_h = self._coerce_particle_array_handle(values)
         fid = self._alloc_runtime_field("particle_max")
         stage = Stage(name=self._unique_name("particle_max"))
@@ -1273,9 +1644,16 @@ class Pipeline:
             kernel="particle_scalar_max_reduce",
             output_buffer=BufferSpec(DType.F64, FixedShape((1,)), InitPolicy.ZERO),
         )
-        return float(self._particle_scalar_from_field(reduced, dtype="float64"))
+        return ParticleScalarHandle(self, reduced, "float64")
 
-    def particle_count(self, mask: ParticleMaskHandle | np.ndarray) -> int:
+    def particle_max(self, values: ParticleArrayHandle | np.ndarray, *, finite_only: bool = True) -> float:
+        """Compatibility eager maximum; high-level callers should use lazy values."""
+
+        return float(self.particle_max_lazy(values, finite_only=finite_only).compute())
+
+    def particle_count_lazy(self, mask: ParticleMaskHandle | np.ndarray) -> ParticleScalarHandle:
+        """Build a lazy selected-particle count without starting execution."""
+
         in_h = self._coerce_particle_mask_handle(mask)
         fid = self._alloc_runtime_field("particle_count")
         stage = Stage(name=self._unique_name("particle_count"))
@@ -1294,17 +1672,24 @@ class Pipeline:
             kernel="particle_int64_sum_reduce",
             output_buffer=BufferSpec(DType.I64, FixedShape((1,)), InitPolicy.ZERO),
         )
-        return int(self._particle_scalar_from_field(reduced, dtype="int64"))
+        return ParticleScalarHandle(self, reduced, "int64")
 
-    def particle_topk_modes(
+    def particle_count(self, mask: ParticleMaskHandle | np.ndarray) -> int:
+        """Compatibility eager count; high-level callers should use lazy values."""
+
+        return int(self.particle_count_lazy(mask).compute())
+
+    def particle_topk_modes_lazy(
         self,
         particle_type: str,
         field: str,
         *,
         k: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> ParticleTopKHandle:
+        """Build a lazy top-k mode reduction without starting execution."""
+
         if k <= 0:
-            return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+            raise ValueError("k must be positive")
         chunk_count = self._particle_chunk_count(particle_type)
         counts_fid = self._alloc_runtime_field("particle_topk_counts")
         stage = Stage(name=self._unique_name("particle_topk_map"))
@@ -1341,16 +1726,22 @@ class Pipeline:
             params=TopKModesParams(int(k)),
         )
         self._append_particle_stage(finalize, chunk_count=1)
-        self._ensure_particle_executed()
-        raw = self.runtime.get_task_chunk(step=0, level=0, field=fid, version=0, block=0, dataset=self.dataset)
-        arr = np.frombuffer(raw, dtype=np.float64)
-        if arr.size < 2 * int(k):
-            return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
-        values = arr[: int(k)].copy()
-        counts = arr[int(k) : 2 * int(k)].copy()
-        return values, counts
+        return ParticleTopKHandle(self, fid, int(k))
 
-    def particle_histogram1d(
+    def particle_topk_modes(
+        self,
+        particle_type: str,
+        field: str,
+        *,
+        k: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compatibility eager top-k; high-level callers should use lazy values."""
+
+        if k <= 0:
+            return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+        return self.particle_topk_modes_lazy(particle_type, field, k=k).compute()
+
+    def particle_histogram1d_lazy(
         self,
         values: ParticleArrayHandle | np.ndarray,
         *,
@@ -1358,7 +1749,9 @@ class Pipeline:
         hist_range: tuple[float, float] | None = None,
         weights: ParticleArrayHandle | np.ndarray | None = None,
         density: bool = False,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> ParticleHistogram1DHandle:
+        """Build a lazy particle histogram without starting execution."""
+
         if (
             weights is not None
             and not isinstance(values, ParticleArrayHandle)
@@ -1403,18 +1796,85 @@ class Pipeline:
                 DType.F64, FixedShape((int(edges.size - 1),)), InitPolicy.ZERO
             ),
         )
-        counts = self._particle_materialize_chunks(reduced, chunk_count=1, dtype="float64")[0]
-        if density:
-            total = float(np.sum(counts))
-            if total > 0.0:
-                widths = np.diff(edges)
-                valid = widths > 0.0
-                counts = counts.astype(np.float64, copy=True)
-                counts[valid] /= total * widths[valid]
-        return counts, edges
+        return ParticleHistogram1DHandle(
+            ParticleArrayHandle(self, reduced, 1, "float64"),
+            edges.copy(),
+            density=bool(density),
+        )
+
+    def particle_histogram1d(
+        self,
+        values: ParticleArrayHandle | np.ndarray,
+        *,
+        bins: int | np.ndarray,
+        hist_range: tuple[float, float] | None = None,
+        weights: ParticleArrayHandle | np.ndarray | None = None,
+        density: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compatibility eager histogram; high-level callers should use lazy values."""
+
+        return self.particle_histogram1d_lazy(
+            values,
+            bins=bins,
+            hist_range=hist_range,
+            weights=weights,
+            density=density,
+        ).compute()
 
     def plan(self) -> Plan:
         return Plan(stages=list(self._stages))
+
+    @staticmethod
+    def _producer_plan(
+        fields: Sequence[int], producers: dict[int, list[Stage]]
+    ) -> Plan:
+        roots: list[Stage] = []
+        seen: set[int] = set()
+        for field in fields:
+            for stage in producers.get(int(field), ()):
+                if id(stage) not in seen:
+                    roots.append(stage)
+                    seen.add(id(stage))
+        return Plan(stages=roots)
+
+    def run_for(
+        self,
+        *,
+        mesh_fields: Sequence[int] = (),
+        particle_fields: Sequence[int] = (),
+        progress_bar: bool = False,
+    ) -> None:
+        """Execute only the producer ancestry needed by the requested fields."""
+
+        mesh_plan = self._producer_plan(mesh_fields, self._field_producers)
+        if mesh_plan.stages:
+            self.runtime.run(
+                mesh_plan,
+                runmeta=self.runmeta,
+                dataset=self.dataset,
+                progress_bar=progress_bar,
+            )
+        particle_plan = self._producer_plan(
+            particle_fields, self._particle_producers
+        )
+        if particle_plan.stages:
+            self.runtime.run(
+                particle_plan,
+                runmeta=self._particle_runmeta(),
+                dataset=self.dataset,
+                progress_bar=progress_bar,
+            )
+            self._particle_executed = True
+
+    def mark_persisted(
+        self, *, mesh_fields: Sequence[int] = (), particle_fields: Sequence[int] = ()
+    ) -> None:
+        """Treat materialized fields as graph sources for subsequently built work."""
+
+        for field in mesh_fields:
+            self._field_producers.pop(int(field), None)
+        for field in particle_fields:
+            self._particle_producers.pop(int(field), None)
 
     def run(self, *, progress_bar: bool = False) -> None:
         if self._stages:

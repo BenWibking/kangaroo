@@ -37,10 +37,20 @@ __all__ = [
     "histogram_edges_2d",
     "cdf_from_histogram",
     "cdf_from_samples",
+    "Client",
+    "Array",
+    "Scalar",
+    "ParticleArray",
+    "ParticleMask",
+    "compute",
 ]
 
 
 def __getattr__(name):
+    if name in {"Client", "Array", "Scalar", "ParticleArray", "ParticleMask", "compute"}:
+        import kangaroo
+
+        return getattr(kangaroo, name)
     if name in {"Runtime", "hpx_configuration_string", "run_console_main"}:
         from .runtime import Runtime, hpx_configuration_string, run_console_main
 
