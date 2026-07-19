@@ -7,10 +7,56 @@ from typing import Iterator, Sequence
 
 import numpy as np
 
+from analysis.runmeta import BlockBox, LevelGeom
+
+
+@dataclass(frozen=True)
+class AMRChunk:
+    """One AMR block together with the geometry needed to locate it."""
+
+    values: np.ndarray
+    step: int
+    level: int
+    block: int
+    box: BlockBox
+    geometry: LevelGeom
+
+
+@dataclass(frozen=True)
+class AMRChunkedArray:
+    """A hierarchy of geometrically located AMR blocks.
+
+    AMR blocks are not a linear sequence: blocks may be disjoint and finer
+    levels may overlap coarser levels.  Consequently this type deliberately
+    refuses dense concatenation.
+    """
+
+    chunks: tuple[AMRChunk, ...]
+
+    def __iter__(self) -> Iterator[AMRChunk]:
+        return iter(self.chunks)
+
+    def __len__(self) -> int:
+        return len(self.chunks)
+
+    @property
+    def nbytes(self) -> int:
+        """Return the total bytes represented by all AMR blocks."""
+
+        return sum(chunk.values.nbytes for chunk in self.chunks)
+
+    def gather(self, *, max_bytes: int | None = None) -> np.ndarray:
+        """Reject concatenation because AMR blocks have no dense ordering."""
+
+        raise ValueError(
+            "gather is not defined for an AMR hierarchy; use iter_chunks(), "
+            "slice(), or project() instead"
+        )
+
 
 @dataclass(frozen=True)
 class ChunkedArray:
-    """A bounded local view of distributed chunks without dense concatenation."""
+    """A linearly ordered chunked array, such as a particle field."""
 
     chunks: tuple[np.ndarray, ...]
 

@@ -134,9 +134,11 @@ array = image.compute()
 ```
 
 Use `kr.compute(image, histogram, progress=True)` to materialize multiple outputs
-through one shared graph execution. AMR and particle arrays remain chunked by
-default; use `compute(gather=True, max_bytes=...)` when dense particle gathering
-is intentional.
+through one shared graph execution. Unbounded AMR fields return an
+`AMRChunkedArray` whose blocks retain their level, box, and geometry; use
+`iter_chunks()`, `slice()`, or `project()` rather than concatenating the
+hierarchy. Particle arrays remain linearly chunked and support explicit dense
+gathering with `compute(gather=True, max_bytes=...)`.
 
 For explicit runtime configuration, construct `kr.Client(hpx_args=[...])` or use
 `kr.Client.from_parsed_args(...)`, then call `client.open_dataset(...)`.

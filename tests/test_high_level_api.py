@@ -235,6 +235,53 @@ def test_non_square_particle_projection_shape_uses_descriptor_order() -> None:
     assert projected.shape == (4, 6)
 
 
+def test_unbounded_amr_gather_is_rejected_before_execution(monkeypatch) -> None:
+    image = _memory_amr_array()
+    executed = False
+
+    def run_for(**_kwargs) -> None:
+        nonlocal executed
+        executed = True
+
+    monkeypatch.setattr(image.dataset._pipeline, "run_for", run_for)
+
+    with pytest.raises(ValueError, match="not defined for an unbounded AMR"):
+        image.compute(gather=True)
+
+    assert not executed
+    assert not image.is_materialized
+
+
+def test_unbounded_amr_result_retains_geometry_and_refuses_gather() -> None:
+    image = _memory_amr_array()
+
+    result = image.compute()
+
+    assert isinstance(result, kr.AMRChunkedArray)
+    assert len(result) == 2
+    assert result.nbytes == 16 * np.dtype(np.float64).itemsize
+    first = result.chunks[0]
+    assert first.step == 0
+    assert first.level == 0
+    assert first.block == 0
+    assert first.box == BlockBox((0, 0, 0), (1, 1, 1))
+    assert first.geometry == image.dataset._pipeline.runmeta.steps[0].levels[0].geom
+    np.testing.assert_array_equal(
+        first.values, np.arange(8, dtype=np.float64).reshape(2, 2, 2)
+    )
+    with pytest.raises(ValueError, match="not defined for an AMR hierarchy"):
+        result.gather()
+
+
+def test_unbounded_amr_iter_chunks_still_yields_arrays() -> None:
+    image = _memory_amr_array()
+
+    chunks = tuple(image.iter_chunks())
+
+    assert len(chunks) == 2
+    assert all(isinstance(chunk, np.ndarray) for chunk in chunks)
+
+
 @pytest.mark.parametrize("operation", ["slice", "project"])
 def test_bounded_array_compute_uses_selected_level(operation: str) -> None:
     image = _memory_amr_array_at_level_one()

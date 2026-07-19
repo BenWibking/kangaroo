@@ -25,6 +25,8 @@ from .array import (
 from .client import Client
 from .dataset import Dataset, Geometry, ParticleSpecies, PlaneGeometry
 from .results import (
+    AMRChunk,
+    AMRChunkedArray,
     ChunkedArray,
     CylindricalFluxSurfaceIntegralResult,
     FluxSurfaceIntegralResult,
@@ -35,6 +37,8 @@ from .results import (
 )
 
 __all__ = [
+    "AMRChunk",
+    "AMRChunkedArray",
     "Array",
     "ChunkedArray",
     "Client",

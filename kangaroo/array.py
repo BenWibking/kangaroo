@@ -25,6 +25,8 @@ from analysis.pipeline import (
 from analysis.plan import Domain
 
 from .results import (
+    AMRChunk,
+    AMRChunkedArray,
     ChunkedArray,
     CylindricalFluxSurfaceIntegralResult,
     FluxSurfaceIntegralResult,
@@ -663,13 +665,25 @@ class Array(LazyValue):
         """Execute and iterate local chunks without dense AMR gathering."""
 
         result = self.compute()
-        if isinstance(result, ChunkedArray):
-            return iter(result.chunks)
+        if isinstance(result, AMRChunkedArray):
+            return iter(tuple(chunk.values for chunk in result.chunks))
         return iter((result,))
 
-    def _materialize(self, **kwargs: Any) -> np.ndarray | ChunkedArray:
+    def _validate_compute_options(self, **kwargs: Any) -> None:
+        unknown = set(kwargs) - {"gather", "max_bytes"}
+        if unknown:
+            raise TypeError(
+                f"unexpected compute options: {', '.join(sorted(unknown))}"
+            )
+        if self._shape is None and bool(kwargs.get("gather", False)):
+            raise ValueError(
+                "gather=True is not defined for an unbounded AMR hierarchy; "
+                "use iter_chunks(), slice(), or project() instead"
+            )
+
+    def _materialize(self, **kwargs: Any) -> np.ndarray | AMRChunkedArray:
         gather = bool(kwargs.pop("gather", False))
-        max_bytes = kwargs.pop("max_bytes", None)
+        kwargs.pop("max_bytes", None)
         if kwargs:
             raise TypeError(f"unexpected compute options: {', '.join(sorted(kwargs))}")
         runtime = self.dataset.client.runtime
@@ -682,21 +696,34 @@ class Array(LazyValue):
                 shape=self._shape,
                 dataset=self.dataset._backend,
             ).copy()
-        chunks: list[np.ndarray] = []
+        chunks: list[AMRChunk] = []
         runmeta = self.dataset._pipeline.runmeta
         for level, level_meta in enumerate(runmeta.steps[self.dataset.step].levels):
-            for block in range(len(level_meta.boxes)):
+            for block, box in enumerate(level_meta.boxes):
                 chunks.append(
-                    runtime.get_task_chunk_array(
+                    AMRChunk(
+                        values=runtime.get_task_chunk_array(
+                            step=self.dataset.step,
+                            level=level,
+                            field=self._field_handle.field,
+                            block=block,
+                            dataset=self.dataset._backend,
+                        ).copy(),
                         step=self.dataset.step,
                         level=level,
-                        field=self._field_handle.field,
                         block=block,
-                        dataset=self.dataset._backend,
-                    ).copy()
+                        box=box,
+                        geometry=level_meta.geom,
+                    )
                 )
-        result = ChunkedArray(tuple(chunks))
-        return result.gather(max_bytes=max_bytes) if gather else result
+        if gather:
+            # ``_validate_compute_options`` rejects this before execution. Keep
+            # the guard here for callers of the private materialization seam.
+            raise ValueError(
+                "gather=True is not defined for an unbounded AMR hierarchy; "
+                "use iter_chunks(), slice(), or project() instead"
+            )
+        return AMRChunkedArray(tuple(chunks))
 
     def _requested_fields(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
         return (self._field_handle.field,), ()
@@ -1379,10 +1406,9 @@ def compute(*values: LazyValue, progress: bool = False, **kwargs: Any) -> Any:
 
     if not values:
         return ()
-    _execute(values, progress=progress)
     array_types = (Array, ParticleArray, ParticleMask)
     has_array_value = any(isinstance(value, array_types) for value in values)
-    results = []
+    options_by_value: list[dict[str, Any]] = []
     for value in values:
         options = kwargs
         if has_array_value and not isinstance(value, array_types):
@@ -1391,6 +1417,13 @@ def compute(*values: LazyValue, progress: bool = False, **kwargs: Any) -> Any:
                 for key, option in kwargs.items()
                 if key not in {"gather", "max_bytes"}
             }
+        options_by_value.append(options)
+        validator = getattr(value, "_validate_compute_options", None)
+        if validator is not None:
+            validator(**options)
+    _execute(values, progress=progress)
+    results = []
+    for value, options in zip(values, options_by_value):
         result = value._materialize(**options)
         value._is_materialized = True
         results.append(result)
