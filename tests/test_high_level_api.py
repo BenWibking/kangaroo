@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 import kangaroo as kr
+from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
 
 
 PLOTFILE = os.getenv(
@@ -18,6 +20,84 @@ def _plotfile() -> str:
     if not os.path.isdir(PLOTFILE):
         pytest.skip("DiskGalaxy example plotfile not found")
     return PLOTFILE
+
+
+def _memory_mesh_array() -> kr.Array:
+    runmeta = RunMeta(
+        steps=[
+            StepMeta(
+                step=0,
+                levels=[
+                    LevelMeta(
+                        geom=LevelGeom(
+                            dx=(1.0, 1.0, 1.0),
+                            x0=(0.0, 0.0, 0.0),
+                            ref_ratio=1,
+                        ),
+                        boxes=[BlockBox((0, 0, 0), (1, 1, 1))],
+                    )
+                ],
+            )
+        ]
+    )
+    ds = kr.open_dataset(
+        "memory://high-level-mesh-dtype",
+        runmeta=runmeta,
+    )
+    field = 61001
+    ds._backend.register_field("image", field)
+    ds._backend.set_chunk(
+        field=field,
+        block=0,
+        data=np.arange(8, dtype=np.float64).reshape(2, 2, 2),
+    )
+    return kr.Array._from_handle(
+        ds,
+        ds._pipeline.field(field),
+        name="image",
+        shape=(2, 2, 2),
+    )
+
+
+class _ParticleLineagePipeline:
+    def __init__(self) -> None:
+        self._next_field = 1
+
+    def _handle(self, *, mask: bool = False) -> SimpleNamespace:
+        handle = SimpleNamespace(
+            field=self._next_field,
+            chunk_count=1,
+            dtype="mask_u8" if mask else "float64",
+        )
+        self._next_field += 1
+        return handle
+
+    def particle_compare_scalar(self, *_args, **_kwargs) -> SimpleNamespace:
+        return self._handle(mask=True)
+
+    def particle_filter(self, *_args, **_kwargs) -> SimpleNamespace:
+        return self._handle()
+
+    def particle_binary(self, *_args, **_kwargs) -> SimpleNamespace:
+        return self._handle()
+
+    def particle_and(self, *_args, **_kwargs) -> SimpleNamespace:
+        return self._handle(mask=True)
+
+    def particle_histogram1d_lazy(self, *_args, **_kwargs) -> SimpleNamespace:
+        return self._handle()
+
+
+def _particle_lineage_arrays() -> tuple[kr.ParticleArray, kr.ParticleArray]:
+    pipeline = _ParticleLineagePipeline()
+    dataset = SimpleNamespace(_pipeline=pipeline)
+    left = kr.ParticleArray._from_handle(
+        dataset, pipeline._handle(), name="stars/x", dtype="float64", species="stars"
+    )
+    right = kr.ParticleArray._from_handle(
+        dataset, pipeline._handle(), name="stars/y", dtype="float64", species="stars"
+    )
+    return left, right
 
 
 def test_four_line_slice_workflow_returns_numpy_array() -> None:
@@ -39,6 +119,28 @@ def test_arithmetic_after_bounded_slice_preserves_domain_and_shape() -> None:
     assert isinstance(result, np.ndarray)
     assert result.shape == (8, 8)
     np.testing.assert_allclose(result, sliced.compute() * 2.0)
+
+
+def test_mesh_float32_arithmetic_preserves_runtime_dtype() -> None:
+    image = _memory_mesh_array()
+
+    result = (image.astype("float32") * 2).compute()
+
+    assert result.dtype == np.float32
+
+
+@pytest.mark.parametrize("symbol", ["eq", "ne"])
+def test_mesh_equality_builds_lazy_expression(symbol: str) -> None:
+    image = _memory_mesh_array()
+
+    comparison = image == 0 if symbol == "eq" else image != 0
+
+    assert isinstance(comparison, kr.Array)
+    assert not comparison.is_materialized
+    expected = np.equal(np.arange(8).reshape(2, 2, 2), 0)
+    if symbol == "ne":
+        expected = np.logical_not(expected)
+    np.testing.assert_array_equal(comparison.compute(), expected)
 
 
 def test_multi_output_compute_returns_typed_results() -> None:
@@ -106,6 +208,38 @@ def test_cross_species_particle_position_operations_fail(operation: str) -> None
             _ = cic_mass.histogram(
                 bins=4, range=(0.0, 1.0e40), weights=stellar_mass
             )
+
+
+@pytest.mark.parametrize("operation", ["arithmetic", "filter", "mask", "weights"])
+def test_differently_filtered_particle_position_operations_fail(operation: str) -> None:
+    left, right = _particle_lineage_arrays()
+    left_filtered = left[left > 0.0]
+    right_filtered = right[right < 1.0]
+
+    with pytest.raises(ValueError, match="different filtered particle domains"):
+        if operation == "arithmetic":
+            _ = left_filtered + right_filtered
+        elif operation == "filter":
+            _ = left_filtered[right_filtered > 0.0]
+        elif operation == "mask":
+            _ = (left_filtered > 0.0) & (right_filtered > 0.0)
+        else:
+            _ = left_filtered.histogram(
+                bins=4, range=(0.0, 1.0), weights=right_filtered
+            )
+
+
+def test_particle_fields_filtered_by_the_same_mask_remain_aligned() -> None:
+    left, right = _particle_lineage_arrays()
+    common_mask = left > 0.0
+
+    combined = left[common_mask] + right[common_mask]
+    weighted = left[common_mask].histogram(
+        bins=4, range=(0.0, 1.0), weights=right[common_mask]
+    )
+
+    assert isinstance(combined, kr.ParticleArray)
+    assert isinstance(weighted, kr.Histogram)
 
 
 def test_particle_topk_uses_backend_provenance_not_display_name() -> None:

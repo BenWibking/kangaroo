@@ -277,6 +277,15 @@ class Array(LazyValue):
         return Domain(step=self.dataset.step, level=0, blocks=[0])
 
     @staticmethod
+    def _field_expr_dtype(dtype: str) -> DType:
+        return DType.F32 if np.dtype(dtype) == np.dtype("float32") else DType.F64
+
+    def _binary_dtype(self, other: Any) -> str:
+        if isinstance(other, Array):
+            return np.result_type(np.dtype(self.dtype), np.dtype(other.dtype)).name
+        return np.dtype(self.dtype).name
+
+    @staticmethod
     def _literal(value: int | float) -> str:
         if not isinstance(value, (int, float, np.integer, np.floating)):
             raise TypeError(f"expected a numeric scalar, got {type(value).__name__}")
@@ -287,6 +296,7 @@ class Array(LazyValue):
 
     def _binary(self, other: Any, symbol: str, name: str, *, reverse: bool = False) -> "Array":
         pipe = self.dataset._pipeline
+        dtype = self._binary_dtype(other)
         if isinstance(other, Array):
             self._require_array(other)
             left, right = (other, self) if reverse else (self, other)
@@ -294,6 +304,7 @@ class Array(LazyValue):
                 f"a {symbol} b",
                 {"a": left._field_handle, "b": right._field_handle},
                 out=name,
+                dtype=self._field_expr_dtype(dtype),
                 domain=self._expression_domain(),
             )
         else:
@@ -303,10 +314,11 @@ class Array(LazyValue):
                 expression,
                 {"a": self._field_handle},
                 out=name,
+                dtype=self._field_expr_dtype(dtype),
                 domain=self._expression_domain(),
             )
         return Array._from_handle(
-            self.dataset, handle, name=name, dtype=self.dtype, shape=self._shape
+            self.dataset, handle, name=name, dtype=dtype, shape=self._shape
         )
 
     def __add__(self, other: Any) -> "Array":
@@ -334,12 +346,14 @@ class Array(LazyValue):
         return self._binary(other, "/", "divide", reverse=True)
 
     def __pow__(self, other: Any) -> "Array":
+        dtype = self._binary_dtype(other)
         if isinstance(other, Array):
             self._require_array(other)
             handle = self.dataset._pipeline.field_expr(
                 "pow(a, b)",
                 {"a": self._field_handle, "b": other._field_handle},
                 out="power",
+                dtype=self._field_expr_dtype(dtype),
                 domain=self._expression_domain(),
             )
         else:
@@ -347,13 +361,14 @@ class Array(LazyValue):
                 f"pow(a, {self._literal(other)})",
                 {"a": self._field_handle},
                 out="power",
+                dtype=self._field_expr_dtype(dtype),
                 domain=self._expression_domain(),
             )
         return Array._from_handle(
             self.dataset,
             handle,
             name="power",
-            dtype=self.dtype,
+            dtype=dtype,
             shape=self._shape,
         )
 
@@ -374,6 +389,16 @@ class Array(LazyValue):
 
     def __ge__(self, other: Any) -> "Array":
         return self._compare(other, ">=")
+
+    def __eq__(self, other: object) -> "Array":  # type: ignore[override]
+        if not isinstance(other, (Array, int, float, np.integer, np.floating)):
+            return NotImplemented
+        return self._compare(other, "==")
+
+    def __ne__(self, other: object) -> "Array":  # type: ignore[override]
+        if not isinstance(other, (Array, int, float, np.integer, np.floating)):
+            return NotImplemented
+        return self._compare(other, "!=")
 
     def __and__(self, other: Any) -> "Array":
         return self._binary(other, "*", "mask_and")
@@ -692,11 +717,17 @@ class ParticleArray(LazyValue):
         dtype: str,
         species: str | None = None,
         backend_field: tuple[str, str] | None = None,
+        position_lineage: object | None = None,
     ) -> None:
         super().__init__(dataset, name=name, dtype=dtype)
         self._particle_handle = handle
         self._particle_species = species
         self._backend_field = backend_field
+        self._position_lineage = (
+            position_lineage
+            if position_lineage is not None
+            else (("particle_species", species) if species is not None else object())
+        )
 
     @classmethod
     def _from_handle(
@@ -708,6 +739,7 @@ class ParticleArray(LazyValue):
         dtype: str,
         species: str | None = None,
         backend_field: tuple[str, str] | None = None,
+        position_lineage: object | None = None,
     ) -> "ParticleArray":
         return cls(
             dataset,
@@ -716,6 +748,7 @@ class ParticleArray(LazyValue):
             dtype=dtype,
             species=species,
             backend_field=backend_field,
+            position_lineage=position_lineage,
         )
 
     def _domain_description(self) -> str:
@@ -737,6 +770,10 @@ class ParticleArray(LazyValue):
                 "cannot combine values from different particle species "
                 f"({self._particle_species!r} and {other._particle_species!r})"
             )
+        if other._position_lineage != self._position_lineage:
+            raise ValueError(
+                "cannot combine particle values from different filtered particle domains"
+            )
 
     def isfinite(self) -> "ParticleMask":
         """Return a lazy mask selecting finite values."""
@@ -747,6 +784,7 @@ class ParticleArray(LazyValue):
             handle,
             name=f"isfinite({self.name})",
             species=self._particle_species,
+            position_lineage=self._position_lineage,
         )
 
     def __gt__(self, scalar: float) -> "ParticleMask":
@@ -758,6 +796,7 @@ class ParticleArray(LazyValue):
             handle,
             name=f"{self.name}>scalar",
             species=self._particle_species,
+            position_lineage=self._position_lineage,
         )
 
     def __le__(self, scalar: float) -> "ParticleMask":
@@ -769,6 +808,7 @@ class ParticleArray(LazyValue):
             handle,
             name=f"{self.name}<=scalar",
             species=self._particle_species,
+            position_lineage=self._position_lineage,
         )
 
     def __lt__(self, scalar: float) -> "ParticleMask":
@@ -780,6 +820,7 @@ class ParticleArray(LazyValue):
             handle,
             name=f"{self.name}<scalar",
             species=self._particle_species,
+            position_lineage=self._position_lineage,
         )
 
     def __ge__(self, scalar: float) -> "ParticleMask":
@@ -791,6 +832,7 @@ class ParticleArray(LazyValue):
             handle,
             name=f"{self.name}>=scalar",
             species=self._particle_species,
+            position_lineage=self._position_lineage,
         )
 
     def __eq__(self, scalar: object) -> "ParticleMask":  # type: ignore[override]
@@ -804,6 +846,7 @@ class ParticleArray(LazyValue):
             handle,
             name=f"{self.name}==scalar",
             species=self._particle_species,
+            position_lineage=self._position_lineage,
         )
 
     def __ne__(self, scalar: object) -> "ParticleMask":  # type: ignore[override]
@@ -817,6 +860,7 @@ class ParticleArray(LazyValue):
             handle,
             name=f"{self.name}!=scalar",
             species=self._particle_species,
+            position_lineage=self._position_lineage,
         )
 
     def _binary_particle(
@@ -843,6 +887,7 @@ class ParticleArray(LazyValue):
             name=f"particle_{operation}",
             dtype="float64",
             species=self._particle_species,
+            position_lineage=self._position_lineage,
         )
 
     def __add__(self, other: Any) -> "ParticleArray":
@@ -890,6 +935,7 @@ class ParticleArray(LazyValue):
             dtype=self.dtype,
             species=self._particle_species,
             backend_field=self._backend_field,
+            position_lineage=self._position_lineage,
         )
 
     def astype(self, dtype: Any) -> "ParticleArray":
@@ -904,6 +950,7 @@ class ParticleArray(LazyValue):
             name=self.name or "particle",
             dtype=target.name,
             species=self._particle_species,
+            position_lineage=self._position_lineage,
         )
 
     def __getitem__(self, mask: "ParticleMask") -> "ParticleArray":
@@ -919,6 +966,7 @@ class ParticleArray(LazyValue):
             name=self.name or "filtered",
             dtype=self.dtype,
             species=self._particle_species,
+            position_lineage=mask._selection_lineage,
         )
 
     def sum(self) -> "Scalar":
@@ -1028,10 +1076,20 @@ class ParticleMask(LazyValue):
         *,
         name: str,
         species: str | None = None,
+        position_lineage: object | None = None,
+        selection_lineage: object | None = None,
     ) -> None:
         super().__init__(dataset, name=name, dtype="bool")
         self._mask_handle = handle
         self._particle_species = species
+        self._position_lineage = (
+            position_lineage
+            if position_lineage is not None
+            else (("particle_species", species) if species is not None else object())
+        )
+        self._selection_lineage = (
+            selection_lineage if selection_lineage is not None else object()
+        )
 
     def _domain_description(self) -> str:
         return f"ParticleMask(chunks={self._mask_handle.chunk_count})"
@@ -1044,11 +1102,19 @@ class ParticleMask(LazyValue):
                 "cannot combine masks from different particle species "
                 f"({self._particle_species!r} and {other._particle_species!r})"
             )
+        if other._position_lineage != self._position_lineage:
+            raise ValueError(
+                "cannot combine masks from different filtered particle domains"
+            )
         handle = self.dataset._pipeline.particle_and(
             self._mask_handle, other._mask_handle
         )
         return ParticleMask(
-            self.dataset, handle, name="mask_and", species=self._particle_species
+            self.dataset,
+            handle,
+            name="mask_and",
+            species=self._particle_species,
+            position_lineage=self._position_lineage,
         )
 
     def count(self) -> "Scalar":
