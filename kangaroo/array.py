@@ -1179,9 +1179,18 @@ def compute(*values: LazyValue, progress: bool = False, **kwargs: Any) -> Any:
     if not values:
         return ()
     _execute(values, progress=progress)
+    array_types = (Array, ParticleArray, ParticleMask)
+    has_array_value = any(isinstance(value, array_types) for value in values)
     results = []
     for value in values:
-        result = value._materialize(**kwargs)
+        options = kwargs
+        if has_array_value and not isinstance(value, array_types):
+            options = {
+                key: option
+                for key, option in kwargs.items()
+                if key not in {"gather", "max_bytes"}
+            }
+        result = value._materialize(**options)
         value._is_materialized = True
         results.append(result)
     return results[0] if len(results) == 1 else tuple(results)

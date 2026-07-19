@@ -8,7 +8,10 @@ import pytest
 import kangaroo as kr
 
 
-PLOTFILE = "/Users/benwibking/amrex_codes/amrex-visit-plugin/example_data/DiskGalaxy/plt0000020"
+PLOTFILE = os.getenv(
+    "KANGAROO_TEST_PLOTFILE",
+    "/Users/benwibking/amrex_codes/amrex-visit-plugin/example_data/DiskGalaxy/plt0000020",
+)
 
 
 def _plotfile() -> str:
@@ -33,7 +36,9 @@ def test_multi_output_compute_returns_typed_results() -> None:
     image = (density * 2.0).slice(axis="z", resolution=(4, 4))
     histogram = density.histogram(bins=4, range=(0.0, 1.0e-20))
 
-    image_result, histogram_result = kr.compute(image, histogram)
+    image_result, histogram_result = kr.compute(
+        image, histogram, gather=True, max_bytes=1024
+    )
 
     assert image_result.shape == (4, 4)
     assert isinstance(histogram_result, kr.HistogramResult)
@@ -51,6 +56,8 @@ def test_particle_reductions_are_lazy_and_gather_is_explicit() -> None:
     assert not total.is_materialized
     with pytest.raises(TypeError, match="compute"):
         float(total)
+    with pytest.raises(TypeError, match="unexpected compute options: gather"):
+        total.compute(gather=True)
 
     chunks = mass.compute()
     assert isinstance(chunks, kr.ChunkedArray)
