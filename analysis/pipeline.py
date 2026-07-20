@@ -734,6 +734,8 @@ class Pipeline:
             raise ValueError("variables must be non-empty")
 
         ordered_vars = list(variables.items())
+        if len(ordered_vars) > 8:
+            raise ValueError("field expressions support at most 8 variables")
         var_names = [str(name) for name, _ in ordered_vars]
         if any(not name for name in var_names):
             raise ValueError("variable names must be non-empty strings")
@@ -788,6 +790,8 @@ class Pipeline:
         if not variables:
             raise ValueError("variables must be non-empty")
         ordered_vars = list(variables.items())
+        if len(ordered_vars) > 8:
+            raise ValueError("mesh comparisons support at most 8 variables")
         var_names = [str(name) for name, _ in ordered_vars]
         if any(not name for name in var_names):
             raise ValueError("variable names must be non-empty strings")

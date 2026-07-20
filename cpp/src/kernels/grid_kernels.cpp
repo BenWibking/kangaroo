@@ -586,6 +586,10 @@ void register_grid_kernels(KernelRegistry &registry) {
             }
           }
           std::array<RealBufferAccessor, 8> input_views{};
+          if (inputs.size() > input_views.size()) {
+            throw std::runtime_error(
+                "field_expr currently supports at most 8 variables");
+          }
           for (std::size_t index = 0; index < inputs.size(); ++index)
             input_views[index] = make_real_buffer_accessor(inputs[index]);
 
@@ -680,6 +684,10 @@ void register_grid_kernels(KernelRegistry &registry) {
                                       "mesh_compare output must be u8");
           }
           std::array<RealBufferAccessor, 8> input_views{};
+          if (inputs.size() > input_views.size()) {
+            throw std::runtime_error(
+                "mesh_compare currently supports at most 8 variables");
+          }
           for (std::size_t index = 0; index < inputs.size(); ++index)
             input_views[index] = make_real_buffer_accessor(inputs[index]);
 

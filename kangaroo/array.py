@@ -658,6 +658,7 @@ class Array(LazyValue):
     def vorticity(self, y: "Array", z: "Array") -> "Array":
         """Build the lazy vorticity magnitude of three velocity components."""
 
+        self._require_unbounded_amr("vorticity")
         self._require_array(y)
         self._require_array(z)
         handle = self.dataset._pipeline.vorticity_mag(
@@ -679,6 +680,7 @@ class Array(LazyValue):
     ) -> "FluxSurfaceIntegral":
         """Build a lazy spherical flux-surface integral using this density."""
 
+        self._require_unbounded_amr("flux_surface_integral")
         operands = [*momentum, energy, passive_scalar, *magnetic_field]
         if temperature is not None:
             operands.append(temperature)
@@ -713,6 +715,7 @@ class Array(LazyValue):
     ) -> "CylindricalFluxSurfaceIntegral":
         """Build a lazy cylindrical flux-surface integral using this density."""
 
+        self._require_unbounded_amr("cylindrical_flux_surface_integral")
         operands = [*momentum, energy, passive_scalar, *magnetic_field]
         if temperature is not None:
             operands.append(temperature)
@@ -749,6 +752,7 @@ class Array(LazyValue):
     ) -> "ToomreQProfile":
         """Build a lazy AMR-aware gas Toomre-Q annular profile."""
 
+        self._require_unbounded_amr("toomre_q_profile")
         operands = [*momentum, internal_energy, *magnetic_field, potential]
         for operand in operands:
             self._require_array(operand)

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
+
 from analysis.pipeline import FieldHandle, Histogram1DHandle, Histogram2DHandle, Pipeline
 
 
@@ -535,6 +537,18 @@ def test_pipeline_field_expr_lowering_wiring() -> None:
     assert expr_templates
     assert all(tmpl.params.expression == "mx / rho" for tmpl in expr_templates)
     assert all(tmpl.params.variables == ("mx", "rho") for tmpl in expr_templates)
+
+
+@pytest.mark.parametrize("operation", ["field_expr", "mesh_compare"])
+def test_expression_lowering_rejects_more_than_eight_variables(operation: str) -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_runmeta()
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    variables = {f"x{index}": pipe.field("density") for index in range(9)}
+
+    with pytest.raises(ValueError, match="at most 8 variables"):
+        getattr(pipe, operation)(" + ".join(variables), variables)
 
 
 def test_pipeline_register_derived_field_cached() -> None:
