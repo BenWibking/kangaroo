@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Iterable, Sequence
 
@@ -36,6 +37,32 @@ from .results import (
     TopKResult,
 )
 from . import config
+
+
+@dataclass(frozen=True)
+class RegularMeshDomain:
+    """Physical index space of a bounded regular mesh value."""
+
+    axis: int
+    selection: str
+    normal_bounds: tuple[float, float]
+    rect: tuple[float, float, float, float]
+    resolution: tuple[int, int]
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.resolution[::-1]
+
+
+@dataclass(frozen=True)
+class _OpaqueRegularMeshDomain:
+    """Lineage-safe fallback for private callers without physical metadata."""
+
+    shape: tuple[int, ...]
+    lineage: object = field(default_factory=object)
+
+
+MeshDomain = RegularMeshDomain | _OpaqueRegularMeshDomain
 
 
 class LazyValue:
@@ -215,10 +242,20 @@ class Array(LazyValue):
         name: str | None,
         dtype: str = "float64",
         shape: tuple[int, ...] | None = None,
+        mesh_domain: MeshDomain | None = None,
     ) -> None:
         super().__init__(dataset, name=name, dtype=dtype)
         self._field_handle = handle
-        self._shape = shape
+        if mesh_domain is not None and shape is not None and mesh_domain.shape != shape:
+            raise ValueError(
+                f"mesh domain shape {mesh_domain.shape!r} does not match {shape!r}"
+            )
+        self._mesh_domain = (
+            mesh_domain
+            if mesh_domain is not None
+            else (_OpaqueRegularMeshDomain(shape) if shape is not None else None)
+        )
+        self._shape = None if self._mesh_domain is None else self._mesh_domain.shape
 
     @classmethod
     def _from_handle(
@@ -229,8 +266,16 @@ class Array(LazyValue):
         name: str | None,
         dtype: str = "float64",
         shape: tuple[int, ...] | None = None,
+        mesh_domain: MeshDomain | None = None,
     ) -> "Array":
-        return cls(dataset, handle, name=name, dtype=dtype, shape=shape)
+        return cls(
+            dataset,
+            handle,
+            name=name,
+            dtype=dtype,
+            shape=shape,
+            mesh_domain=mesh_domain,
+        )
 
     @property
     def chunks(self) -> tuple[tuple[int, int, int], ...]:
@@ -267,10 +312,10 @@ class Array(LazyValue):
                 "cannot combine arrays from different dataset contexts "
                 f"({self.dataset!r} and {other.dataset!r})"
             )
-        if other._shape != self._shape:
+        if other._mesh_domain != self._mesh_domain:
             raise ValueError(
                 "cannot combine mesh arrays with different domains or shapes "
-                f"({self._shape!r} and {other._shape!r})"
+                f"({self._mesh_domain!r} and {other._mesh_domain!r})"
             )
 
     def _expression_domain(self) -> Domain | None:
@@ -298,6 +343,8 @@ class Array(LazyValue):
 
     def _binary(self, other: Any, symbol: str, name: str, *, reverse: bool = False) -> "Array":
         pipe = self.dataset._pipeline
+        if isinstance(other, MeshMask):
+            raise TypeError("boolean mesh masks do not support numeric arithmetic")
         dtype = self._binary_dtype(other)
         if isinstance(other, Array):
             self._require_array(other)
@@ -320,7 +367,11 @@ class Array(LazyValue):
                 domain=self._expression_domain(),
             )
         return Array._from_handle(
-            self.dataset, handle, name=name, dtype=dtype, shape=self._shape
+            self.dataset,
+            handle,
+            name=name,
+            dtype=dtype,
+            mesh_domain=self._mesh_domain,
         )
 
     def __add__(self, other: Any) -> "Array":
@@ -348,6 +399,8 @@ class Array(LazyValue):
         return self._binary(other, "/", "divide", reverse=True)
 
     def __pow__(self, other: Any) -> "Array":
+        if isinstance(other, MeshMask):
+            raise TypeError("boolean mesh masks do not support numeric arithmetic")
         dtype = self._binary_dtype(other)
         if isinstance(other, Array):
             self._require_array(other)
@@ -371,14 +424,35 @@ class Array(LazyValue):
             handle,
             name="power",
             dtype=dtype,
-            shape=self._shape,
+            mesh_domain=self._mesh_domain,
         )
 
     def __neg__(self) -> "Array":
         return self * -1.0
 
-    def _compare(self, other: Any, symbol: str) -> "Array":
-        return self._binary(other, symbol, "mask")
+    def _compare(self, other: Any, symbol: str) -> "MeshMask":
+        pipe = self.dataset._pipeline
+        if isinstance(other, MeshMask):
+            raise TypeError("numeric comparisons do not accept boolean mesh masks")
+        if isinstance(other, Array):
+            self._require_array(other)
+            handle = pipe.mesh_compare(
+                f"a {symbol} b",
+                {"a": self._field_handle, "b": other._field_handle},
+                domain=self._expression_domain(),
+            )
+        else:
+            handle = pipe.mesh_compare(
+                f"a {symbol} {self._literal(other)}",
+                {"a": self._field_handle},
+                domain=self._expression_domain(),
+            )
+        return MeshMask(
+            self.dataset,
+            handle,
+            name="mask",
+            mesh_domain=self._mesh_domain,
+        )
 
     def __lt__(self, other: Any) -> "Array":
         return self._compare(other, "<")
@@ -403,7 +477,10 @@ class Array(LazyValue):
         return self._compare(other, "!=")
 
     def __and__(self, other: Any) -> "Array":
-        return self._binary(other, "*", "mask_and")
+        raise TypeError(
+            "bitwise-and is only supported between boolean mesh masks; "
+            "create masks with comparisons first"
+        )
 
     def rename(self, name: str) -> "Array":
         """Return an equivalent lazy value with a new display name."""
@@ -415,7 +492,7 @@ class Array(LazyValue):
             self._field_handle,
             name=name,
             dtype=self.dtype,
-            shape=self._shape,
+            mesh_domain=self._mesh_domain,
         )
 
     def astype(self, dtype: Any) -> "Array":
@@ -433,7 +510,11 @@ class Array(LazyValue):
             domain=self._expression_domain(),
         )
         return Array._from_handle(
-            self.dataset, handle, name=self.name, dtype=target.name, shape=self._shape
+            self.dataset,
+            handle,
+            name=self.name,
+            dtype=target.name,
+            mesh_domain=self._mesh_domain,
         )
 
     def slice(
@@ -466,7 +547,13 @@ class Array(LazyValue):
             handle,
             name=handle.name,
             dtype=self.dtype,
-            shape=geometry.resolution[::-1],
+            mesh_domain=RegularMeshDomain(
+                axis=int(geometry.axis_index),
+                selection="point",
+                normal_bounds=(float(geometry.coord), float(geometry.coord)),
+                rect=tuple(float(value) for value in output_rect),
+                resolution=tuple(int(value) for value in geometry.resolution),
+            ),
         )
 
     def project(
@@ -499,7 +586,18 @@ class Array(LazyValue):
             handle,
             name=handle.name,
             dtype="float64",
-            shape=geometry.resolution[::-1],
+            mesh_domain=RegularMeshDomain(
+                axis=int(geometry.axis_index),
+                selection="interval",
+                normal_bounds=tuple(
+                    float(value)
+                    for value in (geometry.axis_bounds if bounds is None else bounds)
+                ),
+                rect=tuple(
+                    float(value) for value in (geometry.rect if rect is None else rect)
+                ),
+                resolution=tuple(int(value) for value in geometry.resolution),
+            ),
         )
 
     def histogram(
@@ -731,6 +829,90 @@ class Array(LazyValue):
     def __repr__(self) -> str:
         return (
             f"kangaroo.Array<name={self.name!r}, dtype={self.dtype}, "
+            f"domain={self.domain}, lazy={not self.is_materialized}>"
+        )
+
+
+class MeshMask(Array):
+    """Lazy boolean mask over an AMR hierarchy or bounded regular mesh."""
+
+    def __init__(
+        self,
+        dataset: Any,
+        handle: FieldHandle,
+        *,
+        name: str,
+        mesh_domain: MeshDomain | None = None,
+    ) -> None:
+        super().__init__(
+            dataset,
+            handle,
+            name=name,
+            dtype="bool",
+            mesh_domain=mesh_domain,
+        )
+
+    def _binary(
+        self, other: Any, symbol: str, name: str, *, reverse: bool = False
+    ) -> "Array":
+        raise TypeError("boolean mesh masks do not support numeric arithmetic")
+
+    def _compare(self, other: Any, symbol: str) -> "MeshMask":
+        raise TypeError("numeric comparisons do not accept boolean mesh masks")
+
+    def __and__(self, other: Any) -> "MeshMask":
+        if not isinstance(other, MeshMask):
+            raise TypeError(
+                "logical-and requires two boolean mesh masks; "
+                f"got {type(other).__name__}"
+            )
+        self._require_array(other)
+        handle = self.dataset._pipeline.mesh_mask_and(
+            self._field_handle,
+            other._field_handle,
+            domain=self._expression_domain(),
+        )
+        return MeshMask(
+            self.dataset,
+            handle,
+            name="mask_and",
+            mesh_domain=self._mesh_domain,
+        )
+
+    def rename(self, name: str) -> "MeshMask":
+        if not name:
+            raise ValueError("name must be non-empty")
+        return MeshMask(
+            self.dataset,
+            self._field_handle,
+            name=name,
+            mesh_domain=self._mesh_domain,
+        )
+
+    def astype(self, dtype: Any) -> "Array":
+        raise TypeError("mesh mask conversion is not currently supported")
+
+    def _materialize(self, **kwargs: Any) -> np.ndarray | AMRChunkedArray:
+        result = super()._materialize(**kwargs)
+        if isinstance(result, np.ndarray):
+            return result.astype(np.bool_, copy=False)
+        return AMRChunkedArray(
+            tuple(
+                AMRChunk(
+                    values=chunk.values.astype(np.bool_, copy=False),
+                    step=chunk.step,
+                    level=chunk.level,
+                    block=chunk.block,
+                    box=chunk.box,
+                    geometry=chunk.geometry,
+                )
+                for chunk in result.chunks
+            )
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"kangaroo.MeshMask<name={self.name!r}, dtype=bool, "
             f"domain={self.domain}, lazy={not self.is_materialized}>"
         )
 

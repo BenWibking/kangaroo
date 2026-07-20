@@ -635,7 +635,142 @@ void register_grid_kernels(KernelRegistry &registry) {
 #undef KANGAROO_FIELD_EXPR_CASE
           return hpx::make_ready_future();
         });
+
+    /**
+     * @brief Evaluates a real-valued comparison into a normalized u8 mask.
+     * @par Chunk inputs `inputs[0..N)` are matching f32 or f64 grids.
+     * @par Typed parameters use the same compiled expression representation as
+     * `field_expr`.
+     * @par Chunk outputs `outputs[0]` is a u8 grid containing only 0 or 1.
+     */
+    registry.register_typed_kernel<Params>(
+        KernelDesc{.name = "mesh_compare",
+                   .n_inputs = 1,
+                   .n_outputs = 1,
+                   .needs_neighbors = false},
+        [prepare](const LevelMeta &, int32_t,
+                  std::span<const ChunkBuffer> inputs, const NeighborViews &,
+                  std::span<ChunkBuffer> outputs,
+                  const KernelParamsIR &kernel_params) {
+          const auto &typed =
+              require_kernel_params<Params>(kernel_params, "mesh_compare");
+          const auto prepared = prepare(typed);
+          const auto &params = prepared->params;
+          if (inputs.empty() || outputs.empty()) {
+            return hpx::make_ready_future();
+          }
+          if (params.variables.size() != inputs.size()) {
+            throw std::runtime_error(
+                "mesh_compare variables/input size mismatch");
+          }
+          const auto &input_desc = inputs.front().desc();
+          for (const auto &input : inputs.subspan(1)) {
+            const auto &desc = input.desc();
+            if (desc.rank != input_desc.rank ||
+                !std::equal(input_desc.extents.begin(),
+                            input_desc.extents.begin() + input_desc.rank,
+                            desc.extents.begin())) {
+              throw BufferContractError(
+                  BufferContractReason::kInvalidExtent,
+                  "mesh_compare inputs must have matching shapes");
+            }
+          }
+          if (outputs[0].desc().scalar != ScalarType::kU8) {
+            throw BufferContractError(BufferContractReason::kScalarMismatch,
+                                      "mesh_compare output must be u8");
+          }
+          std::array<RealBufferAccessor, 8> input_views{};
+          for (std::size_t index = 0; index < inputs.size(); ++index)
+            input_views[index] = make_real_buffer_accessor(inputs[index]);
+
+          auto out = outputs[0].mutable_byte_view();
+          const std::size_t cell_count = input_desc.element_count();
+          auto read_value = [&](int variable, std::size_t index) {
+            return input_views[static_cast<std::size_t>(variable)](index);
+          };
+          auto write_value = [&](std::size_t index, double value) {
+            store_buffer_scalar<std::uint8_t>(
+                out.data(), index,
+                value != 0.0 ? std::uint8_t{1} : std::uint8_t{0});
+          };
+
+#define KANGAROO_MESH_COMPARE_CASE(N)                                          \
+  case N: {                                                                    \
+    const auto &executable =                                                   \
+        std::get<amrexpr::ParserExecutor<N>>(prepared->executor);              \
+    for (std::size_t index = 0; index < cell_count; ++index) {                 \
+      double vars[N];                                                          \
+      for (int variable = 0; variable < N; ++variable)                         \
+        vars[variable] = read_value(variable, index);                          \
+      write_value(index, executable(vars));                                    \
+    }                                                                          \
+    break;                                                                     \
   }
+          switch (inputs.size()) {
+            KANGAROO_MESH_COMPARE_CASE(1)
+            KANGAROO_MESH_COMPARE_CASE(2)
+            KANGAROO_MESH_COMPARE_CASE(3)
+            KANGAROO_MESH_COMPARE_CASE(4)
+            KANGAROO_MESH_COMPARE_CASE(5)
+            KANGAROO_MESH_COMPARE_CASE(6)
+            KANGAROO_MESH_COMPARE_CASE(7)
+            KANGAROO_MESH_COMPARE_CASE(8)
+          default:
+            throw std::runtime_error(
+                "mesh_compare variable count is out of range");
+          }
+#undef KANGAROO_MESH_COMPARE_CASE
+          return hpx::make_ready_future();
+        });
+  }
+  /**
+   * @brief Computes elementwise logical conjunction of two mesh masks.
+   * @par Chunk inputs `inputs[0]` and `inputs[1]` are matching u8 grids.
+   * @par Chunk outputs `outputs[0]` is a normalized u8 mask.
+   */
+  registry.register_kernel(
+      KernelDesc{.name = "mesh_mask_and",
+                 .n_inputs = 2,
+                 .n_outputs = 1,
+                 .needs_neighbors = false},
+      [](const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
+         const NeighborViews &, std::span<ChunkBuffer> outputs,
+         const KernelParamsIR &) {
+        if (inputs.size() < 2 || outputs.empty()) {
+          return hpx::make_ready_future();
+        }
+        const auto &left_desc = inputs[0].desc();
+        const auto &right_desc = inputs[1].desc();
+        const auto &output_desc = outputs[0].desc();
+        if (left_desc.scalar != ScalarType::kU8 ||
+            right_desc.scalar != ScalarType::kU8 ||
+            output_desc.scalar != ScalarType::kU8) {
+          throw BufferContractError(BufferContractReason::kScalarMismatch,
+                                    "mesh_mask_and requires u8 buffers");
+        }
+        if (left_desc.rank != right_desc.rank ||
+            left_desc.rank != output_desc.rank ||
+            !std::equal(left_desc.extents.begin(),
+                        left_desc.extents.begin() + left_desc.rank,
+                        right_desc.extents.begin()) ||
+            !std::equal(left_desc.extents.begin(),
+                        left_desc.extents.begin() + left_desc.rank,
+                        output_desc.extents.begin())) {
+          throw BufferContractError(
+              BufferContractReason::kInvalidExtent,
+              "mesh_mask_and inputs and output must have matching shapes");
+        }
+        const auto left = inputs[0].byte_view();
+        const auto right = inputs[1].byte_view();
+        auto output = outputs[0].mutable_byte_view();
+        const auto count = left_desc.element_count();
+        for (std::size_t index = 0; index < count; ++index) {
+          output[index] = left[index] != 0 && right[index] != 0
+                              ? std::uint8_t{1}
+                              : std::uint8_t{0};
+        }
+        return hpx::make_ready_future();
+      });
   {
     using Params = UniformSliceParams;
 

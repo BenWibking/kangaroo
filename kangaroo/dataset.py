@@ -10,7 +10,7 @@ from typing import Any, Generic, TypeVar
 
 from analysis.pipeline import Pipeline
 
-from .array import Array, ParticleArray
+from .array import Array, ParticleArray, RegularMeshDomain
 
 T = TypeVar("T")
 
@@ -139,7 +139,16 @@ class ParticleSpecies:
             handle,
             name=handle.name,
             dtype="float64",
-            shape=geometry.resolution[::-1],
+            mesh_domain=RegularMeshDomain(
+                axis=int(geometry.axis_index),
+                selection="interval",
+                normal_bounds=tuple(
+                    float(value)
+                    for value in (geometry.axis_bounds if bounds is None else bounds)
+                ),
+                rect=tuple(float(value) for value in geometry.rect),
+                resolution=tuple(int(value) for value in geometry.resolution),
+            ),
         )
 
     def __repr__(self) -> str:

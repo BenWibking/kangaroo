@@ -772,6 +772,99 @@ class Pipeline:
         self._append_fragment([stage])
         return FieldHandle(self, out_fid, out_name)
 
+    def mesh_compare(
+        self,
+        expression: str,
+        variables: dict[str, int | FieldHandle],
+        *,
+        out: str | None = None,
+        domain: Domain | None = None,
+    ) -> FieldHandle:
+        """Lower a real-valued comparison to a normalized U8 mesh mask."""
+
+        expr = str(expression).strip()
+        if not expr:
+            raise ValueError("expression must be non-empty")
+        if not variables:
+            raise ValueError("variables must be non-empty")
+        ordered_vars = list(variables.items())
+        var_names = [str(name) for name, _ in ordered_vars]
+        if any(not name for name in var_names):
+            raise ValueError("variable names must be non-empty strings")
+        input_fields = [self._as_field_id(value) for _, value in ordered_vars]
+        out_name = out or self._unique_name("mesh_compare")
+        out_fid = self._alloc_field_id(out_name)
+        ds = self.dataset
+        stage = Stage(name=self._unique_name("mesh_compare"))
+        if domain is not None:
+            stage.map_blocks(
+                name="mesh_compare_bounded",
+                kernel="mesh_compare",
+                domain=domain,
+                inputs=[FieldRef(fid) for fid in input_fields],
+                outputs=[_like_output(out_fid, DType.U8)],
+                deps=DependencyRule(),
+                params=FieldExprParams(expr, tuple(var_names)),
+            )
+        else:
+            for level_idx, level_meta in enumerate(self.runmeta.steps[ds.step].levels):
+                for block_idx, _box in enumerate(level_meta.boxes):
+                    stage.map_blocks(
+                        name=f"mesh_compare_l{level_idx}_b{block_idx}",
+                        kernel="mesh_compare",
+                        domain=Domain(
+                            step=ds.step, level=level_idx, blocks=[block_idx]
+                        ),
+                        inputs=[FieldRef(fid) for fid in input_fields],
+                        outputs=[_block_output(out_fid, DType.U8)],
+                        deps=DependencyRule(),
+                        params=FieldExprParams(expr, tuple(var_names)),
+                    )
+        self._append_fragment([stage])
+        return FieldHandle(self, out_fid, out_name)
+
+    def mesh_mask_and(
+        self,
+        left: int | FieldHandle,
+        right: int | FieldHandle,
+        *,
+        out: str | None = None,
+        domain: Domain | None = None,
+    ) -> FieldHandle:
+        """Lower logical conjunction over two normalized U8 mesh masks."""
+
+        input_fields = [self._as_field_id(left), self._as_field_id(right)]
+        out_name = out or self._unique_name("mesh_mask_and")
+        out_fid = self._alloc_field_id(out_name)
+        ds = self.dataset
+        stage = Stage(name=self._unique_name("mesh_mask_and"))
+        if domain is not None:
+            stage.map_blocks(
+                name="mesh_mask_and_bounded",
+                kernel="mesh_mask_and",
+                domain=domain,
+                inputs=[FieldRef(fid) for fid in input_fields],
+                outputs=[_like_output(out_fid, DType.U8)],
+                deps=DependencyRule(),
+                params=NoKernelParams(),
+            )
+        else:
+            for level_idx, level_meta in enumerate(self.runmeta.steps[ds.step].levels):
+                for block_idx, _box in enumerate(level_meta.boxes):
+                    stage.map_blocks(
+                        name=f"mesh_mask_and_l{level_idx}_b{block_idx}",
+                        kernel="mesh_mask_and",
+                        domain=Domain(
+                            step=ds.step, level=level_idx, blocks=[block_idx]
+                        ),
+                        inputs=[FieldRef(fid) for fid in input_fields],
+                        outputs=[_block_output(out_fid, DType.U8)],
+                        deps=DependencyRule(),
+                        params=NoKernelParams(),
+                    )
+        self._append_fragment([stage])
+        return FieldHandle(self, out_fid, out_name)
+
     def register_derived_field(
         self,
         name: str,

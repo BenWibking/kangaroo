@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from types import SimpleNamespace
+from typing import Any
 
 import numpy as np
 import pytest
@@ -84,10 +85,13 @@ def _memory_amr_array() -> kr.Array:
     ds = kr.open_dataset("memory://high-level-amr", runmeta=runmeta)
     ds.geometry = SimpleNamespace(
         plane=lambda **kwargs: SimpleNamespace(
-            coord=0.5,
+            coord=0.5 if kwargs.get("coord") is None else kwargs["coord"],
             rect=(0.0, 0.0, 4.0, 2.0),
             resolution=kwargs["resolution"],
             axis_bounds=(0.0, 2.0),
+            axis_index={"x": 0, "y": 1, "z": 2}.get(
+                kwargs["axis"], kwargs["axis"]
+            ),
         )
     )
     field = 61002
@@ -142,6 +146,9 @@ def _memory_amr_array_at_level_one() -> kr.Array:
             rect=(0.0, 0.0, 2.0, 2.0),
             resolution=kwargs["resolution"],
             axis_bounds=(0.0, 2.0),
+            axis_index={"x": 0, "y": 1, "z": 2}.get(
+                kwargs["axis"], kwargs["axis"]
+            ),
         )
     )
     field = 61003
@@ -373,6 +380,60 @@ def test_arithmetic_after_bounded_slice_preserves_domain_and_shape() -> None:
     np.testing.assert_allclose(result, sliced.compute() * 2.0)
 
 
+def test_matching_physical_domains_can_be_combined() -> None:
+    image = _memory_amr_array()
+    left = image.slice(axis="z", coord=0.5, resolution=(4, 4))
+    right = image.slice(axis=2, coord=0.5, resolution=(4, 4))
+
+    result = (left + right).compute()
+
+    np.testing.assert_allclose(result, left.compute() + right.compute())
+
+
+@pytest.mark.parametrize(
+    ("left", "right"),
+    [
+        (
+            lambda image: image.slice(axis="z", coord=0.25, resolution=(4, 4)),
+            lambda image: image.slice(axis="z", coord=0.75, resolution=(4, 4)),
+        ),
+        (
+            lambda image: image.slice(axis="x", coord=0.5, resolution=(4, 4)),
+            lambda image: image.slice(axis="z", coord=0.5, resolution=(4, 4)),
+        ),
+        (
+            lambda image: image.slice(
+                axis="z", coord=0.5, resolution=(4, 4), rect=(0.0, 0.0, 2.0, 2.0)
+            ),
+            lambda image: image.slice(
+                axis="z", coord=0.5, resolution=(4, 4), rect=(0.0, 0.0, 4.0, 2.0)
+            ),
+        ),
+        (
+            lambda image: image.project(
+                axis="z", bounds=(0.0, 1.0), resolution=(4, 4)
+            ),
+            lambda image: image.project(
+                axis="z", bounds=(0.0, 2.0), resolution=(4, 4)
+            ),
+        ),
+        (
+            lambda image: image.slice(axis="z", coord=0.5, resolution=(4, 4)),
+            lambda image: image.project(
+                axis="z", bounds=(0.0, 2.0), resolution=(4, 4)
+            ),
+        ),
+    ],
+)
+def test_matching_shapes_with_different_physical_domains_are_rejected(
+    left: Any, right: Any
+) -> None:
+    image = _memory_amr_array()
+
+    with pytest.raises(ValueError, match="different domains or shapes"):
+        left(image) + right(image)
+
+
 def test_mesh_float32_arithmetic_preserves_runtime_dtype() -> None:
     image = _memory_mesh_array()
 
@@ -412,11 +473,56 @@ def test_mesh_equality_builds_lazy_expression(symbol: str) -> None:
     comparison = image == 0 if symbol == "eq" else image != 0
 
     assert isinstance(comparison, kr.Array)
+    assert isinstance(comparison, kr.MeshMask)
+    assert comparison.dtype == "bool"
     assert not comparison.is_materialized
     expected = np.equal(np.arange(8).reshape(2, 2, 2), 0)
     if symbol == "ne":
         expected = np.logical_not(expected)
-    np.testing.assert_array_equal(comparison.compute(), expected)
+    result = comparison.compute()
+    assert result.dtype == np.bool_
+    np.testing.assert_array_equal(result, expected)
+
+
+def test_mesh_comparison_materializes_a_boolean_index_mask() -> None:
+    image = _memory_mesh_array()
+
+    mask = (image >= 2) & (image < 6)
+    result = mask.compute()
+
+    assert isinstance(mask, kr.MeshMask)
+    assert mask.dtype == "bool"
+    assert result.dtype == np.bool_
+    np.testing.assert_array_equal(
+        image.compute()[result], np.array([2.0, 3.0, 4.0, 5.0])
+    )
+
+
+def test_amr_mesh_comparison_materializes_boolean_chunks() -> None:
+    image = _memory_amr_array()
+
+    result = (image >= 8).compute()
+
+    assert isinstance(result, kr.AMRChunkedArray)
+    assert all(chunk.values.dtype == np.bool_ for chunk in result.chunks)
+    np.testing.assert_array_equal(result.chunks[0].values, False)
+    np.testing.assert_array_equal(result.chunks[1].values, True)
+
+
+def test_mesh_mask_and_rejects_different_physical_domains() -> None:
+    image = _memory_amr_array()
+    left = image.slice(axis="z", coord=0.25, resolution=(4, 4)) > 0
+    right = image.slice(axis="z", coord=0.75, resolution=(4, 4)) > 0
+
+    with pytest.raises(ValueError, match="different domains or shapes"):
+        left & right
+
+
+def test_bitwise_and_rejects_numeric_mesh_arrays() -> None:
+    image = _memory_mesh_array()
+
+    with pytest.raises(TypeError, match="only supported between boolean mesh masks"):
+        image & image
 
 
 def test_multi_output_compute_returns_typed_results() -> None:

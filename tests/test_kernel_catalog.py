@@ -10,6 +10,8 @@ EXPECTED_DEFAULT_KERNELS = {
     "gradU_stencil",
     "histogram1d_accumulate",
     "histogram2d_accumulate",
+    "mesh_compare",
+    "mesh_mask_and",
     "particle_abs_lt_mask",
     "particle_add",
     "particle_add_scalar",
