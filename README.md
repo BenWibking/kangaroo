@@ -38,6 +38,18 @@ pixi run test
 
 If `analysis._core` fails to import, install the extension module with `pixi run install`.
 
+## Documentation
+
+The HTML documentation is built with [mdBook](https://rust-lang.github.io/mdBook/):
+
+```bash
+mdbook serve docs --open
+```
+
+Use `mdbook build docs` for a one-off build. The generated site is written to
+`docs/book/` and is published at <https://benwibking.github.io/kangaroo/> after
+changes land on `main`.
+
 ## Plotfile Scripts (Current Workflows)
 
 All examples below assume:
