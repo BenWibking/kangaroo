@@ -1,6 +1,6 @@
 # Kangaroo [experimental]
 
-![image](logo.png)
+![Kangaroo logo](docs/src/logo.webp)
 
 Kangaroo is a prototype distributed analysis runtime with:
 - a lazy scientific Python API in `kangaroo/`

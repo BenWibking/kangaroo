@@ -1,5 +1,7 @@
 # Kangaroo
 
+![Kangaroo logo](logo.webp)
+
 Kangaroo is an experimental distributed analysis runtime for scientific data. It
 combines a lazy Python interface with an HPX/C++ execution engine designed for
 adaptive mesh refinement (AMR) and particle workflows.
