@@ -751,6 +751,27 @@ def test_persisted_field_is_reused_by_later_graphs() -> None:
     assert image.shape == (4, 4)
 
 
+def test_persisted_field_survives_subsequent_dataset_preload() -> None:
+    ds = kr.open_dataset(_plotfile())
+    prepared = (ds["gasDensity"] * 2.0).persist()
+    source_field = ds._pipeline.field("gasDensity").field
+
+    ds.client.runtime.preload(
+        runmeta=ds._pipeline.runmeta,
+        dataset=ds._backend,
+        fields=[source_field],
+    )
+    ds.client.runtime.preload(
+        runmeta=ds._pipeline.runmeta,
+        dataset=ds._backend,
+        fields=[source_field],
+    )
+
+    histogram = prepared.histogram(bins=4, range=(0.0, 1.0e-20)).compute()
+
+    assert np.sum(histogram.counts) > 0.0
+
+
 def test_compatibility_mesh_handle_owns_materialization() -> None:
     ds = kr.open_dataset(_plotfile())
     geometry = ds.geometry.plane(axis="z", resolution=(4, 4))
