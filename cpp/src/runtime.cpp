@@ -1694,7 +1694,14 @@ void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
     });
   }
   const bool reused_preload_context = preload_run_id_ != 0;
-  int32_t plan_id = reused_preload_context ? preload_run_id_ : allocate_runtime_run_id();
+  const bool has_persistent_context = !persistent_fields_.empty() &&
+                                      retained_output_run_id_ != 0;
+  int32_t plan_id = reused_preload_context ? preload_run_id_
+                                           : (has_persistent_context
+                                                  ? retained_output_run_id_
+                                                  : allocate_runtime_run_id());
+  const bool reused_persistent_context =
+      has_persistent_context && plan_id == retained_output_run_id_;
   preload_run_id_ = 0;
   timed_phase("runtime_broadcast_execution_context", "kangaroo.runtime.setup", [&]() {
     hpx::lcos::broadcast<::kangaroo_set_execution_context_action>(
@@ -1728,9 +1735,11 @@ void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
       return 0;
     });
   } catch (...) {
-    try {
-      erase_context(plan_id);
-    } catch (...) {
+    if (!reused_persistent_context) {
+      try {
+        erase_context(plan_id);
+      } catch (...) {
+      }
     }
     try {
       stop_perfetto_sampling();
@@ -1755,7 +1764,10 @@ void Runtime::preload_dataset(const RunMetaHandle& runmeta,
   auto erase_context = [&](int32_t run_id) {
     hpx::lcos::broadcast<::kangaroo_erase_execution_context_action>(localities, run_id).get();
   };
-  if (preload_run_id_ != 0) {
+  const bool has_persistent_context = !persistent_fields_.empty() &&
+                                      retained_output_run_id_ != 0;
+  if (preload_run_id_ != 0 &&
+      (!has_persistent_context || preload_run_id_ != retained_output_run_id_)) {
     const int32_t old_preload_run_id = preload_run_id_;
     erase_context(preload_run_id_);
     retained_output_run_ids_.erase(
@@ -1764,7 +1776,8 @@ void Runtime::preload_dataset(const RunMetaHandle& runmeta,
         retained_output_run_ids_.end());
     preload_run_id_ = 0;
   }
-  preload_run_id_ = allocate_runtime_run_id();
+  preload_run_id_ = has_persistent_context ? retained_output_run_id_
+                                           : allocate_runtime_run_id();
   hpx::lcos::broadcast<::kangaroo_set_execution_context_action>(
       localities, preload_run_id_, runmeta.meta, dataset, PlanIR{})
       .get();
@@ -1808,7 +1821,8 @@ ChunkBuffer Runtime::get_task_chunk(int32_t step,
     } catch (...) {
       continue;
     }
-    if (context_may_produce_chunk(*ctx, ref) || ctx->dataset.has_chunk(ref)) {
+    if (context_may_produce_chunk(*ctx, ref) || ctx->dataset.has_chunk(ref) ||
+        persistent_fields_.contains(ref.field)) {
       DataServiceLocal data(run_id, dataset);
       return data.get_host(ref).get();
     }

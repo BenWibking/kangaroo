@@ -6,6 +6,7 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "flatbuffers",
+    "numpy",
 ]
 
 [build-system]
@@ -14,7 +15,7 @@ build-backend = "scikit_build_core.build"
 
 [tool.scikit-build]
 cmake.minimum-version = "3.22"
-wheel.packages = ["analysis"]
+wheel.packages = ["analysis", "kangaroo"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

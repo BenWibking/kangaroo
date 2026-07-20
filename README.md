@@ -3,16 +3,15 @@
 ![image](logo.png)
 
 Kangaroo is a prototype distributed analysis runtime with:
-- a Python API/DSL in `analysis/`
+- a lazy scientific Python API in `kangaroo/`
+- compatibility and advanced low-level interfaces in `analysis/`
 - an HPX/C++ runtime in `cpp/`
 - plotfile-focused workflows in `scripts/plotfile_*.py`
 
-The current recommended usage pattern is:
-1. create a `Runtime` (typically via `Runtime.from_parsed_args(...)`),
-2. open a dataset with `open_dataset(...)`,
-3. derive geometry with dataset helpers (`metadata_bundle`, `resolve_field`, `plane_geometry`),
-4. build operations with the imperative pipeline API (`pipeline(...).uniform_slice(...)`, `uniform_projection(...)`),
-5. run and fetch output bytes/arrays via `Runtime`.
+The recommended workflow is to `import kangaroo as kr`, open a dataset, build
+expressions from named fields, and call `compute()` only at the desired local
+materialization boundary. Explicit clients and the advanced IR/runtime modules
+remain available for launchers, kernel development, and direct chunk access.
 
 ## Requirements
 
@@ -80,7 +79,7 @@ pixi run python scripts/plotfile_projection.py /path/to/plotfile \
 Notes:
 - projection always uses AMR cell-average semantics.
 - chunk dtype, shape, and physical strides travel with each chunk; projection output is `float64`.
-- `Runtime.get_task_chunk_array(...)` materializes typed outputs without caller-provided shape or dtype.
+- the high-level result owns its materialization coordinates and returns the typed array from `compute()`.
 
 ### 3) Per-FAB min/max inspection
 
@@ -124,85 +123,44 @@ momentum, internal energy, magnetic-field, and potential fields needed by the
 calculation. Run with `--help` for field overrides, alternate geometry, and HPX
 options.
 
-## Pipeline API Example (Recommended)
+## Lazy Python API Example (Recommended)
 
 ```python
-from analysis import Runtime
-from analysis.dataset import open_dataset
-from analysis.pipeline import pipeline
+import kangaroo as kr
 
-rt = Runtime()
-ds = open_dataset("/path/to/plotfile", runtime=rt)
-
-metadata = ds.metadata_bundle()
-runmeta = metadata.runmeta
-comp, field_id, _ = ds.resolve_field("density")
-
-view = ds.plane_geometry(axis="z", level=0, coord=None, zoom=1.0, resolution="512,512")
-
-pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
-out = pipe.uniform_slice(
-    field=pipe.field(field_id),
-    axis="z",
-    coord=view["coord"],
-    rect=view["rect"],
-    resolution=view["resolution"],
-    out="slice",
-)
-
-# Enable a shared tqdm task progress bar during execution.
-pipe.run(progress_bar=True)
-arr = rt.get_task_chunk_array(
-    step=0,
-    level=0,
-    field=out.field,
-    version=0,
-    block=0,
-    shape=view["resolution"],
-    dataset=ds,
-)
+ds = kr.open_dataset("/path/to/plotfile")
+image = ds["density"].slice(axis="z", resolution=(512, 512))
+array = image.compute()
 ```
 
-Pass `progress_bar=True` to `pipeline.run(...)` to show task progress for any pipeline workflow (requires `tqdm` in the Python environment).
+Use `kr.compute(image, histogram, progress=True)` to materialize multiple outputs
+through one shared graph execution. Unbounded AMR fields return an
+`AMRChunkedArray` whose blocks retain their level, box, and geometry; use
+`iter_chunks()`, `slice()`, or `project()` rather than concatenating the
+hierarchy. Particle arrays remain linearly chunked and support explicit dense
+gathering with `compute(gather=True, max_bytes=...)`.
 
-To forward HPX flags from CLI scripts, use `argparse.parse_known_args()` and pass unknown args into `Runtime.from_parsed_args(...)` (as done by `scripts/plotfile_slice.py` and `scripts/plotfile_projection.py`).
+For explicit runtime configuration, construct `kr.Client(hpx_args=[...])` or use
+`kr.Client.from_parsed_args(...)`, then call `client.open_dataset(...)`.
 
 ## Histogram API
 
-The pipeline also supports global histogram reductions:
+Lazy arrays also support global histogram reductions:
 
 ```python
-from analysis import cdf_from_histogram
-
-hist1 = pipe.histogram1d(
-    pipe.field("density"),
-    hist_range=(1.0e-30, 1.0e-20),
+hist1 = ds["density"].histogram(
     bins=128,
-    out="density_hist",
+    range=(1.0e-30, 1.0e-20),
 )
 
-hist2 = pipe.histogram2d(
-    pipe.field("density"),
-    pipe.field("temperature"),
-    x_range=(1.0e-30, 1.0e-20),
-    y_range=(1.0, 1.0e8),
+hist2 = ds["density"].histogram2d(
+    ds["temperature"],
     bins=(256, 256),
-    weights=pipe.field("cell_mass"),
-    out="phase_hist",
+    range=((1.0e-30, 1.0e-20), (1.0, 1.0e8)),
+    weights=ds["cell_mass"],
 )
 
-pipe.run()
-
-h1 = rt.get_task_chunk_array(
-    step=ds.step,
-    level=ds.level,
-    field=hist1.counts.field,
-    block=0,
-    shape=(hist1.bins,),
-    dtype=float,
-    dataset=ds,
-)
-cdf = cdf_from_histogram(h1)
+hist1_result, hist2_result = kr.compute(hist1, hist2)
 ```
 
 Histogram accumulation is AMR-aware and uses global graph reductions across all blocks/levels.
@@ -234,6 +192,7 @@ In distributed runs, each locality writes its own trace file (for example
 
 - Python tests live in `tests/` and run with `pytest -q`.
 - Main implementation areas:
-  - Python API: `analysis/`
+  - recommended Python API: `kangaroo/`
+  - compatibility and low-level Python API: `analysis/`
   - runtime/bindings: `cpp/`
 - Additional design context: `PLAN.md` and `TRACKED_GAPS.md`.

@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
+
 from analysis.pipeline import FieldHandle, Histogram1DHandle, Histogram2DHandle, Pipeline
 
 
@@ -224,6 +226,51 @@ def test_pipeline_imperative_chaining_adds_cross_fragment_edge() -> None:
     vort_stage = next(stage for stage in topo if stage.name == "vortmag")
     slice_stage = next(stage for stage in topo if stage.name == "uniform_slice")
     assert vort_stage in slice_stage.after
+
+
+def test_pipeline_independent_fragments_do_not_gain_definition_order_edges() -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_two_block_runmeta()
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+
+    derived = pipe.field_expr(
+        "a * 2", {"a": pipe.field("density")}, out="derived"
+    )
+    first = pipe.histogram1d(
+        derived, hist_range=(0.0, 1.0), bins=4, out="first"
+    )
+    second = pipe.histogram1d(
+        derived, hist_range=(0.0, 2.0), bins=8, out="second"
+    )
+
+    first_stage = pipe._field_producers[first.counts.field][-1]
+    second_stage = pipe._field_producers[second.counts.field][-1]
+    derived_stage = pipe._field_producers[derived.field][-1]
+    assert first_stage is not second_stage
+    assert first_stage not in second_stage.after
+    assert second_stage not in first_stage.after
+    assert derived_stage in pipe.plan().topo_stages()
+
+
+def test_pipeline_run_for_selects_only_requested_branch() -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_two_block_runmeta()
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+
+    source = pipe.field("density")
+    first = pipe.histogram1d(
+        source, hist_range=(0.0, 1.0), bins=4, out="first"
+    )
+    second = pipe.histogram1d(
+        source, hist_range=(0.0, 2.0), bins=8, out="second"
+    )
+    pipe.run_for(mesh_fields=(first.counts.field,))
+
+    submitted = rt.submitted[0][0].topo_stages()
+    assert pipe._field_producers[first.counts.field][-1] in submitted
+    assert pipe._field_producers[second.counts.field][-1] not in submitted
 
 
 def test_pipeline_histogram1d_lowering_and_result_shape() -> None:
@@ -490,6 +537,18 @@ def test_pipeline_field_expr_lowering_wiring() -> None:
     assert expr_templates
     assert all(tmpl.params.expression == "mx / rho" for tmpl in expr_templates)
     assert all(tmpl.params.variables == ("mx", "rho") for tmpl in expr_templates)
+
+
+@pytest.mark.parametrize("operation", ["field_expr", "mesh_compare"])
+def test_expression_lowering_rejects_more_than_eight_variables(operation: str) -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_runmeta()
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    variables = {f"x{index}": pipe.field("density") for index in range(9)}
+
+    with pytest.raises(ValueError, match="at most 8 variables"):
+        getattr(pipe, operation)(" + ".join(variables), variables)
 
 
 def test_pipeline_register_derived_field_cached() -> None:

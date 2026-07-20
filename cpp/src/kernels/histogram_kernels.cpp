@@ -3,6 +3,8 @@
 #include "kernel_buffer_support.hpp"
 #include "kernel_param_support.hpp"
 
+#include <optional>
+
 namespace kangaroo {
 
 void register_histogram_kernels(KernelRegistry &registry) {
@@ -43,6 +45,37 @@ void register_histogram_kernels(KernelRegistry &registry) {
           auto out = outputs[0].mutable_array<double>();
           for (int bin = 0; bin < params.bins; ++bin)
             out(bin) = 0.0;
+
+          if (inputs[0].desc().rank != 3) {
+            const auto count =
+                static_cast<std::size_t>(inputs[0].desc().element_count());
+            const auto values = make_real_buffer_accessor(inputs[0]);
+            std::optional<RealBufferAccessor> weights;
+            if (inputs.size() == 2) {
+              if (inputs[1].desc().element_count() != count) {
+                throw BufferContractError(
+                    BufferContractReason::kDescriptorStorageMismatch,
+                    "bounded histogram values and weights must have matching extents");
+              }
+              weights = make_real_buffer_accessor(inputs[1]);
+            }
+            const double inv_dx = static_cast<double>(params.bins) / (hi - lo);
+            for (std::size_t index = 0; index < count; ++index) {
+              const double value = values(index);
+              if (!std::isfinite(value) || value < lo || value > hi)
+                continue;
+              const int bin =
+                  value == hi
+                      ? params.bins - 1
+                      : static_cast<int>(std::floor((value - lo) * inv_dx));
+              if (bin < 0 || bin >= params.bins)
+                continue;
+              const double weight = weights ? (*weights)(index) : 1.0;
+              if (std::isfinite(weight))
+                out(bin) = static_cast<double>(out(bin)) + weight;
+            }
+            return hpx::make_ready_future();
+          }
 
           if (block < 0 ||
               static_cast<std::size_t>(block) >= level.boxes.size()) {
@@ -154,6 +187,46 @@ void register_histogram_kernels(KernelRegistry &registry) {
           for (int ix = 0; ix < nx_bins; ++ix)
             for (int iy = 0; iy < ny_bins; ++iy)
               out(ix, iy) = 0.0;
+
+          if (inputs[0].desc().rank != 3) {
+            const auto count =
+                static_cast<std::size_t>(inputs[0].desc().element_count());
+            for (std::size_t input = 1; input < inputs.size(); ++input) {
+              if (inputs[input].desc().element_count() != count) {
+                throw BufferContractError(
+                    BufferContractReason::kDescriptorStorageMismatch,
+                    "bounded histogram inputs must have matching extents");
+              }
+            }
+            const auto x_values = make_real_buffer_accessor(inputs[0]);
+            const auto y_values = make_real_buffer_accessor(inputs[1]);
+            std::optional<RealBufferAccessor> weights;
+            if (inputs.size() == 3)
+              weights = make_real_buffer_accessor(inputs[2]);
+            const double inv_dx = static_cast<double>(nx_bins) / (xhi - xlo);
+            const double inv_dy = static_cast<double>(ny_bins) / (yhi - ylo);
+            for (std::size_t index = 0; index < count; ++index) {
+              const double x = x_values(index);
+              const double y = y_values(index);
+              if (!std::isfinite(x) || !std::isfinite(y) || x < xlo ||
+                  x > xhi || y < ylo || y > yhi)
+                continue;
+              const int ix =
+                  x == xhi
+                      ? nx_bins - 1
+                      : static_cast<int>(std::floor((x - xlo) * inv_dx));
+              const int iy =
+                  y == yhi
+                      ? ny_bins - 1
+                      : static_cast<int>(std::floor((y - ylo) * inv_dy));
+              if (ix < 0 || ix >= nx_bins || iy < 0 || iy >= ny_bins)
+                continue;
+              const double weight = weights ? (*weights)(index) : 1.0;
+              if (std::isfinite(weight))
+                out(ix, iy) = static_cast<double>(out(ix, iy)) + weight;
+            }
+            return hpx::make_ready_future();
+          }
 
           if (block < 0 ||
               static_cast<std::size_t>(block) >= level.boxes.size()) {

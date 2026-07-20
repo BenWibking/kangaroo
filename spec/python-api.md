@@ -1,6 +1,65 @@
 # Python API Specification
 
-## 1. Package Export Contract
+## High-level `kangaroo` contract
+
+`kangaroo` is the recommended product namespace. Its default surface MUST expose
+`Client`, `Dataset`, `Array`, `ParticleArray`, `ParticleMask`, `Scalar`, the
+structured lazy result expressions, their typed materialized results,
+`open_dataset()`, and `compute()`.
+
+### Client and datasets
+
+- `Client` MUST own one low-level runtime and explicit HPX configuration.
+- Module-level `open_dataset()` MUST use a lazily created process-local default
+  client.
+- `Dataset` MUST expose mapping-like `fields`, `particles`, and `meshes`
+  collections, named field indexing, typed `geometry`, read-only metadata, and
+  immutable selection through `select()`.
+- Unknown names MUST report the requested name, available names, and close
+  matches when available.
+- Values from different selected dataset contexts MUST fail when combined.
+
+### Lazy values
+
+- Mesh arithmetic, comparisons, casts, renaming, slices, projections,
+  histograms, vorticity, flux integrals, and Toomre-Q profiles MUST construct
+  lazy values without running scientific kernels.
+- Particle arithmetic, scalar comparisons, masks, filtering, casts, top-k,
+  histograms, and scalar reductions MUST use the same lazy execution boundary.
+- `float()`, `int()`, and truth testing of a lazy `Scalar` MUST fail with an
+  error directing the caller to `compute()`.
+- Public lazy values MUST expose stable `name`, `dtype`, `domain`, `dataset`,
+  and `is_materialized` metadata. AMR source fields MUST describe per-level
+  chunks rather than advertise a misleading global dense shape.
+
+### Execution and materialization
+
+- `value.compute()` and `kangaroo.compute(*values)` are the explicit local
+  materialization boundaries.
+- Multi-output compute MUST validate one owning dataset context, union requested
+  producer ancestry, and submit each compatible mesh or particle graph once so
+  common work is shared.
+- Stage dependencies MUST derive from the producers of actual input fields.
+  Independent branches MUST NOT acquire definition-order edges.
+- Bounded mesh results MUST return NumPy arrays using authoritative runtime
+  descriptors. Histograms and scientific multi-component operations MUST return
+  typed result dataclasses.
+- AMR and particle values MUST return `ChunkedArray` by default. Dense particle
+  gathering MUST require `gather=True`; `max_bytes` MUST reject an oversized
+  gather before concatenation.
+- `persist()` MUST execute and retain the requested distributed fields, then
+  treat those fields as sources for subsequently built work.
+- `explain()` and `visualize()` MUST describe the graph without execution.
+
+### Advanced namespaces and compatibility
+
+Typed plan and buffer concepts MUST be available from `kangaroo.ir`. Direct
+runtime and chunk retrieval MUST be available from `kangaroo.runtime`. Backend
+interfaces MUST be available from `kangaroo.backends`. The `analysis` package
+and its low-level modules remain supported during the compatibility period and
+MUST re-export the broadly useful high-level entry points.
+
+## 1. Compatibility Package Export Contract
 
 The `analysis` package MUST expose the following public symbols (directly or via lazy attribute loading):
 - Runtime: `Runtime`, runtime configuration string helper.
@@ -197,7 +256,9 @@ Pipeline MUST support:
 - `histogram1d(...)`
 - `histogram2d(...)`
 
-Each operator MUST append its lowered fragment with correct dependency linkage to prior frontier stages.
+Each operator MUST append its lowered fragment with dependency linkage to the
+producer stages of its actual input fields. Definition order alone MUST NOT add
+an edge.
 
 ### 6.5 Particle Operators
 

@@ -789,6 +789,37 @@ void register_particle_kernels(KernelRegistry &registry) {
           }
           return hpx::make_ready_future();
         });
+
+    auto register_scalar_comparison = [&registry](const std::string &name,
+                                                  auto comparison) {
+      registry.register_typed_kernel<Params>(
+          KernelDesc{.name = name,
+                     .n_inputs = 1,
+                     .n_outputs = 1,
+                     .needs_neighbors = false},
+          [comparison, name](
+              const LevelMeta &, int32_t, std::span<const ChunkBuffer> inputs,
+              const NeighborViews &, std::span<ChunkBuffer> outputs,
+              const KernelParamsIR &kernel_params) {
+            const auto &params =
+                require_kernel_params<Params>(kernel_params, name.c_str());
+            if (inputs.empty() || outputs.empty()) {
+              return hpx::make_ready_future();
+            }
+            const auto in = inputs[0].array<double>();
+            auto out = outputs[0].mutable_array<std::uint8_t>();
+            for (std::size_t i = 0; i < in.extent(0); ++i) {
+              out(i) = comparison(in(i), params.scalar) ? 1 : 0;
+            }
+            return hpx::make_ready_future();
+          });
+    };
+    register_scalar_comparison("particle_lt_mask",
+                               [](double a, double b) { return a < b; });
+    register_scalar_comparison("particle_ge_mask",
+                               [](double a, double b) { return a >= b; });
+    register_scalar_comparison("particle_ne_mask",
+                               [](double a, double b) { return a != b; });
   }
   {
     using Params = ValuesParams;
@@ -1233,6 +1264,81 @@ void register_particle_kernels(KernelRegistry &registry) {
         outputs[0].commit_dynamic_extent(count);
         return hpx::make_ready_future();
       });
+  auto register_particle_binary = [&registry](const std::string &name,
+                                              auto operation) {
+    registry.register_kernel(
+        KernelDesc{.name = name,
+                   .n_inputs = 2,
+                   .n_outputs = 1,
+                   .needs_neighbors = false},
+        [operation](const LevelMeta &, int32_t,
+                    std::span<const ChunkBuffer> inputs, const NeighborViews &,
+                    std::span<ChunkBuffer> outputs, const KernelParamsIR &) {
+          if (inputs.size() < 2 || outputs.empty()) {
+            return hpx::make_ready_future();
+          }
+          const auto a = inputs[0].array<double>();
+          const auto b = inputs[1].array<double>();
+          const std::size_t n = std::min(a.extent(0), b.extent(0));
+          auto out = outputs[0].mutable_dynamic_array<double>();
+          for (std::size_t i = 0; i < n; ++i) {
+            out(i) = operation(a(i), b(i));
+          }
+          outputs[0].commit_dynamic_extent(n);
+          return hpx::make_ready_future();
+        });
+  };
+  register_particle_binary("particle_add",
+                           [](double a, double b) { return a + b; });
+  register_particle_binary("particle_multiply",
+                           [](double a, double b) { return a * b; });
+  register_particle_binary("particle_divide",
+                           [](double a, double b) { return a / b; });
+  register_particle_binary("particle_power",
+                           [](double a, double b) { return std::pow(a, b); });
+
+  auto register_particle_scalar = [&registry](const std::string &name,
+                                              auto operation) {
+    registry.register_typed_kernel<ScalarParams>(
+        KernelDesc{.name = name,
+                   .n_inputs = 1,
+                   .n_outputs = 1,
+                   .needs_neighbors = false},
+        [operation, name](const LevelMeta &, int32_t,
+                          std::span<const ChunkBuffer> inputs,
+                          const NeighborViews &, std::span<ChunkBuffer> outputs,
+                          const KernelParamsIR &kernel_params) {
+          if (inputs.empty() || outputs.empty()) {
+            return hpx::make_ready_future();
+          }
+          const auto &params =
+              require_kernel_params<ScalarParams>(kernel_params, name.c_str());
+          const auto in = inputs[0].array<double>();
+          const std::size_t n = in.extent(0);
+          auto out = outputs[0].mutable_dynamic_array<double>();
+          for (std::size_t i = 0; i < n; ++i) {
+            out(i) = operation(in(i), params.scalar);
+          }
+          outputs[0].commit_dynamic_extent(n);
+          return hpx::make_ready_future();
+        });
+  };
+  register_particle_scalar("particle_add_scalar",
+                           [](double a, double b) { return a + b; });
+  register_particle_scalar("particle_subtract_scalar",
+                           [](double a, double b) { return a - b; });
+  register_particle_scalar("particle_rsubtract_scalar",
+                           [](double a, double b) { return b - a; });
+  register_particle_scalar("particle_multiply_scalar",
+                           [](double a, double b) { return a * b; });
+  register_particle_scalar("particle_divide_scalar",
+                           [](double a, double b) { return a / b; });
+  register_particle_scalar("particle_rdivide_scalar",
+                           [](double a, double b) { return b / a; });
+  register_particle_scalar("particle_power_scalar",
+                           [](double a, double b) { return std::pow(a, b); });
+  register_particle_scalar("particle_rpower_scalar",
+                           [](double a, double b) { return std::pow(b, a); });
   /**
    * @brief Subtracts two particle arrays elementwise.
    * @par Chunk inputs `inputs[0]` and `inputs[1]` are f64 particle arrays.

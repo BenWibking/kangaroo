@@ -33,6 +33,16 @@ struct RealGridAccessor {
   double operator()(int i, int j, int k) const { return load(*this, i, j, k); }
 };
 
+struct RealBufferAccessor {
+  const std::uint8_t *data = nullptr;
+  std::uint8_t rank = 0;
+  std::array<std::uint64_t, kMaxBufferRank> extents{};
+  std::array<std::int64_t, kMaxBufferRank> strides{};
+  double (*load)(const RealBufferAccessor &, std::size_t) = nullptr;
+
+  double operator()(std::size_t index) const { return load(*this, index); }
+};
+
 template <typename T>
 RealGridAccessor make_real_grid_accessor(const TensorView<const T, 3> &grid) {
   RealGridAccessor accessor;
@@ -50,5 +60,6 @@ RealGridAccessor make_real_grid_accessor(const TensorView<const T, 3> &grid) {
 }
 
 RealGridAccessor make_real_grid_accessor(const ChunkBuffer &buffer);
+RealBufferAccessor make_real_buffer_accessor(const ChunkBuffer &buffer);
 
 } // namespace kangaroo
