@@ -232,6 +232,30 @@ def test_non_square_bounded_mesh_shape_uses_descriptor_order(operation: str) -> 
     assert bounded.compute().shape == (4, 6)
 
 
+@pytest.mark.parametrize("bounded_operation", ["slice", "project"])
+@pytest.mark.parametrize("followup_operation", ["slice", "project"])
+def test_amr_only_operations_reject_bounded_arrays_before_plan_lowering(
+    bounded_operation: str,
+    followup_operation: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image = _memory_amr_array()
+    bounded = getattr(image, bounded_operation)(axis="z", resolution=(4, 4))
+
+    def unexpected_lowering(*_args: Any, **_kwargs: Any) -> None:
+        pytest.fail("bounded operation reached AMR plan lowering")
+
+    monkeypatch.setattr(
+        image.dataset._pipeline, "uniform_slice", unexpected_lowering
+    )
+    monkeypatch.setattr(
+        image.dataset._pipeline, "uniform_projection", unexpected_lowering
+    )
+
+    with pytest.raises(ValueError, match="only defined for unbounded AMR arrays"):
+        getattr(bounded, followup_operation)(axis="z", resolution=(4, 4))
+
+
 def test_non_square_particle_projection_shape_uses_descriptor_order() -> None:
     image = _memory_amr_array()
 

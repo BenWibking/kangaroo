@@ -323,6 +323,13 @@ class Array(LazyValue):
             return None
         return Domain(step=self.dataset.step, level=self.dataset.level, blocks=[0])
 
+    def _require_unbounded_amr(self, operation: str) -> None:
+        if self._mesh_domain is not None:
+            raise ValueError(
+                f"{operation}() is only defined for unbounded AMR arrays; "
+                "this array is a bounded regular mesh"
+            )
+
     @staticmethod
     def _field_expr_dtype(dtype: str) -> DType:
         return DType.F32 if np.dtype(dtype) == np.dtype("float32") else DType.F64
@@ -528,6 +535,7 @@ class Array(LazyValue):
     ) -> "Array":
         """Lazily sample this AMR value onto a bounded uniform plane."""
 
+        self._require_unbounded_amr("slice")
         geometry = self.dataset.geometry.plane(
             axis=axis, coord=coord, resolution=resolution, zoom=zoom
         )
@@ -568,6 +576,7 @@ class Array(LazyValue):
     ) -> "Array":
         """Lazily project this AMR value through a physical axis interval."""
 
+        self._require_unbounded_amr("project")
         geometry = self.dataset.geometry.plane(
             axis=axis, resolution=resolution, zoom=zoom
         )
