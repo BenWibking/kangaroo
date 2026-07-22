@@ -170,6 +170,15 @@ def _write_single_fab_plotfile(path) -> None:
     (level / "Cell_D_00000").write_bytes(fab_header + values.tobytes())
 
 
+def test_plotfile_open_rejects_missing_indexed_fab(tmp_path) -> None:
+    plotfile = tmp_path / "plt00000"
+    _write_single_fab_plotfile(plotfile)
+    (plotfile / "Level_0" / "Cell_D_00000").unlink()
+
+    with pytest.raises(RuntimeError, match="failed to open FAB file"):
+        open_dataset(str(plotfile), runtime=Runtime(), step=0, level=0)
+
+
 def _max_base_task_concurrency(events: list[dict]) -> int:
     active: set[str] = set()
     max_active = 0

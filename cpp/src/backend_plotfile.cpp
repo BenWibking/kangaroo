@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <unordered_map>
+#include <unordered_set>
 
 #include <hpx/runtime_local/get_locality_id.hpp>
 #include <hpx/runtime_local/get_worker_thread_num.hpp>
@@ -93,7 +94,26 @@ void log_plotfile_read_fab_event(const char* status,
 }  // namespace
 
 PlotfileBackend::PlotfileBackend(std::string plotfile_dir)
-    : plotfile_dir_(std::move(plotfile_dir)), reader_(plotfile_dir_) {}
+    : plotfile_dir_(std::move(plotfile_dir)), reader_(plotfile_dir_) {
+  for (int level = 0; level < reader_.num_levels(); ++level) {
+    std::unordered_set<std::string> checked_files;
+    for (const auto& fab : reader_.vismf_header(level).fab_on_disk) {
+      if (!checked_files.insert(fab.file_name).second) {
+        continue;
+      }
+      const std::string path = plotfile_dir_ + "/Level_" + std::to_string(level) + "/" +
+                               fab.file_name;
+      std::ifstream stream(path, std::ios::binary);
+      if (!stream) {
+        throw std::runtime_error("failed to open FAB file: " + path);
+      }
+      stream.seekg(0, std::ios::end);
+      if (stream.tellg() <= fab.offset) {
+        throw std::runtime_error("FAB file is shorter than its indexed offset: " + path);
+      }
+    }
+  }
+}
 
 std::optional<ChunkBuffer> PlotfileBackend::get_chunk(const ChunkRef& ref) {
   auto chunks = get_chunks(std::vector<ChunkRef>{ref});
