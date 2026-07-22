@@ -574,7 +574,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
       return hpx::make_ready_future(std::vector<ChunkBuffer>{});
     }
     auto host_futures = data.get_hosts(refs);
-    return hpx::when_all(host_futures).then([](auto&& all) {
+    return hpx::when_all(std::move(host_futures)).then([](auto&& all) {
       std::vector<ChunkBuffer> out;
       out.reserve(all.get().size());
       for (auto& f : all.get()) {
@@ -627,8 +627,8 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
     end_span(get_inputs_event);
   }
 
-  auto all_inputs = hpx::when_all(input_futures);
-  auto all_neighbors = hpx::when_all(neighbor_futures);
+  auto all_inputs = hpx::when_all(std::move(input_futures));
+  auto all_neighbors = hpx::when_all(std::move(neighbor_futures));
 
   TaskEvent wait_inputs_event;
   if (log_enabled) {
@@ -771,7 +771,7 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
               if (log_enabled) {
                 wait_outputs_event = start_span(base_event, "wait_outputs");
               }
-              return hpx::when_all(puts).then(
+              return hpx::when_all(std::move(puts)).then(
                   [log_enabled, wait_outputs_event](auto&&) mutable {
                     if (log_enabled) {
                       end_span(wait_outputs_event);
@@ -1035,7 +1035,7 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
               if (log_enabled) {
                 wait_outputs_event = start_span(base_event, "wait_outputs");
               }
-              return hpx::when_all(puts).then(
+              return hpx::when_all(std::move(puts)).then(
                   [log_enabled, wait_outputs_event](auto&&) mutable {
                     if (log_enabled) {
                       end_span(wait_outputs_event);
@@ -1692,7 +1692,7 @@ hpx::future<void> Executor::run(const PlanIR& plan) {
       deps.push_back(stage_futures.at(dep));
     }
     stage_futures[stage_idx] =
-        hpx::when_all(deps).then([this, stage, stage_idx](auto&& ready_deps) {
+        hpx::when_all(std::move(deps)).then([this, stage, stage_idx](auto&& ready_deps) {
           auto dep_results = ready_deps.get();
           for (auto& dep : dep_results) {
             dep.get();
@@ -1701,7 +1701,7 @@ hpx::future<void> Executor::run(const PlanIR& plan) {
         }).share();
   }
 
-  return hpx::when_all(stage_futures).then([this](auto&& ready_stages) {
+  return hpx::when_all(std::move(stage_futures)).then([this](auto&& ready_stages) {
     try {
       auto stage_results = ready_stages.get();
       for (auto& stage : stage_results) {
@@ -1773,7 +1773,7 @@ hpx::future<void> Executor::run_stage_eager(int32_t stage_idx, const StageIR& st
   if (futures.empty()) {
     return hpx::make_ready_future();
   }
-  return hpx::when_all(futures).then([](auto&& ready_tasks) {
+  return hpx::when_all(std::move(futures)).then([](auto&& ready_tasks) {
     auto task_results = ready_tasks.get();
     for (auto& task : task_results) {
       task.get();
@@ -2033,7 +2033,7 @@ hpx::future<void> Executor::run_stage_streaming(int32_t stage_idx, const StageIR
   if (partition_futures.empty()) {
     return hpx::make_ready_future();
   }
-  return hpx::when_all(partition_futures).then([](auto&& ready_partitions) {
+  return hpx::when_all(std::move(partition_futures)).then([](auto&& ready_partitions) {
     auto partition_results = ready_partitions.get();
     for (auto& partition : partition_results) {
       partition.get();
