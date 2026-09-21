@@ -282,6 +282,100 @@ or a sequence of half-heights. Temperature bins and `gamma` work as they do for
 spherical flux surfaces. The returned result also carries `radius`, `heights`,
 component names, and temperature-bin edges.
 
+### Angular-momentum transport
+
+The cylinder is centered at the coordinate origin and aligned with the z axis.
+Eight components are returned, in order: mass, hydrodynamic energy, MHD energy,
+passive scalar, **advective radial angular momentum**, **Maxwell radial angular
+momentum**, **advective vertical angular momentum**, and **Maxwell vertical
+angular momentum**. The first six components retain their previous order; raw
+output arrays now have eight entries per geometric section. Rebuild the native
+extension together with Python. The transported quantity is `L_z = x p_y - y p_x`.
+
+For a cylinder wall, the integrated fluxes are
+
+- advective: `integral R * rho * v_R * v_phi dA`;
+- Maxwell: `-integral R * B_R * B_phi dA`.
+
+Magnetic fields use the existing convention `magnetic_energy_density = B^2/2`
+(i.e. Gaussian fields divided by `sqrt(4*pi)`). Positive flux carries positive
+`L_z` outward. Each component is binned by **its own flux sign**, not by the
+sign of radial velocity: retrograde inflow can carry positive outward `L_z`
+flux. Sum the negative and positive bins to obtain a net flux. The two new
+radial components are zero on horizontal endcaps; the two vertical components
+are zero on walls. For the endcaps the vertical fluxes are
+
+- advective: `integral (x*p_y - y*p_x) * v_z * n_z dA`;
+- Maxwell: `-integral (x*B_y - y*B_x) * B_z * n_z dA`.
+
+Here `n_z=+1` on the upper cap and `n_z=-1` on the lower cap. The `endcaps`
+section sums both outward-oriented caps, not both fluxes in the +z direction.
+For example, a prograde bipolar wind contributes positive advective flux on
+both caps. Uniform upward throughflow contributes oppositely signed fluxes
+and can have zero net flux despite nonzero transport through each cap.
+There is no isotropic pressure contribution on the ideal cylindrical surface.
+
+**Accepted approximation for endcap sign bins:** each cell's clipped cap
+footprint is integrated before its contribution is assigned to the negative or
+positive bin. Even with piecewise-constant fields, the lever-arm factors
+`x*p_y - y*p_x` and `x*B_y - y*B_x` can change sign within that footprint.
+Opposing contributions then cancel within the cell: for example, `+5` and `-3`
+are recorded as `+2`, rather than separately. The signed bins therefore can
+underestimate the magnitudes of the separately integrated positive and negative
+fluxes. Their sum, the net endcap flux, is unaffected by this binning approximation.
+The effect is expected to be small when the relevant spatial variation is well
+resolved; this is not a quantitative error bound. Splitting footprints at their
+zero-flux lines is intentionally not implemented.
+
+```python
+import numpy as np
+
+nt = 1 if result.temperature_bins is None else len(result.temperature_bins) - 1
+# Logical axes: half-height, flux sign, temperature, section, component.
+values = np.asarray(result.values).reshape(len(result.heights), 2, nt, 2, 8)
+net = values.sum(axis=(1, 2))
+radial_advective = net[:, 1, 4]   # section 1 is walls
+radial_maxwell = net[:, 1, 5]
+radial_total = radial_advective + radial_maxwell
+vertical_advective = net[:, 0, 6]  # section 0 combines both endcaps
+vertical_maxwell = net[:, 0, 7]
+vertical_total = vertical_advective + vertical_maxwell
+```
+
+These are angular momentum per time (`g cm^2 s^-2` for cgs inputs), not flux
+per area and not a time-integrated change. No gravitational torque is included.
+The existing geometry approximates the curved wall by tangent-plane sections
+of intersecting AMR cells and uses piecewise-constant states. The wall lever
+arm is the requested `radius`. Check spatial convergence for the radii used.
+Endcap footprints are clipped to the circular disk. Their areas and first
+moments (`integral x dA`, `integral y dA`) are integrated analytically, so the
+lever arm is integrated over each footprint, not fixed to the cylinder rim.
+Fluid and magnetic fields are still piecewise constant within each cell.
+On a grid-aligned cap, the cell on the cylinder's interior side supplies the
+state, with that face counted once. A wall tangent plane coincident with a cell
+face likewise belongs only to the interior-side cell. AMR coverage excludes
+superseded cells.
+
+This also corrects pre-existing endcap mass/energy/scalar integration: blocks
+inside the radius are included, boundary footprints are clipped, and coincident
+cell faces are not counted twice. Consequently those endcap results can change;
+the existing wall geometry and radial angular-momentum definition are unchanged.
+This is a plotfile reconstruction, not the simulation's Riemann-solver flux.
+
+The existing CLI emits both new components in each flux dictionary, plus net
+advective, Maxwell, and total fluxes under
+`derived.radial_angular_momentum_flux_by_height[i].by_geometric_section.walls`
+and
+`derived.vertical_angular_momentum_flux_by_height[i].by_geometric_section.endcaps`:
+
+```bash
+pixi run -e pixi-hpx python scripts/plotfile_cylindrical_flux_surface.py PLOTFILE \
+    --radius-kpc 8 --height-kpc 2 --output-json cylinder_R8_H2.json
+```
+
+Run once per desired radius for a radial profile. The existing input requirements
+(including energy, passive scalar, and all magnetic components) are unchanged.
+
 ## Gas Toomre-Q profiles
 
 `toomre_q_profile()` accumulates the radial information needed to calculate gas

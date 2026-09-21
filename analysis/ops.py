@@ -1348,9 +1348,9 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
         if num_temperature_bins > 1:
             out_shape_parts.append(num_temperature_bins)
         if len(out_shape_parts) < 3:
-            out_shape_parts.extend((num_geometric_sections, 4))
+            out_shape_parts.extend((num_geometric_sections, 8))
         else:
-            out_shape_parts.append(num_geometric_sections * 4)
+            out_shape_parts.append(num_geometric_sections * 8)
         out_shape = tuple(out_shape_parts)
         radius2 = self.radius * self.radius
         height_intersects = [False] * len(self.heights)
@@ -1365,11 +1365,13 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
             block_height_indices: list[tuple[int, list[int]]] = []
             for block_idx, block in enumerate(level_meta.boxes):
                 lo2, hi2, z_abs_min, z_abs_max = self._block_cylinder_bounds(level_meta, block)
-                if not (lo2 <= radius2 <= hi2):
+                if lo2 > radius2:
                     continue
                 active_height_indices: list[int] = []
                 for height_idx, height in enumerate(self.heights):
-                    if z_abs_min <= height and z_abs_max >= 0.0:
+                    wall_intersects = radius2 <= hi2 and z_abs_min <= height
+                    cap_intersects = z_abs_min <= height <= z_abs_max
+                    if wall_intersects or cap_intersects:
                         height_intersects[height_idx] = True
                         active_height_indices.append(height_idx)
                 if active_height_indices:

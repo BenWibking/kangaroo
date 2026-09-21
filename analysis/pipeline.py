@@ -181,10 +181,18 @@ class CylindricalFluxSurfaceIntegralHandle:
         "hydro_energy_flux_cylinder_negative",
         "mhd_energy_flux_cylinder_negative",
         "passive_scalar_flux_cylinder_negative",
+        "advective_radial_angular_momentum_flux_cylinder_negative",
+        "maxwell_radial_angular_momentum_flux_cylinder_negative",
+        "advective_vertical_angular_momentum_flux_cylinder_negative",
+        "maxwell_vertical_angular_momentum_flux_cylinder_negative",
         "mass_flux_cylinder_positive",
         "hydro_energy_flux_cylinder_positive",
         "mhd_energy_flux_cylinder_positive",
         "passive_scalar_flux_cylinder_positive",
+        "advective_radial_angular_momentum_flux_cylinder_positive",
+        "maxwell_radial_angular_momentum_flux_cylinder_positive",
+        "advective_vertical_angular_momentum_flux_cylinder_positive",
+        "maxwell_vertical_angular_momentum_flux_cylinder_positive",
     )
 
     @property

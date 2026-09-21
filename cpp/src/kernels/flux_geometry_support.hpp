@@ -11,6 +11,16 @@ struct CellIndexRange {
   bool empty() const { return first > last; }
 };
 
+// Exact area and first moments of the intersection with an origin-centered disk.
+struct DiskSectionMoments {
+  double area = 0.0;
+  double x = 0.0; // integral x dA
+  double y = 0.0; // integral y dA
+};
+
+DiskSectionMoments disk_rectangle_moments(double radius, double x0, double x1,
+                                         double y0, double y1);
+
 double min_dist_sq_to_interval(double a0, double a1);
 double max_dist_sq_to_interval(double a0, double a1);
 bool sphere_may_intersect_cell(double radius2, double x0, double x1, double y0,

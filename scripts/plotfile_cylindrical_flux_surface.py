@@ -1,5 +1,12 @@
 #!/usr/bin/env python3
-"""Integrate fluxes through fixed-radius cylindrical surfaces in an AMReX plotfile."""
+"""Integrate fluxes through origin-centered, z-aligned cylinders in a plotfile.
+
+Use --radius-kpc and --height-kpc for one cylinder, or --zmin-kpc,
+--zmax-kpc and --nbins for a half-height profile. The wall section contains
+radial angular-momentum flux; endcaps contain the vertical angular-momentum flux. Magnetic fields must use
+B**2/2 energy normalization. Angular-momentum flux is in g cm**2 s**-2 for
+cgs input. Sign bins classify each flux's sign, not the gas velocity.
+"""
 
 from __future__ import annotations
 
@@ -34,7 +41,12 @@ from scripts.plotfile_flux_surface import (  # noqa: E402
 )
 
 
-COMPONENTS = tuple(name.replace("_sphere", "_cylinder") for name in SPHERE_COMPONENTS)
+COMPONENTS = tuple(name.replace("_sphere", "_cylinder") for name in SPHERE_COMPONENTS) + (
+    "advective_radial_angular_momentum_flux_cylinder",
+    "maxwell_radial_angular_momentum_flux_cylinder",
+    "advective_vertical_angular_momentum_flux_cylinder",
+    "maxwell_vertical_angular_momentum_flux_cylinder",
+)
 GEOMETRIC_SECTIONS = ("endcaps", "walls")
 
 
@@ -74,7 +86,7 @@ def _flux_rows_and_derived(
         ):
             values_by_temperature_section = values[:, :, np.newaxis, :, :]
         else:
-            raise ValueError("flux values must have shape (num_heights, 2, 2, 4)")
+            raise ValueError("flux values must have shape (num_heights, 2, 2, 8)")
         temperature_edges = None
     else:
         expected_shape = (
@@ -95,7 +107,7 @@ def _flux_rows_and_derived(
             values_by_temperature_section[:, :, :, 1, :] = values
         elif values.shape != expected_shape:
             raise ValueError(
-                "flux values must have shape (num_heights, 2, num_temperature_bins, 2, 4)"
+                "flux values must have shape (num_heights, 2, num_temperature_bins, 2, 8)"
             )
         else:
             values_by_temperature_section = values
@@ -168,7 +180,40 @@ def _flux_rows_and_derived(
         }
         for i in range(len(heights))
     ]
+    # Sum both component sign bins before forming the net total. Opposite
+    # angular-momentum signs need not correspond to inward/outward gas.
+    net_by_section = section_summed_values.sum(axis=1)
     derived = {
+        "radial_angular_momentum_flux_by_height": [
+            {
+                "height": float(heights[i]),
+                "height_kpc": float(heights[i] / (1.0e3 * pc_cm)),
+                "by_geometric_section": {
+                    section: {
+                        "advective": float(net_by_section[i, section_idx, 4]),
+                        "maxwell": float(net_by_section[i, section_idx, 5]),
+                        "total": float(net_by_section[i, section_idx, 4:6].sum()),
+                    }
+                    for section_idx, section in enumerate(GEOMETRIC_SECTIONS)
+                },
+            }
+            for i in range(len(heights))
+        ],
+        "vertical_angular_momentum_flux_by_height": [
+            {
+                "height": float(heights[i]),
+                "height_kpc": float(heights[i] / (1.0e3 * pc_cm)),
+                "by_geometric_section": {
+                    section: {
+                        "advective": float(net_by_section[i, section_idx, 6]),
+                        "maxwell": float(net_by_section[i, section_idx, 7]),
+                        "total": float(net_by_section[i, section_idx, 6:8].sum()),
+                    }
+                    for section_idx, section in enumerate(GEOMETRIC_SECTIONS)
+                },
+            }
+            for i in range(len(heights))
+        ],
         "mass_flux_msun_per_yr": (
             float(summed_values[0, 0] * YR_S / MSUN_G) if len(heights) == 1 else None
         ),
@@ -349,10 +394,10 @@ def main() -> int:
                 2,
                 len(temperature_bins) - 1,
                 len(GEOMETRIC_SECTIONS),
-                4,
+                len(COMPONENTS),
             )
             if temperature_bins is not None
-            else (len(heights), 2, len(GEOMETRIC_SECTIONS), 4)
+            else (len(heights), 2, len(GEOMETRIC_SECTIONS), len(COMPONENTS))
         )
         flux_rows, derived = _flux_rows_and_derived(
             heights,
@@ -376,6 +421,15 @@ def main() -> int:
                 else None
             ),
             "gamma": float(a.gamma),
+            "radial_angular_momentum_axis": "z",
+            "vertical_angular_momentum_axis": "z",
+            "endcap_normal_convention": "upper +z, lower -z; both summed",
+            "center": [0.0, 0.0, 0.0],
+            "magnetic_normalization": "magnetic_energy_density = B^2/2",
+            "radial_angular_momentum_flux_units": "g cm^2 s^-2 (for cgs input)",
+            "vertical_angular_momentum_flux_units": "g cm^2 s^-2 (for cgs input)",
+            "sign_bin_convention": "sign of each flux component, not velocity",
+            "components": list(COMPONENTS),
             "fields": {role: name for role, (name, _) in fields.items()},
             "fluxes": flux_rows[0]["fluxes"] if len(heights) == 1 else None,
             "flux_bins": flux_rows[0]["flux_bins"] if len(heights) == 1 else None,

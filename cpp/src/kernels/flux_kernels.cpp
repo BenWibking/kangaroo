@@ -19,7 +19,7 @@ void register_flux_kernels(KernelRegistry &registry) {
      * `num_radii`, `temperature_bins`, `gamma`, and `covered_boxes` select the
      * surfaces, output slots, thermodynamic bins, equation of state, and AMR
      * mask.
-     * @par Chunk outputs `outputs[0]` is an f64 tensor of inward/outward mass,
+     * @par Chunk outputs `outputs[0]` is an f64 tensor of signed mass,
      * momentum, energy, and passive-scalar flux for each radius and temperature
      * bin.
      */
@@ -368,9 +368,9 @@ void register_flux_kernels(KernelRegistry &registry) {
      * `num_heights`, `temperature_bins`, `gamma`, and `covered_boxes` select
      * the cylinder sections, output slots, thermodynamic bins, equation of
      * state, and AMR mask.
-     * @par Chunk outputs `outputs[0]` is an f64 tensor of inward/outward mass,
-     * momentum, energy, and passive-scalar flux for each cylindrical section
-     * and temperature bin.
+     * @par Chunk outputs `outputs[0]` is an f64 tensor of signed mass,
+     * energy, passive-scalar, and advective/Maxwell radial and vertical L_z
+     * flux for each section and temperature bin.
      */
     registry.register_typed_kernel<Params>(
         KernelDesc{.name = "cylindrical_flux_surface_integral_accumulate",
@@ -388,6 +388,7 @@ void register_flux_kernels(KernelRegistry &registry) {
           const std::size_t num_temperature_bins =
               use_temperature_bins ? params.temperature_bins.size() - 1 : 1;
           constexpr std::size_t num_geometric_sections = 2;
+          constexpr std::size_t num_components = 8;
           constexpr std::size_t endcaps_section = 0;
           constexpr std::size_t walls_section = 1;
           if (outputs.empty()) {
@@ -520,8 +521,8 @@ void register_flux_kernels(KernelRegistry &registry) {
 
           auto accumulate_flux = [&](std::size_t height_idx, int i, int j,
                                      int k, double nx, double ny, double nz,
-                                     double area,
-                                     std::size_t geometric_section) {
+                                     double area, std::size_t geometric_section,
+                                     double cap_x_moment, double cap_y_moment) {
             if (area <= 0.0 || geometric_section >= num_geometric_sections) {
               return;
             }
@@ -598,19 +599,46 @@ void register_flux_kernels(KernelRegistry &registry) {
                 ((energy_density + pgas + emag) * vnormal - bdotv * bnormal) *
                 area;
             const double scalar_flux = scalar_density * vnormal * area;
-            const std::array<double, 4> fluxes{mass_flux, hydro_energy_flux,
-                                               mhd_energy_flux, scalar_flux};
+            // These two components measure radial L_z transport only.
+            // The lever arm is the requested cylinder radius, not cell radius.
+            // Horizontal endcaps have nx=ny=0, hence zero radial contribution.
+            const double advective_angular_momentum_flux =
+                params.radius * (nx * momy - ny * momx) * vnormal * area;
+            // Magnetic fields use the existing B^2/2 energy convention.
+            const double maxwell_angular_momentum_flux =
+                -params.radius * (nx * by - ny * bx) * bnormal * area;
+            // First moments integrate the lever arm over the clipped disk
+            // footprint exactly for the piecewise-constant cell state.
+            // Accepted sign-bin approximation: bin this integrated footprint,
+            // allowing opposing local L_z fluxes to cancel within a cell.
+            // This affects separate sign bins, not their net sum; footprints
+            // are intentionally not split along their zero-flux lines.
+            const double vertical_advective_angular_momentum_flux =
+                (cap_x_moment * momy - cap_y_moment * momx) * vnormal;
+            const double vertical_maxwell_angular_momentum_flux =
+                -(cap_x_moment * by - cap_y_moment * bx) * bnormal;
+            const std::array<double, num_components> fluxes{
+                mass_flux,
+                hydro_energy_flux,
+                mhd_energy_flux,
+                scalar_flux,
+                advective_angular_momentum_flux,
+                maxwell_angular_momentum_flux,
+                vertical_advective_angular_momentum_flux,
+                vertical_maxwell_angular_momentum_flux};
             const std::size_t height_base =
                 static_cast<std::size_t>(params.height_indices[height_idx]) *
-                2 * num_temperature_bins * num_geometric_sections * 4;
+                2 * num_temperature_bins * num_geometric_sections *
+                num_components;
             for (std::size_t component = 0; component < fluxes.size();
                  ++component) {
               const std::size_t sign_bin = fluxes[component] < 0.0 ? 0 : 1;
               const auto output_index =
                   height_base +
-                  sign_bin * num_temperature_bins * num_geometric_sections * 4 +
-                  temperature_bin * num_geometric_sections * 4 +
-                  geometric_section * 4 + component;
+                  sign_bin * num_temperature_bins * num_geometric_sections *
+                      num_components +
+                  temperature_bin * num_geometric_sections * num_components +
+                  geometric_section * num_components + component;
               store_buffer_scalar(
                   output_storage_bytes.data(), output_index,
                   load_buffer_scalar<double>(output_storage_bytes.data(),
@@ -657,7 +685,7 @@ void register_flux_kernels(KernelRegistry &registry) {
                   for (int k = k_range.first; k <= k_range.last; ++k) {
                     const int gk = box.lo.z + k;
                     const double z0 = cell_edge(2, gk);
-                    const double z1 = z0 + level.geom.dx[2];
+                    const double z1 = cell_edge(2, gk + 1);
                     if (max_xy >= radius2 &&
                         cylinder_may_intersect_cell(radius2, height, x0, x1, y0,
                                                     y1, z0, z1)) {
@@ -669,20 +697,26 @@ void register_flux_kernels(KernelRegistry &registry) {
                             cylindrical_section_area_in_intersecting_cell(
                                 params.radius, height, x0, x1, y0, y1, z0, z1);
                         accumulate_flux(height_idx, i, j, k, x / rxy, y / rxy,
-                                        0.0, area, walls_section);
+                                        0.0, area, walls_section, 0.0, 0.0);
                       }
                     }
-                    if (z0 <= height && z1 >= height) {
-                      const double area = plane_box_section_area(
-                          x0, x1, y0, y1, z0, z1, 0.0, 0.0, 1.0, height);
-                      accumulate_flux(height_idx, i, j, k, 0.0, 0.0, 1.0, area,
-                                      endcaps_section);
-                    }
-                    if (z0 <= -height && z1 >= -height) {
-                      const double area = plane_box_section_area(
-                          x0, x1, y0, y1, z0, z1, 0.0, 0.0, 1.0, -height);
-                      accumulate_flux(height_idx, i, j, k, 0.0, 0.0, -1.0, area,
-                                      endcaps_section);
+                    // Take the cell on the cylinder's interior side when a
+                    // cap coincides with a grid face, counting it only once.
+                    const bool upper_cap = z0 < height && height <= z1;
+                    const bool lower_cap = z0 <= -height && -height < z1;
+                    if (upper_cap || lower_cap) {
+                      const auto cap =
+                          disk_rectangle_moments(params.radius, x0, x1, y0, y1);
+                      if (upper_cap) {
+                        accumulate_flux(height_idx, i, j, k, 0.0, 0.0, 1.0,
+                                        cap.area, endcaps_section, cap.x,
+                                        cap.y);
+                      }
+                      if (lower_cap) {
+                        accumulate_flux(height_idx, i, j, k, 0.0, 0.0, -1.0,
+                                        cap.area, endcaps_section, cap.x,
+                                        cap.y);
+                      }
                     }
                   }
                 }

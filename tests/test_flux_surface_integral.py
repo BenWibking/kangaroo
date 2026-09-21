@@ -336,10 +336,18 @@ def test_cylindrical_flux_surface_integral_lowering_accepts_height_array() -> No
         "hydro_energy_flux_cylinder_negative",
         "mhd_energy_flux_cylinder_negative",
         "passive_scalar_flux_cylinder_negative",
+        "advective_radial_angular_momentum_flux_cylinder_negative",
+        "maxwell_radial_angular_momentum_flux_cylinder_negative",
+        "advective_vertical_angular_momentum_flux_cylinder_negative",
+        "maxwell_vertical_angular_momentum_flux_cylinder_negative",
         "mass_flux_cylinder_positive",
         "hydro_energy_flux_cylinder_positive",
         "mhd_energy_flux_cylinder_positive",
         "passive_scalar_flux_cylinder_positive",
+        "advective_radial_angular_momentum_flux_cylinder_positive",
+        "maxwell_radial_angular_momentum_flux_cylinder_positive",
+        "advective_vertical_angular_momentum_flux_cylinder_positive",
+        "maxwell_vertical_angular_momentum_flux_cylinder_positive",
     )
     templates = [tmpl for stage in plan.stages for tmpl in stage.templates]
     accum = [
@@ -350,10 +358,10 @@ def test_cylindrical_flux_surface_integral_lowering_accepts_height_array() -> No
     assert len(accum) == 1
     assert accum[0].params.radius == 0.5
     assert accum[0].params.heights == (0.5, 1.5)
-    assert _output_bytes(accum[0]) == 256
+    assert _output_bytes(accum[0]) == 512
     reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
     assert reducers
-    assert all(_output_bytes(tmpl) == 256 for tmpl in reducers)
+    assert all(_output_bytes(tmpl) == 512 for tmpl in reducers)
 
 
 def test_flux_surface_integral_rejects_temperature_bins_without_temperature_field() -> None:
@@ -719,14 +727,15 @@ def test_cylindrical_flux_surface_integral_runtime_outputs_endcaps_and_walls() -
         step=step,
         level=0,
         field=flux.field,
-        shape=(2, 2, 4),
+        shape=(2, 2, 8),
         dtype=np.float64,
         dataset=ds,
         block=0,
     )
-    expected = np.zeros((2, 2, 4), dtype=np.float64)
-    expected[0, 0] = np.array([-4.0, -(199.0 / 3.0), -(199.0 / 3.0), -10.0])
-    expected[1, 0] = np.array([4.0, 199.0 / 3.0, 199.0 / 3.0, 10.0])
+    expected = np.zeros((2, 2, 8), dtype=np.float64)
+    expected[0, 0, :4] = np.array([-4.0, -(199.0 / 3.0), -(199.0 / 3.0), -10.0])
+    expected[1, 0, :4] = np.array([4.0, 199.0 / 3.0, 199.0 / 3.0, 10.0])
+    expected *= np.pi / 8.0  # cap footprint is a half disk of radius 0.5
     assert np.allclose(raw, expected)
 
 
@@ -816,13 +825,13 @@ def test_cylindrical_flux_surface_integral_runtime_one_cell_mhd_energy_term() ->
         step=step,
         level=0,
         field=flux.field,
-        shape=(2, 2, 4),
+        shape=(2, 2, 8),
         dtype=np.float64,
         dataset=ds,
         block=0,
     )
-    expected = np.zeros((2, 2, 4), dtype=np.float64)
-    expected[1, 1] = np.array([6.0, 87.0, 90.0, 15.0])
+    expected = np.zeros((2, 2, 8), dtype=np.float64)
+    expected[1, 1, :4] = np.array([6.0, 87.0, 90.0, 15.0])
     assert np.allclose(raw, expected)
 
 
@@ -1171,3 +1180,345 @@ def test_flux_surface_integral_runtime_amr_covered_cells_are_excluded() -> None:
         block=0,
     )
     assert np.allclose(raw, np.zeros((2, 4)))
+
+
+@pytest.mark.parametrize("momx,momy", [(6.0, 4.0), (-6.0, 4.0), (6.0, -4.0), (0.0, 4.0)])
+def test_cylindrical_angular_momentum_uses_surface_lever_arm_and_flux_sign(
+    momx: float, momy: float,
+) -> None:
+    rt = Runtime()
+    levels = [LevelMeta(
+        geom=LevelGeom(dx=(1.0, 1.0, 1.0), x0=(0.0, -0.5, -0.5), ref_ratio=1),
+        boxes=[BlockBox((0, 0, 0), (0, 0, 0))],
+    )]
+    runmeta = _runmeta_with_step_index(0, levels)
+    ds = open_dataset("memory://cyl-angular-cell", runmeta=runmeta,
+                      step=0, level=0, runtime=rt)
+    state = _one_cell_state(rho=2.0, momx=momx, energy=100.0, scalar=1.0, bz=5.0)
+    state[3][...] = momy
+    state[7][...] = 2.0
+    state[8][...] = 3.0
+    state[10] = np.full((1, 1, 1), 15.0)
+    for fid, values in state.items():
+        ds.register_field(f"f{fid}", fid)
+        _set_block_double(ds, step=0, level=0, field=fid, block=0, values=values)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    flux = pipe.cylindrical_flux_surface_integral(
+        1, momentum=(2, 3, 4), energy=5, passive_scalar=6,
+        magnetic_field=(7, 8, 9), radius=0.75, height=[0.25, 0.4],
+        temperature=10, temperature_bins=[0.0, 10.0, 20.0],
+    )
+    pipe.run()
+    result = rt.get_task_chunk_array(
+        step=0, level=0, field=flux.field, block=0, dtype=np.float64, dataset=ds,
+    ).reshape(2, 2, 2, 2, 8)
+    assert np.all(result[:, :, 0] == 0.0)
+    for height_idx, height in enumerate((0.25, 0.4)):
+        area = 2.0 * height  # tangent-plane wall strip in this unit-width cell
+        advective = 0.75 * momy * momx / 2.0 * area
+        maxwell = -0.75 * 3.0 * 2.0 * area
+        expected = np.zeros((2, 2))
+        expected[0 if advective < 0.0 else 1, 0] = advective
+        expected[0, 1] = maxwell
+        np.testing.assert_allclose(result[height_idx, :, 1, 1, 4:6], expected)
+        # Integral x dA over x>=0, |y|<0.5 in the radius-0.75 disk.
+        cap_moment_x = 23.0 / 96.0
+        np.testing.assert_allclose(result[height_idx, :, 1, 0, 6], 0.0)
+        np.testing.assert_allclose(
+            result[height_idx, :, 1, 0, 7],
+            [-15.0 * cap_moment_x, 15.0 * cap_moment_x],
+        )
+        np.testing.assert_allclose(result[height_idx, :, 1, 1, 6:8], 0.0)
+        # Radial transport excludes both caps, even with nonzero Bz.
+        np.testing.assert_allclose(result[height_idx, :, 1, 0, 4], 0.0)
+        np.testing.assert_allclose(result[height_idx, :, 1, 0, 5], 0.0)
+
+
+def _cylindrical_analytic_profile(
+    n: int, *, refined: bool = False, poison_covered: bool = False,
+    radial_velocity: float = 0.3, magnetic: bool = True,
+) -> np.ndarray:
+    """Sample constant cylindrical components on a Cartesian AMR hierarchy."""
+    rt = Runtime()
+    dx = 3.0 / n
+    levels = [LevelMeta(
+        geom=LevelGeom(dx=(dx, dx, 0.375), x0=(-1.5, -1.5, -0.75),
+                       ref_ratio=2 if refined else 1),
+        boxes=[BlockBox((0, 0, 0), (n // 2 - 1, n - 1, 3)),
+               BlockBox((n // 2, 0, 0), (n - 1, n - 1, 3))],
+    )]
+    if refined:
+        levels.append(LevelMeta(
+            geom=LevelGeom(dx=(dx / 2, dx / 2, 0.1875),
+                           x0=(-1.5, -1.5, -0.75), ref_ratio=1),
+            boxes=[BlockBox((n, 0, 0), (2 * n - 1, 2 * n - 1, 7))],
+        ))
+    runmeta = _runmeta_with_step_index(0, levels)
+    ds = open_dataset("memory://cyl-angular-profile", runmeta=runmeta,
+                      step=0, level=0, runtime=rt)
+    for fid in range(1, 10):
+        ds.register_field(f"f{fid}", fid)
+    for lev, meta in enumerate(levels):
+        for block, box in enumerate(meta.boxes):
+            axes = [meta.geom.x0[a] +
+                    (np.arange(box.lo[a], box.hi[a] + 1) + 0.5) * meta.geom.dx[a]
+                    for a in range(3)]
+            x, y, z = np.meshgrid(*axes, indexing="ij")
+            radius = np.hypot(x, y)
+            nx, ny = x / radius, y / radius
+            rho = np.full_like(x, 2.0)
+            if poison_covered and lev == 0:
+                rho[x > 0] *= 100.0
+            vx = radial_velocity * nx - 1.7 * ny
+            vy = radial_velocity * ny + 1.7 * nx
+            bx = (0.4 * nx - 0.6 * ny) if magnetic else np.zeros_like(x)
+            by = (0.4 * ny + 0.6 * nx) if magnetic else np.zeros_like(x)
+            state = [rho, rho * vx, rho * vy, np.zeros_like(z),
+                     10.0 + 0.5 * rho * (vx**2 + vy**2) + 0.5 * (bx**2 + by**2),
+                     np.ones_like(x), bx, by, np.zeros_like(z)]
+            for fid, values in enumerate(state, 1):
+                _set_block_double(ds, step=0, level=lev, field=fid, block=block, values=values)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    flux = pipe.cylindrical_flux_surface_integral(
+        1, momentum=(2, 3, 4), energy=5, passive_scalar=6,
+        magnetic_field=(7, 8, 9), radius=0.8, height=0.37,
+    )
+    pipe.run()
+    result = rt.get_task_chunk_array(
+        step=0, level=0, field=flux.field, block=0, dtype=np.float64, dataset=ds,
+    ).reshape(2, 2, 8)
+    return result[:, 1].sum(axis=0)
+
+
+def test_cylindrical_angular_momentum_surface_converges() -> None:
+    expected = 4.0 * np.pi * 0.37 * 0.8**2 * np.array([2.0 * 0.3 * 1.7, -0.4 * 0.6])
+    coarse = _cylindrical_analytic_profile(16)[4:6]
+    fine = _cylindrical_analytic_profile(64)[4:6]
+    np.testing.assert_allclose(fine, expected, rtol=0.01)
+    assert np.linalg.norm(fine - expected) < np.linalg.norm(coarse - expected)
+
+
+def test_cylindrical_angular_momentum_pure_rotation() -> None:
+    values = _cylindrical_analytic_profile(24, radial_velocity=0.0, magnetic=False)
+    np.testing.assert_allclose(values[[0, 4, 5]], 0.0, atol=1.0e-12)
+
+
+def test_cylindrical_angular_momentum_masks_covered_coarse_cells() -> None:
+    clean = _cylindrical_analytic_profile(32, refined=True)
+    poisoned = _cylindrical_analytic_profile(32, refined=True, poison_covered=True)
+    np.testing.assert_allclose(poisoned, clean, rtol=1.0e-12, atol=1.0e-12)
+    expected = 4.0 * np.pi * 0.37 * 0.8**2 * np.array([2.0 * 0.3 * 1.7, -0.4 * 0.6])
+    np.testing.assert_allclose(clean[4:6], expected, rtol=0.01)
+
+
+@pytest.mark.parametrize(
+    "x0,y0,dx,dy,radius,area,x_moment,y_moment",
+    [
+        (0.0, 0.0, 1.0, 1.0, 0.5, np.pi / 16.0, 1.0 / 24.0, 1.0 / 24.0),
+        (-1.0, 0.0, 1.0, 1.0, 0.5, np.pi / 16.0, -1.0 / 24.0, 1.0 / 24.0),
+        (0.0, -1.0, 1.0, 1.0, 0.5, np.pi / 16.0, 1.0 / 24.0, -1.0 / 24.0),
+        (-1.0, -1.0, 2.0, 2.0, 0.5, np.pi / 4.0, 0.0, 0.0),
+        # Entire block is inside the cylinder: only the endcaps intersect it.
+        (0.1, 0.2, 0.2, 0.2, 1.0, 0.04, 0.008, 0.012),
+    ],
+)
+def test_cylindrical_endcap_disk_area_and_lever_moments(
+    x0, y0, dx, dy, radius, area, x_moment, y_moment,
+) -> None:
+    rt = Runtime()
+    levels = [LevelMeta(
+        geom=LevelGeom(dx=(dx, dy, 1.0), x0=(x0, y0, -0.5), ref_ratio=1),
+        boxes=[BlockBox((0, 0, 0), (0, 0, 0))],
+    )]
+    runmeta = _runmeta_with_step_index(0, levels)
+    ds = open_dataset("memory://cap-moments", runmeta=runmeta, runtime=rt, step=0, level=0)
+    state = _one_cell_state(rho=2.0, momx=1.0, energy=100.0, scalar=1.0, bz=5.0)
+    for fid, value in ((3, 3.0), (4, 4.0), (7, 1.0), (8, 2.0)):
+        state[fid][...] = value
+    for fid, values in state.items():
+        ds.register_field(f"f{fid}", fid)
+        _set_block_double(ds, step=0, level=0, field=fid, block=0, values=values)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    flux = pipe.cylindrical_flux_surface_integral(
+        1, momentum=(2, 3, 4), energy=5, passive_scalar=6,
+        magnetic_field=(7, 8, 9), radius=radius, height=0.25,
+    )
+    pipe.run()
+    result = rt.get_task_chunk_array(
+        step=0, level=0, field=flux.field, block=0, dtype=np.float64, dataset=ds,
+    ).reshape(2, 2, 8)
+    np.testing.assert_allclose(result[:, 0, 0], [-4.0 * area, 4.0 * area], atol=1.e-14)
+    advective = 2.0 * (3.0 * x_moment - y_moment)
+    maxwell = -5.0 * (2.0 * x_moment - y_moment)
+    np.testing.assert_allclose(result[:, 0, 6], [-abs(advective), abs(advective)], atol=1.e-14)
+    np.testing.assert_allclose(result[:, 0, 7], [-abs(maxwell), abs(maxwell)], atol=1.e-14)
+
+
+def _vertical_analytic_profile(
+    n: int, *, refined: bool = False, poison_covered: bool = False,
+    bipolar: bool = True, height: float = 0.375,
+) -> np.ndarray:
+    """Rigid rotation and a vertical flow on a tiled mesh with optional AMR."""
+    rt = Runtime()
+    dx = 3.0 / n
+    tile = n // 8
+    levels = [LevelMeta(
+        geom=LevelGeom(dx=(dx, dx, 0.1875), x0=(-1.5, -1.5, -0.75),
+                       ref_ratio=2 if refined else 1),
+        boxes=[BlockBox((i, j, k), (i + tile - 1, j + tile - 1, k + 3))
+               for i in range(0, n, tile) for j in range(0, n, tile) for k in (0, 4)],
+    )]
+    if refined:
+        levels.append(LevelMeta(
+            geom=LevelGeom(dx=(dx / 2, dx / 2, 0.09375),
+                           x0=(-1.5, -1.5, -0.75), ref_ratio=1),
+            boxes=[BlockBox((n, 0, 0), (2*n - 1, 2*n - 1, 15))],
+        ))
+    runmeta = _runmeta_with_step_index(0, levels)
+    ds = open_dataset("memory://cap-profile", runmeta=runmeta, runtime=rt, step=0, level=0)
+    for fid in range(1, 10):
+        ds.register_field(f"f{fid}", fid)
+    for lev, meta in enumerate(levels):
+        for block, box in enumerate(meta.boxes):
+            axes = [meta.geom.x0[a] +
+                    (np.arange(box.lo[a], box.hi[a] + 1) + 0.5) * meta.geom.dx[a]
+                    for a in range(3)]
+            x, y, z = np.meshgrid(*axes, indexing="ij")
+            rho = np.full_like(x, 2.0)
+            if poison_covered and lev == 0:
+                rho[x > 0] *= 100.0
+            sign = np.sign(z) if bipolar else np.ones_like(z)
+            vx, vy, vz = -1.7*y, 1.7*x, 0.3*sign
+            bx, by, bz = -0.6*y*sign, 0.6*x*sign, np.full_like(z, 0.4)
+            state = [rho, rho*vx, rho*vy, rho*vz,
+                     10.0 + 0.5*rho*(vx**2 + vy**2 + vz**2) + 0.5*(bx**2 + by**2 + bz**2),
+                     np.ones_like(x), bx, by, bz]
+            for fid, values in enumerate(state, 1):
+                _set_block_double(ds, step=0, level=lev, field=fid, block=block, values=values)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    flux = pipe.cylindrical_flux_surface_integral(
+        1, momentum=(2, 3, 4), energy=5, passive_scalar=6,
+        magnetic_field=(7, 8, 9), radius=0.8, height=height,
+    )
+    pipe.run()
+    return rt.get_task_chunk_array(
+        step=0, level=0, field=flux.field, block=0, dtype=np.float64, dataset=ds,
+    ).reshape(2, 2, 8)
+
+
+def test_cylindrical_vertical_flux_converges_and_counts_grid_aligned_caps_once() -> None:
+    expected = np.pi * 0.8**4 * np.array([2.0 * 1.7 * 0.3, -0.6 * 0.4])
+    coarse = _vertical_analytic_profile(16)[:, 0, 6:8].sum(axis=0)
+    fine = _vertical_analytic_profile(64)
+    net = fine[:, 0, 6:8].sum(axis=0)
+    np.testing.assert_allclose(net, expected, rtol=0.005)
+    assert np.linalg.norm(net - expected) < np.linalg.norm(coarse - expected)
+    np.testing.assert_allclose(fine[:, 0, 0].sum(), 2.0 * np.pi * 0.8**2 * 2.0 * 0.3,
+                               rtol=1.e-12)
+    np.testing.assert_allclose(fine[:, 0, 4:6], 0.0, atol=1.e-14)
+    np.testing.assert_allclose(fine[:, 1, 6:8], 0.0, atol=1.e-14)
+    assert fine[1, 0, 6] > 0.0  # both caps export prograde angular momentum
+    assert fine[0, 0, 7] < 0.0  # magnetic stress transports it in the opposite sense
+
+
+@pytest.mark.parametrize("height", [0.375, 0.75, 0.37])
+def test_cylindrical_vertical_flux_lower_normal_cancels_uniform_throughflow(height) -> None:
+    result = _vertical_analytic_profile(32, bipolar=False, height=height)
+    mass_flux = np.pi * 0.8**2 * 2.0 * 0.3
+    np.testing.assert_allclose(result[:, 0, 0], [-mass_flux, mass_flux], rtol=1.e-12)
+    assert result[0, 0, 6] < 0.0
+    assert result[1, 0, 6] > 0.0
+    np.testing.assert_allclose(result[:, 0, 6:8].sum(axis=0), 0.0, atol=1.e-12)
+
+
+def test_cylindrical_vertical_flux_masks_partial_amr_coverage() -> None:
+    clean = _vertical_analytic_profile(32, refined=True)
+    poisoned = _vertical_analytic_profile(32, refined=True, poison_covered=True)
+    np.testing.assert_allclose(poisoned, clean, rtol=1.e-12, atol=1.e-12)
+    expected = np.pi * 0.8**4 * np.array([2.0 * 1.7 * 0.3, -0.6 * 0.4])
+    np.testing.assert_allclose(clean[:, 0, 6:8].sum(axis=0), expected, rtol=0.01)
+
+
+@pytest.mark.parametrize("axis", [0, 1], ids=["x", "y"])
+@pytest.mark.parametrize("side", [-1, 1], ids=["negative", "positive"])
+@pytest.mark.parametrize(
+    "layout,offset",
+    [(layout, offset) for layout in ("single", "split")
+     for offset in (-1.e-6, 0.0, 1.e-13, 1.e-6)] + [("amr", 0.0)],
+)
+def test_cylindrical_wall_grid_face_has_single_owner(axis, side, layout, offset):
+    """A coincident tangent patch uses only the cylinder-interior cell."""
+    rt = Runtime()
+    origin = [-0.5, -0.5, -0.5]
+    origin[axis] = 0.0 if side > 0 else -2.0
+    hi = [0, 0, 0]
+    hi[axis] = 1
+    boxes = [BlockBox((0, 0, 0), tuple(hi))]
+    if layout == "split":
+        boxes = []
+        for i in range(2):
+            index = [0, 0, 0]
+            index[axis] = i
+            boxes.append(BlockBox(tuple(index), tuple(index)))
+    levels = [LevelMeta(
+        geom=LevelGeom(dx=(1.0, 1.0, 1.0), x0=tuple(origin),
+                       ref_ratio=3 if layout == "amr" else 1),
+        boxes=boxes,
+    )]
+    if layout == "amr":
+        # Refine the exterior cell. Ratio three retains a fine row whose
+        # center lies on the coordinate axis, reproducing the shared patch.
+        lo, hi = [0, 0, 0], [2, 2, 2]
+        lo[axis], hi[axis] = (3, 5) if side > 0 else (0, 2)
+        levels.append(LevelMeta(
+            geom=LevelGeom(dx=(1.0 / 3.0,) * 3, x0=tuple(origin), ref_ratio=1),
+            boxes=[BlockBox(tuple(lo), tuple(hi))],
+        ))
+    meta = _runmeta_with_step_index(0, levels)
+    ds = open_dataset("memory://wall-face-owner", runmeta=meta, runtime=rt,
+                      step=0, level=0)
+    for fid in range(1, 10):
+        ds.register_field(f"f{fid}", fid)
+    normal = np.zeros(3)
+    normal[axis] = side
+    tangent = np.array([-normal[1], normal[0], 0.0])
+    momentum = normal + 2.0 * tangent
+    magnetic = 3.0 * normal + 4.0 * tangent
+    for lev, level in enumerate(levels):
+        for block, box in enumerate(level.boxes):
+            shape = tuple(box.hi[a] - box.lo[a] + 1 for a in range(3))
+            radial_centers = (
+                origin[axis] +
+                (np.arange(box.lo[axis], box.hi[axis] + 1) + 0.5)
+                * level.geom.dx[axis]
+            )
+            radial_shape = [1, 1, 1]
+            radial_shape[axis] = shape[axis]
+            exterior = np.broadcast_to(
+                (side * radial_centers > 1.0).reshape(radial_shape), shape
+            )
+            for fid, value in enumerate(
+                [1.0, *momentum, 1000.0, 1.0, *magnetic], 1
+            ):
+                values = np.full(shape, value)
+                if abs(offset) < 1.e-12 and fid in (2, 3, 7, 8):
+                    # Distinguish correct interior ownership from arbitrarily
+                    # choosing one of two identical states on the face.
+                    values[exterior] *= 7.0
+                _set_block_double(ds, step=0, level=lev, field=fid, block=block,
+                                  values=values)
+    pipe = Pipeline(runtime=rt, runmeta=meta, dataset=ds)
+    radius = 1.0 + offset
+    flux = pipe.cylindrical_flux_surface_integral(
+        1, momentum=(2, 3, 4), energy=5, passive_scalar=6,
+        magnetic_field=(7, 8, 9), radius=radius, height=0.25,
+    )
+    pipe.run()
+    result = rt.get_task_chunk_array(
+        step=0, level=0, field=flux.field, block=0, dtype=np.float64, dataset=ds,
+    ).reshape(2, 2, 8)
+    # The tangent patch has area 1 * (2 * height) = 0.5.
+    expected = np.array([[0.0, 0.0, -6.0 * radius],
+                         [0.5, radius, 0.0]])
+    np.testing.assert_allclose(result[:, 1, :][:, [0, 4, 5]], expected,
+                               rtol=1.e-12, atol=1.e-12)

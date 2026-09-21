@@ -81,6 +81,14 @@ CellIndexRange cells_intersecting_axis_band(double band_lo, double band_hi,
 
 namespace {
 
+double plane_box_distance_tolerance(double x0, double x1, double y0,
+                                    double y1, double z0, double z1, double d) {
+  const double scale = std::abs(x0) + std::abs(x1) + std::abs(y0) +
+                       std::abs(y1) + std::abs(z0) + std::abs(z1) +
+                       std::abs(d) + 1.0;
+  return 1.0e-12 * scale;
+}
+
 struct FluxPoint {
   double x = 0.0;
   double y = 0.0;
@@ -109,10 +117,8 @@ void add_point_unique(std::array<FluxPoint, 16> &pts, int &npts, double x,
 double plane_box_section_area(double x0, double x1, double y0, double y1,
                               double z0, double z1, double nx, double ny,
                               double nz, double d) {
-  const double scale = std::abs(x0) + std::abs(x1) + std::abs(y0) +
-                       std::abs(y1) + std::abs(z0) + std::abs(z1) +
-                       std::abs(d) + 1.0;
-  const double tol = 1.0e-12 * scale;
+  const double tol =
+      plane_box_distance_tolerance(x0, x1, y0, y1, z0, z1, d);
 
   const std::array<FluxPoint, 8> verts{
       FluxPoint{x0, y0, z0}, FluxPoint{x1, y0, z0}, FluxPoint{x0, y1, z0},
@@ -287,6 +293,82 @@ double spherical_section_area_in_cell(double radius, double x0, double x1,
 
 } // namespace
 
+namespace {
+
+// Integrate a rectangle in the positive quadrant of a unit disk. Split at
+// the point where the circle first cuts its upper edge: the first interval
+// is a rectangle, and the second has upper boundary sqrt(1-x*x).
+DiskSectionMoments quadrant_disk_moments(double a, double b, double c,
+                                         double d) {
+  a = std::clamp(a, 0.0, 1.0);
+  b = std::clamp(b, 0.0, 1.0);
+  c = std::clamp(c, 0.0, 1.0);
+  d = std::clamp(d, 0.0, 1.0);
+  DiskSectionMoments result;
+  if (b <= a || d <= c) {
+    return result;
+  }
+  b = std::min(b, std::sqrt(std::max(0.0, 1.0 - c * c)));
+  if (b <= a) {
+    return result;
+  }
+  const double split = std::sqrt(std::max(0.0, 1.0 - d * d));
+  const double full_hi = std::min(b, split);
+  if (full_hi > a) {
+    const double width = full_hi - a;
+    result.area = width * (d - c);
+    result.x = 0.5 * width * (full_hi + a) * (d - c);
+    result.y = 0.5 * width * (d - c) * (d + c);
+  }
+  const double lo = std::max(a, split);
+  if (b > lo) {
+    const auto primitive = [](double x) {
+      return 0.5 * (x * std::sqrt(std::max(0.0, 1.0 - x * x)) + std::asin(x));
+    };
+    const double width = b - lo;
+    const double area = primitive(b) - primitive(lo) - c * width;
+    const double moment_x = (std::pow(std::max(0.0, 1.0 - lo * lo), 1.5) -
+                             std::pow(std::max(0.0, 1.0 - b * b), 1.5)) /
+                                3.0 -
+                            0.5 * c * width * (b + lo);
+    const double moment_y =
+        0.5 * width * (1.0 - c * c - (b * b + b * lo + lo * lo) / 3.0);
+    // Roundoff can make vanishing boundary slivers slightly negative.
+    result.area += std::max(0.0, area);
+    result.x += std::max(0.0, moment_x);
+    result.y += std::max(0.0, moment_y);
+  }
+  return result;
+}
+
+} // namespace
+
+DiskSectionMoments disk_rectangle_moments(double radius, double x0, double x1,
+                                          double y0, double y1) {
+  DiskSectionMoments result;
+  if (radius <= 0.0 || x1 <= x0 || y1 <= y0) {
+    return result;
+  }
+  // Work in units of radius to avoid cancellation between large cgs lengths.
+  for (int sx : {-1, 1}) {
+    const double a = std::max(0.0, (sx > 0 ? x0 : -x1) / radius);
+    const double b = std::max(0.0, (sx > 0 ? x1 : -x0) / radius);
+    for (int sy : {-1, 1}) {
+      const double c = std::max(0.0, (sy > 0 ? y0 : -y1) / radius);
+      const double d = std::max(0.0, (sy > 0 ? y1 : -y0) / radius);
+      const auto part = quadrant_disk_moments(a, b, c, d);
+      result.area += part.area;
+      result.x += sx * part.x;
+      result.y += sy * part.y;
+    }
+  }
+  const double radius2 = radius * radius;
+  result.area *= radius2;
+  result.x *= radius2 * radius;
+  result.y *= radius2 * radius;
+  return result;
+}
+
 double cylindrical_section_area_in_intersecting_cell(double radius,
                                                      double height, double x0,
                                                      double x1, double y0,
@@ -305,7 +387,20 @@ double cylindrical_section_area_in_intersecting_cell(double radius,
     return 0.0;
   }
 
-  return plane_box_section_area(x0, x1, y0, y1, zlo, zhi, xc / rc, yc / rc, 0.0,
+  const double nx = xc / rc;
+  const double ny = yc / rc;
+  const double tol =
+      plane_box_distance_tolerance(x0, x1, y0, y1, zlo, zhi, radius);
+  const double min_distance =
+      nx * (nx >= 0.0 ? x0 : x1) + ny * (ny >= 0.0 ? y0 : y1) - radius;
+  // A tangent plane on a shared face belongs to the interior-side cell.
+  // Require a vertex strictly inside, using the clipping routine's tolerance;
+  // an exterior cell touching the plane must not contribute the face again.
+  if (min_distance >= -tol) {
+    return 0.0;
+  }
+
+  return plane_box_section_area(x0, x1, y0, y1, zlo, zhi, nx, ny, 0.0,
                                 radius);
 }
 
