@@ -9,7 +9,11 @@
 
 module load gcc/14.2.0
 
-PLOTFILE=/lustre/orion/ast236/proj-shared/wibking/MW_Gen1_Phase2/plt0426651
+if [[ $# -ne 1 ]]; then
+  echo "Usage: sbatch $0 PLOTFILE" >&2
+  exit 2
+fi
+PLOTFILE=$1
 
 export SPACK_HPX_PREFIX="$(spack location -i 'hpx@1.11.0 networking=mpi %gcc@14.2.0')"
 export SPACK_MPI_PREFIX="$(spack location -i 'openmpi%gcc@14.2.0')"
