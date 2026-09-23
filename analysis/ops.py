@@ -1300,7 +1300,10 @@ class CylindricalMoments:
 
     def lower(self, ctx: LoweringContext):
         ds = ctx.dataset
-        for name, edges in (("radial_edges", self.radial_edges), ("z_edges", self.z_edges)):
+        for name, edges in (
+            ("radial_edges", self.radial_edges),
+            ("z_edges", self.z_edges),
+        ):
             if len(edges) < 2:
                 raise ValueError(f"{name} must contain at least two values")
             if (
@@ -1414,7 +1417,9 @@ class CylindricalMoments:
                 FieldRef(
                     total_profile.field.field,
                     version=total_profile.field.version,
-                    domain=ctx.domain(step=ds.step, level=total_profile.level, blocks=[0]),
+                    domain=ctx.domain(
+                        step=ds.step, level=total_profile.level, blocks=[0]
+                    ),
                 )
             ],
             outputs=[OutputRef(out_field, output_buffer)],

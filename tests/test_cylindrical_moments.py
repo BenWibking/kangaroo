@@ -9,7 +9,15 @@ from analysis import Runtime
 from analysis.buffer import BufferSpec, DType, FixedShape, InitPolicy
 from analysis.dataset import open_dataset
 from analysis.kernel_params import ToomreProfileParams
-from analysis.plan import DependencyRule, Domain, FieldRef, OutputRef, Plan, Stage, TaskTemplate
+from analysis.plan import (
+    DependencyRule,
+    Domain,
+    FieldRef,
+    OutputRef,
+    Plan,
+    Stage,
+    TaskTemplate,
+)
 from analysis.plan_codec import encode_plan
 from analysis.pipeline import Pipeline
 from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
