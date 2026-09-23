@@ -29,6 +29,7 @@ from .kernel_params import (
 )
 from .ops import (
     CylindricalFluxSurfaceIntegral,
+    CylindricalMoments,
     FluxSurfaceIntegral,
     Histogram1D,
     Histogram2D,
@@ -270,6 +271,52 @@ class ToomreQProfileHandle:
             self.center,
             self.gamma,
         )
+
+
+@dataclass(frozen=True)
+class CylindricalMomentsHandle:
+    """AMR-aware ``(radius, |z|)`` moments of a cell-centered field."""
+
+    moments: FieldHandle
+    radial_edges: tuple[float, ...]
+    z_edges: tuple[float, ...]
+    center: tuple[float, float, float]
+    components: tuple[str, ...] = ("integral", "sampled_volume")
+
+    @property
+    def field(self) -> int:
+        return self.moments.field
+
+    @property
+    def name(self) -> str | None:
+        return self.moments.name
+
+    @property
+    def radial_range(self) -> tuple[float, float]:
+        return (self.radial_edges[0], self.radial_edges[-1])
+
+    @property
+    def z_range(self) -> tuple[float, float]:
+        return (self.z_edges[0], self.z_edges[-1])
+
+    @property
+    def bins(self) -> tuple[int, int]:
+        return (len(self.radial_edges) - 1, len(self.z_edges) - 1)
+
+    @property
+    def radial_edges_array(self) -> np.ndarray:
+        return np.asarray(self.radial_edges, dtype=np.float64)
+
+    @property
+    def z_edges_array(self) -> np.ndarray:
+        return np.asarray(self.z_edges, dtype=np.float64)
+
+    def compute(self) -> Any:
+        """Execute and return the ``(bins_r, bins_z, 2)`` moment array."""
+
+        values = np.asarray(self.moments.compute(), dtype=np.float64)
+        bins_r, bins_z = self.bins
+        return values.reshape(bins_r, bins_z, len(self.components))
 
 
 @dataclass(frozen=True)
@@ -1238,6 +1285,43 @@ class Pipeline:
             z_bounds=op.z_bounds,
             center=op.center,
             gamma=op.gamma,
+        )
+
+    def cylindrical_moments(
+        self,
+        field: int | FieldHandle,
+        *,
+        radial_edges: Sequence[float],
+        z_edges: Sequence[float],
+        center: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        out: str | None = None,
+        reduce_fan_in: int | None = None,
+    ) -> CylindricalMomentsHandle:
+        """Accumulate AMR-aware ``(radius, |z|)`` moments of one field.
+
+        Bins uncovered cells by cylindrical radius and absolute height
+        relative to ``center``; each ``(radial, height)`` bin stores the volume
+        integral of ``field`` and the sampled volume.  Enclosed profiles along
+        either axis follow from a single pass by cumulative summation.
+        """
+
+        out_name = out or self._unique_name("cylindrical_moments")
+        op = CylindricalMoments(
+            field=self._as_field_id(field),
+            radial_edges=radial_edges,
+            z_edges=z_edges,
+            center=center,
+            out_name=out_name,
+            reduce_fan_in=reduce_fan_in,
+        )
+        fragment = op.lower(self._ctx)
+        self._append_fragment(fragment)
+        out_field = self._sink_fields(fragment)[-1]
+        return CylindricalMomentsHandle(
+            moments=FieldHandle(self, out_field, out_name),
+            radial_edges=op.radial_edges,
+            z_edges=op.z_edges,
+            center=op.center,
         )
 
     def histogram1d(

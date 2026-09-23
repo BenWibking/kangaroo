@@ -1219,6 +1219,212 @@ class ToomreQProfile:
         return ctx.fragment(reductions.stages)
 
 
+class CylindricalMoments:
+    """Accumulate AMR-aware two-dimensional cylindrical moments.
+
+    Bins uncovered cells by cylindrical radius and absolute height relative
+    to ``center`` using ``radial_edges`` and ``z_edges``, accumulating the
+    volume integral of a single cell-centered field plus the sampled volume
+    per bin.  Enclosed quantities at every sample point follow from one pass
+    by cumulative summation, so scans over radius or height share a single
+    evaluation and a single field read.  Unlike the Toomre profile operator
+    no potential gradient (and therefore no neighbor halos) is required.
+    """
+
+    NUM_MOMENTS = 2
+
+    def __init__(
+        self,
+        *,
+        field: int,
+        radial_edges: Sequence[float],
+        z_edges: Sequence[float],
+        center: Sequence[float] = (0.0, 0.0, 0.0),
+        out_name: str = "cylindrical_moments",
+        reduce_fan_in: Optional[int] = None,
+    ) -> None:
+        self.field = int(field)
+        self.radial_edges = tuple(float(value) for value in radial_edges)
+        self.z_edges = tuple(float(value) for value in z_edges)
+        self.center = tuple(float(value) for value in center)
+        self.out_name = str(out_name)
+        self.reduce_fan_in = reduce_fan_in
+
+    def _reduce_fan_in(self, num_inputs: int) -> int:
+        return resolve_reduce_fan_in(self.reduce_fan_in, num_inputs)
+
+    def _covered_boxes_for_level(
+        self,
+        ctx: LoweringContext,
+        *,
+        level: int,
+    ) -> list[tuple[tuple[int, int, int], tuple[int, int, int]]]:
+        levels = ctx.runmeta.steps[ctx.dataset.step].levels
+        return covered_volume_boxes(levels, level=level)
+
+    def _block_intersects_cylinder(self, level_meta, block) -> bool:
+        geom = level_meta.geom
+        zmax = self.z_edges[-1]
+        z0, z1 = _bounds_1d(
+            block.lo[2],
+            block.hi[2],
+            geom.x0[2],
+            geom.dx[2],
+            geom.index_origin[2],
+        )
+        zmin_abs = self.center[2] - zmax
+        zmax_abs = self.center[2] + zmax
+        if z1 <= zmin_abs or z0 >= zmax_abs:
+            return False
+
+        lo2 = 0.0
+        hi2 = 0.0
+        for axis in (0, 1):
+            x0, x1 = _bounds_1d(
+                block.lo[axis],
+                block.hi[axis],
+                geom.x0[axis],
+                geom.dx[axis],
+                geom.index_origin[axis],
+            )
+            x0 -= self.center[axis]
+            x1 -= self.center[axis]
+            if x1 < 0.0:
+                lo2 += x1 * x1
+            elif x0 > 0.0:
+                lo2 += x0 * x0
+            hi2 += max(abs(x0), abs(x1)) ** 2
+        rmin2 = self.radial_edges[0] ** 2
+        rmax2 = self.radial_edges[-1] ** 2
+        return lo2 < rmax2 and hi2 >= rmin2
+
+    def lower(self, ctx: LoweringContext):
+        ds = ctx.dataset
+        for name, edges in (("radial_edges", self.radial_edges), ("z_edges", self.z_edges)):
+            if len(edges) < 2:
+                raise ValueError(f"{name} must contain at least two values")
+            if (
+                any(not math.isfinite(value) for value in edges)
+                or edges[0] < 0.0
+                or any(
+                    right <= left for left, right in zip(edges, edges[1:])
+                )
+            ):
+                raise ValueError(
+                    f"{name} must be finite, non-negative, and strictly increasing"
+                )
+        if len(self.center) != 3 or any(
+            not math.isfinite(value) for value in self.center
+        ):
+            raise ValueError("center must contain three finite coordinates")
+
+        radial_bins = len(self.radial_edges) - 1
+        z_bins = len(self.z_edges) - 1
+        zmax = self.z_edges[-1]
+        z_bounds = (self.center[2] - zmax, self.center[2] + zmax)
+
+        levels = ctx.runmeta.steps[ds.step].levels
+        active_by_level: dict[int, list[int]] = {}
+        for level_idx, level_meta in enumerate(levels):
+            active = [
+                block_idx
+                for block_idx, block in enumerate(level_meta.boxes)
+                if self._block_intersects_cylinder(level_meta, block)
+            ]
+            if active:
+                active_by_level[level_idx] = active
+        if not active_by_level:
+            raise ValueError("radial_edges and z_edges do not intersect any mesh block")
+
+        output_buffer = BufferSpec(
+            DType.F64,
+            FixedShape((radial_bins * z_bins, self.NUM_MOMENTS)),
+            InitPolicy.ZERO,
+        )
+        accumulate_stage = ctx.stage("cylindrical_moments")
+        reductions = GraphReductionBuilder(ctx)
+        reductions.add_stage(accumulate_stage)
+        profile_fields: list[ReducedField] = []
+
+        for level_idx in range(len(levels) - 1, -1, -1):
+            blocks = active_by_level.get(level_idx, [])
+            if not blocks:
+                continue
+            covered_boxes = self._covered_boxes_for_level(ctx, level=level_idx)
+            covered_payload = _covered_boxes_payload(covered_boxes)
+            profile_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
+
+            for block in blocks:
+                dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
+                accumulate_stage.map_blocks(
+                    name=f"cylindrical_moments_l{level_idx}_b{block}",
+                    kernel="cylindrical_moments_accumulate",
+                    domain=dom,
+                    inputs=[FieldRef(self.field)],
+                    outputs=[OutputRef(profile_field, output_buffer)],
+                    deps=DependencyRule(),
+                    params=ToomreProfileParams(
+                        radial_edges=self.radial_edges,
+                        z_bounds=z_bounds,
+                        center=self.center,
+                        z_edges=self.z_edges,
+                        covered_boxes=covered_payload,
+                    ),
+                )
+
+            reductions.add_stage(accumulate_stage, outputs=[profile_field])
+            profile_fields.append(
+                reductions.reduce_blocks(
+                    value=ReducedField(profile_field, level_idx),
+                    input_blocks=blocks,
+                    step=ds.step,
+                    fan_in=self._reduce_fan_in(len(blocks)),
+                    kernel="uniform_slice_reduce",
+                    output_buffer=output_buffer,
+                    stage_name="cylindrical_moments_reduce",
+                    template_name="cylindrical_moments_reduce_s{round}",
+                    singleton_template_name="cylindrical_moments_reduce_single",
+                    temporary_name=f"{self.out_name}_sum_reduce_{level_idx}_{{round}}",
+                    after=accumulate_stage,
+                    normalize_single=True,
+                )
+            )
+
+        total_profile = reductions.reduce_pairwise(
+            profile_fields,
+            step=ds.step,
+            target_level=ds.level,
+            kernel="uniform_slice_add",
+            output_buffer=output_buffer,
+            stage_name="cylindrical_moments_add",
+            template_name="cylindrical_moments_add_{round}_{index}",
+            temporary_name=f"{self.out_name}_sum_add_{{round}}_{{index}}",
+        )
+        out_field = ctx.output_field(self.out_name)
+        finalize = ctx.stage(
+            "cylindrical_moments_output",
+            plane="graph",
+            after=reductions.dependencies([total_profile.field]),
+        )
+        finalize.map_blocks(
+            name="cylindrical_moments_output",
+            kernel="uniform_slice_reduce",
+            domain=ctx.domain(step=ds.step, level=ds.level),
+            inputs=[
+                FieldRef(
+                    total_profile.field.field,
+                    version=total_profile.field.version,
+                    domain=ctx.domain(step=ds.step, level=total_profile.level, blocks=[0]),
+                )
+            ],
+            outputs=[OutputRef(out_field, output_buffer)],
+            deps=DependencyRule(),
+            graph_reduce=GraphReduceSpec(fan_in=1, num_inputs=1),
+        )
+        reductions.add_stage(finalize, outputs=[out_field])
+        return ctx.fragment(reductions.stages)
+
+
 class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
     def __init__(
         self,

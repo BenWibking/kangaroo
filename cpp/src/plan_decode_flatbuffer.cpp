@@ -237,6 +237,7 @@ KernelParamsIR decode_params(const fb::KernelParamsUnion &input) {
     out.radial_edges = p.radial_edges;
     out.z_bounds = copy_array<double, 2>(p.z_bounds, "Toomre z bounds");
     out.center = copy_array<double, 3>(p.center, "Toomre center");
+    out.z_edges = p.z_edges;
     return out;
   }
   case fb::KernelParams::UniformSliceCellParams: {

@@ -1,6 +1,10 @@
 # Codex files
 .codex
 
+# Slurm batch logs and editor backups of submit scripts
+slurm-*.out
+*.submit~
+
 # Python-generated files
 __pycache__/
 *.py[oc]

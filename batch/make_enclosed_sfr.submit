@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH -t 05:00:00
+#SBATCH -t 00:30:00
 #SBATCH -A ast236
 #SBATCH -N 1
 #SBATCH -p batch
-#SBATCH -J kangaroo-toomre-p0
+#SBATCH -J kangaroo-enclosed-sfr
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=32
+#SBATCH --cpus-per-task=128
 
 set -euo pipefail
 
@@ -31,13 +31,38 @@ if [[ $# -ne 1 ]]; then
   exit 2
 fi
 PLOTFILE=$1
-: "${OUTPUT_DIR:=toomre_q_noCGM_0.1uG_Phase0}"
-: "${R_MIN_KPC:=0.0}"
-: "${R_MAX_KPC:=17.5}"
-: "${DR_KPC:=0.25}"
-: "${Z_MAX_KPC:=1.0}"
-: "${GAMMA:=1.6666666666666667}"
-: "${OVERWRITE:=1}"
+# Disk profile: SFR(R) within |z| <= DISK_HEIGHT_KPC.
+: "${RMIN_KPC:=0.1}"
+: "${RMAX_KPC:=30.0}"
+: "${DISK_HEIGHT_KPC:=1.0}"
+# Wind profile: SFR(h) within radius WIND_RADIUS_KPC.
+: "${WIND_RADIUS_KPC:=5.0}"
+: "${ZMIN_KPC:=0.1}"
+: "${ZMAX_KPC:=30.0}"
+: "${SFR_WINDOW_MYR:=10.0}"
+: "${FIELD_KIND:=rate_density}"
+: "${KANGAROO_FLUX_PROFILE:=production}"
+
+case "$KANGAROO_FLUX_PROFILE" in
+  production)
+    : "${NBINS:=50}"
+    : "${OUTPUT_JSON_DISK:=enclosed_sfr_disk.json}"
+    : "${OUTPUT_JSON_WIND:=enclosed_sfr_wind.json}"
+    : "${OUTPUT_JSON_JOINT:=enclosed_sfr_joint.json}"
+    ;;
+  diagnostic)
+    : "${NBINS:=8}"
+    : "${OUTPUT_JSON_DISK:=enclosed_sfr_disk.diagnostic.json}"
+    : "${OUTPUT_JSON_WIND:=enclosed_sfr_wind.diagnostic.json}"
+    : "${OUTPUT_JSON_JOINT:=enclosed_sfr_joint.diagnostic.json}"
+    : "${KANGAROO_EVENT_LOG:=auto}"
+    : "${KANGAROO_PROGRESS:=1}"
+    ;;
+  *)
+    echo "Unsupported KANGAROO_FLUX_PROFILE='$KANGAROO_FLUX_PROFILE' (use production or diagnostic)" >&2
+    exit 2
+    ;;
+esac
 
 : "${KANGAROO_EXECUTOR_MODE:=streaming}"
 : "${KANGAROO_EXECUTOR_MAX_ACTIVE_TASKS_PER_LOCALITY:=128}"
@@ -61,19 +86,13 @@ export KANGAROO_PLOTFILE_IO_POOL_THREADS
 export KANGAROO_PLOTFILE_ZERO_COPY_READS
 
 PROGRESS_ARGS=()
-if [[ "${KANGAROO_PROGRESS:-1}" == "1" ]]; then
+if [[ "${KANGAROO_PROGRESS:-0}" == "1" ]]; then
   PROGRESS_ARGS+=(--progress)
 fi
-
-OVERWRITE_ARGS=()
-if [[ "$OVERWRITE" == "1" ]]; then
-  OVERWRITE_ARGS+=(--overwrite)
-fi
-
 if [[ -n "${KANGAROO_EVENT_LOG:-}" ]]; then
   mkdir -p event_logs
   if [[ "$KANGAROO_EVENT_LOG" == "1" || "$KANGAROO_EVENT_LOG" == "auto" ]]; then
-    KANGAROO_EVENT_LOG="$PWD/event_logs/toomre_q.${SLURM_JOB_ID:-manual}.events.jsonl"
+    KANGAROO_EVENT_LOG="$PWD/event_logs/enclosed_sfr.${SLURM_JOB_ID:-manual}.events.jsonl"
   fi
   export KANGAROO_EVENT_LOG
 fi
@@ -85,8 +104,8 @@ export SPACK_HPX_PREFIX="$(spack location -i 'hpx@1.11.0 networking=mpi %gcc@14.
 export SPACK_MPI_PREFIX="$(spack location -i 'openmpi%gcc@14.2.0')"
 export LD_LIBRARY_PATH="$SPACK_HPX_PREFIX/lib64:$SPACK_HPX_PREFIX/lib:$SPACK_MPI_PREFIX/lib64:$SPACK_MPI_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
-NNODES="${SLURM_NNODES:-4}"
-CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-32}"
+NNODES="${SLURM_NNODES:-1}"
+CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-128}"
 if [[ "${SLURM_TRES_PER_TASK:-}" =~ (^|,)cpu=([0-9]+)(,|$) ]]; then
   CPUS_PER_TASK="${BASH_REMATCH[2]}"
   if [[ "${SLURM_CPUS_PER_TASK:-}" != "$CPUS_PER_TASK" ]]; then
@@ -106,6 +125,7 @@ echo "CPUS_PER_TASK=${CPUS_PER_TASK}"
 echo "SPACK_HPX_PREFIX=${SPACK_HPX_PREFIX}"
 echo "SPACK_MPI_PREFIX=${SPACK_MPI_PREFIX}"
 echo "HPXRUN_ARGS=${HPXRUN_ARGS}"
+echo "KANGAROO_FLUX_PROFILE=${KANGAROO_FLUX_PROFILE}"
 echo "KANGAROO_EXECUTOR_MODE=${KANGAROO_EXECUTOR_MODE}"
 echo "KANGAROO_EXECUTOR_MAX_ACTIVE_TASKS_PER_LOCALITY=${KANGAROO_EXECUTOR_MAX_ACTIVE_TASKS_PER_LOCALITY}"
 echo "KANGAROO_EXECUTOR_MAX_ACTIVE_STORAGE_UNITS_PER_LOCALITY=${KANGAROO_EXECUTOR_MAX_ACTIVE_STORAGE_UNITS_PER_LOCALITY}"
@@ -118,30 +138,42 @@ echo "KANGAROO_PLOTFILE_IO_POOL_THREADS=${KANGAROO_PLOTFILE_IO_POOL_THREADS}"
 echo "KANGAROO_PLOTFILE_ZERO_COPY_READS=${KANGAROO_PLOTFILE_ZERO_COPY_READS}"
 echo "KANGAROO_EVENT_LOG=${KANGAROO_EVENT_LOG:-disabled}"
 echo "plotfile=${PLOTFILE}"
-echo "output_dir=${OUTPUT_DIR}"
-echo "r_min_kpc=${R_MIN_KPC}"
-echo "r_max_kpc=${R_MAX_KPC}"
-echo "dr_kpc=${DR_KPC}"
-echo "z_max_kpc=${Z_MAX_KPC}"
-echo "gamma=${GAMMA}"
-echo "overwrite=${OVERWRITE}"
+echo "rmin_kpc=${RMIN_KPC}"
+echo "rmax_kpc=${RMAX_KPC}"
+echo "disk_height_kpc=${DISK_HEIGHT_KPC}"
+echo "wind_radius_kpc=${WIND_RADIUS_KPC}"
+echo "zmin_kpc=${ZMIN_KPC}"
+echo "zmax_kpc=${ZMAX_KPC}"
+echo "nbins=${NBINS}"
+echo "sfr_window_myr=${SFR_WINDOW_MYR}"
+echo "field_kind=${FIELD_KIND}"
+echo "output_json_disk=${OUTPUT_JSON_DISK}"
+echo "output_json_wind=${OUTPUT_JSON_WIND}"
+echo "output_json_joint=${OUTPUT_JSON_JOINT}"
 
+# One AMR-aware cylindrical-moments pass produces both the disk profile
+# SFR(R) for |z| <= DISK_HEIGHT_KPC and the wind profile SFR(h) within
+# WIND_RADIUS_KPC: cells are binned once by (r, |z|), and the enclosed
+# profiles follow by cumulative summation.
 "$PWD/scripts/utils/hpxrun_spack_hpx.sh" \
   -r srun \
   -p mpi \
   -l "$NNODES" \
   -t "$CPUS_PER_TASK" \
   "$PWD/.pixi/envs/spack-hpx/bin/python" \
-  "$PWD/scripts/plotfile_toomre_q.py" \
+  "$PWD/scripts/plotfile_enclosed_sfr.py" \
   -- \
   "$PLOTFILE" \
-  --output-dir "$OUTPUT_DIR" \
-  --r-min-kpc "$R_MIN_KPC" \
-  --r-max-kpc "$R_MAX_KPC" \
-  --dr-kpc "$DR_KPC" \
-  --z-max-kpc "$Z_MAX_KPC" \
-  --gamma "$GAMMA" \
-  "${OVERWRITE_ARGS[@]}" \
-  "${PROGRESS_ARGS[@]}"
+  --rmin-kpc "$RMIN_KPC" --rmax-kpc "$RMAX_KPC" \
+  --disk-height-kpc "$DISK_HEIGHT_KPC" \
+  --zmin-kpc "$ZMIN_KPC" --zmax-kpc "$ZMAX_KPC" \
+  --wind-radius-kpc "$WIND_RADIUS_KPC" \
+  --nbins "$NBINS" \
+  --field-kind "$FIELD_KIND" \
+  --sfr-window-myr "$SFR_WINDOW_MYR" \
+  "${PROGRESS_ARGS[@]}" \
+  --output-json "$OUTPUT_JSON_DISK" \
+  --output-json-wind "$OUTPUT_JSON_WIND" \
+  --output-json-joint "$OUTPUT_JSON_JOINT"
 
 date
