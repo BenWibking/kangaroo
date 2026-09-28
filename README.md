@@ -208,3 +208,30 @@ In distributed runs, each locality writes its own trace file (for example
   - compatibility and low-level Python API: `analysis/`
   - runtime/bindings: `cpp/`
 - Additional design context: `PLAN.md` and `TRACKED_GAPS.md`.
+
+### Short batch commands
+
+The `scripts/kangaroo` helper submits existing batch analyses and places their
+outputs and Slurm logs in `results/<campaign>/<plotfile>/<analysis>/`.
+With `~/.local/bin/kangaroo` forwarding to this helper, run:
+
+```bash
+export KANGAROO_CAMPAIGN=noCGM_0.1uG_Phase0
+kangaroo toomre-q /path/to/plt000100
+kangaroo enclosed-sfr /path/to/plt000100 -- --time=01:00:00
+kangaroo cylindrical-flux /path/to/plt000100 --dry-run
+kangaroo jobs
+```
+
+Alternatively, supply `--campaign NAME` on each invocation. Run
+`kangaroo --help` for available commands. Relative input paths are resolved
+before submission; jobs run from the repository root. Existing batch environment
+variables still control scientific settings, while this helper sets output paths.
+Existing overwrite behavior is unchanged. The projection command currently uses
+the stellar yz-map settings from `batch/make_projection.submit`. This helper
+submits jobs only; the existing Python plotting scripts remain available directly.
+
+`kangaroo jobs` lists your pending and running Kangaroo jobs, including job ID,
+name, state, elapsed time, node count, and assigned nodes or pending reason.
+It recognizes `kangaroo-*` job names and the existing Kangaroo batch script
+paths, including projection jobs submitted under the older `quokka` name.

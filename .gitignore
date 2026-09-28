@@ -17,3 +17,4 @@ docs/book/
 # Virtual environments
 .venv
 .pixi/
+/results/
