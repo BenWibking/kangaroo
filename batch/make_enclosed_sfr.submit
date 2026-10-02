@@ -1,11 +1,11 @@
 #!/bin/bash
-#SBATCH -t 00:30:00
+#SBATCH -t 00:20:00
 #SBATCH -A ast236
 #SBATCH -N 1
 #SBATCH -p batch
 #SBATCH -J kangaroo-enclosed-sfr
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=128
+#SBATCH --cpus-per-task=32
 
 set -euo pipefail
 

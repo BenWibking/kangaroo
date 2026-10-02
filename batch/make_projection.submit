@@ -7,7 +7,14 @@
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=32
 
+set -euo pipefail
+
 module load gcc/14.2.0
+
+# Batch shells may not inherit the submitting shell's PATH.
+if ! command -v spack >/dev/null 2>&1; then
+  export PATH="${HOME}/spack/bin:${PATH}"
+fi
 
 if [[ $# -ne 1 ]]; then
   echo "Usage: sbatch $0 PLOTFILE" >&2
@@ -16,8 +23,9 @@ fi
 PLOTFILE=$1
 : "${OUTPUT_PNG:=p2_stellar_projection_yz_plane.png}"
 
-export SPACK_HPX_PREFIX="$(spack location -i 'hpx@1.11.0 networking=mpi %gcc@14.2.0')"
-export SPACK_MPI_PREFIX="$(spack location -i 'openmpi%gcc@14.2.0')"
+SPACK_HPX_PREFIX="$(spack location -i 'hpx@1.11.0 networking=mpi %gcc@14.2.0')"
+SPACK_MPI_PREFIX="$(spack location -i 'openmpi%gcc@14.2.0')"
+export SPACK_HPX_PREFIX SPACK_MPI_PREFIX
 export LD_LIBRARY_PATH="$SPACK_HPX_PREFIX/lib64:$SPACK_HPX_PREFIX/lib:$SPACK_MPI_PREFIX/lib64:$SPACK_MPI_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
 date
