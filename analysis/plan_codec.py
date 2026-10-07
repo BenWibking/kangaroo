@@ -153,7 +153,9 @@ def _params(value: model_params.KernelParams) -> tuple[int, Any]:
         )
     if isinstance(value, p.CylindricalFluxParams):
         return KernelParams.KernelParams.CylindricalFluxParams, CylindricalFluxParams.CylindricalFluxParamsT(
-            value.radius, list(value.heights), list(value.height_indices), list(value.temperature_bins), value.num_heights, value.gamma
+            list(value.radii), list(value.radius_indices), list(value.heights),
+            list(value.height_indices), value.num_radii,
+            list(value.temperature_bins), value.num_heights, value.gamma
         )
     if isinstance(value, p.ToomreProfileParams):
         return KernelParams.KernelParams.ToomreProfileParams, ToomreProfileParams.ToomreProfileParamsT(

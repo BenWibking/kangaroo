@@ -116,11 +116,15 @@ class CylindricalFluxSurfaceIntegralResult:
     """Materialized cylindrical flux components and geometric coordinates."""
 
     values: np.ndarray
-    radius: float
+    radii: tuple[float, ...]
     heights: tuple[float, ...]
     geometric_sections: tuple[str, ...]
     components: tuple[str, ...]
     temperature_bins: tuple[float, ...] | None = None
+
+    @property
+    def radius(self) -> float:
+        return self.radii[0]
 
 
 @dataclass(frozen=True)

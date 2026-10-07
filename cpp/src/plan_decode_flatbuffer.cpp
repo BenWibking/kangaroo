@@ -223,9 +223,11 @@ KernelParamsIR decode_params(const fb::KernelParamsUnion &input) {
   case fb::KernelParams::CylindricalFluxParams: {
     const auto &p = *input.AsCylindricalFluxParams();
     CylindricalFluxParams out;
-    out.radius = p.radius;
+    out.radii = p.radii;
+    out.radius_indices = p.radius_indices;
     out.heights = p.heights;
     out.height_indices = p.height_indices;
+    out.num_radii = static_cast<std::size_t>(p.num_radii);
     out.temperature_bins = p.temperature_bins;
     out.num_heights = static_cast<std::size_t>(p.num_heights);
     out.gamma = p.gamma;

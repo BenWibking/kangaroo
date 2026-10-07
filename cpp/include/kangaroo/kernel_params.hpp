@@ -75,15 +75,17 @@ struct FluxSurfaceParams {
 };
 
 struct CylindricalFluxParams {
-  double radius = 0.0;
+  std::vector<double> radii;
+  std::vector<int32_t> radius_indices;
   std::vector<double> heights;
   std::vector<int32_t> height_indices;
+  std::size_t num_radii = 0;
   std::vector<double> temperature_bins;
   std::size_t num_heights = 0;
   double gamma = 5.0 / 3.0;
   std::shared_ptr<const CoveredBoxListIR> covered_boxes;
-  KANGAROO_SERIALIZE_FIELDS(radius & heights & height_indices &
-                            temperature_bins & num_heights & gamma)
+  KANGAROO_SERIALIZE_FIELDS(radii & radius_indices & heights & height_indices &
+                            num_radii & temperature_bins & num_heights & gamma)
 };
 
 struct ToomreProfileParams {

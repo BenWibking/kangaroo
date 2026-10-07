@@ -51,9 +51,11 @@ class FluxSurfaceParams:
 
 @dataclass(frozen=True)
 class CylindricalFluxParams:
-    radius: float = 0.0
+    radii: tuple[float, ...] = ()
+    radius_indices: tuple[int, ...] = ()
     heights: tuple[float, ...] = ()
     height_indices: tuple[int, ...] = ()
+    num_radii: int = 0
     temperature_bins: tuple[float, ...] = ()
     num_heights: int = 0
     gamma: float = 5.0 / 3.0

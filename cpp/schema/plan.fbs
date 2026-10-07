@@ -95,9 +95,11 @@ table FluxSurfaceParams {
   gamma:double = 1.6666666666666667;
 }
 table CylindricalFluxParams {
-  radius:double;
+  radii:[double];
+  radius_indices:[int];
   heights:[double];
   height_indices:[int];
+  num_radii:ulong;
   temperature_bins:[double];
   num_heights:ulong;
   gamma:double = 1.6666666666666667;

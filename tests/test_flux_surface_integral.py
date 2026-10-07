@@ -356,12 +356,93 @@ def test_cylindrical_flux_surface_integral_lowering_accepts_height_array() -> No
         if tmpl.kernel == "cylindrical_flux_surface_integral_accumulate"
     ]
     assert len(accum) == 1
-    assert accum[0].params.radius == 0.5
+    assert accum[0].params.radii == (0.5,)
+    assert accum[0].params.radius_indices == (0,)
     assert accum[0].params.heights == (0.5, 1.5)
     assert _output_bytes(accum[0]) == 512
     reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
     assert reducers
     assert all(_output_bytes(tmpl) == 512 for tmpl in reducers)
+
+
+def test_cylindrical_flux_surface_integral_lowering_accepts_radius_array() -> None:
+    rt = _FakeRuntime()
+    runmeta = _RunMeta(
+        steps=[
+            _Step(
+                step=0,
+                levels=[
+                    _Level(
+                        geom=_Geom(
+                            dx=(1.0, 1.0, 1.0),
+                            x0=(0.0, -0.5, -0.5),
+                            index_origin=(0, 0, 0),
+                        ),
+                        boxes=[_Box((0, 0, 0), (1, 0, 0))],
+                    )
+                ],
+            )
+        ]
+    )
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=_FakeDataset(rt))
+
+    flux = pipe.cylindrical_flux_surface_integral(
+        1,
+        momentum=(2, 3, 4),
+        energy=5,
+        passive_scalar=6,
+        magnetic_field=(7, 8, 9),
+        radius=np.array([0.5, 1.5]),
+        height=0.5,
+        out="flux",
+    )
+    plan = pipe.plan()
+
+    assert flux.radii == (0.5, 1.5)
+    assert flux.heights == (0.5,)
+    accum = [
+        tmpl
+        for stage in plan.stages
+        for tmpl in stage.templates
+        if tmpl.kernel == "cylindrical_flux_surface_integral_accumulate"
+    ]
+    assert len(accum) == 1
+    assert accum[0].params.radii == (0.5, 1.5)
+    assert accum[0].params.radius_indices == (0, 1)
+    assert _output_bytes(accum[0]) == 512
+
+
+def test_cylindrical_flux_surface_integral_rejects_two_dimensional_scan() -> None:
+    rt = _FakeRuntime()
+    runmeta = _RunMeta(
+        steps=[
+            _Step(
+                step=0,
+                levels=[
+                    _Level(
+                        geom=_Geom(
+                            dx=(1.0, 1.0, 1.0),
+                            x0=(0.0, -0.5, -0.5),
+                            index_origin=(0, 0, 0),
+                        ),
+                        boxes=[_Box((0, 0, 0), (1, 0, 0))],
+                    )
+                ],
+            )
+        ]
+    )
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=_FakeDataset(rt))
+
+    with pytest.raises(ValueError, match="cannot both contain multiple"):
+        pipe.cylindrical_flux_surface_integral(
+            1,
+            momentum=(2, 3, 4),
+            energy=5,
+            passive_scalar=6,
+            magnetic_field=(7, 8, 9),
+            radius=[0.5, 1.5],
+            height=[0.5, 1.5],
+        )
 
 
 def test_flux_surface_integral_rejects_temperature_bins_without_temperature_field() -> None:
@@ -737,6 +818,75 @@ def test_cylindrical_flux_surface_integral_runtime_outputs_endcaps_and_walls() -
     expected[1, 0, :4] = np.array([4.0, 199.0 / 3.0, 199.0 / 3.0, 10.0])
     expected *= np.pi / 8.0  # cap footprint is a half disk of radius 0.5
     assert np.allclose(raw, expected)
+
+
+def test_cylindrical_flux_surface_integral_runtime_radius_array_matches_scalars() -> None:
+    rt = Runtime()
+    step = 20
+    levels = [
+        LevelMeta(
+            geom=LevelGeom(
+                dx=(1.0, 1.0, 1.0),
+                x0=(0.0, -0.5, -0.5),
+                ref_ratio=1,
+            ),
+            boxes=[BlockBox((0, 0, 0), (0, 0, 0))],
+        )
+    ]
+    runmeta = _runmeta_with_step_index(step, levels)
+    ds = open_dataset(
+        "memory://cylflux-radius-array",
+        runmeta=runmeta,
+        step=step,
+        level=0,
+        runtime=rt,
+    )
+    for fid in range(1, 10):
+        ds.register_field(f"f{fid}", fid)
+    for fid, values in _one_cell_state(
+        rho=2.0, momx=6.0, energy=21.5, scalar=5.0, bz=1.0
+    ).items():
+        _set_block_double(
+            ds, step=step, level=0, field=fid, block=0, values=values
+        )
+
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    common = dict(
+        momentum=(2, 3, 4),
+        energy=5,
+        passive_scalar=6,
+        magnetic_field=(7, 8, 9),
+        height=0.25,
+    )
+    vectorized = pipe.cylindrical_flux_surface_integral(
+        1, radius=[0.25, 0.5], out="vectorized", **common
+    )
+    scalar_small = pipe.cylindrical_flux_surface_integral(
+        1, radius=0.25, out="scalar_small", **common
+    )
+    scalar_large = pipe.cylindrical_flux_surface_integral(
+        1, radius=0.5, out="scalar_large", **common
+    )
+    pipe.run()
+
+    vectorized_values = rt.get_task_chunk_array(
+        step=step,
+        level=0,
+        field=vectorized.field,
+        block=0,
+        dtype=np.float64,
+        dataset=ds,
+    ).reshape(2, 2, 2, 8)
+    for radius_idx, scalar in enumerate((scalar_small, scalar_large)):
+        scalar_values = rt.get_task_chunk_array(
+            step=step,
+            level=0,
+            field=scalar.field,
+            block=0,
+            dtype=np.float64,
+            dataset=ds,
+        ).reshape(2, 2, 8)
+        np.testing.assert_allclose(vectorized_values[radius_idx], scalar_values)
 
 
 def test_flux_surface_integral_runtime_radius_array() -> None:

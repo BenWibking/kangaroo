@@ -1531,7 +1531,7 @@ class CylindricalFluxSurfaceIntegral(LazyValue):
         ).copy()
         return CylindricalFluxSurfaceIntegralResult(
             values,
-            self._handle.radius,
+            getattr(self._handle, "radii", (self._handle.radius,)),
             self._handle.heights,
             self._handle.geometric_sections,
             self._handle.components,

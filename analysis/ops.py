@@ -1439,7 +1439,7 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
         energy: int,
         passive_scalar: int,
         magnetic_field: tuple[int, int, int],
-        radius: float,
+        radius: float | Sequence[float],
         height: float | Sequence[float],
         temperature: int | None = None,
         temperature_bins: Sequence[float] | None = None,
@@ -1460,10 +1460,11 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
             gamma=gamma,
             reduce_fan_in=reduce_fan_in,
         )
-        self.radius = self.radii[0]
-        if len(self.radii) != 1:
-            raise ValueError("radius must be a single fixed value")
         self.heights = self._coerce_heights(height)
+
+    @property
+    def radius(self) -> float:
+        return self.radii[0]
 
     def _coerce_heights(self, height: float | Sequence[float]) -> tuple[float, ...]:
         if isinstance(height, (str, bytes)):
@@ -1519,6 +1520,8 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
             raise ValueError("height values must be finite and positive")
         if any(not math.isfinite(radius) or radius <= 0.0 for radius in self.radii):
             raise ValueError("radius values must be finite and positive")
+        if len(self.radii) > 1 and len(self.heights) > 1:
+            raise ValueError("radius and height cannot both contain multiple values")
         if self.temperature_bins is not None:
             if self.temperature is None:
                 raise ValueError("temperature must be provided when temperature_bins are set")
@@ -1552,9 +1555,10 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
             len(self.temperature_bins) - 1 if self.temperature_bins is not None else 1
         )
         num_geometric_sections = 2
+        num_surfaces = max(len(self.radii), len(self.heights))
         out_shape_parts: list[int] = []
-        if len(self.heights) > 1:
-            out_shape_parts.append(len(self.heights))
+        if num_surfaces > 1:
+            out_shape_parts.append(num_surfaces)
         out_shape_parts.append(2)
         if num_temperature_bins > 1:
             out_shape_parts.append(num_temperature_bins)
@@ -1563,7 +1567,7 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
         else:
             out_shape_parts.append(num_geometric_sections * 8)
         out_shape = tuple(out_shape_parts)
-        radius2 = self.radius * self.radius
+        radius_intersects = [False] * len(self.radii)
         height_intersects = [False] * len(self.heights)
 
         flux_fields: list[ReducedField] = []
@@ -1573,31 +1577,45 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
 
         for level_idx in range(len(levels) - 1, -1, -1):
             level_meta = levels[level_idx]
-            block_height_indices: list[tuple[int, list[int]]] = []
+            block_surface_indices: list[tuple[int, list[int]]] = []
             for block_idx, block in enumerate(level_meta.boxes):
                 lo2, hi2, z_abs_min, z_abs_max = self._block_cylinder_bounds(level_meta, block)
-                if lo2 > radius2:
-                    continue
-                active_height_indices: list[int] = []
-                for height_idx, height in enumerate(self.heights):
-                    wall_intersects = radius2 <= hi2 and z_abs_min <= height
-                    cap_intersects = z_abs_min <= height <= z_abs_max
+                active_surface_indices: list[int] = []
+                for surface_idx in range(num_surfaces):
+                    radius_idx = surface_idx if len(self.radii) > 1 else 0
+                    height_idx = surface_idx if len(self.heights) > 1 else 0
+                    radius2 = self.radii[radius_idx] * self.radii[radius_idx]
+                    height = self.heights[height_idx]
+                    wall_intersects = lo2 <= radius2 <= hi2 and z_abs_min <= height
+                    cap_intersects = lo2 <= radius2 and z_abs_min <= height <= z_abs_max
                     if wall_intersects or cap_intersects:
+                        radius_intersects[radius_idx] = True
                         height_intersects[height_idx] = True
-                        active_height_indices.append(height_idx)
-                if active_height_indices:
-                    block_height_indices.append((block_idx, active_height_indices))
-            if not block_height_indices:
+                        active_surface_indices.append(surface_idx)
+                if active_surface_indices:
+                    block_surface_indices.append((block_idx, active_surface_indices))
+            if not block_surface_indices:
                 continue
-            blocks = [block_idx for block_idx, _ in block_height_indices]
+            blocks = [block_idx for block_idx, _ in block_surface_indices]
 
             covered_boxes = covered_volume_boxes(levels, level=level_idx)
             covered_payload = _covered_boxes_payload(covered_boxes)
             flux_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 
-            for block, active_height_indices in block_height_indices:
+            for block, active_surface_indices in block_surface_indices:
                 dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
-                active_heights = [self.heights[idx] for idx in active_height_indices]
+                active_radii = [
+                    self.radii[idx] for idx in active_surface_indices
+                ] if len(self.radii) > 1 else [self.radii[0]]
+                active_radius_indices = (
+                    active_surface_indices if len(self.radii) > 1 else [0]
+                )
+                active_heights = [
+                    self.heights[idx] for idx in active_surface_indices
+                ] if len(self.heights) > 1 else [self.heights[0]]
+                active_height_indices = (
+                    active_surface_indices if len(self.heights) > 1 else [0]
+                )
                 accumulate_stage.map_blocks(
                     name=f"cylindrical_flux_surface_integral_b{block}",
                     kernel="cylindrical_flux_surface_integral_accumulate",
@@ -1606,9 +1624,11 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
                     outputs=[_fixed_f64_shape(flux_field, out_shape)],
                     deps=DependencyRule(),
                     params=CylindricalFluxParams(
-                        radius=self.radius,
+                        radii=tuple(active_radii),
+                        radius_indices=tuple(active_radius_indices),
                         heights=tuple(active_heights),
                         height_indices=tuple(active_height_indices),
+                        num_radii=len(self.radii),
                         num_heights=len(self.heights),
                         temperature_bins=tuple(self.temperature_bins or ()),
                         gamma=self.gamma,
@@ -1640,11 +1660,14 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
             )
 
         if not flux_fields:
-            if len(self.heights) > 1:
-                raise ValueError(
-                    f"height values do not intersect any mesh block: {list(self.heights)}"
-                )
             raise ValueError("cylindrical surface does not intersect any mesh block")
+        if not all(radius_intersects):
+            missing = [
+                radius
+                for radius, intersects in zip(self.radii, radius_intersects)
+                if not intersects
+            ]
+            raise ValueError(f"radius values do not intersect any mesh block: {missing}")
         if not all(height_intersects):
             missing = [
                 height

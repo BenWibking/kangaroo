@@ -173,7 +173,7 @@ class FluxSurfaceIntegralHandle:
 @dataclass(frozen=True)
 class CylindricalFluxSurfaceIntegralHandle:
     fluxes: FieldHandle
-    radius: float
+    radii: tuple[float, ...]
     heights: tuple[float, ...] = ()
     temperature_bins: tuple[float, ...] | None = None
     geometric_sections: tuple[str, ...] = ("endcaps", "walls")
@@ -204,6 +204,10 @@ class CylindricalFluxSurfaceIntegralHandle:
     def name(self) -> str | None:
         return self.fluxes.name
 
+    @property
+    def radius(self) -> float:
+        return self.radii[0]
+
     def compute(self) -> Any:
         """Execute and return a typed cylindrical flux result."""
 
@@ -211,7 +215,7 @@ class CylindricalFluxSurfaceIntegralHandle:
 
         return CylindricalFluxSurfaceIntegralResult(
             np.asarray(self.fluxes.compute()),
-            self.radius,
+            self.radii,
             self.heights,
             self.geometric_sections,
             self.components,
@@ -1176,7 +1180,7 @@ class Pipeline:
         energy: int | FieldHandle,
         passive_scalar: int | FieldHandle,
         magnetic_field: tuple[int | FieldHandle, int | FieldHandle, int | FieldHandle],
-        radius: float,
+        radius: float | Sequence[float],
         height: float | Sequence[float],
         temperature: int | FieldHandle | None = None,
         temperature_bins: Sequence[float] | None = None,
@@ -1210,7 +1214,7 @@ class Pipeline:
         out_field = self._sink_fields(fragment)[-1]
         return CylindricalFluxSurfaceIntegralHandle(
             FieldHandle(self, out_field, out_name),
-            radius=op.radius,
+            radii=op.radii,
             heights=op.heights,
             temperature_bins=op.temperature_bins,
         )
