@@ -220,6 +220,7 @@ export KANGAROO_CAMPAIGN=noCGM_0.1uG_Phase0
 kangaroo toomre-q /path/to/plt000100
 kangaroo enclosed-sfr /path/to/plt000100 -- --time=01:00:00
 kangaroo cylindrical-flux /path/to/plt000100 --dry-run
+kangaroo plot-cylindrical-flux plt000100
 kangaroo jobs
 ```
 
@@ -228,8 +229,26 @@ Alternatively, supply `--campaign NAME` on each invocation. Run
 before submission; jobs run from the repository root. Existing batch environment
 variables still control scientific settings, while this helper sets output paths.
 Existing overwrite behavior is unchanged. The projection command currently uses
-the stellar yz-map settings from `batch/make_projection.submit`. This helper
-submits jobs only; the existing Python plotting scripts remain available directly.
+the stellar yz-map settings from `batch/make_projection.submit`. A copied launcher
+discovers the checkout from the current Git worktree or `~/kangaroo`; set
+`KANGAROO_REPO_ROOT` when the checkout lives elsewhere.
+
+After the corresponding jobs finish, `plot-cylindrical-flux`,
+`plot-cylindrical-radial-flux`, `plot-spherical-flux`,
+`plot-radial-flux-to-sfr`, and `plot-wind-disk-angular-momentum-flux` run the
+applicable existing plotting scripts. They accept either the original plotfile
+directory or just its basename and locate the inputs under
+`$PWD/results/<campaign>/`.
+Single-analysis plots are written beside their JSON; the wind/disk comparison is
+written in the plotfile's result directory. For example:
+
+```bash
+kangaroo plot-cylindrical-flux plt000100
+kangaroo plot-cylindrical-radial-flux /path/to/plt000100
+kangaroo plot-spherical-flux plt000100 --campaign noCGM_0.1uG_Phase0
+kangaroo plot-radial-flux-to-sfr plt000100
+kangaroo plot-wind-disk-angular-momentum-flux plt000100
+```
 
 `kangaroo jobs` lists your pending and running Kangaroo jobs, including job ID,
 name, state, elapsed time, node count, and assigned nodes or pending reason.

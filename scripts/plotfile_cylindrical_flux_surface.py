@@ -414,55 +414,62 @@ def main() -> int:
             if temperature_bins is not None
             else None
         )
-        fluxes = [
-            pipe.cylindrical_flux_surface_integral(
-                density,
-                momentum=momentum,
-                energy=energy,
-                passive_scalar=passive_scalar,
-                magnetic_field=magnetic_field,
-                radius=float(radius),
-                height=heights,
-                temperature=temperature,
-                temperature_bins=temperature_bins,
-                gamma=float(a.gamma),
-                out=f"cylindrical_flux_surface_integral_r{radius_idx}",
-            )
-            for radius_idx, radius in enumerate(radii)
-        ]
+        flux = pipe.cylindrical_flux_surface_integral(
+            density,
+            momentum=momentum,
+            energy=energy,
+            passive_scalar=passive_scalar,
+            magnetic_field=magnetic_field,
+            radius=radii,
+            height=heights,
+            temperature=temperature,
+            temperature_bins=temperature_bins,
+            gamma=float(a.gamma),
+            out="cylindrical_flux_surface_integral",
+        )
         pipe.run(progress_bar=bool(a.progress))
 
+        scan_count = max(len(radii), len(heights))
         value_shape = (
             (
-                len(heights),
+                scan_count,
                 2,
                 len(temperature_bins) - 1,
                 len(GEOMETRIC_SECTIONS),
                 len(COMPONENTS),
             )
             if temperature_bins is not None
-            else (len(heights), 2, len(GEOMETRIC_SECTIONS), len(COMPONENTS))
+            else (scan_count, 2, len(GEOMETRIC_SECTIONS), len(COMPONENTS))
         )
-        rows_and_derived = []
-        for flux in fluxes:
-            values = rt.get_task_chunk_array(
-                step=0,
-                level=0,
-                field=flux.field,
-                version=0,
-                block=0,
-                dtype=np.float64,
-                dataset=ds,
-            )
-            values = values.reshape(value_shape)
-            rows_and_derived.append(
+        values = rt.get_task_chunk_array(
+            step=0,
+            level=0,
+            field=flux.field,
+            version=0,
+            block=0,
+            dtype=np.float64,
+            dataset=ds,
+        )
+        values = values.reshape(value_shape)
+        if len(radii) > 1:
+            rows_and_derived = [
+                _flux_rows_and_derived(
+                    heights,
+                    values[radius_idx : radius_idx + 1],
+                    pc_cm=pc_cm,
+                    temperature_bins=temperature_bins,
+                )
+                for radius_idx in range(len(radii))
+            ]
+        else:
+            rows_and_derived = [
                 _flux_rows_and_derived(
                     heights,
                     values,
                     pc_cm=pc_cm,
                     temperature_bins=temperature_bins,
                 )
-            )
+            ]
 
         flux_rows, first_derived = rows_and_derived[0]
         flux_rows_by_radius = []

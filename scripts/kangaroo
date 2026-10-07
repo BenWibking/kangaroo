@@ -1,30 +1,75 @@
 #!/usr/bin/env bash
 # Repository entry point; ~/.local/bin/kangaroo forwards here.
 set -euo pipefail
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+SCRIPT_PATH=${BASH_SOURCE[0]}
+while [[ -L "$SCRIPT_PATH" ]]; do
+  script_dir=$(cd -P "$(dirname "$SCRIPT_PATH")" && pwd)
+  SCRIPT_PATH=$(readlink "$SCRIPT_PATH")
+  [[ "$SCRIPT_PATH" == /* ]] || SCRIPT_PATH="$script_dir/$SCRIPT_PATH"
+done
+script_root=$(cd -P "$(dirname "$SCRIPT_PATH")/.." && pwd)
+if [[ -n "${KANGAROO_REPO_ROOT:-}" ]]; then
+  REPO_ROOT=$(cd -P "$KANGAROO_REPO_ROOT" && pwd)
+elif [[ -f "$script_root/pixi.toml" && -d "$script_root/batch" ]]; then
+  REPO_ROOT=$script_root
+elif git_root=$(git -C "$PWD" rev-parse --show-toplevel 2>/dev/null) && \
+    [[ -f "$git_root/scripts/kangaroo" && -d "$git_root/batch" ]]; then
+  REPO_ROOT=$(cd -P "$git_root" && pwd)
+elif [[ -f "$HOME/kangaroo/scripts/kangaroo" && -d "$HOME/kangaroo/batch" ]]; then
+  REPO_ROOT=$(cd -P "$HOME/kangaroo" && pwd)
+else
+  echo "kangaroo: cannot locate the Kangaroo checkout; set KANGAROO_REPO_ROOT" >&2
+  exit 2
+fi
 usage() {
   cat <<'HELP'
 Usage: kangaroo jobs
        kangaroo COMMAND PLOTFILE [--campaign NAME] [--dry-run] [-- SBATCH_OPTIONS...]
+       kangaroo PLOT_COMMAND PLOTFILE [--campaign NAME]
 
 List your pending/running Kangaroo jobs with "kangaroo jobs", or submit an
 existing analysis batch job from this checkout.
 Commands: toomre-q, enclosed-sfr, cylindrical-flux, cylindrical-radial-flux,
           spherical-flux, projection
+Plot commands: plot-cylindrical-flux, plot-cylindrical-radial-flux,
+               plot-spherical-flux, plot-radial-flux-to-sfr,
+               plot-wind-disk-angular-momentum-flux
 
 Outputs: results/CAMPAIGN/PLOTFILE/ANALYSIS/
 Set KANGAROO_CAMPAIGN to omit --campaign. Existing batch environment settings
 (e.g. R_MAX_KPC, DISK_HEIGHT_KPC) still apply. Output locations are managed here.
 Projection currently uses the stellar yz-map settings in make_projection.submit.
+Plot commands accept either a plotfile directory or its basename and write PNGs
+beside the corresponding JSON output.
 
 Examples:
   export KANGAROO_CAMPAIGN=noCGM_0.1uG_Phase0
   kangaroo toomre-q /path/to/plt000100
   kangaroo enclosed-sfr /path/to/plt000100 -- --time=01:00:00
   kangaroo cylindrical-flux /path/to/plt000100 --dry-run
+  kangaroo plot-cylindrical-flux plt000100
+  kangaroo plot-radial-flux-to-sfr plt000100
 HELP
 }
 fail() { echo "kangaroo: $*" >&2; exit 2; }
+parse_campaign() {
+  campaign=${KANGAROO_CAMPAIGN:-}
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --campaign)
+        [[ $# -ge 2 ]] || fail '--campaign requires a name'
+        campaign=$2; shift 2 ;;
+      --campaign=*) campaign=${1#*=}; shift ;;
+      *) fail "unknown option '$1'" ;;
+    esac
+  done
+  [[ "$campaign" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || fail 'set --campaign or KANGAROO_CAMPAIGN to a name using letters, digits, dots, underscores, and hyphens'
+}
+run_plot() {
+  local script=$1
+  shift
+  "$REPO_ROOT/.pixi/envs/default/bin/python" "$REPO_ROOT/scripts/$script" "$@"
+}
 if [[ $# -eq 0 || "$1" == --help || "$1" == -h ]]; then usage; exit 0; fi
 command_name=$1
 shift
@@ -46,6 +91,73 @@ case "$command_name" in
       }
       END { if (!count) print "No pending or running Kangaroo jobs." }
     ' <<< "$queue"
+    exit 0 ;;
+  plot-cylindrical-flux|plot-cylindrical-radial-flux|plot-spherical-flux|plot-radial-flux-to-sfr|plot-wind-disk-angular-momentum-flux)
+    [[ $# -gt 0 ]] || fail 'a plotfile directory or basename is required'
+    plotfile_name=$(basename "$1")
+    [[ "$plotfile_name" == "$1" || -d "$1" ]] || fail "plotfile directory does not exist: $1"
+    shift
+    parse_campaign "$@"
+    plotfile_results="$PWD/results/$campaign/$plotfile_name"
+    [[ -d "$plotfile_results" ]] || fail "result directory does not exist: $plotfile_results"
+    [[ -x "$REPO_ROOT/.pixi/envs/default/bin/python" ]] || fail 'default Pixi environment is missing; run pixi install'
+    case "$command_name" in
+      plot-cylindrical-flux)
+        output_dir="$plotfile_results/cylindrical_flux"
+        [[ -d "$output_dir" ]] || fail "result directory does not exist: $output_dir"
+        cd "$output_dir"
+        input=cylindrical_flux_surface.json
+        [[ -f "$input" ]] || fail "batch output does not exist: $output_dir/$input"
+        run_plot plot_cylindrical_flux_surface_mass_flux.py "$input" -o mass_flux_vs_height.png
+        run_plot plot_cylindrical_flux_surface_energy_flux.py "$input" -o energy_flux_vs_height.png
+        run_plot plot_cylindrical_flux_surface_passive_scalar_flux.py "$input" -o passive_scalar_flux_vs_height.png
+        run_plot plot_cylindrical_flux_surface_angular_momentum_flux.py "$input" -o angular_momentum_flux_vs_height.png
+        ;;
+      plot-cylindrical-radial-flux)
+        output_dir="$plotfile_results/cylindrical_radial_flux"
+        [[ -d "$output_dir" ]] || fail "result directory does not exist: $output_dir"
+        cd "$output_dir"
+        input=cylindrical_radial_flux.json
+        [[ -f "$input" ]] || fail "batch output does not exist: $output_dir/$input"
+        run_plot plot_cylindrical_flux_surface_angular_momentum_flux.py "$input" \
+          --x-axis radius -o angular_momentum_flux_vs_radius.png
+        ;;
+      plot-spherical-flux)
+        output_dir="$plotfile_results/spherical_flux"
+        [[ -d "$output_dir" ]] || fail "result directory does not exist: $output_dir"
+        cd "$output_dir"
+        input=flux_surface.json
+        [[ -f "$input" ]] || fail "batch output does not exist: $output_dir/$input"
+        run_plot plot_flux_surface_mass_flux.py "$input" -o mass_flux_vs_radius.png
+        run_plot plot_flux_surface_energy_flux.py "$input" -o energy_flux_vs_radius.png
+        run_plot plot_flux_surface_passive_scalar_flux.py "$input" -o passive_scalar_flux_vs_radius.png
+        ;;
+      plot-radial-flux-to-sfr)
+        flux_input="$plotfile_results/cylindrical_radial_flux/cylindrical_radial_flux.json"
+        sfr_input="$plotfile_results/enclosed_sfr/enclosed_sfr_disk.json"
+        [[ -f "$flux_input" ]] || fail "batch output does not exist: $flux_input"
+        [[ -f "$sfr_input" ]] || fail "batch output does not exist: $sfr_input"
+        cd "$plotfile_results/cylindrical_radial_flux"
+        run_plot plot_cylindrical_radial_mass_flux_to_sfr.py \
+          --flux-input "$flux_input" --sfr-input "$sfr_input" \
+          -o radial_mass_flux_to_sfr.png
+        ;;
+      plot-wind-disk-angular-momentum-flux)
+        wind_input="$plotfile_results/cylindrical_flux/cylindrical_flux_surface.json"
+        disk_input="$plotfile_results/cylindrical_radial_flux/cylindrical_radial_flux.json"
+        wind_sfr_input="$plotfile_results/enclosed_sfr/enclosed_sfr_wind.json"
+        disk_sfr_input="$plotfile_results/enclosed_sfr/enclosed_sfr_disk.json"
+        omega_input="$plotfile_results/toomre_q/${plotfile_name}_toomre_q.csv"
+        for input in "$wind_input" "$disk_input" "$wind_sfr_input" "$disk_sfr_input" "$omega_input"; do
+          [[ -f "$input" ]] || fail "batch output does not exist: $input"
+        done
+        cd "$plotfile_results"
+        run_plot plot_cylindrical_wind_disk_angular_momentum_flux.py \
+          --wind-input "$wind_input" --disk-input "$disk_input" \
+          --wind-sfr-input "$wind_sfr_input" --disk-sfr-input "$disk_sfr_input" \
+          --disk-omega-csv "$omega_input" -o angular_momentum_flux_wind_vs_disk.png
+        ;;
+    esac
     exit 0 ;;
   toomre-q|enclosed-sfr|cylindrical-flux|cylindrical-radial-flux|spherical-flux|projection)
     analysis_name=${command_name//-/_} ;;
