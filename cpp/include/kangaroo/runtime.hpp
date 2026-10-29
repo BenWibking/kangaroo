@@ -220,6 +220,9 @@ bool execution_context_may_produce_chunk(int32_t run_id, const ChunkRef& ref);
 void erase_execution_context(int32_t run_id);
 const RunMeta& current_runmeta();
 const DatasetHandle& current_dataset();
+// The run whose kernel is executing on this thread (ScopedExecutionContext),
+// for a kernel that needs the run's own data service; 0 outside a kernel.
+int32_t current_execution_context_id();
 
 void set_global_kernel_registry(KernelRegistry* registry);
 KernelRegistry& global_kernels();

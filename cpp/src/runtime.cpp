@@ -1398,6 +1398,8 @@ ScopedExecutionContext::~ScopedExecutionContext() {
   g_current_execution_context_id = previous_run_id_;
 }
 
+int32_t current_execution_context_id() { return g_current_execution_context_id; }
+
 const RunMeta& current_runmeta() {
   if (g_current_execution_context_id != 0) {
     return execution_context(g_current_execution_context_id).meta;

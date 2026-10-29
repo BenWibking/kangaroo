@@ -746,10 +746,14 @@ hpx::future<void> run_block_task_impl(const TaskTemplateIR& tmpl,
                    outputs_ptr = std::move(outputs_ptr),
                    log_enabled,
                    base_event,
-                   kernel_event](auto&&) mutable {
+                   kernel_event](auto&& kernel_done) mutable {
               if (log_enabled) {
                 end_span(kernel_event);
               }
+              // Rethrow a failed kernel. Ignoring the future published the
+              // failed task's outputs as if it had succeeded, which is how
+              // every halo fetch could fail without anyone seeing it.
+              kernel_done.get();
               TaskEvent put_outputs_event;
               if (log_enabled) {
                 put_outputs_event = start_span(base_event, "put_outputs");
@@ -1009,10 +1013,14 @@ hpx::future<void> run_graph_task_impl(const TaskTemplateIR& tmpl,
                    outputs_ptr = std::move(outputs_ptr),
                    log_enabled,
                    base_event,
-                   kernel_event](auto&&) mutable {
+                   kernel_event](auto&& kernel_done) mutable {
               if (log_enabled) {
                 end_span(kernel_event);
               }
+              // Rethrow a failed kernel. Ignoring the future published the
+              // failed task's outputs as if it had succeeded, which is how
+              // every halo fetch could fail without anyone seeing it.
+              kernel_done.get();
               TaskEvent put_outputs_event;
               if (log_enabled) {
                 put_outputs_event = start_span(base_event, "put_outputs");
