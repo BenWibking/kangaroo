@@ -6,8 +6,309 @@
 #include "projection_kernel_support.hpp"
 
 #include "kangaroo/runtime.hpp"
+#include <span>
+#include <limits>
+#include <cmath>
+#include <array>
+#include <algorithm>
 
 namespace kangaroo {
+
+namespace {
+
+// Conservative cloud-in-cell deposition on the AMR hierarchy as a whole.
+//
+// A block's task used to deposit into an array of its own cells only, so
+// CIC weight that landed in a neighboring block, in a cell a finer level
+// covers, or outside the domain was dropped: mass was lost at block,
+// coarse-fine and domain boundaries. Here each share is resolved against
+// every level's boxes before it is projected:
+//
+// - a cell held by any grid of its level receives the share there;
+// - a cell a finer level covers shares it among the finer cells under it, in
+//   proportion to their image-plane area, in the fine layer along the line of
+//   sight that holds the particle, recursing where those are covered;
+// - a cell no grid of its level holds passes it to the coarser cell that
+//   contains it;
+// - periodic axes wrap; on the others, a share leaving the domain is folded
+//   back into the boundary cell.
+//
+// The receiving cell's footprint is then spread over the image's pixels by
+// overlap area. Each block's task still writes a partial image, so depositing
+// into cells of other blocks is safe: the partial images are summed.
+class HierarchyDeposit {
+ public:
+  HierarchyDeposit(const std::vector<LevelMeta> &levels, int axis,
+                   const double rect[4], int out_nx, int out_ny,
+                   std::span<std::uint8_t> out)
+      : levels_(levels), axis_(axis), out_nx_(out_nx), out_ny_(out_ny), out_(out) {
+    u_axis_ = (axis == 0) ? 1 : 0;
+    v_axis_ = (axis == 2) ? 1 : 2;
+    rect_u_lo_ = std::min(rect[0], rect[2]);
+    rect_u_hi_ = std::max(rect[0], rect[2]);
+    rect_v_lo_ = std::min(rect[1], rect[3]);
+    rect_v_hi_ = std::max(rect[1], rect[3]);
+    out_du_ = (rect_u_hi_ - rect_u_lo_) / static_cast<double>(out_nx);
+    out_dv_ = (rect_v_hi_ - rect_v_lo_) / static_cast<double>(out_ny);
+
+    // Each level's domain, from the level-0 boxes' extent refined down.
+    domain_lo_.resize(levels.size());
+    domain_hi_.resize(levels.size());
+    int32_t lo0[3] = {std::numeric_limits<int32_t>::max(),
+                      std::numeric_limits<int32_t>::max(),
+                      std::numeric_limits<int32_t>::max()};
+    int32_t hi0[3] = {std::numeric_limits<int32_t>::min(),
+                      std::numeric_limits<int32_t>::min(),
+                      std::numeric_limits<int32_t>::min()};
+    if (!levels.empty()) {
+      for (const auto &b : levels.front().boxes) {
+        lo0[0] = std::min(lo0[0], b.lo.x);
+        lo0[1] = std::min(lo0[1], b.lo.y);
+        lo0[2] = std::min(lo0[2], b.lo.z);
+        hi0[0] = std::max(hi0[0], b.hi.x);
+        hi0[1] = std::max(hi0[1], b.hi.y);
+        hi0[2] = std::max(hi0[2], b.hi.z);
+      }
+    }
+    int64_t ratio = 1;
+    for (std::size_t lev = 0; lev < levels.size(); ++lev) {
+      if (lev > 0) {
+        ratio *= std::max(1, levels[lev - 1].geom.ref_ratio);
+      }
+      const auto &g = levels[lev].geom;
+      const auto &g0 = levels.front().geom;
+      for (int ax = 0; ax < 3; ++ax) {
+        domain_lo_[lev][ax] = static_cast<int32_t>(
+            (static_cast<int64_t>(lo0[ax]) - g0.index_origin[ax]) * ratio + g.index_origin[ax]);
+        domain_hi_[lev][ax] = static_cast<int32_t>(
+            (static_cast<int64_t>(hi0[ax]) + 1 - g0.index_origin[ax]) * ratio - 1 +
+            g.index_origin[ax]);
+      }
+    }
+  }
+
+  // The particle's four CIC shares at `level`.
+  void deposit_particle(int level, double u, double v, double a, double mass) {
+    const auto &g = levels_[static_cast<std::size_t>(level)].geom;
+    const double du = g.dx[u_axis_];
+    const double dv = g.dx[v_axis_];
+    const double u_center0 = g.x0[u_axis_] + (0.5 - static_cast<double>(g.index_origin[u_axis_])) * du;
+    const double v_center0 = g.x0[v_axis_] + (0.5 - static_cast<double>(g.index_origin[v_axis_])) * dv;
+    const double su = (u - u_center0) / du;
+    const double sv = (v - v_center0) / dv;
+    const int iu0 = static_cast<int>(std::floor(su));
+    const int iv0 = static_cast<int>(std::floor(sv));
+    const double tu = su - static_cast<double>(iu0);
+    const double tv = sv - static_cast<double>(iv0);
+    const int ia = static_cast<int>(std::floor((a - g.x0[axis_]) / g.dx[axis_])) +
+                   g.index_origin[axis_];
+    const double shares[4][3] = {{0.0, 0.0, (1.0 - tu) * (1.0 - tv)},
+                                 {1.0, 0.0, tu * (1.0 - tv)},
+                                 {0.0, 1.0, (1.0 - tu) * tv},
+                                 {1.0, 1.0, tu * tv}};
+    for (const auto &share : shares) {
+      if (share[2] == 0.0) {
+        continue;
+      }
+      int32_t cell[3];
+      cell[u_axis_] = iu0 + static_cast<int>(share[0]);
+      cell[v_axis_] = iv0 + static_cast<int>(share[1]);
+      cell[axis_] = ia;
+      resolve(level, cell, mass * share[2], a, Direction::kAny);
+    }
+  }
+
+  std::size_t deposited_cells() const { return deposited_cells_; }
+
+ private:
+  enum class Direction { kAny, kNoRefine, kNoCoarsen };
+
+  static int32_t floor_divide(int64_t value, int64_t divisor) {
+    int64_t q = value / divisor;
+    if ((value % divisor != 0) && (value < 0)) {
+      --q;
+    }
+    return static_cast<int32_t>(q);
+  }
+
+  void fold(int level, int32_t cell[3]) const {
+    const auto &g = levels_[static_cast<std::size_t>(level)].geom;
+    for (int ax = 0; ax < 3; ++ax) {
+      const int32_t lo = domain_lo_[static_cast<std::size_t>(level)][ax];
+      const int32_t hi = domain_hi_[static_cast<std::size_t>(level)][ax];
+      if (g.is_periodic[ax]) {
+        const int64_t period = static_cast<int64_t>(hi) - lo + 1;
+        int64_t offset = (static_cast<int64_t>(cell[ax]) - lo) % period;
+        if (offset < 0) {
+          offset += period;
+        }
+        cell[ax] = static_cast<int32_t>(lo + offset);
+      } else {
+        cell[ax] = std::clamp(cell[ax], lo, hi);
+      }
+    }
+  }
+
+  bool in_grid(int level, const int32_t cell[3]) const {
+    for (const auto &b : levels_[static_cast<std::size_t>(level)].boxes) {
+      if (cell[0] >= b.lo.x && cell[0] <= b.hi.x && cell[1] >= b.lo.y &&
+          cell[1] <= b.hi.y && cell[2] >= b.lo.z && cell[2] <= b.hi.z) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool any_grid_meets(int level, const int32_t lo[3], const int32_t hi[3]) const {
+    for (const auto &b : levels_[static_cast<std::size_t>(level)].boxes) {
+      if (b.lo.x <= hi[0] && b.hi.x >= lo[0] && b.lo.y <= hi[1] && b.hi.y >= lo[1] &&
+          b.lo.z <= hi[2] && b.hi.z >= lo[2]) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  bool resolve(int level, int32_t cell_in[3], double weight, double a, Direction direction) {
+    int32_t cell[3] = {cell_in[0], cell_in[1], cell_in[2]};
+    fold(level, cell);
+    const auto &g = levels_[static_cast<std::size_t>(level)].geom;
+    if (!in_grid(level, cell)) {
+      if (direction == Direction::kNoCoarsen) {
+        return false;
+      }
+      if (level == 0) {
+        // Level 0 covers the domain in a valid hierarchy; keep the weight.
+        project(level, cell, weight);
+        return true;
+      }
+      const auto &coarse = levels_[static_cast<std::size_t>(level - 1)].geom;
+      const int ratio = std::max(1, coarse.ref_ratio);
+      int32_t parent[3];
+      for (int ax = 0; ax < 3; ++ax) {
+        parent[ax] = floor_divide(static_cast<int64_t>(cell[ax]) - g.index_origin[ax], ratio) +
+                     coarse.index_origin[ax];
+      }
+      return resolve(level - 1, parent, weight, a, Direction::kNoRefine);
+    }
+    const int finer = level + 1;
+    if (direction != Direction::kNoRefine &&
+        static_cast<std::size_t>(finer) < levels_.size()) {
+      const auto &fg = levels_[static_cast<std::size_t>(finer)].geom;
+      const int ratio = std::max(1, g.ref_ratio);
+      int32_t lo[3];
+      int32_t hi[3];
+      for (int ax = 0; ax < 3; ++ax) {
+        lo[ax] = static_cast<int32_t>((static_cast<int64_t>(cell[ax]) - g.index_origin[ax]) * ratio +
+                                      fg.index_origin[ax]);
+        hi[ax] = lo[ax] + ratio - 1;
+      }
+      if (any_grid_meets(finer, lo, hi)) {
+        int32_t layer = static_cast<int32_t>(std::floor((a - fg.x0[axis_]) / fg.dx[axis_])) +
+                        fg.index_origin[axis_];
+        layer = std::clamp(layer, lo[axis_], hi[axis_]);
+        const double share = weight / (static_cast<double>(ratio) * static_cast<double>(ratio));
+        double kept = 0.0;
+        for (int32_t cv = lo[v_axis_]; cv <= hi[v_axis_]; ++cv) {
+          for (int32_t cu = lo[u_axis_]; cu <= hi[u_axis_]; ++cu) {
+            int32_t child[3];
+            child[u_axis_] = cu;
+            child[v_axis_] = cv;
+            child[axis_] = layer;
+            if (!resolve(finer, child, share, a, Direction::kNoCoarsen)) {
+              kept += share;
+            }
+          }
+        }
+        if (kept > 0.0) {
+          project(level, cell, kept);
+        }
+        return true;
+      }
+    }
+    project(level, cell, weight);
+    return true;
+  }
+
+  // Spread a cell's weight over the pixels its image-plane footprint meets.
+  void project(int level, const int32_t cell[3], double weight) {
+    ++deposited_cells_;
+    const auto &g = levels_[static_cast<std::size_t>(level)].geom;
+    const double du = g.dx[u_axis_];
+    const double dv = g.dx[v_axis_];
+    const double u_lo = g.x0[u_axis_] + static_cast<double>(cell[u_axis_] - g.index_origin[u_axis_]) * du;
+    const double u_hi = u_lo + du;
+    const double v_lo = g.x0[v_axis_] + static_cast<double>(cell[v_axis_] - g.index_origin[v_axis_]) * dv;
+    const double v_hi = v_lo + dv;
+    if (u_hi <= rect_u_lo_ || u_lo >= rect_u_hi_ || v_hi <= rect_v_lo_ || v_lo >= rect_v_hi_) {
+      return;
+    }
+    int ix_lo = static_cast<int>(std::floor((u_lo - rect_u_lo_) / out_du_));
+    int ix_hi = static_cast<int>(std::floor((u_hi - rect_u_lo_) / out_du_));
+    int iy_lo = static_cast<int>(std::floor((v_lo - rect_v_lo_) / out_dv_));
+    int iy_hi = static_cast<int>(std::floor((v_hi - rect_v_lo_) / out_dv_));
+    ix_lo = std::max(0, ix_lo);
+    iy_lo = std::max(0, iy_lo);
+    ix_hi = std::min(out_nx_ - 1, ix_hi);
+    iy_hi = std::min(out_ny_ - 1, iy_hi);
+    const double cell_area = du * dv;
+    for (int iy = iy_lo; iy <= iy_hi; ++iy) {
+      const double pv_lo = rect_v_lo_ + static_cast<double>(iy) * out_dv_;
+      const double ov = std::max(0.0, std::min(v_hi, pv_lo + out_dv_) - std::max(v_lo, pv_lo));
+      if (ov <= 0.0) {
+        continue;
+      }
+      for (int ix = ix_lo; ix <= ix_hi; ++ix) {
+        const double pu_lo = rect_u_lo_ + static_cast<double>(ix) * out_du_;
+        const double ou = std::max(0.0, std::min(u_hi, pu_lo + out_du_) - std::max(u_lo, pu_lo));
+        if (ou <= 0.0) {
+          continue;
+        }
+        const auto index = static_cast<std::size_t>(iy) * static_cast<std::size_t>(out_nx_) +
+                           static_cast<std::size_t>(ix);
+        store_buffer_scalar<double>(
+            out_.data(), index,
+            load_buffer_scalar<double>(out_.data(), index) + weight * (ou * ov) / cell_area);
+      }
+    }
+  }
+
+  const std::vector<LevelMeta> &levels_;
+  int axis_ = 2;
+  int u_axis_ = 0;
+  int v_axis_ = 1;
+  int out_nx_ = 0;
+  int out_ny_ = 0;
+  std::span<std::uint8_t> out_;
+  double rect_u_lo_ = 0.0;
+  double rect_u_hi_ = 0.0;
+  double rect_v_lo_ = 0.0;
+  double rect_v_hi_ = 0.0;
+  double out_du_ = 0.0;
+  double out_dv_ = 0.0;
+  std::vector<std::array<int32_t, 3>> domain_lo_;
+  std::vector<std::array<int32_t, 3>> domain_hi_;
+  std::size_t deposited_cells_ = 0;
+};
+
+// The step whose level list holds `level`: the executor hands kernels a
+// reference into the run's metadata.
+const std::vector<LevelMeta> &levels_containing(const LevelMeta &level) {
+  const RunMeta &meta = current_runmeta();
+  for (const auto &step : meta.steps) {
+    for (const auto &candidate : step.levels) {
+      if (&candidate == &level) {
+        return step.levels;
+      }
+    }
+  }
+  if (meta.steps.size() == 1) {
+    return meta.steps.front().levels;
+  }
+  throw std::runtime_error("particle_cic_projection_accumulate: cannot find the block's step");
+}
+
+} // namespace
 
 void register_particle_kernels(KernelRegistry &registry) {
   {
@@ -422,24 +723,8 @@ void register_particle_kernels(KernelRegistry &registry) {
           const int u_axis = (axis == 0) ? 1 : 0;
           const int v_axis = (axis == 2) ? 1 : 2;
 
-          const auto &box = level.boxes[static_cast<std::size_t>(block)];
-          const int box_lo[3] = {box.lo.x, box.lo.y, box.lo.z};
-          const int box_hi[3] = {box.hi.x, box.hi.y, box.hi.z};
-
-          const double x0[3] = {level.geom.x0[0], level.geom.x0[1],
-                                level.geom.x0[2]};
-          const double dx[3] = {level.geom.dx[0], level.geom.dx[1],
-                                level.geom.dx[2]};
-          const int origin[3] = {level.geom.index_origin[0],
-                                 level.geom.index_origin[1],
-                                 level.geom.index_origin[2]};
-          if (dx[0] == 0.0 || dx[1] == 0.0 || dx[2] == 0.0) {
-            return hpx::make_ready_future();
-          }
-
-          const int nu = box_hi[u_axis] - box_lo[u_axis] + 1;
-          const int nv = box_hi[v_axis] - box_lo[v_axis] + 1;
-          if (nu <= 0 || nv <= 0) {
+          if (level.geom.dx[0] == 0.0 || level.geom.dx[1] == 0.0 ||
+              level.geom.dx[2] == 0.0) {
             return hpx::make_ready_future();
           }
 
@@ -447,97 +732,18 @@ void register_particle_kernels(KernelRegistry &registry) {
               std::min(params.axis_bounds[0], params.axis_bounds[1]);
           const double a_hi =
               std::max(params.axis_bounds[0], params.axis_bounds[1]);
-          const double rect_u_lo = std::min(params.rect[0], params.rect[2]);
-          const double rect_u_hi = std::max(params.rect[0], params.rect[2]);
-          const double rect_v_lo = std::min(params.rect[1], params.rect[3]);
-          const double rect_v_hi = std::max(params.rect[1], params.rect[3]);
-          const double out_du =
-              (rect_u_hi - rect_u_lo) / static_cast<double>(out_nx);
-          const double out_dv =
-              (rect_v_hi - rect_v_lo) / static_cast<double>(out_ny);
-          if (out_du <= 0.0 || out_dv <= 0.0) {
+          const double rect[4] = {params.rect[0], params.rect[1], params.rect[2],
+                                  params.rect[3]};
+          if (!(std::abs(rect[2] - rect[0]) > 0.0) || !(std::abs(rect[3] - rect[1]) > 0.0)) {
             return hpx::make_ready_future();
           }
-          const double inv_out_du = 1.0 / out_du;
-          const double inv_out_dv = 1.0 / out_dv;
-
-          auto covered = [&](int i, int j, int k) -> bool {
-            if (!params.covered_boxes) {
-              return false;
-            }
-            for (const auto &b : *params.covered_boxes) {
-              if (covered_box_contains(b, i, j, k)) {
-                return true;
-              }
-            }
-            return false;
-          };
-
-          std::vector<double> native_mass(
-              static_cast<std::size_t>(nu) * static_cast<std::size_t>(nv), 0.0);
-          auto native_index = [nu](int iu_local, int iv_local) -> std::size_t {
-            return static_cast<std::size_t>(iv_local) *
-                       static_cast<std::size_t>(nu) +
-                   static_cast<std::size_t>(iu_local);
-          };
-          std::size_t covered_skips = 0;
-          std::size_t bounds_skips = 0;
-          std::size_t deposited_cells = 0;
-          auto native_add = [&](int iu, int iv, int ia, double wmass) {
-            int ii = 0;
-            int jj = 0;
-            int kk = 0;
-            if (axis == 0) {
-              ii = ia;
-              jj = iu;
-              kk = iv;
-            } else if (axis == 1) {
-              ii = iu;
-              jj = ia;
-              kk = iv;
-            } else {
-              ii = iu;
-              jj = iv;
-              kk = ia;
-            }
-            if (ii < box_lo[0] || ii > box_hi[0] || jj < box_lo[1] ||
-                jj > box_hi[1] || kk < box_lo[2] || kk > box_hi[2]) {
-              ++bounds_skips;
-              return;
-            }
-            if (covered(ii, jj, kk)) {
-              ++covered_skips;
-              return;
-            }
-            const int iu_local = iu - box_lo[u_axis];
-            const int iv_local = iv - box_lo[v_axis];
-            if (iu_local < 0 || iu_local >= nu || iv_local < 0 ||
-                iv_local >= nv) {
-              ++bounds_skips;
-              return;
-            }
-            native_mass[native_index(iu_local, iv_local)] += wmass;
-            ++deposited_cells;
-          };
+          HierarchyDeposit deposit(levels_containing(level), axis, rect, out_nx, out_ny, out);
 
           const double *coord[3] = {px_vals.data(), py_vals.data(),
                                     pz_vals.data()};
-          const double du = dx[u_axis];
-          const double dv = dx[v_axis];
-          const double da = dx[axis];
-
-          const double u_center0 =
-              x0[u_axis] + (0.5 - static_cast<double>(origin[u_axis])) * du;
-          const double v_center0 =
-              x0[v_axis] + (0.5 - static_cast<double>(origin[v_axis])) * dv;
-          const double a_cell_lo =
-              x0[axis] +
-              (static_cast<double>(box_lo[axis] - origin[axis])) * da;
-          const double a_cell_hi =
-              x0[axis] +
-              (static_cast<double>(box_hi[axis] + 1 - origin[axis])) * da;
           std::size_t candidates = 0;
-
+          std::size_t bounds_skips = 0;
+          const std::size_t covered_skips = 0;
           for (std::size_t p = 0; p < n; ++p) {
             ++candidates;
             const double u = coord[u_axis][p];
@@ -561,111 +767,14 @@ void register_particle_kernels(KernelRegistry &registry) {
               ++bounds_skips;
               continue;
             }
-            if (a < a_cell_lo || a >= a_cell_hi) {
-              ++bounds_skips;
-              continue;
-            }
-
-            const double su = (u - u_center0) / du;
-            const double sv = (v - v_center0) / dv;
-            const int iu0 = static_cast<int>(std::floor(su));
-            const int iv0 = static_cast<int>(std::floor(sv));
-            const double tu = su - static_cast<double>(iu0);
-            const double tv = sv - static_cast<double>(iv0);
-            const int ia = static_cast<int>(std::floor((a - x0[axis]) / da)) +
-                           origin[axis];
-
-            native_add(iu0, iv0, ia, m * (1.0 - tu) * (1.0 - tv));
-            native_add(iu0 + 1, iv0, ia, m * tu * (1.0 - tv));
-            native_add(iu0, iv0 + 1, ia, m * (1.0 - tu) * tv);
-            native_add(iu0 + 1, iv0 + 1, ia, m * tu * tv);
+            deposit.deposit_particle(params.level_index, u, v, a, m);
           }
-
-          const double cell_area = du * dv;
-          if (cell_area <= 0.0) {
-            return hpx::make_ready_future();
-          }
-
-          for (int iv_local = 0; iv_local < nv; ++iv_local) {
-            const int iv = box_lo[v_axis] + iv_local;
-            const double v_center =
-                x0[v_axis] +
-                (static_cast<double>(iv - origin[v_axis]) + 0.5) * dv;
-            const double v_lo = v_center - 0.5 * dv;
-            const double v_hi = v_center + 0.5 * dv;
-            if (v_hi <= rect_v_lo || v_lo >= rect_v_hi) {
-              continue;
-            }
-
-            int iy_lo =
-                static_cast<int>(std::floor((v_lo - rect_v_lo) * inv_out_dv));
-            int iy_hi =
-                static_cast<int>(std::floor((v_hi - rect_v_lo) * inv_out_dv));
-            if (iy_hi < 0 || iy_lo >= out_ny) {
-              continue;
-            }
-            iy_lo = std::max(0, iy_lo);
-            iy_hi = std::min(out_ny - 1, iy_hi);
-
-            for (int iu_local = 0; iu_local < nu; ++iu_local) {
-              const double mass = native_mass[native_index(iu_local, iv_local)];
-              if (mass == 0.0) {
-                continue;
-              }
-              const int iu = box_lo[u_axis] + iu_local;
-              const double u_center =
-                  x0[u_axis] +
-                  (static_cast<double>(iu - origin[u_axis]) + 0.5) * du;
-              const double u_lo = u_center - 0.5 * du;
-              const double u_hi = u_center + 0.5 * du;
-              if (u_hi <= rect_u_lo || u_lo >= rect_u_hi) {
-                continue;
-              }
-
-              int ix_lo =
-                  static_cast<int>(std::floor((u_lo - rect_u_lo) * inv_out_du));
-              int ix_hi =
-                  static_cast<int>(std::floor((u_hi - rect_u_lo) * inv_out_du));
-              if (ix_hi < 0 || ix_lo >= out_nx) {
-                continue;
-              }
-              ix_lo = std::max(0, ix_lo);
-              ix_hi = std::min(out_nx - 1, ix_hi);
-
-              for (int iy = iy_lo; iy <= iy_hi; ++iy) {
-                const double pv_lo =
-                    rect_v_lo + static_cast<double>(iy) * out_dv;
-                const double pv_hi = pv_lo + out_dv;
-                const double ov = std::max(0.0, std::min(v_hi, pv_hi) -
-                                                    std::max(v_lo, pv_lo));
-                if (ov <= 0.0) {
-                  continue;
-                }
-                const std::size_t row = static_cast<std::size_t>(iy) *
-                                        static_cast<std::size_t>(out_nx);
-                for (int ix = ix_lo; ix <= ix_hi; ++ix) {
-                  const double pu_lo =
-                      rect_u_lo + static_cast<double>(ix) * out_du;
-                  const double pu_hi = pu_lo + out_du;
-                  const double ou = std::max(0.0, std::min(u_hi, pu_hi) -
-                                                      std::max(u_lo, pu_lo));
-                  if (ou <= 0.0) {
-                    continue;
-                  }
-                  const double w = (ou * ov) / cell_area;
-                  const auto index = row + static_cast<std::size_t>(ix);
-                  store_buffer_scalar<double>(
-                      out.data(), index,
-                      load_buffer_scalar<double>(out.data(), index) + mass * w);
-                }
-              }
-            }
-          }
+          const std::size_t deposited_cells = deposit.deposited_cells();
           double total_sum = 0.0;
           for (std::size_t idx = 0; idx < static_cast<std::size_t>(out_nx) *
                                               static_cast<std::size_t>(out_ny);
                ++idx) {
-            total_sum += out[idx];
+            total_sum += load_buffer_scalar<double>(out.data(), idx);
           }
           log_projection_kernel_summary(
               "particle_cic_projection_accumulate", params.level_index, block,
