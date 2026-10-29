@@ -739,7 +739,52 @@ FabData PlotfileReader::read_fab(int level, int fab_index, int comp_start,
   }
   is.seekg(fod.offset, std::ios::beg);
   FabHeader fab_hdr = read_fab_header(is);
-  return read_fab_payload(is, fab_hdr, comp_start, comp_count);
+  FabData data = read_fab_payload(is, fab_hdr, comp_start, comp_count);
+
+  // A MultiFab written with nGrow > 0 stores each FAB over its grown box,
+  // but every consumer indexes the data by the valid box from the BoxArray.
+  // Crop the stored ghost cells away so the two agree.
+  const Box& valid = v.box_array.boxes.at(static_cast<size_t>(fab_index));
+  const Box& stored = fab_hdr.box;
+  const bool grown = stored.lo.x != valid.lo.x || stored.lo.y != valid.lo.y ||
+                     stored.lo.z != valid.lo.z || stored.hi.x != valid.hi.x ||
+                     stored.hi.y != valid.hi.y || stored.hi.z != valid.hi.z;
+  if (!grown) {
+    return data;
+  }
+  if (valid.lo.x < stored.lo.x || valid.lo.y < stored.lo.y || valid.lo.z < stored.lo.z ||
+      valid.hi.x > stored.hi.x || valid.hi.y > stored.hi.y || valid.hi.z > stored.hi.z) {
+    throw std::runtime_error("FAB payload box does not contain its valid box");
+  }
+  const size_t bytes_per = (data.type == RealType::kFloat32) ? 4 : 8;
+  const int64_t snx = stored.hi.x - stored.lo.x + 1;
+  const int64_t sny = stored.hi.y - stored.lo.y + 1;
+  const int64_t snz = stored.hi.z - stored.lo.z + 1;
+  const int64_t vnx = valid.hi.x - valid.lo.x + 1;
+  const int64_t vny = valid.hi.y - valid.lo.y + 1;
+  const int64_t vnz = valid.hi.z - valid.lo.z + 1;
+  const size_t row_bytes = static_cast<size_t>(vnx) * bytes_per;
+  std::vector<std::uint8_t> cropped(static_cast<size_t>(vnx * vny * vnz) *
+                                    static_cast<size_t>(data.ncomp) * bytes_per);
+  size_t out = 0;
+  for (int32_t comp = 0; comp < data.ncomp; ++comp) {
+    const int64_t comp_base = static_cast<int64_t>(comp) * snx * sny * snz;
+    for (int64_t k = 0; k < vnz; ++k) {
+      for (int64_t j = 0; j < vny; ++j) {
+        const int64_t src = comp_base +
+                            ((k + valid.lo.z - stored.lo.z) * sny + (j + valid.lo.y - stored.lo.y)) * snx +
+                            (valid.lo.x - stored.lo.x);
+        std::memcpy(cropped.data() + out,
+                    data.bytes.data() + static_cast<size_t>(src) * bytes_per, row_bytes);
+        out += row_bytes;
+      }
+    }
+  }
+  data.bytes = std::move(cropped);
+  data.nx = static_cast<int32_t>(vnx);
+  data.ny = static_cast<int32_t>(vny);
+  data.nz = static_cast<int32_t>(vnz);
+  return data;
 }
 
 void PlotfileReader::discover_particles() {
