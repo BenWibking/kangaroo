@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import sys
 from typing import Optional, Sequence
 
 from .amr_coverage import (
@@ -173,7 +174,22 @@ def _axis_index(axis: str | int) -> int:
 def _bounds_1d(
     lo: int, hi: int, x0: float, dx: float, origin: int
 ) -> tuple[float, float]:
-    return x0 + (lo - origin) * dx, x0 + (hi + 1 - origin) * dx
+    """A block's extent along one axis, padded outward for culling.
+
+    The kernels compute cell faces in their own floating-point order (fused
+    multiply-adds included), which can land an ulp or two from these. Every
+    caller culls blocks against a surface or bound; an unpadded face one ulp
+    inside a cap height or radius dropped the block whose cells the kernel
+    would have counted, losing that surface over the block's footprint.
+    Keeping a block that turns out not to intersect costs only its cell tests.
+    """
+    lower = x0 + (lo - origin) * dx
+    upper = x0 + (hi + 1 - origin) * dx
+    # Scaled by the terms, not the result: when x0 and the offset nearly
+    # cancel, the two orders differ by an ulp of the terms.
+    terms = abs(x0) + max(abs(lo - origin), abs(hi + 1 - origin)) * abs(dx) + abs(dx)
+    pad = 16.0 * sys.float_info.epsilon * terms
+    return lower - pad, upper + pad
 
 
 def _resolve_real_dtype(dtype: DType | str) -> DType:
