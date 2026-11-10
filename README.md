@@ -15,7 +15,7 @@ Explicit clients and the advanced IR/runtime modules remain available for launch
 
 ## Requirements
 
-- Python 3.10-3.13
+- Python 3.13 (Pixi environment)
 - CMake + C++ toolchain (installed by Pixi)
 - On macOS, Apple Command Line Tools (`xcode-select --install`) for the system SDK
 - HPX (Pixi-managed by default)
