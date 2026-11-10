@@ -2,6 +2,8 @@ from pathlib import Path
 import shutil
 import subprocess
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 KANGAROO = REPO_ROOT / "scripts" / "kangaroo"
@@ -88,3 +90,19 @@ def test_plot_command_looks_for_results_in_current_directory(tmp_path: Path) -> 
 
     assert result.returncode == 2
     assert str(tmp_path / "results") in result.stderr
+
+
+@pytest.mark.parametrize("sbatch_options", [[], ["--", "--time=01:00:00"]])
+def test_submission_dry_run(tmp_path: Path, sbatch_options: list[str]) -> None:
+    plotfile = tmp_path / "plt000100"
+    plotfile.mkdir()
+
+    result = run_kangaroo("toomre-q", str(plotfile), "--dry-run", *sbatch_options)
+
+    assert result.returncode == 0, result.stderr
+    assert "sbatch " in result.stdout
+    assert "make_toomre_q.submit" in result.stdout
+    assert str(plotfile) in result.stdout
+    if sbatch_options:
+        assert "--time=01:00:00" in result.stdout
+    assert not (REPO_ROOT / "results" / "test-campaign" / plotfile.name).exists()

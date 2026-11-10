@@ -197,7 +197,8 @@ case "$command_name" in
   projection) exports+=("OUTPUT_PNG=$output_dir/stellar_projection_yz.png") ;;
 esac
 batch_script="$REPO_ROOT/batch/make_${analysis_name}.submit"
-args=(sbatch "${sbatch_args[@]}" --export=ALL --chdir="$REPO_ROOT"
+# Bash 3 with nounset treats an empty array as unset.
+args=(sbatch ${sbatch_args[@]+"${sbatch_args[@]}"} --export=ALL --chdir="$REPO_ROOT"
   --output="$output_dir/slurm-%j.out" "$batch_script" "$plotfile")
 if [[ "$dry_run" == 1 ]]; then
   printf '%q ' env "${exports[@]}" "${args[@]}"
