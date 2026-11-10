@@ -11,6 +11,9 @@ __all__ = [
     "TaskTemplate",
     "Domain",
     "FieldRef",
+    "OutputRef",
+    "BufferSpec",
+    "DType",
     "LoweringContext",
     "Dataset",
     "open_dataset",
@@ -24,6 +27,7 @@ __all__ = [
     "Pipeline",
     "FieldHandle",
     "FluxSurfaceIntegralHandle",
+    "ToomreQProfileHandle",
     "Histogram1DHandle",
     "Histogram2DHandle",
     "ParticleArrayHandle",
@@ -33,10 +37,20 @@ __all__ = [
     "histogram_edges_2d",
     "cdf_from_histogram",
     "cdf_from_samples",
+    "Client",
+    "Array",
+    "Scalar",
+    "ParticleArray",
+    "ParticleMask",
+    "compute",
 ]
 
 
 def __getattr__(name):
+    if name in {"Client", "Array", "Scalar", "ParticleArray", "ParticleMask", "compute"}:
+        import kangaroo
+
+        return getattr(kangaroo, name)
     if name in {"Runtime", "hpx_configuration_string", "run_console_main"}:
         from .runtime import Runtime, hpx_configuration_string, run_console_main
 
@@ -45,8 +59,8 @@ def __getattr__(name):
             "hpx_configuration_string": hpx_configuration_string,
             "run_console_main": run_console_main,
         }[name]
-    if name in {"Plan", "Stage", "TaskTemplate", "Domain", "FieldRef"}:
-        from .plan import Plan, Stage, TaskTemplate, Domain, FieldRef
+    if name in {"Plan", "Stage", "TaskTemplate", "Domain", "FieldRef", "OutputRef"}:
+        from .plan import Plan, Stage, TaskTemplate, Domain, FieldRef, OutputRef
 
         return {
             "Plan": Plan,
@@ -54,6 +68,7 @@ def __getattr__(name):
             "TaskTemplate": TaskTemplate,
             "Domain": Domain,
             "FieldRef": FieldRef,
+            "OutputRef": OutputRef,
         }[name]
     if name == "LoweringContext":
         from .ctx import LoweringContext
@@ -89,6 +104,7 @@ def __getattr__(name):
         "Pipeline",
         "FieldHandle",
         "FluxSurfaceIntegralHandle",
+        "ToomreQProfileHandle",
         "Histogram1DHandle",
         "Histogram2DHandle",
         "ParticleArrayHandle",
@@ -103,6 +119,7 @@ def __getattr__(name):
             ParticleArrayHandle,
             ParticleMaskHandle,
             Pipeline,
+            ToomreQProfileHandle,
             pipeline,
         )
 
@@ -110,6 +127,7 @@ def __getattr__(name):
             "Pipeline": Pipeline,
             "FieldHandle": FieldHandle,
             "FluxSurfaceIntegralHandle": FluxSurfaceIntegralHandle,
+            "ToomreQProfileHandle": ToomreQProfileHandle,
             "Histogram1DHandle": Histogram1DHandle,
             "Histogram2DHandle": Histogram2DHandle,
             "ParticleArrayHandle": ParticleArrayHandle,
@@ -126,3 +144,13 @@ def __getattr__(name):
             "cdf_from_samples": cdf_from_samples,
         }[name]
     raise AttributeError(name)
+from .buffer import (
+    BlockShape,
+    BufferSpec,
+    DType,
+    DynamicShape,
+    DynamicUpperBound,
+    FixedShape,
+    InitPolicy,
+    LikeInputShape,
+)

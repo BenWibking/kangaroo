@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+import pytest
+
 from analysis.pipeline import FieldHandle, Histogram1DHandle, Histogram2DHandle, Pipeline
 
 
@@ -226,6 +228,51 @@ def test_pipeline_imperative_chaining_adds_cross_fragment_edge() -> None:
     assert vort_stage in slice_stage.after
 
 
+def test_pipeline_independent_fragments_do_not_gain_definition_order_edges() -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_two_block_runmeta()
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+
+    derived = pipe.field_expr(
+        "a * 2", {"a": pipe.field("density")}, out="derived"
+    )
+    first = pipe.histogram1d(
+        derived, hist_range=(0.0, 1.0), bins=4, out="first"
+    )
+    second = pipe.histogram1d(
+        derived, hist_range=(0.0, 2.0), bins=8, out="second"
+    )
+
+    first_stage = pipe._field_producers[first.counts.field][-1]
+    second_stage = pipe._field_producers[second.counts.field][-1]
+    derived_stage = pipe._field_producers[derived.field][-1]
+    assert first_stage is not second_stage
+    assert first_stage not in second_stage.after
+    assert second_stage not in first_stage.after
+    assert derived_stage in pipe.plan().topo_stages()
+
+
+def test_pipeline_run_for_selects_only_requested_branch() -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_two_block_runmeta()
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+
+    source = pipe.field("density")
+    first = pipe.histogram1d(
+        source, hist_range=(0.0, 1.0), bins=4, out="first"
+    )
+    second = pipe.histogram1d(
+        source, hist_range=(0.0, 2.0), bins=8, out="second"
+    )
+    pipe.run_for(mesh_fields=(first.counts.field,))
+
+    submitted = rt.submitted[0][0].topo_stages()
+    assert pipe._field_producers[first.counts.field][-1] in submitted
+    assert pipe._field_producers[second.counts.field][-1] not in submitted
+
+
 def test_pipeline_histogram1d_lowering_and_result_shape() -> None:
     rt = _FakeRuntime()
     runmeta = _single_level_two_block_runmeta()
@@ -249,8 +296,28 @@ def test_pipeline_histogram1d_lowering_and_result_shape() -> None:
     red = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
     assert len(acc) == 2
     assert red
-    assert all(tmpl.params["bins"] == 8 for tmpl in acc)
-    assert all(tmpl.params["range"] == [0.0, 1.0] for tmpl in acc)
+    assert all(tmpl.params.bins == 8 for tmpl in acc)
+    assert all(tmpl.params.range == (0.0, 1.0) for tmpl in acc)
+
+
+def test_pipeline_rejects_reduce_fan_in_one() -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_two_block_runmeta()
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+
+    scalar = pipe.field("scalar")
+    try:
+        pipe.histogram1d(
+            scalar,
+            hist_range=(0.0, 1.0),
+            bins=8,
+            reduce_fan_in=1,
+        )
+    except ValueError as exc:
+        assert "reduce_fan_in must be >= 2" in str(exc)
+    else:
+        raise AssertionError("expected reduce_fan_in=1 to be rejected")
 
 
 def test_pipeline_histogram2d_weighted_input_wiring() -> None:
@@ -281,7 +348,7 @@ def test_pipeline_histogram2d_weighted_input_wiring() -> None:
     acc = [tmpl for tmpl in templates if tmpl.kernel == "histogram2d_accumulate"]
     assert acc
     assert all(len(tmpl.inputs) == 3 for tmpl in acc)
-    assert all(tmpl.params["bins"] == [4, 5] for tmpl in acc)
+    assert all(tmpl.params.bins == (4, 5) for tmpl in acc)
 
 
 def test_pipeline_histogram2d_weight_mode_wiring() -> None:
@@ -310,7 +377,7 @@ def test_pipeline_histogram2d_weight_mode_wiring() -> None:
     ]
     assert acc
     assert all(len(tmpl.inputs) == 2 for tmpl in acc)
-    assert all(tmpl.params["weight_mode"] == "cell_mass" for tmpl in acc)
+    assert all(tmpl.params.weight_mode == "cell_mass" for tmpl in acc)
 
 
 def test_pipeline_particle_cic_projection_lowering_wiring() -> None:
@@ -336,9 +403,9 @@ def test_pipeline_particle_cic_projection_lowering_wiring() -> None:
     assert len(acc) == 1
     assert red
     assert acc[0].domain.blocks == [0, 1]
-    assert all(tmpl.params["resolution"] == [16, 16] for tmpl in acc)
-    assert all(tmpl.params["particle_type"] == "StochasticStellarPop_particles" for tmpl in acc)
-    assert all(tmpl.params["level_index"] == 0 for tmpl in acc)
+    assert all(tmpl.params.resolution == (16, 16) for tmpl in acc)
+    assert all(tmpl.params.particle_type == "StochasticStellarPop_particles" for tmpl in acc)
+    assert all(tmpl.params.level_index == 0 for tmpl in acc)
 
 
 def test_pipeline_projection_reduce_carries_group_output_blocks() -> None:
@@ -367,13 +434,13 @@ def test_pipeline_projection_reduce_carries_group_output_blocks() -> None:
     ]
 
     assert len(reductions) == 2
-    assert reductions[0].params["fan_in"] == 4
-    assert reductions[0].params["input_blocks"] == list(range(16))
-    assert reductions[0].params["output_blocks"] == [0, 4, 8, 12]
-    assert reductions[0].params["group_offsets"] == [0, 4, 8, 12, 16]
-    assert reductions[1].params["input_blocks"] == [0, 4, 8, 12]
-    assert reductions[1].params["output_blocks"] == [0]
-    assert reductions[1].params["group_offsets"] == [0, 4]
+    assert reductions[0].graph_reduce.fan_in == 4
+    assert reductions[0].graph_reduce.input_blocks == tuple(range(16))
+    assert reductions[0].graph_reduce.output_blocks == (0, 4, 8, 12)
+    assert reductions[0].graph_reduce.group_offsets == (0, 4, 8, 12, 16)
+    assert reductions[1].graph_reduce.input_blocks == (0, 4, 8, 12)
+    assert reductions[1].graph_reduce.output_blocks == (0,)
+    assert reductions[1].graph_reduce.group_offsets == (0, 4)
 
 
 def test_pipeline_projection_reduce_groups_by_locality() -> None:
@@ -402,21 +469,21 @@ def test_pipeline_projection_reduce_groups_by_locality() -> None:
     ]
 
     assert len(reductions) == 3
-    assert reductions[0].params["fan_in"] == 4
-    assert reductions[0].params["input_blocks"] == [
+    assert reductions[0].graph_reduce.fan_in == 4
+    assert reductions[0].graph_reduce.input_blocks == (
         0, 2, 4, 6,
         8, 10, 12, 14,
         1, 3, 5, 7,
         9, 11, 13, 15,
-    ]
-    assert reductions[0].params["output_blocks"] == [0, 8, 1, 9]
-    assert reductions[0].params["group_offsets"] == [0, 4, 8, 12, 16]
-    assert reductions[1].params["input_blocks"] == [0, 8, 1, 9]
-    assert reductions[1].params["output_blocks"] == [0, 1]
-    assert reductions[1].params["group_offsets"] == [0, 2, 4]
-    assert reductions[2].params["input_blocks"] == [0, 1]
-    assert reductions[2].params["output_blocks"] == [0]
-    assert reductions[2].params["group_offsets"] == [0, 2]
+    )
+    assert reductions[0].graph_reduce.output_blocks == (0, 8, 1, 9)
+    assert reductions[0].graph_reduce.group_offsets == (0, 4, 8, 12, 16)
+    assert reductions[1].graph_reduce.input_blocks == (0, 8, 1, 9)
+    assert reductions[1].graph_reduce.output_blocks == (0, 1)
+    assert reductions[1].graph_reduce.group_offsets == (0, 2, 4)
+    assert reductions[2].graph_reduce.input_blocks == (0, 1)
+    assert reductions[2].graph_reduce.output_blocks == (0,)
+    assert reductions[2].graph_reduce.group_offsets == (0, 2)
 
 
 def test_pipeline_projection_final_adds_group_levels_by_locality() -> None:
@@ -446,7 +513,7 @@ def test_pipeline_projection_final_adds_group_levels_by_locality() -> None:
 
     assert [[ref.domain.level for ref in tmpl.inputs] for tmpl in adds[:2]] == [[2, 0], [3, 1]]
     assert [tmpl.domain.level for tmpl in adds[:2]] == [2, 3]
-    assert [tmpl.params["output_blocks"] for tmpl in adds[:2]] == [[0], [0]]
+    assert [tmpl.graph_reduce.output_blocks for tmpl in adds[:2]] == [(0,), (0,)]
 
 
 def test_pipeline_field_expr_lowering_wiring() -> None:
@@ -468,8 +535,20 @@ def test_pipeline_field_expr_lowering_wiring() -> None:
         if tmpl.kernel == "field_expr"
     ]
     assert expr_templates
-    assert all(tmpl.params["expression"] == "mx / rho" for tmpl in expr_templates)
-    assert all(tmpl.params["variables"] == ["mx", "rho"] for tmpl in expr_templates)
+    assert all(tmpl.params.expression == "mx / rho" for tmpl in expr_templates)
+    assert all(tmpl.params.variables == ("mx", "rho") for tmpl in expr_templates)
+
+
+@pytest.mark.parametrize("operation", ["field_expr", "mesh_compare"])
+def test_expression_lowering_rejects_more_than_eight_variables(operation: str) -> None:
+    rt = _FakeRuntime()
+    runmeta = _single_level_runmeta()
+    ds = _FakeDataset(rt)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    variables = {f"x{index}": pipe.field("density") for index in range(9)}
+
+    with pytest.raises(ValueError, match="at most 8 variables"):
+        getattr(pipe, operation)(" + ".join(variables), variables)
 
 
 def test_pipeline_register_derived_field_cached() -> None:

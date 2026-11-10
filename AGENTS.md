@@ -8,12 +8,20 @@
 - Root docs: `README.md`, `PLAN.md`, and performance/tracking notes for design context.
 
 ## Build, Test, and Development Commands
-- `pixi install`: create/update the managed dev environment (Python, HPX, CMake, pytest, etc.).
-- `pixi run configure`: configure CMake in `.pixi/build` with HPX and nanobind paths.
+- `pixi install -e pixi-hpx`: create/update the managed dev environment (Python, HPX, CMake, pytest, etc.).
+- `pixi run configure`: configure CMake in `.pixi/build-pixi-hpx` using the `pixi-hpx` environment with HPX and nanobind paths.
 - `pixi run build`: compile C++ targets.
 - `pixi run install`: install extension modules and Python package into the Pixi environment.
 - `pixi run test`: run tests (`pytest -q`).
 - `KANGAROO_PERFETTO_TRACE=run.pftrace pixi run python <script>`: emit a Perfetto trace and inspect it in Perfetto UI.
+
+## HPX Toolchain Consistency
+- Always build and test HPX-dependent code in the dedicated `pixi-hpx` environment. Do not combine the default Pixi compiler with HPX or Boost from Spack, and do not allow Homebrew HDF5 or hwloc into a `pixi-hpx` build.
+- Configure a fresh build tree with `KANGAROO_BUILD_DIR=.pixi/build-pixi-hpx pixi run -e pixi-hpx configure-pixi-hpx`. Build and install with the same environment and `KANGAROO_BUILD_DIR`, then run tests with `pixi run -e pixi-hpx pytest ...`.
+- Do not wrap Pixi toolchain discovery in a login shell (`bash -lc`): on macOS it can reorder `PATH` so `/opt/homebrew` precedes `$CONDA_PREFIX`. Use a non-login shell when one is required.
+- Before trusting native test failures, inspect `CMakeCache.txt` and linked libraries. `CMAKE_C_COMPILER`, `CMAKE_CXX_COMPILER`, `HPX_DIR`, `Boost_DIR`, HDF5, and hwloc must all resolve inside `.pixi/envs/pixi-hpx`; no Spack or Homebrew paths are acceptable.
+- Never reuse a CMake tree configured with a different HPX/compiler stack. Use a new build directory when changing environments.
+- Exception for HPC cluster batch runs: keep Slurm submit scripts that need the MPI parcelport on the Spack HPX launcher/runtime (for example, Spack `hpxrun.py` and its `LD_LIBRARY_PATH`). Do not rewrite those batch paths to `.pixi/envs/pixi-hpx`; the `pixi-hpx` guidance above is for configuring, building, installing, and testing the Kangaroo extensions.
 
 ## Coding Style & Naming Conventions
 - Python: PEP 8 style, 4-space indentation, type hints used throughout (`analysis/runtime.py` is a good reference).

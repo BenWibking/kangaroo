@@ -30,6 +30,58 @@ def _pack_linear_field_double(box_lo, box_hi, geom, ax=0.0, ay=0.0, az=0.0, c0=0
     return bytes(out)
 
 
+def _set_f64_grid(ds, step, level, field, lo, hi, payload: bytes) -> None:
+    shape = [hi[axis] - lo[axis] + 1 for axis in range(3)]
+    ds._h.set_chunk_ref(step, level, field, 0, 0, payload, "f64", shape)
+
+
+def test_vorticity_mag_single_block_without_amr_neighbors() -> None:
+    rt = Runtime()
+    lo = (0, 0, 0)
+    hi = (3, 3, 3)
+    runmeta = RunMeta(
+        steps=[
+            StepMeta(
+                step=0,
+                levels=[
+                    LevelMeta(
+                        geom=LevelGeom(
+                            dx=(1.0, 1.0, 1.0),
+                            x0=(0.0, 0.0, 0.0),
+                            ref_ratio=1,
+                        ),
+                        boxes=[BlockBox(lo, hi)],
+                    )
+                ],
+            )
+        ]
+    )
+    ds = open_dataset("memory://local", runmeta=runmeta, step=0, level=0, runtime=rt)
+    geom = {
+        "dx": (1.0, 1.0, 1.0),
+        "x0": (0.0, 0.0, 0.0),
+        "index_origin": (0, 0, 0),
+    }
+
+    # u=y, v=z, w=x gives curl=(-1,-1,-1) without needing neighbor patches.
+    fu = ds.field_id("vel_x")
+    fv = ds.field_id("vel_y")
+    fw = ds.field_id("vel_z")
+    _set_f64_grid(ds, 0, 0, fu, lo, hi, _pack_linear_field_double(lo, hi, geom, ay=1.0))
+    _set_f64_grid(ds, 0, 0, fv, lo, hi, _pack_linear_field_double(lo, hi, geom, az=1.0))
+    _set_f64_grid(ds, 0, 0, fw, lo, hi, _pack_linear_field_double(lo, hi, geom, ax=1.0))
+
+    op = VorticityMag((fu, fv, fw), out_name="vort")
+    ctx = LoweringContext(runtime=rt._rt, runmeta=runmeta, dataset=ds)
+    plan = Plan(stages=op.lower(ctx))
+    rt.run(plan, runmeta=runmeta, dataset=ds)
+
+    vort_field = plan.stages[-1].templates[0].outputs[0].field.field
+    raw = rt.get_task_chunk(step=0, level=0, field=vort_field, version=0, block=0)
+    vals = np.frombuffer(raw, dtype=np.float64)
+    assert np.allclose(vals, math.sqrt(3.0), rtol=0.0, atol=1.0e-8)
+
+
 def test_vorticity_mag_from_three_component_gradients_amr() -> None:
     rt = Runtime()
     runmeta = RunMeta(
@@ -62,9 +114,9 @@ def test_vorticity_mag_from_three_component_gradients_amr() -> None:
         (0, geom0, (0, 0, 0), (3, 3, 3)),
         (1, geom1, (2, 0, 0), (7, 7, 7)),
     ]:
-        ds._h.set_chunk_ref(0, level, fu, 0, 0, _pack_linear_field_double(lo, hi, geom, ay=1.0))
-        ds._h.set_chunk_ref(0, level, fv, 0, 0, _pack_linear_field_double(lo, hi, geom, az=1.0))
-        ds._h.set_chunk_ref(0, level, fw, 0, 0, _pack_linear_field_double(lo, hi, geom, ax=1.0))
+        _set_f64_grid(ds, 0, level, fu, lo, hi, _pack_linear_field_double(lo, hi, geom, ay=1.0))
+        _set_f64_grid(ds, 0, level, fv, lo, hi, _pack_linear_field_double(lo, hi, geom, az=1.0))
+        _set_f64_grid(ds, 0, level, fw, lo, hi, _pack_linear_field_double(lo, hi, geom, ax=1.0))
 
     op = VorticityMag((fu, fv, fw), out_name="vort")
     ctx = LoweringContext(runtime=rt._rt, runmeta=runmeta, dataset=ds)
@@ -75,7 +127,7 @@ def test_vorticity_mag_from_three_component_gradients_amr() -> None:
     assert "vorticity_mag" in kernels
     rt.run(plan, runmeta=runmeta, dataset=ds)
 
-    vort_field = plan.stages[-1].templates[0].outputs[0].field
+    vort_field = plan.stages[-1].templates[0].outputs[0].field.field
     raw = rt.get_task_chunk(step=0, level=0, field=vort_field, version=0, block=0)
     vals = struct.unpack(f"<{len(raw) // 8}d", raw)
 
@@ -134,22 +186,19 @@ def test_vorticity_mag_closed_form_on_cell_centers_two_level_amr() -> None:
         (0, geom0, (0, 0, 0), (3, 3, 3)),
         (1, geom1, (2, 0, 0), (7, 7, 7)),
     ]:
-        ds._h.set_chunk_ref(
-            step, level, fu, 0, 0, _pack_linear_field_double(lo, hi, geom, ay=2.0, az=3.0)
-        )
-        ds._h.set_chunk_ref(
-            step, level, fv, 0, 0, _pack_linear_field_double(lo, hi, geom, ax=7.0, az=5.0)
-        )
-        ds._h.set_chunk_ref(
-            step, level, fw, 0, 0, _pack_linear_field_double(lo, hi, geom, ax=11.0, ay=13.0)
-        )
+        _set_f64_grid(ds, step, level, fu, lo, hi,
+                      _pack_linear_field_double(lo, hi, geom, ay=2.0, az=3.0))
+        _set_f64_grid(ds, step, level, fv, lo, hi,
+                      _pack_linear_field_double(lo, hi, geom, ax=7.0, az=5.0))
+        _set_f64_grid(ds, step, level, fw, lo, hi,
+                      _pack_linear_field_double(lo, hi, geom, ax=11.0, ay=13.0))
 
     op = VorticityMag((fu, fv, fw), out_name="vort_cf")
     ctx = LoweringContext(runtime=rt._rt, runmeta=runmeta, dataset=ds)
     plan = Plan(stages=op.lower(ctx))
     rt.run(plan, runmeta=runmeta, dataset=ds)
 
-    vort_field = plan.stages[-1].templates[0].outputs[0].field
+    vort_field = plan.stages[-1].templates[0].outputs[0].field.field
     raw = rt.get_task_chunk(step=step, level=0, field=vort_field, version=0, block=0)
     vals = struct.unpack(f"<{len(raw) // 8}d", raw)
 
@@ -239,15 +288,12 @@ def test_vorticity_mag_closed_form_variable_field_two_level_amr() -> None:
                 (0, geom0, (0, 0, 0), (n0 - 1, n0 - 1, n0 - 1)),
                 (1, geom1, (n0, 0, 0), (2 * n0 - 1, 2 * n0 - 1, 2 * n0 - 1)),
             ]:
-                ds._h.set_chunk_ref(
-                    step, level, fu, 0, 0, _pack_periodic_velocity_component_double(lo, hi, geom, component="u")
-                )
-                ds._h.set_chunk_ref(
-                    step, level, fv, 0, 0, _pack_periodic_velocity_component_double(lo, hi, geom, component="v")
-                )
-                ds._h.set_chunk_ref(
-                    step, level, fw, 0, 0, _pack_periodic_velocity_component_double(lo, hi, geom, component="w")
-                )
+                _set_f64_grid(ds, step, level, fu, lo, hi,
+                              _pack_periodic_velocity_component_double(lo, hi, geom, component="u"))
+                _set_f64_grid(ds, step, level, fv, lo, hi,
+                              _pack_periodic_velocity_component_double(lo, hi, geom, component="v"))
+                _set_f64_grid(ds, step, level, fw, lo, hi,
+                              _pack_periodic_velocity_component_double(lo, hi, geom, component="w"))
 
         op0 = VorticityMag((fu0, fv0, fw0), out_name=f"vort_var0_{step}")
         op1 = VorticityMag((fu1, fv1, fw1), out_name=f"vort_var1_{step}")
@@ -258,8 +304,8 @@ def test_vorticity_mag_closed_form_variable_field_two_level_amr() -> None:
         rt.run(plan0, runmeta=runmeta, dataset=ds0)
         rt.run(plan1, runmeta=runmeta, dataset=ds1)
 
-        vort0 = plan0.stages[-1].templates[0].outputs[0].field
-        vort1 = plan1.stages[-1].templates[0].outputs[0].field
+        vort0 = plan0.stages[-1].templates[0].outputs[0].field.field
+        vort1 = plan1.stages[-1].templates[0].outputs[0].field.field
         raw0 = rt.get_task_chunk(step=step, level=0, field=vort0, version=0, block=0)
         raw1 = rt.get_task_chunk(step=step, level=1, field=vort1, version=0, block=0)
         arr0 = np.frombuffer(raw0, dtype=np.float64).copy().reshape((n0, n0, n0))

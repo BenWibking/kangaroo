@@ -10,9 +10,8 @@ import sys
 
 import numpy as np
 
-from analysis import Runtime, run_console_main  # noqa: E402
-from analysis.dataset import open_dataset  # noqa: E402
-from analysis.pipeline import pipeline  # noqa: E402
+import kangaroo as kr  # noqa: E402
+from kangaroo.runtime import run_console_main  # noqa: E402
 
 
 def _parse_range(range_arg: str) -> tuple[float, float]:
@@ -83,12 +82,11 @@ def main() -> int:
     )
     a, u = p.parse_known_args()
 
-    rt = Runtime.from_parsed_args(a, unknown_args=u)
+    client = kr.Client.from_parsed_args(a, unknown_args=u)
     def _run() -> int:
-        ds = open_dataset(a.plotfile, runtime=rt, step=0, level=0)
-        runmeta = ds.get_runmeta()
+        ds = client.open_dataset(a.plotfile, step=0, level=0)
 
-        particle_types = ds.list_particle_types()
+        particle_types = list(ds.particles)
         if not particle_types:
             raise RuntimeError("No particle species found in plotfile.")
         particle_type = a.particle_type or particle_types[0]
@@ -97,7 +95,8 @@ def main() -> int:
             raise RuntimeError(
                 f"particle type '{particle_type}' not found in plotfile; available: {available}"
             )
-        particle_fields = ds.list_particle_fields(particle_type)
+        species = ds.particles[particle_type]
+        particle_fields = list(species.fields)
         if "mass" not in particle_fields:
             available = ", ".join(particle_fields) if particle_fields else "<none>"
             raise RuntimeError(
@@ -107,15 +106,10 @@ def main() -> int:
         topk_specified = any(arg == "--topk" or arg.startswith("--topk=") for arg in sys.argv[1:])
         if topk_specified:
             if a.topk > 0:
-                pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
-                mode_vals, mode_counts = pipe.particle_topk_modes(
-                    particle_type,
-                    "mass",
-                    k=a.topk,
-                )
+                modes = species["mass"].topk(a.topk).compute()
                 msun_g = 1.98847e33
                 print("topk_mass_modes (value_msun,count):")
-                for v, c in zip(mode_vals, mode_counts):
+                for v, c in zip(modes.values, modes.counts):
                     if not np.isfinite(v) or c <= 0:
                         continue
                     print(f"{v / msun_g:.8e},{int(c)}")
@@ -126,10 +120,8 @@ def main() -> int:
             r0, r1 = _parse_range(a.hist_range)
             hist_range = (10.0**r0, 10.0**r1) if a.log_range else (r0, r1)
         else:
-            range_pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
-            mass_h = range_pipe.particle_field(particle_type, "mass")
-            rmin = range_pipe.particle_min(mass_h)
-            rmax = range_pipe.particle_max(mass_h)
+            mass = species["mass"]
+            rmin, rmax = kr.compute(mass.min(), mass.max())
             if not np.isfinite(rmin) or not np.isfinite(rmax):
                 raise RuntimeError("Particle mass range contains non-finite values.")
             if rmin == rmax:
@@ -138,8 +130,7 @@ def main() -> int:
         if hist_range[0] <= 0.0:
             raise RuntimeError("Log-mass binning requires a strictly positive minimum mass.")
 
-        pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
-        mass_h = pipe.particle_field(particle_type, "mass")
+        mass = species["mass"]
         log_edges = np.linspace(
             np.log10(hist_range[0]),
             np.log10(hist_range[1]),
@@ -150,39 +141,23 @@ def main() -> int:
         edges[-1] = max(edges[-1], hist_range[1])
         edges[0] = np.nextafter(edges[0], 0.0)
         edges[-1] = np.nextafter(edges[-1], np.inf)
-        counts, edges = pipe.particle_histogram1d(
-            mass_h,
+        histogram = mass.histogram(
             bins=edges,
             density=a.density,
-        )
+        ).compute()
+        counts, edges = histogram.counts, histogram.edges
         if np.sum(counts) == 0.0:
-            verify_pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
-            v_mass = verify_pipe.particle_field(particle_type, "mass")
-            in_range = verify_pipe.particle_count(
-                verify_pipe.particle_and(
-                    verify_pipe.particle_gt(v_mass, hist_range[0]),
-                    verify_pipe.particle_le(v_mass, hist_range[1]),
-                )
-            )
+            in_range = ((mass > hist_range[0]) & (mass <= hist_range[1])).count().compute()
             if in_range > 0:
-                print(
-                    "Warning: runtime histogram returned all zeros; "
-                    "falling back to a NumPy histogram for this run."
+                raise RuntimeError(
+                    "runtime histogram returned all zeros despite in-range particles"
                 )
-                masses = v_mass.values
-                mask = np.isfinite(masses) & (masses >= hist_range[0]) & (masses <= hist_range[1])
-                masses = masses[mask]
-                counts, edges = np.histogram(masses, bins=edges, density=a.density)
 
         if a.topk > 0:
-            mode_vals, mode_counts = pipe.particle_topk_modes(
-                particle_type,
-                "mass",
-                k=a.topk,
-            )
+            modes = mass.topk(a.topk).compute()
             msun_g = 1.98847e33
             print("topk_mass_modes (value_msun,count):")
-            for v, c in zip(mode_vals, mode_counts):
+            for v, c in zip(modes.values, modes.counts):
                 if not np.isfinite(v) or c <= 0:
                     continue
                 print(f"{v / msun_g:.8e},{int(c)}")
@@ -236,7 +211,7 @@ def main() -> int:
 
         return 0
 
-    return int(run_console_main(rt, _run))
+    return int(run_console_main(client.runtime, _run))
 
 
 if __name__ == "__main__":

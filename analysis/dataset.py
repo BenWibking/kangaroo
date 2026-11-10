@@ -7,6 +7,7 @@ from typing import Any, Dict, Optional
 import numpy as np
 
 from . import _core  # type: ignore
+from .buffer import DType, dtype_from_numpy, materialize_payload, parse_dtype_tag
 
 
 @dataclass(frozen=True)
@@ -25,66 +26,24 @@ class Dataset:
     _h: Any = field(init=False)
     _fields: Dict[str, int] = field(default_factory=dict)
     _kind: str = field(init=False, default="unknown")
-    _path: str = field(init=False, default="")
 
     def __post_init__(self) -> None:
-        kind, path = self._parse_uri(self.uri)
-        self._kind = kind
-        self._path = path
         self._h = _core.DatasetHandle(self.uri, self.step, self.level)
+        self._kind = str(self._h.kind())
         self._auto_register()
-
-    @staticmethod
-    def _parse_uri(uri: str) -> tuple[str, str]:
-        if uri.startswith("amrex://"):
-            return "amrex", uri[8:]
-        if uri.startswith("openpmd://"):
-            return "openpmd", uri
-        if uri.startswith("parthenon://"):
-            return "parthenon", uri[12:]
-        if uri.startswith("file://"):
-            path = uri[7:]
-            import os
-
-            if os.path.isfile(path) and path.endswith((".phdf", ".h5", ".hdf5")):
-                return "parthenon", path
-            return "amrex", path
-        if uri.startswith("memory://"):
-            return "memory", uri
-        return "unknown", uri
 
     @property
     def kind(self) -> str:
         return self._kind
 
     def _auto_register(self) -> None:
-        if self._kind == "amrex":
-            path = self._path
-            import os
-            header_path = os.path.join(path, "Header")
-            if os.path.exists(header_path):
-                with open(header_path, "r") as f:
-                    lines = f.readlines()
-                    if len(lines) > 2:
-                        ncomp = int(lines[1].strip())
-                        for i in range(ncomp):
-                            name = lines[2 + i].strip()
-                            fid = self.field_id(name)
-                            self._h.register_field(fid, i)
-        elif self._kind == "openpmd":
-            meta = self.metadata
-            for name in meta.get("var_names", []):
-                fid = self.field_id(name)
-                self._h.register_field(fid, name)
-        elif self._kind == "parthenon":
-            meta = self.metadata
-            for name in meta.get("var_names", []):
-                fid = self.field_id(name)
-                self._h.register_field(fid, name)
-            for info in meta.get("variable_info", {}).values():
-                for label in info.get("component_names", []):
-                    fid = self.field_id(label)
-                    self._h.register_field(fid, label)
+        meta = self.metadata
+        names = list(meta.get("var_names", []))
+        for info in meta.get("variable_info", {}).values():
+            names.extend(info.get("component_names", []))
+        for name in dict.fromkeys(names):
+            fid = self.field_id(name)
+            self._h.register_field(fid, name)
 
     def list_meshes(self) -> list[str]:
         return list(self._h.list_meshes())
@@ -119,22 +78,11 @@ class Dataset:
         if not hasattr(self._h, "read_particle_field_chunk"):
             raise RuntimeError("Particle chunk field access is not available in this runtime")
         payload = self._h.read_particle_field_chunk(particle_type, field, int(chunk_index))
-        dtype = payload["dtype"]
-        raw = payload["data"]
-        if dtype == "float32":
-            np_dtype = np.float32
-        elif dtype == "float64":
-            np_dtype = np.float64
-        elif dtype == "int64":
-            np_dtype = np.int64
-        else:
-            raise RuntimeError(f"unsupported particle dtype '{dtype}'")
-        return np.frombuffer(raw, dtype=np_dtype)
+        return materialize_payload(payload)
 
     def register_field(self, name: str, fid: int) -> None:
         self._fields[name] = fid
-        if self._kind in {"openpmd", "parthenon"}:
-            self._h.register_field(fid, name)
+        self._h.register_field(fid, name)
 
     def field_id(self, name: str) -> int:
         if name in self._fields:
@@ -149,8 +97,7 @@ class Dataset:
             return self._h.metadata()
         except RuntimeError as exc:
             raise RuntimeError(
-                f"Failed to load dataset metadata for '{self.uri}': {exc}. "
-                "Only cell-centered openPMD mesh records are supported."
+                f"Failed to load dataset metadata for '{self.uri}': {exc}"
             ) from exc
 
     def metadata_bundle(self, periodic: Optional[tuple[bool, bool, bool]] = None) -> DatasetMetadata:
@@ -350,40 +297,43 @@ class Dataset:
             "axis_bounds": axis_bounds,
         }
 
-    def infer_bytes_per_value(
+    def set_chunk(
         self,
-        runtime: Any,
         *,
         field: int,
-        level: int,
-        step: int = 0,
         version: int = 0,
-        block: int = 0,
-    ) -> int:
-        level_boxes = self.metadata["level_boxes"][level]
-        if not level_boxes:
-            raise RuntimeError(f"No boxes found for level {level}")
-        b0_lo, b0_hi = level_boxes[0]
-        b0_elems = (
-            (b0_hi[0] - b0_lo[0] + 1)
-            * (b0_hi[1] - b0_lo[1] + 1)
-            * (b0_hi[2] - b0_lo[2] + 1)
-        )
-        raw = runtime.get_task_chunk(
-            step=step,
-            level=level,
-            field=field,
-            version=version,
-            block=block,
-            dataset=self,
-        )
-        bpv = len(raw) // b0_elems
-        if bpv <= 0:
-            raise RuntimeError("Unable to infer bytes-per-value from dataset chunk")
-        return bpv
+        block: int,
+        data: bytes | bytearray | memoryview | np.ndarray,
+        dtype: DType | str | None = None,
+        shape: tuple[int, ...] | None = None,
+        opaque: bool = False,
+    ) -> None:
+        if isinstance(data, np.ndarray):
+            array = np.ascontiguousarray(data)
+            inferred_dtype = dtype_from_numpy(array.dtype)
+            if dtype is not None and parse_dtype_tag(dtype) is not inferred_dtype:
+                raise ValueError("explicit dtype does not match NumPy array dtype")
+            if shape is not None and tuple(shape) != tuple(array.shape):
+                raise ValueError("explicit shape does not match NumPy array shape")
+            self._h.set_chunk(
+                field,
+                version,
+                block,
+                array.tobytes(order="C"),
+                inferred_dtype.value,
+                list(array.shape),
+            )
+            return
 
-    def set_chunk(self, *, field: int, version: int = 0, block: int, data: bytes) -> None:
-        self._h.set_chunk(field, version, block, data)
+        raw = bytes(data)
+        if opaque:
+            if dtype is not None or shape is not None:
+                raise ValueError("opaque writes cannot also specify numeric dtype or shape")
+            self._h.set_chunk(field, version, block, raw, DType.OPAQUE.value, [len(raw)])
+            return
+        if dtype is None or shape is None:
+            raise ValueError("raw-byte chunk writes require dtype and shape, or opaque=True")
+        self._h.set_chunk(field, version, block, raw, parse_dtype_tag(dtype).value, list(shape))
 
 
 def _resolve_dataset_uri(path_or_uri: str) -> str:

@@ -6,9 +6,8 @@ from __future__ import annotations
 import argparse
 import numpy as np
 
-from analysis import Runtime, run_console_main  # noqa: E402
-from analysis.dataset import open_dataset  # noqa: E402
-from analysis.pipeline import pipeline  # noqa: E402
+import kangaroo as kr  # noqa: E402
+from kangaroo.runtime import run_console_main  # noqa: E402
 
 
 
@@ -35,51 +34,31 @@ def main() -> int:
     p.add_argument("--resolution")
     a, u = p.parse_known_args()
 
-    rt = Runtime.from_parsed_args(a, unknown_args=u)
+    client = kr.Client.from_parsed_args(a, unknown_args=u)
 
     def _run() -> int:
         base_level = 0
-        ds = open_dataset(a.plotfile, level=base_level, runtime=rt)
-        metadata = ds.metadata_bundle()
-        runmeta = metadata.runmeta
-        comp, field, _ = ds.resolve_field(a.var)
-        bytes_per_value = ds.infer_bytes_per_value(rt, field=field, level=a.level)
+        ds = client.open_dataset(a.plotfile, level=base_level)
+        comp = a.var or next(iter(ds.fields))
 
-        view = ds.plane_geometry(
+        view = ds.geometry.plane(
             axis=a.axis,
-            level=base_level,
             zoom=a.zoom,
             resolution=a.resolution,
         )
-        rect = view["rect"]
-        res = view["resolution"]
-        labels = view["labels"]
-        plane = view["plane"]
-        axis_bounds = _parse_bounds(a.axis_bounds) if a.axis_bounds else view["axis_bounds"]
+        rect = view.rect
+        res = view.resolution
+        labels = view.labels
+        plane = view.plane
+        axis_bounds = _parse_bounds(a.axis_bounds) if a.axis_bounds else view.axis_bounds
 
-        pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
-        out = pipe.uniform_projection(
-            field=pipe.field(field),
+        arr = ds[comp].project(
             axis=a.axis,
-            axis_bounds=axis_bounds,
+            bounds=axis_bounds,
             rect=rect,
             resolution=res,
-            out="projection",
-            bytes_per_value=bytes_per_value,
             amr_cell_average=True,
-        )
-        rt.run(pipe.plan(), runmeta=runmeta, dataset=ds)
-
-        arr = rt.get_task_chunk_array(
-            step=0,
-            level=base_level,
-            field=out.field,
-            version=0,
-            block=0,
-            shape=res,
-            bytes_per_value=bytes_per_value,
-            dataset=ds,
-        )
+        ).compute()
 
         import matplotlib.pyplot as plt
 
@@ -107,7 +86,7 @@ def main() -> int:
 
         return 0
 
-    return int(run_console_main(rt, _run))
+    return int(run_console_main(client.runtime, _run))
 
 
 if __name__ == "__main__":

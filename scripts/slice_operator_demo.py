@@ -105,7 +105,13 @@ def main() -> int:
             )
             data = make_synthetic_field(bx, by, bz, dx, x0_block)
             block_data.append(data)
-            ds.set_chunk(field=field, block=block_id, data=data.astype(np.float32).tobytes(order="C"))
+            ds.set_chunk(
+                field=field,
+                block=block_id,
+                data=data.astype(np.float32).tobytes(order="C"),
+                dtype="f32",
+                shape=data.shape,
+            )
 
         axis = "z"
         k = nz // 2
@@ -126,9 +132,15 @@ def main() -> int:
         except Exception as exc:
             print("Runtime executed but raised (kernels may be missing):", exc)
 
-        slice_field = plan.stages[-1].templates[0].outputs[0].field
-        raw = rt.get_task_chunk(step=0, level=0, field=slice_field, version=0, block=0)
-        slice_2d = np.frombuffer(raw, dtype=np.float32, count=nx * ny).reshape((nx, ny))
+        slice_ref = plan.stages[-1].templates[0].outputs[0].field
+        slice_2d = rt.get_task_chunk_array(
+            step=0,
+            level=0,
+            field=slice_ref.field,
+            version=slice_ref.version,
+            block=0,
+            dataset=ds,
+        )
         full_field = np.concatenate(block_data, axis=0)
         expected_slice = full_field[:, :, k]
         kangaroo_slice = slice_2d.T

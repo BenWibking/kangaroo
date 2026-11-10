@@ -3,6 +3,8 @@
 #include "kangaroo/kernel.hpp"
 
 #include <cstdint>
+#include <optional>
+#include <string>
 #include <vector>
 
 #include <hpx/future.hpp>
@@ -63,33 +65,45 @@ struct ChunkSubboxRef {
   ChunkRef chunk;
   IndexBox3 chunk_box;
   IndexBox3 request_box;
-  int32_t bytes_per_value = 4;
 
   template <typename Archive>
   void serialize(Archive& ar, unsigned) {
-    ar& chunk& chunk_box& request_box& bytes_per_value;
+    ar& chunk& chunk_box& request_box;
   }
 };
 
 struct SubboxView {
-  HostView data;
+  ChunkBuffer data;
   IndexBox3 box;
-  int32_t bytes_per_value = 4;
 
   template <typename Archive>
   void serialize(Archive& ar, unsigned) {
-    ar& data& box& bytes_per_value;
+    ar& data& box;
   }
+};
+
+struct ResolvedBufferSpec {
+  BufferDesc desc;
+  InitPolicy init = InitPolicy::kUninitialized;
+  std::optional<std::uint64_t> dynamic_capacity_elements;
 };
 
 class DataService {
  public:
   virtual ~DataService() = default;
   virtual int home_rank(const ChunkRef&) const = 0;
-  virtual HostView alloc_host(const ChunkRef&, std::size_t bytes) = 0;
-  virtual hpx::future<HostView> get_host(const ChunkRef&) = 0;
-  virtual std::vector<hpx::future<HostView>> get_hosts(const std::vector<ChunkRef>& refs) {
-    std::vector<hpx::future<HostView>> out;
+  virtual std::size_t estimate_host_bytes(const ChunkRef&) const = 0;
+  virtual std::optional<BufferDesc> describe_host(const ChunkRef&) const {
+    return std::nullopt;
+  }
+  virtual std::optional<std::uint64_t> estimate_particle_chunk_records(
+      const std::string&, std::int64_t) const {
+    return std::nullopt;
+  }
+  virtual ChunkBuffer alloc_host(const ChunkRef&, const ResolvedBufferSpec&) = 0;
+  virtual hpx::future<ChunkBuffer> get_host(const ChunkRef&) = 0;
+  virtual std::vector<hpx::future<ChunkBuffer>> get_hosts(const std::vector<ChunkRef>& refs) {
+    std::vector<hpx::future<ChunkBuffer>> out;
     out.reserve(refs.size());
     for (const auto& ref : refs) {
       out.push_back(get_host(ref));
@@ -97,7 +111,7 @@ class DataService {
     return out;
   }
   virtual hpx::future<SubboxView> get_subbox(const ChunkSubboxRef&) = 0;
-  virtual hpx::future<void> put_host(const ChunkRef&, HostView) = 0;
+  virtual hpx::future<void> put_host(const ChunkRef&, ChunkBuffer) = 0;
 };
 
 }  // namespace kangaroo

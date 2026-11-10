@@ -2,17 +2,17 @@
 
 #include "kangaroo/kernel.hpp"
 
-#include <array>
 #include <cstdint>
 #include <memory>
 #include <optional>
 #include <string>
-#include <typeindex>
 #include <vector>
 
 #include <hpx/datastructures/serialization/optional.hpp>
 
 namespace kangaroo {
+
+class DynamicOutputBoundEvaluator;
 
 enum class ExecPlane : uint8_t { Chunk = 0, Graph = 1, Mixed = 2 };
 
@@ -61,24 +61,58 @@ struct GraphReduceSpecIR {
   std::vector<int32_t> input_blocks;
   std::vector<int32_t> output_blocks;
   std::vector<int32_t> group_offsets;
-};
-
-struct CoveredBoxIR {
-  std::array<int32_t, 3> lo{0, 0, 0};
-  std::array<int32_t, 3> hi{0, 0, 0};
 
   template <typename Archive>
   void serialize(Archive& ar, unsigned) {
-    for (auto& v : lo) {
-      ar& v;
-    }
-    for (auto& v : hi) {
-      ar& v;
-    }
+    ar& fan_in& num_inputs& input_base& output_base& input_blocks& output_blocks&
+        group_offsets;
   }
 };
 
-using CoveredBoxListIR = std::vector<CoveredBoxIR>;
+enum class ShapeRuleKind : std::uint8_t { kBlock = 0, kFixed = 1, kLikeInput = 2, kDynamic = 3 };
+enum class DynamicUpperBoundKind : std::uint8_t {
+  kLiteral = 0,
+  kLikeInput = 1,
+  kBackendChunk = 2,
+  kAmrSubboxPack = 3,
+};
+
+struct DynamicUpperBoundIR {
+  DynamicUpperBoundKind kind = DynamicUpperBoundKind::kLiteral;
+  std::uint64_t value = 0;
+  std::int32_t input_index = -1;
+
+  template <typename Archive>
+  void serialize(Archive& ar, unsigned) {
+    ar& kind& value& input_index;
+  }
+};
+
+struct BufferSpecIR {
+  ScalarType scalar = ScalarType::kOpaque;
+  ShapeRuleKind shape_kind = ShapeRuleKind::kFixed;
+  std::vector<std::uint64_t> fixed_extents;
+  std::uint32_t block_components = 1;
+  std::int32_t like_input_index = -1;
+  DynamicUpperBoundIR dynamic_upper_bound;
+  InitPolicy init = InitPolicy::kUninitialized;
+
+  template <typename Archive>
+  void serialize(Archive& ar, unsigned) {
+    ar& scalar& shape_kind& fixed_extents& block_components& like_input_index&
+        dynamic_upper_bound& init;
+  }
+};
+
+struct OutputRefIR {
+  FieldRefIR field;
+  BufferSpecIR buffer;
+
+  template <typename Archive>
+  void serialize(Archive& ar, unsigned) {
+    ar& field& buffer;
+  }
+};
 
 struct TaskTemplateIR {
   std::string name;
@@ -86,20 +120,18 @@ struct TaskTemplateIR {
   std::string kernel;
   DomainIR domain;
   std::vector<FieldRefIR> inputs;
-  std::vector<FieldRefIR> outputs;
-  std::vector<int32_t> output_bytes;
+  std::vector<OutputRefIR> outputs;
   DepRuleIR deps;
   int32_t covered_boxes_ref = -1;
-  std::vector<std::uint8_t> params_msgpack;
+  KernelParamsIR params;
+  std::optional<GraphReduceSpecIR> graph_reduce;
   std::shared_ptr<const KernelFn> kernel_fn;           // locality-local prepared metadata
-  std::optional<GraphReduceSpecIR> graph_reduce;       // locality-local prepared metadata
-  std::shared_ptr<const void> prepared_params;         // locality-local prepared metadata
-  std::type_index prepared_params_type{typeid(void)};  // locality-local prepared metadata
+  std::shared_ptr<const DynamicOutputBoundEvaluator> dynamic_output_bound;  // locality-local
 
   template <typename Archive>
   void serialize(Archive& ar, unsigned) {
-    ar& name& plane& kernel& domain& inputs& outputs& output_bytes& deps& covered_boxes_ref&
-        params_msgpack;
+    ar& name& plane& kernel& domain& inputs& outputs& deps& covered_boxes_ref&
+        params& graph_reduce;
   }
 };
 

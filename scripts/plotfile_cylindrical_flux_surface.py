@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Integrate fluxes through fixed-radius cylindrical surfaces in an AMReX plotfile."""
+"""Integrate fluxes through origin-centered, z-aligned cylinders in a plotfile.
+
+Use --radius-kpc and --height-kpc for one cylinder. For a one-dimensional
+profile, either vary half-height with --zmin-kpc/--zmax-kpc at fixed radius or
+vary radius with --rmin-kpc/--rmax-kpc at fixed half-height. The wall section
+contains radial angular-momentum flux; endcaps contain the vertical
+angular-momentum flux. Magnetic fields must use B**2/2 energy normalization.
+Angular-momentum flux is in g cm**2 s**-2 for cgs input. Sign bins classify
+each flux's sign, not the gas velocity.
+"""
 
 from __future__ import annotations
 
@@ -34,7 +43,12 @@ from scripts.plotfile_flux_surface import (  # noqa: E402
 )
 
 
-COMPONENTS = tuple(name.replace("_sphere", "_cylinder") for name in SPHERE_COMPONENTS)
+COMPONENTS = tuple(name.replace("_sphere", "_cylinder") for name in SPHERE_COMPONENTS) + (
+    "advective_radial_angular_momentum_flux_cylinder",
+    "maxwell_radial_angular_momentum_flux_cylinder",
+    "advective_vertical_angular_momentum_flux_cylinder",
+    "maxwell_vertical_angular_momentum_flux_cylinder",
+)
 GEOMETRIC_SECTIONS = ("endcaps", "walls")
 
 
@@ -43,6 +57,13 @@ def _finite_heights(values: Iterable[float]) -> np.ndarray:
     if heights.size == 0 or not np.all(np.isfinite(heights)) or np.any(heights <= 0.0):
         raise ValueError("heights must be finite and positive")
     return heights
+
+
+def _finite_radii(values: Iterable[float]) -> np.ndarray:
+    radii = np.asarray([float(value) for value in values], dtype=np.float64)
+    if radii.size == 0 or not np.all(np.isfinite(radii)) or np.any(radii <= 0.0):
+        raise ValueError("radii must be finite and positive")
+    return radii
 
 
 def _flux_rows_and_derived(
@@ -74,7 +95,7 @@ def _flux_rows_and_derived(
         ):
             values_by_temperature_section = values[:, :, np.newaxis, :, :]
         else:
-            raise ValueError("flux values must have shape (num_heights, 2, 2, 4)")
+            raise ValueError("flux values must have shape (num_heights, 2, 2, 8)")
         temperature_edges = None
     else:
         expected_shape = (
@@ -95,7 +116,7 @@ def _flux_rows_and_derived(
             values_by_temperature_section[:, :, :, 1, :] = values
         elif values.shape != expected_shape:
             raise ValueError(
-                "flux values must have shape (num_heights, 2, num_temperature_bins, 2, 4)"
+                "flux values must have shape (num_heights, 2, num_temperature_bins, 2, 8)"
             )
         else:
             values_by_temperature_section = values
@@ -168,7 +189,40 @@ def _flux_rows_and_derived(
         }
         for i in range(len(heights))
     ]
+    # Sum both component sign bins before forming the net total. Opposite
+    # angular-momentum signs need not correspond to inward/outward gas.
+    net_by_section = section_summed_values.sum(axis=1)
     derived = {
+        "radial_angular_momentum_flux_by_height": [
+            {
+                "height": float(heights[i]),
+                "height_kpc": float(heights[i] / (1.0e3 * pc_cm)),
+                "by_geometric_section": {
+                    section: {
+                        "advective": float(net_by_section[i, section_idx, 4]),
+                        "maxwell": float(net_by_section[i, section_idx, 5]),
+                        "total": float(net_by_section[i, section_idx, 4:6].sum()),
+                    }
+                    for section_idx, section in enumerate(GEOMETRIC_SECTIONS)
+                },
+            }
+            for i in range(len(heights))
+        ],
+        "vertical_angular_momentum_flux_by_height": [
+            {
+                "height": float(heights[i]),
+                "height_kpc": float(heights[i] / (1.0e3 * pc_cm)),
+                "by_geometric_section": {
+                    section: {
+                        "advective": float(net_by_section[i, section_idx, 6]),
+                        "maxwell": float(net_by_section[i, section_idx, 7]),
+                        "total": float(net_by_section[i, section_idx, 6:8].sum()),
+                    }
+                    for section_idx, section in enumerate(GEOMETRIC_SECTIONS)
+                },
+            }
+            for i in range(len(heights))
+        ],
         "mass_flux_msun_per_yr": (
             float(summed_values[0, 0] * YR_S / MSUN_G) if len(heights) == 1 else None
         ),
@@ -206,11 +260,18 @@ def main() -> int:
     p.add_argument("plotfile")
     p.add_argument("--radius", type=float, help="Cylinder radius in plotfile coordinate units.")
     p.add_argument("--radius-kpc", type=float, help="Cylinder radius in kpc; converted to cm.")
+    p.add_argument("--rmin-kpc", "--rmin_kpc", dest="rmin_kpc", type=float)
+    p.add_argument("--rmax-kpc", "--rmax_kpc", dest="rmax_kpc", type=float)
     p.add_argument("--height", type=float, help="Half-height in plotfile coordinate units.")
     p.add_argument("--height-kpc", type=float, help="Half-height in kpc; converted to cm.")
     p.add_argument("--zmin-kpc", "--zmin_kpc", dest="zmin_kpc", type=float)
     p.add_argument("--zmax-kpc", "--zmax_kpc", dest="zmax_kpc", type=float)
-    p.add_argument("--nbins", type=int, default=64, help="Number of log-spaced half-heights.")
+    p.add_argument(
+        "--nbins",
+        type=int,
+        default=64,
+        help="Number of log-spaced values in the requested radius or half-height range.",
+    )
     p.add_argument("--density")
     p.add_argument("--momx")
     p.add_argument("--momy")
@@ -223,7 +284,6 @@ def main() -> int:
     p.add_argument("--temperature")
     p.add_argument("--temperature-bins", nargs="+")
     p.add_argument("--gamma", type=float, default=5.0 / 3.0)
-    p.add_argument("--bytes-per-value", type=int, choices=(4, 8), default=8)
     p.add_argument("--output-json")
     p.add_argument("--list-fields", action="store_true")
     p.add_argument("--progress", action="store_true")
@@ -243,12 +303,38 @@ def main() -> int:
             return 0
 
         pc_cm = 3.0856775814913673e18
-        radius_count = sum(value is not None for value in (a.radius, a.radius_kpc))
-        if radius_count != 1:
-            raise RuntimeError("Pass exactly one of --radius or --radius-kpc")
-        radius = _finite_radius(
-            a.radius if a.radius is not None else float(a.radius_kpc) * 1.0e3 * pc_cm
-        )
+        single_radius_count = sum(value is not None for value in (a.radius, a.radius_kpc))
+        range_radius_count = sum(value is not None for value in (a.rmin_kpc, a.rmax_kpc))
+        if single_radius_count == 0 and range_radius_count == 0:
+            raise RuntimeError(
+                "Pass --radius, --radius-kpc, or both --rmin-kpc and --rmax-kpc"
+            )
+        if single_radius_count > 0 and range_radius_count > 0:
+            raise RuntimeError(
+                "Pass either a single radius or --rmin-kpc/--rmax-kpc, not both"
+            )
+        if single_radius_count > 1:
+            raise RuntimeError("Pass only one of --radius or --radius-kpc")
+        if range_radius_count not in (0, 2):
+            raise RuntimeError("Pass both --rmin-kpc and --rmax-kpc")
+        if range_radius_count == 2:
+            if int(a.nbins) <= 0:
+                raise ValueError("nbins must be positive")
+            rmin_kpc = _finite_radius(a.rmin_kpc)
+            rmax_kpc = _finite_radius(a.rmax_kpc)
+            if rmin_kpc > rmax_kpc:
+                raise ValueError("rmin_kpc must be less than or equal to rmax_kpc")
+            radii_kpc = _finite_radii(
+                np.logspace(np.log10(rmin_kpc), np.log10(rmax_kpc), int(a.nbins))
+            )
+            radii = _finite_radii(radii_kpc * 1.0e3 * pc_cm)
+        else:
+            radius = _finite_radius(
+                a.radius
+                if a.radius is not None
+                else float(a.radius_kpc) * 1.0e3 * pc_cm
+            )
+            radii = _finite_radii([radius])
 
         single_height_count = sum(value is not None for value in (a.height, a.height_kpc))
         range_height_count = sum(value is not None for value in (a.zmin_kpc, a.zmax_kpc))
@@ -276,6 +362,12 @@ def main() -> int:
                 a.height if a.height is not None else float(a.height_kpc) * 1.0e3 * pc_cm
             )
             heights = _finite_heights([height])
+
+        if len(radii) > 1 and len(heights) > 1:
+            raise RuntimeError(
+                "Radius and half-height cannot both vary in one run; use a radius "
+                "range with --height/--height-kpc, or a single radius with a height range"
+            )
 
         temperature_bins = (
             _parse_temperature_bins(a.temperature_bins)
@@ -308,85 +400,174 @@ def main() -> int:
             flush=True,
         )
         pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+        density = pipe.field(fields["density"][1])
+        momentum = tuple(
+            pipe.field(fields[role][1]) for role in ("momx", "momy", "momz")
+        )
+        energy = pipe.field(fields["energy"][1])
+        passive_scalar = pipe.field(fields["scalar"][1])
+        magnetic_field = tuple(
+            pipe.field(fields[role][1]) for role in ("bx", "by", "bz")
+        )
+        temperature = (
+            pipe.field(fields["temperature"][1])
+            if temperature_bins is not None
+            else None
+        )
         flux = pipe.cylindrical_flux_surface_integral(
-            pipe.field(fields["density"][1]),
-            momentum=(
-                pipe.field(fields["momx"][1]),
-                pipe.field(fields["momy"][1]),
-                pipe.field(fields["momz"][1]),
-            ),
-            energy=pipe.field(fields["energy"][1]),
-            passive_scalar=pipe.field(fields["scalar"][1]),
-            magnetic_field=(
-                pipe.field(fields["bx"][1]),
-                pipe.field(fields["by"][1]),
-                pipe.field(fields["bz"][1]),
-            ),
-            radius=radius,
+            density,
+            momentum=momentum,
+            energy=energy,
+            passive_scalar=passive_scalar,
+            magnetic_field=magnetic_field,
+            radius=radii,
             height=heights,
-            temperature=(
-                pipe.field(fields["temperature"][1])
-                if temperature_bins is not None
-                else None
-            ),
+            temperature=temperature,
             temperature_bins=temperature_bins,
             gamma=float(a.gamma),
-            bytes_per_value=int(a.bytes_per_value),
             out="cylindrical_flux_surface_integral",
         )
         pipe.run(progress_bar=bool(a.progress))
 
+        scan_count = max(len(radii), len(heights))
+        value_shape = (
+            (
+                scan_count,
+                2,
+                len(temperature_bins) - 1,
+                len(GEOMETRIC_SECTIONS),
+                len(COMPONENTS),
+            )
+            if temperature_bins is not None
+            else (scan_count, 2, len(GEOMETRIC_SECTIONS), len(COMPONENTS))
+        )
         values = rt.get_task_chunk_array(
             step=0,
             level=0,
             field=flux.field,
             version=0,
             block=0,
-            shape=(
-                (len(heights), 2, len(temperature_bins) - 1, len(GEOMETRIC_SECTIONS), 4)
-                if temperature_bins is not None
-                else (len(heights), 2, len(GEOMETRIC_SECTIONS), 4)
-            ),
             dtype=np.float64,
             dataset=ds,
         )
-        flux_rows, derived = _flux_rows_and_derived(
-            heights,
-            values,
-            pc_cm=pc_cm,
-            temperature_bins=temperature_bins,
-        )
+        values = values.reshape(value_shape)
+        if len(radii) > 1:
+            rows_and_derived = [
+                _flux_rows_and_derived(
+                    heights,
+                    values[radius_idx : radius_idx + 1],
+                    pc_cm=pc_cm,
+                    temperature_bins=temperature_bins,
+                )
+                for radius_idx in range(len(radii))
+            ]
+        else:
+            rows_and_derived = [
+                _flux_rows_and_derived(
+                    heights,
+                    values,
+                    pc_cm=pc_cm,
+                    temperature_bins=temperature_bins,
+                )
+            ]
+
+        flux_rows, first_derived = rows_and_derived[0]
+        flux_rows_by_radius = []
+        derived_by_radius = {
+            "mass_flux_msun_per_yr_by_radius": [],
+            "radial_angular_momentum_flux_by_radius": [],
+            "vertical_angular_momentum_flux_by_radius": [],
+        }
+        if len(heights) == 1:
+            for radius, (radius_flux_rows, radius_derived) in zip(
+                radii, rows_and_derived
+            ):
+                row = dict(radius_flux_rows[0])
+                row.update(
+                    radius=float(radius),
+                    radius_kpc=float(radius / (1.0e3 * pc_cm)),
+                )
+                flux_rows_by_radius.append(row)
+                for height_key, radius_key in (
+                    ("mass_flux_msun_per_yr_by_height", "mass_flux_msun_per_yr_by_radius"),
+                    (
+                        "radial_angular_momentum_flux_by_height",
+                        "radial_angular_momentum_flux_by_radius",
+                    ),
+                    (
+                        "vertical_angular_momentum_flux_by_height",
+                        "vertical_angular_momentum_flux_by_radius",
+                    ),
+                ):
+                    derived_row = dict(radius_derived[height_key][0])
+                    derived_row.update(
+                        radius=float(radius),
+                        radius_kpc=float(radius / (1.0e3 * pc_cm)),
+                    )
+                    derived_by_radius[radius_key].append(derived_row)
+            if len(radii) > 1:
+                derived = derived_by_radius
+            else:
+                derived = dict(first_derived)
+                derived.update(derived_by_radius)
+        else:
+            derived = first_derived
         result = {
             "plotfile": a.plotfile,
             "time": float(bundle.dataset["time"]) if "time" in bundle.dataset else None,
-            "radius": float(radius),
-            "radius_kpc": float(radius / (1.0e3 * pc_cm)),
+            "radius": float(radii[0]) if len(radii) == 1 else None,
+            "radius_kpc": (
+                float(radii[0] / (1.0e3 * pc_cm)) if len(radii) == 1 else None
+            ),
+            "radii": [float(radius) for radius in radii],
+            "radii_kpc": [float(radius / (1.0e3 * pc_cm)) for radius in radii],
             "height": float(heights[0]) if len(heights) == 1 else None,
             "height_kpc": float(heights[0] / (1.0e3 * pc_cm)) if len(heights) == 1 else None,
             "heights": [float(height) for height in heights],
             "heights_kpc": [float(height / (1.0e3 * pc_cm)) for height in heights],
-            "nbins": int(len(heights)),
+            "nbins": int(max(len(radii), len(heights))),
+            "num_radii": int(len(radii)),
+            "num_heights": int(len(heights)),
             "temperature_bins": (
                 [float(edge) for edge in temperature_bins]
                 if temperature_bins is not None
                 else None
             ),
             "gamma": float(a.gamma),
-            "bytes_per_value": int(a.bytes_per_value),
+            "radial_angular_momentum_axis": "z",
+            "vertical_angular_momentum_axis": "z",
+            "endcap_normal_convention": "upper +z, lower -z; both summed",
+            "center": [0.0, 0.0, 0.0],
+            "magnetic_normalization": "magnetic_energy_density = B^2/2",
+            "radial_angular_momentum_flux_units": "g cm^2 s^-2 (for cgs input)",
+            "vertical_angular_momentum_flux_units": "g cm^2 s^-2 (for cgs input)",
+            "sign_bin_convention": "sign of each flux component, not velocity",
+            "components": list(COMPONENTS),
             "fields": {role: name for role, (name, _) in fields.items()},
-            "fluxes": flux_rows[0]["fluxes"] if len(heights) == 1 else None,
-            "flux_bins": flux_rows[0]["flux_bins"] if len(heights) == 1 else None,
+            "fluxes": (
+                flux_rows[0]["fluxes"]
+                if len(radii) == 1 and len(heights) == 1
+                else None
+            ),
+            "flux_bins": (
+                flux_rows[0]["flux_bins"]
+                if len(radii) == 1 and len(heights) == 1
+                else None
+            ),
             "flux_bins_by_geometric_section": (
                 flux_rows[0]["flux_bins_by_geometric_section"]
-                if len(heights) == 1
+                if len(radii) == 1 and len(heights) == 1
                 else None
             ),
             "flux_bins_by_temperature": (
                 flux_rows[0]["flux_bins_by_temperature"]
-                if len(heights) == 1 and temperature_bins is not None
+                if len(radii) == 1
+                and len(heights) == 1
+                and temperature_bins is not None
                 else None
             ),
-            "fluxes_by_height": flux_rows,
+            "fluxes_by_height": flux_rows if len(radii) == 1 else None,
+            "fluxes_by_radius": flux_rows_by_radius if len(heights) == 1 else None,
             "derived": derived,
         }
 

@@ -5,22 +5,68 @@ from typing import Any, Callable, Sequence
 
 import numpy as np
 
+from .buffer import (
+    BlockShape,
+    BufferSpec,
+    DType,
+    DynamicShape,
+    DynamicUpperBound,
+    FixedShape,
+    InitPolicy,
+    LikeInputShape,
+)
 from .ctx import LoweringContext
+from .kernel_params import (
+    FieldExprParams,
+    FiniteOnlyParams,
+    KernelParams,
+    NoKernelParams,
+    ParticleFieldParams,
+    ParticleHistogramParams,
+    ScalarParams,
+    TopKModesParams,
+    ValuesParams,
+)
 from .ops import (
     CylindricalFluxSurfaceIntegral,
+    CylindricalMoments,
     FluxSurfaceIntegral,
     Histogram1D,
     Histogram2D,
     ParticleCICProjection,
+    ToomreQProfile,
     UniformProjection,
     UniformSlice,
     VorticityMag,
-    _reduce_group_plan,
     histogram_edges_1d,
     histogram_edges_2d,
 )
-from .plan import Domain, FieldRef, Plan, Stage
+from .plan import DependencyRule, Domain, FieldRef, OutputRef, Plan, Stage
+from .reduction import (
+    GraphReductionBuilder,
+    ReducedField,
+    default_reduce_fan_in,
+)
 from .runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
+
+
+def _fixed_output(field: int, dtype: DType, elements: int) -> OutputRef:
+    return OutputRef(
+        FieldRef(field),
+        BufferSpec(dtype, FixedShape((int(elements),)), InitPolicy.ZERO),
+    )
+
+
+def _block_output(field: int, dtype: DType) -> OutputRef:
+    return OutputRef(FieldRef(field), BufferSpec(dtype, BlockShape()))
+
+
+def _like_output(field: int, dtype: DType, input_index: int = 0) -> OutputRef:
+    return OutputRef(FieldRef(field), BufferSpec(dtype, LikeInputShape(input_index)))
+
+
+def _dynamic_output(field: int, dtype: DType, upper_bound: DynamicUpperBound) -> OutputRef:
+    return OutputRef(FieldRef(field), BufferSpec(dtype, DynamicShape(upper_bound)))
 
 
 @dataclass(frozen=True)
@@ -30,6 +76,19 @@ class FieldHandle:
     pipeline: "Pipeline"
     field: int
     name: str | None = None
+
+    def iter_chunks(self) -> list[np.ndarray]:
+        """Execute producer ancestry and return descriptor-materialized chunks."""
+
+        return self.pipeline._materialize_mesh_field(self.field)
+
+    def compute(self) -> Any:
+        """Execute and return one bounded array or a chunked AMR result."""
+
+        from kangaroo.results import ChunkedArray
+
+        chunks = tuple(self.iter_chunks())
+        return chunks[0] if len(chunks) == 1 else ChunkedArray(chunks)
 
 
 @dataclass(frozen=True)
@@ -42,6 +101,14 @@ class Histogram1DHandle:
     def edges(self) -> list[float]:
         return histogram_edges_1d(self.hist_range, self.bins)
 
+    def compute(self) -> Any:
+        """Execute and return typed histogram counts and edges."""
+
+        from kangaroo.results import HistogramResult
+
+        counts = self.counts.compute()
+        return HistogramResult(np.asarray(counts), np.asarray(self.edges))
+
 
 @dataclass(frozen=True)
 class Histogram2DHandle:
@@ -53,6 +120,17 @@ class Histogram2DHandle:
     @property
     def edges(self) -> tuple[list[float], list[float]]:
         return histogram_edges_2d(self.x_range, self.y_range, self.bins)
+
+    def compute(self) -> Any:
+        """Execute and return typed 2D histogram counts and edges."""
+
+        from kangaroo.results import Histogram2DResult
+
+        counts = self.counts.compute()
+        x_edges, y_edges = self.edges
+        return Histogram2DResult(
+            np.asarray(counts), np.asarray(x_edges), np.asarray(y_edges)
+        )
 
 
 @dataclass(frozen=True)
@@ -79,11 +157,23 @@ class FluxSurfaceIntegralHandle:
     def name(self) -> str | None:
         return self.fluxes.name
 
+    def compute(self) -> Any:
+        """Execute and return a typed flux-surface result."""
+
+        from kangaroo.results import FluxSurfaceIntegralResult
+
+        return FluxSurfaceIntegralResult(
+            np.asarray(self.fluxes.compute()),
+            self.radii,
+            self.components,
+            self.temperature_bins,
+        )
+
 
 @dataclass(frozen=True)
 class CylindricalFluxSurfaceIntegralHandle:
     fluxes: FieldHandle
-    radius: float
+    radii: tuple[float, ...]
     heights: tuple[float, ...] = ()
     temperature_bins: tuple[float, ...] | None = None
     geometric_sections: tuple[str, ...] = ("endcaps", "walls")
@@ -92,10 +182,18 @@ class CylindricalFluxSurfaceIntegralHandle:
         "hydro_energy_flux_cylinder_negative",
         "mhd_energy_flux_cylinder_negative",
         "passive_scalar_flux_cylinder_negative",
+        "advective_radial_angular_momentum_flux_cylinder_negative",
+        "maxwell_radial_angular_momentum_flux_cylinder_negative",
+        "advective_vertical_angular_momentum_flux_cylinder_negative",
+        "maxwell_vertical_angular_momentum_flux_cylinder_negative",
         "mass_flux_cylinder_positive",
         "hydro_energy_flux_cylinder_positive",
         "mhd_energy_flux_cylinder_positive",
         "passive_scalar_flux_cylinder_positive",
+        "advective_radial_angular_momentum_flux_cylinder_positive",
+        "maxwell_radial_angular_momentum_flux_cylinder_positive",
+        "advective_vertical_angular_momentum_flux_cylinder_positive",
+        "maxwell_vertical_angular_momentum_flux_cylinder_positive",
     )
 
     @property
@@ -105,6 +203,124 @@ class CylindricalFluxSurfaceIntegralHandle:
     @property
     def name(self) -> str | None:
         return self.fluxes.name
+
+    @property
+    def radius(self) -> float:
+        return self.radii[0]
+
+    def compute(self) -> Any:
+        """Execute and return a typed cylindrical flux result."""
+
+        from kangaroo.results import CylindricalFluxSurfaceIntegralResult
+
+        return CylindricalFluxSurfaceIntegralResult(
+            np.asarray(self.fluxes.compute()),
+            self.radii,
+            self.heights,
+            self.geometric_sections,
+            self.components,
+            self.temperature_bins,
+        )
+
+
+@dataclass(frozen=True)
+class ToomreQProfileHandle:
+    """Reduced annular moments used to derive gas Toomre-Q profiles."""
+
+    moments: FieldHandle
+    radial_edges: tuple[float, ...]
+    z_bounds: tuple[float, float]
+    center: tuple[float, float, float]
+    gamma: float
+    components: tuple[str, ...] = (
+        "mass",
+        "internal_energy",
+        "magnetic_b2_volume",
+        "radial_momentum",
+        "radial_velocity_second_moment",
+        "radial_gravity_moment",
+        "sampled_volume",
+    )
+
+    @property
+    def field(self) -> int:
+        return self.moments.field
+
+    @property
+    def name(self) -> str | None:
+        return self.moments.name
+
+    @property
+    def radial_range(self) -> tuple[float, float]:
+        return (self.radial_edges[0], self.radial_edges[-1])
+
+    @property
+    def bins(self) -> int:
+        return len(self.radial_edges) - 1
+
+    @property
+    def edges(self) -> np.ndarray:
+        return np.asarray(self.radial_edges, dtype=np.float64)
+
+    def compute(self) -> Any:
+        """Execute and return typed annular moments and coordinates."""
+
+        from kangaroo.results import ToomreQProfileResult
+
+        return ToomreQProfileResult(
+            np.asarray(self.moments.compute()),
+            self.edges,
+            self.components,
+            self.z_bounds,
+            self.center,
+            self.gamma,
+        )
+
+
+@dataclass(frozen=True)
+class CylindricalMomentsHandle:
+    """AMR-aware ``(radius, |z|)`` moments of a cell-centered field."""
+
+    moments: FieldHandle
+    radial_edges: tuple[float, ...]
+    z_edges: tuple[float, ...]
+    center: tuple[float, float, float]
+    components: tuple[str, ...] = ("integral", "sampled_volume")
+
+    @property
+    def field(self) -> int:
+        return self.moments.field
+
+    @property
+    def name(self) -> str | None:
+        return self.moments.name
+
+    @property
+    def radial_range(self) -> tuple[float, float]:
+        return (self.radial_edges[0], self.radial_edges[-1])
+
+    @property
+    def z_range(self) -> tuple[float, float]:
+        return (self.z_edges[0], self.z_edges[-1])
+
+    @property
+    def bins(self) -> tuple[int, int]:
+        return (len(self.radial_edges) - 1, len(self.z_edges) - 1)
+
+    @property
+    def radial_edges_array(self) -> np.ndarray:
+        return np.asarray(self.radial_edges, dtype=np.float64)
+
+    @property
+    def z_edges_array(self) -> np.ndarray:
+        return np.asarray(self.z_edges, dtype=np.float64)
+
+    def compute(self) -> Any:
+        """Execute and return the ``(bins_r, bins_z, 2)`` moment array."""
+
+        values = np.asarray(self.moments.compute(), dtype=np.float64)
+        bins_r, bins_z = self.bins
+        return values.reshape(bins_r, bins_z, len(self.components))
 
 
 @dataclass(frozen=True)
@@ -127,6 +343,14 @@ class ParticleArrayHandle:
             self.field, chunk_count=self.chunk_count, dtype=dtype
         )
 
+    def compute(self, *, gather: bool = False, max_bytes: int | None = None) -> Any:
+        """Return chunked values, or explicitly gather them with a byte limit."""
+
+        from kangaroo.results import ChunkedArray
+
+        result = ChunkedArray(tuple(self.iter_chunks()))
+        return result.gather(max_bytes=max_bytes) if gather else result
+
 
 @dataclass(frozen=True)
 class ParticleMaskHandle:
@@ -146,6 +370,85 @@ class ParticleMaskHandle:
             self.field, chunk_count=self.chunk_count, dtype="mask_u8"
         )
 
+    def compute(self, *, gather: bool = False, max_bytes: int | None = None) -> Any:
+        """Return chunked mask values, or explicitly gather them with a limit."""
+
+        from kangaroo.results import ChunkedArray
+
+        result = ChunkedArray(tuple(self.iter_chunks()))
+        return result.gather(max_bytes=max_bytes) if gather else result
+
+
+@dataclass(frozen=True)
+class ParticleScalarHandle:
+    """Lazy scalar produced by a particle reduction."""
+
+    pipeline: "Pipeline"
+    field: int
+    dtype: str
+
+    def compute(self) -> float | int:
+        """Execute the particle graph and return the local Python scalar."""
+
+        return self.pipeline._particle_scalar_from_field(self.field, dtype=self.dtype)
+
+    def __bool__(self) -> bool:
+        raise TypeError("a lazy scalar has no truth value; call compute() first")
+
+    def __float__(self) -> float:
+        raise TypeError("a lazy scalar cannot be converted implicitly; call compute() first")
+
+    def __int__(self) -> int:
+        raise TypeError("a lazy scalar cannot be converted implicitly; call compute() first")
+
+
+@dataclass(frozen=True)
+class ParticleHistogram1DHandle:
+    """Lazy particle histogram with statically known bin edges."""
+
+    counts: ParticleArrayHandle
+    edges: np.ndarray
+    density: bool = False
+
+    def compute(self) -> tuple[np.ndarray, np.ndarray]:
+        """Execute and materialize histogram counts and edges."""
+
+        counts = self.counts.iter_chunks()[0]
+        if self.density:
+            total = float(np.sum(counts))
+            if total > 0.0:
+                widths = np.diff(self.edges)
+                valid = widths > 0.0
+                counts = counts.astype(np.float64, copy=True)
+                counts[valid] /= total * widths[valid]
+        return counts, self.edges.copy()
+
+
+@dataclass(frozen=True)
+class ParticleTopKHandle:
+    """Lazy top-k particle modes and their counts."""
+
+    pipeline: "Pipeline"
+    field: int
+    k: int
+
+    def compute(self) -> tuple[np.ndarray, np.ndarray]:
+        """Execute and split the packed values/counts output."""
+
+        self.pipeline._ensure_particle_executed()
+        raw = self.pipeline.runtime.get_task_chunk(
+            step=0,
+            level=0,
+            field=self.field,
+            version=0,
+            block=0,
+            dataset=self.pipeline.dataset,
+        )
+        arr = np.frombuffer(raw, dtype=np.float64)
+        if arr.size < 2 * self.k:
+            return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+        return arr[: self.k].copy(), arr[self.k : 2 * self.k].copy()
+
 
 class Pipeline:
     """Imperative facade that records a DAG and lowers to the existing Plan IR."""
@@ -160,10 +463,10 @@ class Pipeline:
         core_runtime = getattr(runtime, "_rt", runtime)
         self._ctx = LoweringContext(runtime=core_runtime, runmeta=runmeta, dataset=dataset)
         self._stages: list[Stage] = []
-        self._frontier: list[Stage] = []
+        self._field_producers: dict[int, list[Stage]] = {}
         self._name_counters: dict[str, int] = {}
         self._particle_stages: list[Stage] = []
-        self._particle_frontier: list[Stage] = []
+        self._particle_producers: dict[int, list[Stage]] = {}
         self._particle_max_chunks: int = 1
         self._particle_executed: bool = False
         self._particle_cache: dict[int, list[np.ndarray]] = {}
@@ -218,18 +521,18 @@ class Pipeline:
         raise RuntimeError("runtime does not provide alloc_field_id")
 
     def _append_particle_stage(self, stage: Stage, *, chunk_count: int) -> None:
-        if self._particle_frontier:
-            for parent in self._particle_frontier:
-                if parent not in stage.after:
-                    stage.after.append(parent)
+        for tmpl in stage.templates:
+            for input_ref in tmpl.inputs:
+                for parent in self._particle_producers.get(input_ref.field, ()):
+                    if parent is not stage and parent not in stage.after:
+                        stage.after.append(parent)
         self._particle_stages.append(stage)
-        self._particle_frontier = [stage]
+        for tmpl in stage.templates:
+            for output_ref in tmpl.outputs:
+                self._particle_producers.setdefault(output_ref.field.field, []).append(stage)
         self._particle_max_chunks = max(self._particle_max_chunks, int(chunk_count))
         self._particle_executed = False
         self._particle_cache.clear()
-
-    def _particle_reduce_fan_in(self, num_inputs: int) -> int:
-        return max(2, min(8, int(np.sqrt(max(1, num_inputs)))))
 
     def _append_particle_reduce_tree(
         self,
@@ -237,52 +540,39 @@ class Pipeline:
         input_field: int,
         chunk_count: int,
         kernel: str,
-        output_bytes: int,
-        params: dict[str, Any],
+        output_buffer: BufferSpec,
+        params: KernelParams = NoKernelParams(),
     ) -> int:
-        num_inputs = int(chunk_count)
-        fan_in = self._particle_reduce_fan_in(num_inputs)
-        in_field = int(input_field)
-        current_blocks = list(range(chunk_count))
-        reduce_idx = 0
-        while num_inputs > 1:
-            input_blocks, output_blocks, group_offsets = _reduce_group_plan(
-                self._ctx,
-                step=0,
-                level=0,
-                input_blocks=current_blocks,
-                fan_in=fan_in,
-            )
-            num_groups = len(output_blocks)
-            out_field = in_field if num_groups == 1 else self._alloc_runtime_field("particle_reduce")
-            reduce_stage = Stage(name=self._unique_name(f"{kernel}_reduce"), plane="graph")
-            reduce_params = {
-                "graph_kind": "reduce",
-                "fan_in": fan_in,
-                "num_inputs": num_inputs,
-                "input_base": 0,
-                "output_base": 0,
-                "input_blocks": list(input_blocks),
-                "output_blocks": list(output_blocks),
-                "group_offsets": list(group_offsets),
-                **params,
-            }
-            reduce_stage.map_blocks(
-                name=kernel,
-                kernel=kernel,
-                domain=Domain(step=0, level=0),
-                inputs=[FieldRef(in_field)],
-                outputs=[FieldRef(out_field)],
-                output_bytes=[int(output_bytes)],
-                deps={"kind": "None"},
-                params=reduce_params,
-            )
-            self._append_particle_stage(reduce_stage, chunk_count=max(1, num_groups))
-            in_field = out_field
-            current_blocks = output_blocks
-            num_inputs = num_groups
-            reduce_idx += 1
-        return in_field
+        if chunk_count <= 1:
+            return int(input_field)
+        source_producers = self._particle_producers.get(int(input_field), [])
+        if not source_producers:
+            raise RuntimeError("particle reduction requires a producer stage")
+
+        reductions = GraphReductionBuilder(self._ctx)
+        source = FieldRef(int(input_field))
+        source_stage = source_producers[-1]
+        reductions.add_stage(source_stage, outputs=[source])
+        reduced = reductions.reduce_blocks(
+            value=ReducedField(source, level=0),
+            input_blocks=list(range(chunk_count)),
+            step=0,
+            fan_in=default_reduce_fan_in(chunk_count),
+            kernel=kernel,
+            output_buffer=output_buffer,
+            stage_name=f"{kernel}_reduce_{{round}}",
+            template_name=kernel,
+            temporary_name="particle_reduce_{round}",
+            after=source_stage,
+            params=params,
+        )
+        for stage in reductions.stages[1:]:
+            graph_reduce = stage.templates[0].graph_reduce
+            if graph_reduce is None:
+                raise RuntimeError("particle reduction is missing graph topology")
+            group_count = len(graph_reduce.output_blocks)
+            self._append_particle_stage(stage, chunk_count=max(1, group_count))
+        return reduced.field.field
 
     def _particle_import_array(
         self, values: np.ndarray, *, dtype: str, chunk_count: int
@@ -295,14 +585,19 @@ class Pipeline:
             chunks = np.array_split(arr, chunk_count)
         for block, chunk in enumerate(chunks):
             if dtype == "float64":
-                payload = np.ascontiguousarray(chunk, dtype=np.float64).tobytes(order="C")
+                array = np.ascontiguousarray(chunk, dtype=np.float64)
+                dtype_tag = DType.F64.value
             elif dtype == "int64":
-                payload = np.ascontiguousarray(chunk, dtype=np.int64).tobytes(order="C")
+                array = np.ascontiguousarray(chunk, dtype=np.int64)
+                dtype_tag = DType.I64.value
             elif dtype == "mask_u8":
-                payload = np.ascontiguousarray(chunk, dtype=np.uint8).tobytes(order="C")
+                array = np.ascontiguousarray(chunk, dtype=np.uint8)
+                dtype_tag = DType.U8.value
             else:
                 raise ValueError(f"unsupported particle import dtype '{dtype}'")
-            self.dataset._h.set_chunk_ref(0, 0, fid, 0, block, payload)
+            self.dataset._h.set_chunk_ref(
+                0, 0, fid, 0, block, array.tobytes(order="C"), dtype_tag, list(array.shape)
+            )
         self._particle_max_chunks = max(self._particle_max_chunks, int(chunk_count))
         if dtype == "mask_u8":
             return ParticleMaskHandle(self, fid, int(chunk_count))
@@ -378,6 +673,64 @@ class Pipeline:
             return int(arr[0]) if arr.size else 0
         raise ValueError(f"unsupported scalar dtype '{dtype}'")
 
+    def _mesh_field_coordinates(self, field: int) -> list[tuple[int, int, int]]:
+        producers = self._field_producers.get(int(field), [])
+        if not producers:
+            coordinates: list[tuple[int, int, int]] = []
+            for level, level_meta in enumerate(
+                self.runmeta.steps[self.dataset.step].levels
+            ):
+                coordinates.extend(
+                    (self.dataset.step, level, block)
+                    for block in range(len(level_meta.boxes))
+                )
+            return coordinates
+        coordinates = []
+        for tmpl in producers[-1].templates:
+            if not any(output.field.field == int(field) for output in tmpl.outputs):
+                continue
+            if tmpl.graph_reduce is not None:
+                if tmpl.graph_reduce.output_blocks:
+                    blocks = tmpl.graph_reduce.output_blocks
+                else:
+                    group_count = (
+                        tmpl.graph_reduce.num_inputs
+                        + tmpl.graph_reduce.fan_in
+                        - 1
+                    ) // tmpl.graph_reduce.fan_in
+                    blocks = range(
+                        tmpl.graph_reduce.output_base,
+                        tmpl.graph_reduce.output_base + group_count,
+                    )
+            elif tmpl.domain.blocks is not None:
+                blocks = tmpl.domain.blocks
+            else:
+                blocks = range(
+                    len(
+                        self.runmeta.steps[tmpl.domain.step]
+                        .levels[tmpl.domain.level]
+                        .boxes
+                    )
+                )
+            coordinates.extend(
+                (tmpl.domain.step, tmpl.domain.level, int(block))
+                for block in blocks
+            )
+        return list(dict.fromkeys(coordinates))
+
+    def _materialize_mesh_field(self, field: int) -> list[np.ndarray]:
+        self.run_for(mesh_fields=(int(field),))
+        return [
+            self.runtime.get_task_chunk_array(
+                step=step,
+                level=level,
+                field=int(field),
+                block=block,
+                dataset=self.dataset,
+            ).copy()
+            for step, level, block in self._mesh_field_coordinates(field)
+        ]
+
     def _root_stages(self, fragment: list[Stage]) -> list[Stage]:
         fragment_ids = {id(stage) for stage in fragment}
         roots: list[Stage] = []
@@ -399,7 +752,7 @@ class Pipeline:
         consumed: set[int] = set()
         for stage in fragment:
             for tmpl in stage.templates:
-                produced.update(ref.field for ref in tmpl.outputs)
+                produced.update(ref.field.field for ref in tmpl.outputs)
                 consumed.update(ref.field for ref in tmpl.inputs)
         sinks = sorted(produced - consumed)
         if not sinks:
@@ -410,24 +763,19 @@ class Pipeline:
         if not fragment:
             return
 
-        roots = self._root_stages(fragment)
-        if self._frontier:
-            for stage in roots:
-                for parent in self._frontier:
-                    if parent not in stage.after:
-                        stage.after.append(parent)
+        fragment_ids = {id(stage) for stage in fragment}
+        for stage in fragment:
+            for tmpl in stage.templates:
+                for input_ref in tmpl.inputs:
+                    for parent in self._field_producers.get(input_ref.field, ()):
+                        if id(parent) not in fragment_ids and parent not in stage.after:
+                            stage.after.append(parent)
 
         self._stages.extend(fragment)
-        self._frontier = self._leaf_stages(fragment)
-
-    def _infer_field_bytes_per_value(self, field: int, *, level: int) -> int:
-        infer = getattr(self.dataset, "infer_bytes_per_value", None)
-        if callable(infer):
-            try:
-                return int(infer(self.runtime, field=int(field), level=int(level), step=int(self.dataset.step)))
-            except Exception:
-                pass
-        return 8
+        for stage in fragment:
+            for tmpl in stage.templates:
+                for output_ref in tmpl.outputs:
+                    self._field_producers.setdefault(output_ref.field.field, []).append(stage)
 
     def field_expr(
         self,
@@ -435,7 +783,8 @@ class Pipeline:
         variables: dict[str, int | FieldHandle],
         *,
         out: str | None = None,
-        bytes_per_value: int | None = None,
+        dtype: DType | str = DType.F64,
+        domain: Domain | None = None,
     ) -> FieldHandle:
         expr = str(expression).strip()
         if not expr:
@@ -444,39 +793,138 @@ class Pipeline:
             raise ValueError("variables must be non-empty")
 
         ordered_vars = list(variables.items())
+        if len(ordered_vars) > 8:
+            raise ValueError("field expressions support at most 8 variables")
         var_names = [str(name) for name, _ in ordered_vars]
         if any(not name for name in var_names):
             raise ValueError("variable names must be non-empty strings")
         input_fields = [self._as_field_id(value) for _, value in ordered_vars]
         out_name = out or self._unique_name("field_expr")
         out_fid = self._alloc_field_id(out_name)
-        out_bpv = int(bytes_per_value) if bytes_per_value is not None else 8
+        output_dtype = DType(dtype)
+        if output_dtype not in (DType.F32, DType.F64):
+            raise ValueError("field expressions require dtype='f32' or dtype='f64'")
 
         ds = self.dataset
         stage = Stage(name=self._unique_name("field_expr"))
+        if domain is not None:
+            stage.map_blocks(
+                name="field_expr_bounded",
+                kernel="field_expr",
+                domain=domain,
+                inputs=[FieldRef(fid) for fid in input_fields],
+                outputs=[_like_output(out_fid, output_dtype)],
+                deps=DependencyRule(),
+                params=FieldExprParams(expr, tuple(var_names)),
+            )
+            self._append_fragment([stage])
+            return FieldHandle(self, out_fid, out_name)
         for level_idx, level_meta in enumerate(self.runmeta.steps[ds.step].levels):
-            input_bpvs = [self._infer_field_bytes_per_value(fid, level=level_idx) for fid in input_fields]
             for block_idx, box in enumerate(level_meta.boxes):
-                ncell = (
-                    (int(box.hi[0]) - int(box.lo[0]) + 1)
-                    * (int(box.hi[1]) - int(box.lo[1]) + 1)
-                    * (int(box.hi[2]) - int(box.lo[2]) + 1)
-                )
                 stage.map_blocks(
                     name=f"field_expr_l{level_idx}_b{block_idx}",
                     kernel="field_expr",
                     domain=Domain(step=ds.step, level=level_idx, blocks=[block_idx]),
                     inputs=[FieldRef(fid) for fid in input_fields],
-                    outputs=[FieldRef(out_fid)],
-                    output_bytes=[int(ncell) * out_bpv],
-                    deps={"kind": "None"},
-                    params={
-                        "expression": expr,
-                        "variables": var_names,
-                        "input_bytes_per_value": input_bpvs,
-                        "out_bytes_per_value": out_bpv,
-                    },
+                    outputs=[_block_output(out_fid, output_dtype)],
+                    deps=DependencyRule(),
+                    params=FieldExprParams(expr, tuple(var_names)),
                 )
+        self._append_fragment([stage])
+        return FieldHandle(self, out_fid, out_name)
+
+    def mesh_compare(
+        self,
+        expression: str,
+        variables: dict[str, int | FieldHandle],
+        *,
+        out: str | None = None,
+        domain: Domain | None = None,
+    ) -> FieldHandle:
+        """Lower a real-valued comparison to a normalized U8 mesh mask."""
+
+        expr = str(expression).strip()
+        if not expr:
+            raise ValueError("expression must be non-empty")
+        if not variables:
+            raise ValueError("variables must be non-empty")
+        ordered_vars = list(variables.items())
+        if len(ordered_vars) > 8:
+            raise ValueError("mesh comparisons support at most 8 variables")
+        var_names = [str(name) for name, _ in ordered_vars]
+        if any(not name for name in var_names):
+            raise ValueError("variable names must be non-empty strings")
+        input_fields = [self._as_field_id(value) for _, value in ordered_vars]
+        out_name = out or self._unique_name("mesh_compare")
+        out_fid = self._alloc_field_id(out_name)
+        ds = self.dataset
+        stage = Stage(name=self._unique_name("mesh_compare"))
+        if domain is not None:
+            stage.map_blocks(
+                name="mesh_compare_bounded",
+                kernel="mesh_compare",
+                domain=domain,
+                inputs=[FieldRef(fid) for fid in input_fields],
+                outputs=[_like_output(out_fid, DType.U8)],
+                deps=DependencyRule(),
+                params=FieldExprParams(expr, tuple(var_names)),
+            )
+        else:
+            for level_idx, level_meta in enumerate(self.runmeta.steps[ds.step].levels):
+                for block_idx, _box in enumerate(level_meta.boxes):
+                    stage.map_blocks(
+                        name=f"mesh_compare_l{level_idx}_b{block_idx}",
+                        kernel="mesh_compare",
+                        domain=Domain(
+                            step=ds.step, level=level_idx, blocks=[block_idx]
+                        ),
+                        inputs=[FieldRef(fid) for fid in input_fields],
+                        outputs=[_block_output(out_fid, DType.U8)],
+                        deps=DependencyRule(),
+                        params=FieldExprParams(expr, tuple(var_names)),
+                    )
+        self._append_fragment([stage])
+        return FieldHandle(self, out_fid, out_name)
+
+    def mesh_mask_and(
+        self,
+        left: int | FieldHandle,
+        right: int | FieldHandle,
+        *,
+        out: str | None = None,
+        domain: Domain | None = None,
+    ) -> FieldHandle:
+        """Lower logical conjunction over two normalized U8 mesh masks."""
+
+        input_fields = [self._as_field_id(left), self._as_field_id(right)]
+        out_name = out or self._unique_name("mesh_mask_and")
+        out_fid = self._alloc_field_id(out_name)
+        ds = self.dataset
+        stage = Stage(name=self._unique_name("mesh_mask_and"))
+        if domain is not None:
+            stage.map_blocks(
+                name="mesh_mask_and_bounded",
+                kernel="mesh_mask_and",
+                domain=domain,
+                inputs=[FieldRef(fid) for fid in input_fields],
+                outputs=[_like_output(out_fid, DType.U8)],
+                deps=DependencyRule(),
+                params=NoKernelParams(),
+            )
+        else:
+            for level_idx, level_meta in enumerate(self.runmeta.steps[ds.step].levels):
+                for block_idx, _box in enumerate(level_meta.boxes):
+                    stage.map_blocks(
+                        name=f"mesh_mask_and_l{level_idx}_b{block_idx}",
+                        kernel="mesh_mask_and",
+                        domain=Domain(
+                            step=ds.step, level=level_idx, blocks=[block_idx]
+                        ),
+                        inputs=[FieldRef(fid) for fid in input_fields],
+                        outputs=[_block_output(out_fid, DType.U8)],
+                        deps=DependencyRule(),
+                        params=NoKernelParams(),
+                    )
         self._append_fragment([stage])
         return FieldHandle(self, out_fid, out_name)
 
@@ -521,13 +969,13 @@ class Pipeline:
         right: int | FieldHandle,
         *,
         out: str | None = None,
-        bytes_per_value: int | None = None,
+        dtype: DType | str = DType.F64,
     ) -> FieldHandle:
         return self.field_expr(
             "a + b",
             {"a": left, "b": right},
             out=out or self._unique_name("field_add"),
-            bytes_per_value=bytes_per_value,
+            dtype=dtype,
         )
 
     def field_subtract(
@@ -536,13 +984,13 @@ class Pipeline:
         right: int | FieldHandle,
         *,
         out: str | None = None,
-        bytes_per_value: int | None = None,
+        dtype: DType | str = DType.F64,
     ) -> FieldHandle:
         return self.field_expr(
             "a - b",
             {"a": left, "b": right},
             out=out or self._unique_name("field_subtract"),
-            bytes_per_value=bytes_per_value,
+            dtype=dtype,
         )
 
     def field_multiply(
@@ -551,13 +999,13 @@ class Pipeline:
         right: int | FieldHandle,
         *,
         out: str | None = None,
-        bytes_per_value: int | None = None,
+        dtype: DType | str = DType.F64,
     ) -> FieldHandle:
         return self.field_expr(
             "a * b",
             {"a": left, "b": right},
             out=out or self._unique_name("field_multiply"),
-            bytes_per_value=bytes_per_value,
+            dtype=dtype,
         )
 
     def field_divide(
@@ -566,13 +1014,13 @@ class Pipeline:
         right: int | FieldHandle,
         *,
         out: str | None = None,
-        bytes_per_value: int | None = None,
+        dtype: DType | str = DType.F64,
     ) -> FieldHandle:
         return self.field_expr(
             "a / b",
             {"a": left, "b": right},
             out=out or self._unique_name("field_divide"),
-            bytes_per_value=bytes_per_value,
+            dtype=dtype,
         )
 
     def vorticity_mag(
@@ -608,7 +1056,7 @@ class Pipeline:
         rect: tuple[float, float, float, float],
         resolution: tuple[int, int],
         out: str | None = None,
-        bytes_per_value: int | None = None,
+        dtype: DType | str = DType.F64,
         reduce_fan_in: int | None = None,
     ) -> FieldHandle:
         out_name = out or self._unique_name("slice")
@@ -619,7 +1067,7 @@ class Pipeline:
             rect=rect,
             resolution=resolution,
             out_name=out_name,
-            bytes_per_value=bytes_per_value,
+            dtype=dtype,
             reduce_fan_in=reduce_fan_in,
         ).lower(self._ctx)
         self._append_fragment(fragment)
@@ -635,7 +1083,6 @@ class Pipeline:
         rect: tuple[float, float, float, float],
         resolution: tuple[int, int],
         out: str | None = None,
-        bytes_per_value: int | None = None,
         reduce_fan_in: int | None = None,
         amr_cell_average: bool = True,
     ) -> FieldHandle:
@@ -647,7 +1094,6 @@ class Pipeline:
             rect=rect,
             resolution=resolution,
             out_name=out_name,
-            bytes_per_value=bytes_per_value,
             reduce_fan_in=reduce_fan_in,
             amr_cell_average=amr_cell_average,
         ).lower(self._ctx)
@@ -695,7 +1141,6 @@ class Pipeline:
         temperature_bins: Sequence[float] | None = None,
         out: str | None = None,
         gamma: float = 5.0 / 3.0,
-        bytes_per_value: int | None = None,
         reduce_fan_in: int | None = None,
     ) -> FluxSurfaceIntegralHandle:
         if len(momentum) != 3:
@@ -716,7 +1161,6 @@ class Pipeline:
             temperature_bins=temperature_bins,
             out_name=out_name,
             gamma=gamma,
-            bytes_per_value=bytes_per_value,
             reduce_fan_in=reduce_fan_in,
         )
         fragment = op.lower(self._ctx)
@@ -736,13 +1180,12 @@ class Pipeline:
         energy: int | FieldHandle,
         passive_scalar: int | FieldHandle,
         magnetic_field: tuple[int | FieldHandle, int | FieldHandle, int | FieldHandle],
-        radius: float,
+        radius: float | Sequence[float],
         height: float | Sequence[float],
         temperature: int | FieldHandle | None = None,
         temperature_bins: Sequence[float] | None = None,
         out: str | None = None,
         gamma: float = 5.0 / 3.0,
-        bytes_per_value: int | None = None,
         reduce_fan_in: int | None = None,
     ) -> CylindricalFluxSurfaceIntegralHandle:
         if len(momentum) != 3:
@@ -764,7 +1207,6 @@ class Pipeline:
             temperature_bins=temperature_bins,
             out_name=out_name,
             gamma=gamma,
-            bytes_per_value=bytes_per_value,
             reduce_fan_in=reduce_fan_in,
         )
         fragment = op.lower(self._ctx)
@@ -772,9 +1214,118 @@ class Pipeline:
         out_field = self._sink_fields(fragment)[-1]
         return CylindricalFluxSurfaceIntegralHandle(
             FieldHandle(self, out_field, out_name),
-            radius=op.radius,
+            radii=op.radii,
             heights=op.heights,
             temperature_bins=op.temperature_bins,
+        )
+
+    def toomre_q_profile(
+        self,
+        density: int | FieldHandle,
+        *,
+        momentum: tuple[int | FieldHandle, int | FieldHandle],
+        internal_energy: int | FieldHandle,
+        magnetic_field: tuple[
+            int | FieldHandle,
+            int | FieldHandle,
+            int | FieldHandle,
+        ],
+        potential: int | FieldHandle,
+        z_bounds: tuple[float, float],
+        radial_range: tuple[float, float] | None = None,
+        bins: int | None = None,
+        radial_edges: Sequence[float] | None = None,
+        center: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        out: str | None = None,
+        gamma: float = 5.0 / 3.0,
+        reduce_fan_in: int | None = None,
+    ) -> ToomreQProfileHandle:
+        """Accumulate AMR-aware annular moments for gas Toomre-Q profiles."""
+
+        if len(momentum) != 2:
+            raise ValueError("momentum must contain x and y fields")
+        if len(magnetic_field) != 3:
+            raise ValueError("magnetic_field must contain three cell-centered fields")
+        if radial_edges is None:
+            if radial_range is None or bins is None:
+                raise ValueError(
+                    "provide radial_edges or both radial_range and bins"
+                )
+            if len(radial_range) != 2:
+                raise ValueError("radial_range must contain two values")
+            if int(bins) <= 0:
+                raise ValueError("bins must be positive")
+            edges = np.linspace(
+                float(radial_range[0]), float(radial_range[1]), int(bins) + 1
+            )
+        else:
+            if radial_range is not None or bins is not None:
+                raise ValueError(
+                    "radial_edges cannot be combined with radial_range or bins"
+                )
+            edges = np.asarray(radial_edges, dtype=np.float64)
+            if edges.ndim != 1:
+                raise ValueError("radial_edges must be one-dimensional")
+        out_name = out or self._unique_name("toomre_q_profile")
+        op = ToomreQProfile(
+            density=self._as_field_id(density),
+            momentum=tuple(self._as_field_id(comp) for comp in momentum),
+            internal_energy=self._as_field_id(internal_energy),
+            magnetic_field=tuple(self._as_field_id(comp) for comp in magnetic_field),
+            potential=self._as_field_id(potential),
+            radial_edges=tuple(float(value) for value in edges),
+            z_bounds=z_bounds,
+            center=center,
+            out_name=out_name,
+            gamma=gamma,
+            reduce_fan_in=reduce_fan_in,
+        )
+        fragment = op.lower(self._ctx)
+        self._append_fragment(fragment)
+        out_field = self._sink_fields(fragment)[-1]
+        return ToomreQProfileHandle(
+            moments=FieldHandle(self, out_field, out_name),
+            radial_edges=op.radial_edges,
+            z_bounds=op.z_bounds,
+            center=op.center,
+            gamma=op.gamma,
+        )
+
+    def cylindrical_moments(
+        self,
+        field: int | FieldHandle,
+        *,
+        radial_edges: Sequence[float],
+        z_edges: Sequence[float],
+        center: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        out: str | None = None,
+        reduce_fan_in: int | None = None,
+    ) -> CylindricalMomentsHandle:
+        """Accumulate AMR-aware ``(radius, |z|)`` moments of one field.
+
+        Bins uncovered cells by cylindrical radius and absolute height
+        relative to ``center``; each ``(radial, height)`` bin stores the volume
+        integral of ``field`` and the sampled volume.  Enclosed profiles along
+        either axis follow from a single pass by cumulative summation.
+        """
+
+        out_name = out or self._unique_name("cylindrical_moments")
+        op = CylindricalMoments(
+            field=self._as_field_id(field),
+            radial_edges=radial_edges,
+            z_edges=z_edges,
+            center=center,
+            out_name=out_name,
+            reduce_fan_in=reduce_fan_in,
+        )
+        fragment = op.lower(self._ctx)
+        self._append_fragment(fragment)
+        out_field = self._sink_fields(fragment)[-1]
+        return CylindricalMomentsHandle(
+            moments=FieldHandle(self, out_field, out_name),
+            radial_edges=op.radial_edges,
+            z_edges=op.z_edges,
+            center=op.center,
         )
 
     def histogram1d(
@@ -785,7 +1336,7 @@ class Pipeline:
         bins: int,
         out: str | None = None,
         weights: int | FieldHandle | None = None,
-        bytes_per_value: int | None = None,
+        domain: Domain | None = None,
         reduce_fan_in: int | None = None,
     ) -> Histogram1DHandle:
         out_name = out or self._unique_name("histogram1d")
@@ -796,7 +1347,7 @@ class Pipeline:
             bins=bins,
             out_name=out_name,
             weight_field=weight_field,
-            bytes_per_value=bytes_per_value,
+            domain=domain,
             reduce_fan_in=reduce_fan_in,
         ).lower(self._ctx)
         self._append_fragment(fragment)
@@ -818,7 +1369,7 @@ class Pipeline:
         out: str | None = None,
         weights: int | FieldHandle | None = None,
         weight_mode: str = "input",
-        bytes_per_value: int | None = None,
+        domain: Domain | None = None,
         reduce_fan_in: int | None = None,
     ) -> Histogram2DHandle:
         out_name = out or self._unique_name("histogram2d")
@@ -832,7 +1383,7 @@ class Pipeline:
             out_name=out_name,
             weight_field=weight_field,
             weight_mode=weight_mode,
-            bytes_per_value=bytes_per_value,
+            domain=domain,
             reduce_fan_in=reduce_fan_in,
         ).lower(self._ctx)
         self._append_fragment(fragment)
@@ -854,10 +1405,9 @@ class Pipeline:
             kernel="particle_load_field_chunk_f64",
             domain=Domain(step=0, level=0, blocks=list(range(chunk_count))),
             inputs=[],
-            outputs=[FieldRef(out_fid)],
-            output_bytes=[8],
-            deps={"kind": "None"},
-            params={"particle_type": particle_type, "field_name": field},
+            outputs=[_dynamic_output(out_fid, DType.F64, DynamicUpperBound.backend_chunk())],
+            deps=DependencyRule(),
+            params=ParticleFieldParams(particle_type, field),
         )
         self._append_particle_stage(stage, chunk_count=chunk_count)
         return ParticleArrayHandle(self, out_fid, chunk_count, "float64")
@@ -873,10 +1423,9 @@ class Pipeline:
             kernel="particle_eq_mask",
             domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
-            outputs=[FieldRef(out_fid)],
-            output_bytes=[1],
-            deps={"kind": "None"},
-            params={"scalar": float(scalar)},
+            outputs=[_like_output(out_fid, DType.U8)],
+            deps=DependencyRule(),
+            params=ScalarParams(float(scalar)),
         )
         self._append_particle_stage(stage, chunk_count=in_h.chunk_count)
         return ParticleMaskHandle(self, out_fid, in_h.chunk_count)
@@ -892,10 +1441,9 @@ class Pipeline:
             kernel="particle_isin_mask",
             domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
-            outputs=[FieldRef(out_fid)],
-            output_bytes=[1],
-            deps={"kind": "None"},
-            params={"values": [float(x) for x in np.asarray(scalars).ravel()]},
+            outputs=[_like_output(out_fid, DType.U8)],
+            deps=DependencyRule(),
+            params=ValuesParams(tuple(float(x) for x in np.asarray(scalars).ravel())),
         )
         self._append_particle_stage(stage, chunk_count=in_h.chunk_count)
         return ParticleMaskHandle(self, out_fid, in_h.chunk_count)
@@ -909,10 +1457,8 @@ class Pipeline:
             kernel="particle_isfinite_mask",
             domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
-            outputs=[FieldRef(out_fid)],
-            output_bytes=[1],
-            deps={"kind": "None"},
-            params={},
+            outputs=[_like_output(out_fid, DType.U8)],
+            deps=DependencyRule(),
         )
         self._append_particle_stage(stage, chunk_count=in_h.chunk_count)
         return ParticleMaskHandle(self, out_fid, in_h.chunk_count)
@@ -928,10 +1474,9 @@ class Pipeline:
             kernel="particle_abs_lt_mask",
             domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
-            outputs=[FieldRef(out_fid)],
-            output_bytes=[1],
-            deps={"kind": "None"},
-            params={"scalar": float(scalar)},
+            outputs=[_like_output(out_fid, DType.U8)],
+            deps=DependencyRule(),
+            params=ScalarParams(float(scalar)),
         )
         self._append_particle_stage(stage, chunk_count=in_h.chunk_count)
         return ParticleMaskHandle(self, out_fid, in_h.chunk_count)
@@ -947,10 +1492,9 @@ class Pipeline:
             kernel="particle_le_mask",
             domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
-            outputs=[FieldRef(out_fid)],
-            output_bytes=[1],
-            deps={"kind": "None"},
-            params={"scalar": float(scalar)},
+            outputs=[_like_output(out_fid, DType.U8)],
+            deps=DependencyRule(),
+            params=ScalarParams(float(scalar)),
         )
         self._append_particle_stage(stage, chunk_count=in_h.chunk_count)
         return ParticleMaskHandle(self, out_fid, in_h.chunk_count)
@@ -966,10 +1510,45 @@ class Pipeline:
             kernel="particle_gt_mask",
             domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
-            outputs=[FieldRef(out_fid)],
-            output_bytes=[1],
-            deps={"kind": "None"},
-            params={"scalar": float(scalar)},
+            outputs=[_like_output(out_fid, DType.U8)],
+            deps=DependencyRule(),
+            params=ScalarParams(float(scalar)),
+        )
+        self._append_particle_stage(stage, chunk_count=in_h.chunk_count)
+        return ParticleMaskHandle(self, out_fid, in_h.chunk_count)
+
+    def particle_compare_scalar(
+        self,
+        values: ParticleArrayHandle | np.ndarray,
+        scalar: float,
+        *,
+        comparison: str,
+    ) -> ParticleMaskHandle:
+        """Build a lazy scalar comparison for the supported comparison names."""
+
+        kernels = {
+            "lt": "particle_lt_mask",
+            "le": "particle_le_mask",
+            "gt": "particle_gt_mask",
+            "ge": "particle_ge_mask",
+            "eq": "particle_eq_mask",
+            "ne": "particle_ne_mask",
+        }
+        try:
+            kernel = kernels[comparison]
+        except KeyError as exc:
+            raise ValueError(f"unsupported particle comparison '{comparison}'") from exc
+        in_h = self._coerce_particle_array_handle(values)
+        out_fid = self._alloc_runtime_field(f"particle_{comparison}")
+        stage = Stage(name=self._unique_name(f"particle_{comparison}"))
+        stage.map_blocks(
+            name=kernel,
+            kernel=kernel,
+            domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
+            inputs=[FieldRef(in_h.field)],
+            outputs=[_like_output(out_fid, DType.U8)],
+            deps=DependencyRule(),
+            params=ScalarParams(float(scalar)),
         )
         self._append_particle_stage(stage, chunk_count=in_h.chunk_count)
         return ParticleMaskHandle(self, out_fid, in_h.chunk_count)
@@ -989,10 +1568,10 @@ class Pipeline:
                 kernel="particle_and_mask",
                 domain=Domain(step=0, level=0, blocks=list(range(out_h.chunk_count))),
                 inputs=[FieldRef(out_h.field), FieldRef(rhs_h.field)],
-                outputs=[FieldRef(fid)],
-                output_bytes=[1],
-                deps={"kind": "None"},
-                params={},
+                outputs=[
+                    _dynamic_output(fid, DType.U8, DynamicUpperBound.like_input(0))
+                ],
+                deps=DependencyRule(),
             )
             self._append_particle_stage(stage, chunk_count=out_h.chunk_count)
             out_h = ParticleMaskHandle(self, fid, out_h.chunk_count)
@@ -1012,10 +1591,8 @@ class Pipeline:
             kernel="particle_filter",
             domain=Domain(step=0, level=0, blocks=list(range(arr_h.chunk_count))),
             inputs=[FieldRef(arr_h.field), FieldRef(mask_h.field)],
-            outputs=[FieldRef(fid)],
-            output_bytes=[8],
-            deps={"kind": "None"},
-            params={},
+            outputs=[_dynamic_output(fid, DType.F64, DynamicUpperBound.like_input(0))],
+            deps=DependencyRule(),
         )
         self._append_particle_stage(stage, chunk_count=arr_h.chunk_count)
         return ParticleArrayHandle(self, fid, arr_h.chunk_count, "float64")
@@ -1034,10 +1611,10 @@ class Pipeline:
             kernel="particle_subtract",
             domain=Domain(step=0, level=0, blocks=list(range(a_h.chunk_count))),
             inputs=[FieldRef(a_h.field), FieldRef(b_h.field)],
-            outputs=[FieldRef(fid)],
-            output_bytes=[8],
-            deps={"kind": "None"},
-            params={},
+            outputs=[
+                _dynamic_output(fid, DType.F64, DynamicUpperBound.like_input(0))
+            ],
+            deps=DependencyRule(),
         )
         self._append_particle_stage(stage, chunk_count=a_h.chunk_count)
         return ParticleArrayHandle(self, fid, a_h.chunk_count, "float64")
@@ -1075,15 +1652,100 @@ class Pipeline:
                 FieldRef(by_h.field),
                 FieldRef(bz_h.field),
             ],
-            outputs=[FieldRef(fid)],
-            output_bytes=[8],
-            deps={"kind": "None"},
-            params={},
+            outputs=[
+                _dynamic_output(fid, DType.F64, DynamicUpperBound.like_input(0))
+            ],
+            deps=DependencyRule(),
         )
         self._append_particle_stage(stage, chunk_count=chunk_count)
         return ParticleArrayHandle(self, fid, chunk_count, "float64")
 
-    def particle_sum(self, values: ParticleArrayHandle | np.ndarray) -> float:
+    def particle_binary(
+        self,
+        left: ParticleArrayHandle | np.ndarray,
+        right: ParticleArrayHandle | np.ndarray,
+        *,
+        operation: str,
+    ) -> ParticleArrayHandle:
+        """Build a lazy elementwise binary particle operation."""
+
+        kernels = {
+            "add": "particle_add",
+            "subtract": "particle_subtract",
+            "multiply": "particle_multiply",
+            "divide": "particle_divide",
+            "power": "particle_power",
+        }
+        try:
+            kernel = kernels[operation]
+        except KeyError as exc:
+            raise ValueError(f"unsupported particle operation '{operation}'") from exc
+        left_h = self._coerce_particle_array_handle(left)
+        right_h = self._coerce_particle_array_handle(
+            right, chunk_count=left_h.chunk_count
+        )
+        if left_h.chunk_count != right_h.chunk_count:
+            raise ValueError("particle operands must have matching chunk_count")
+        fid = self._alloc_runtime_field(f"particle_{operation}")
+        stage = Stage(name=self._unique_name(f"particle_{operation}"))
+        stage.map_blocks(
+            name=kernel,
+            kernel=kernel,
+            domain=Domain(
+                step=0, level=0, blocks=list(range(left_h.chunk_count))
+            ),
+            inputs=[FieldRef(left_h.field), FieldRef(right_h.field)],
+            outputs=[
+                _dynamic_output(fid, DType.F64, DynamicUpperBound.like_input(0))
+            ],
+            deps=DependencyRule(),
+        )
+        self._append_particle_stage(stage, chunk_count=left_h.chunk_count)
+        return ParticleArrayHandle(self, fid, left_h.chunk_count, "float64")
+
+    def particle_scalar(
+        self,
+        values: ParticleArrayHandle | np.ndarray,
+        scalar: float,
+        *,
+        operation: str,
+    ) -> ParticleArrayHandle:
+        """Build a lazy scalar particle arithmetic operation."""
+
+        kernels = {
+            "add": "particle_add_scalar",
+            "subtract": "particle_subtract_scalar",
+            "rsubtract": "particle_rsubtract_scalar",
+            "multiply": "particle_multiply_scalar",
+            "divide": "particle_divide_scalar",
+            "rdivide": "particle_rdivide_scalar",
+            "power": "particle_power_scalar",
+            "rpower": "particle_rpower_scalar",
+        }
+        try:
+            kernel = kernels[operation]
+        except KeyError as exc:
+            raise ValueError(f"unsupported particle scalar operation '{operation}'") from exc
+        in_h = self._coerce_particle_array_handle(values)
+        fid = self._alloc_runtime_field(f"particle_{operation}")
+        stage = Stage(name=self._unique_name(f"particle_{operation}"))
+        stage.map_blocks(
+            name=kernel,
+            kernel=kernel,
+            domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
+            inputs=[FieldRef(in_h.field)],
+            outputs=[
+                _dynamic_output(fid, DType.F64, DynamicUpperBound.like_input(0))
+            ],
+            deps=DependencyRule(),
+            params=ScalarParams(float(scalar)),
+        )
+        self._append_particle_stage(stage, chunk_count=in_h.chunk_count)
+        return ParticleArrayHandle(self, fid, in_h.chunk_count, "float64")
+
+    def particle_sum_lazy(self, values: ParticleArrayHandle | np.ndarray) -> ParticleScalarHandle:
+        """Build a lazy sum reduction without starting execution."""
+
         in_h = self._coerce_particle_array_handle(values)
         fid = self._alloc_runtime_field("particle_sum")
         stage = Stage(name=self._unique_name("particle_sum"))
@@ -1092,22 +1754,26 @@ class Pipeline:
             kernel="particle_sum",
             domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
-            outputs=[FieldRef(fid)],
-            output_bytes=[8],
-            deps={"kind": "None"},
-            params={},
+            outputs=[_fixed_output(fid, DType.F64, 1)],
+            deps=DependencyRule(),
         )
         self._append_particle_stage(stage, chunk_count=in_h.chunk_count)
         reduced = self._append_particle_reduce_tree(
             input_field=fid,
             chunk_count=in_h.chunk_count,
             kernel="uniform_slice_reduce",
-            output_bytes=8,
-            params={"bytes_per_value": 8},
+            output_buffer=BufferSpec(DType.F64, FixedShape((1,)), InitPolicy.ZERO),
         )
-        return float(self._particle_scalar_from_field(reduced, dtype="float64"))
+        return ParticleScalarHandle(self, reduced, "float64")
 
-    def particle_len(self, values: ParticleArrayHandle | np.ndarray) -> int:
+    def particle_sum(self, values: ParticleArrayHandle | np.ndarray) -> float:
+        """Compatibility eager sum; high-level callers should use lazy values."""
+
+        return float(self.particle_sum_lazy(values).compute())
+
+    def particle_len_lazy(self, values: ParticleArrayHandle | np.ndarray) -> ParticleScalarHandle:
+        """Build a lazy particle length reduction without starting execution."""
+
         in_h = self._coerce_particle_array_handle(values)
         fid = self._alloc_runtime_field("particle_len")
         stage = Stage(name=self._unique_name("particle_len"))
@@ -1116,22 +1782,28 @@ class Pipeline:
             kernel="particle_len_f64",
             domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
-            outputs=[FieldRef(fid)],
-            output_bytes=[8],
-            deps={"kind": "None"},
-            params={},
+            outputs=[_fixed_output(fid, DType.I64, 1)],
+            deps=DependencyRule(),
         )
         self._append_particle_stage(stage, chunk_count=in_h.chunk_count)
         reduced = self._append_particle_reduce_tree(
             input_field=fid,
             chunk_count=in_h.chunk_count,
             kernel="particle_int64_sum_reduce",
-            output_bytes=8,
-            params={},
+            output_buffer=BufferSpec(DType.I64, FixedShape((1,)), InitPolicy.ZERO),
         )
-        return int(self._particle_scalar_from_field(reduced, dtype="int64"))
+        return ParticleScalarHandle(self, reduced, "int64")
 
-    def particle_min(self, values: ParticleArrayHandle | np.ndarray, *, finite_only: bool = True) -> float:
+    def particle_len(self, values: ParticleArrayHandle | np.ndarray) -> int:
+        """Compatibility eager length; high-level callers should use lazy values."""
+
+        return int(self.particle_len_lazy(values).compute())
+
+    def particle_min_lazy(
+        self, values: ParticleArrayHandle | np.ndarray, *, finite_only: bool = True
+    ) -> ParticleScalarHandle:
+        """Build a lazy minimum reduction without starting execution."""
+
         in_h = self._coerce_particle_array_handle(values)
         fid = self._alloc_runtime_field("particle_min")
         stage = Stage(name=self._unique_name("particle_min"))
@@ -1140,22 +1812,29 @@ class Pipeline:
             kernel="particle_min",
             domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
-            outputs=[FieldRef(fid)],
-            output_bytes=[8],
-            deps={"kind": "None"},
-            params={"finite_only": bool(finite_only)},
+            outputs=[_fixed_output(fid, DType.F64, 1)],
+            deps=DependencyRule(),
+            params=FiniteOnlyParams(bool(finite_only)),
         )
         self._append_particle_stage(stage, chunk_count=in_h.chunk_count)
         reduced = self._append_particle_reduce_tree(
             input_field=fid,
             chunk_count=in_h.chunk_count,
             kernel="particle_scalar_min_reduce",
-            output_bytes=8,
-            params={},
+            output_buffer=BufferSpec(DType.F64, FixedShape((1,)), InitPolicy.ZERO),
         )
-        return float(self._particle_scalar_from_field(reduced, dtype="float64"))
+        return ParticleScalarHandle(self, reduced, "float64")
 
-    def particle_max(self, values: ParticleArrayHandle | np.ndarray, *, finite_only: bool = True) -> float:
+    def particle_min(self, values: ParticleArrayHandle | np.ndarray, *, finite_only: bool = True) -> float:
+        """Compatibility eager minimum; high-level callers should use lazy values."""
+
+        return float(self.particle_min_lazy(values, finite_only=finite_only).compute())
+
+    def particle_max_lazy(
+        self, values: ParticleArrayHandle | np.ndarray, *, finite_only: bool = True
+    ) -> ParticleScalarHandle:
+        """Build a lazy maximum reduction without starting execution."""
+
         in_h = self._coerce_particle_array_handle(values)
         fid = self._alloc_runtime_field("particle_max")
         stage = Stage(name=self._unique_name("particle_max"))
@@ -1164,22 +1843,27 @@ class Pipeline:
             kernel="particle_max",
             domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
-            outputs=[FieldRef(fid)],
-            output_bytes=[8],
-            deps={"kind": "None"},
-            params={"finite_only": bool(finite_only)},
+            outputs=[_fixed_output(fid, DType.F64, 1)],
+            deps=DependencyRule(),
+            params=FiniteOnlyParams(bool(finite_only)),
         )
         self._append_particle_stage(stage, chunk_count=in_h.chunk_count)
         reduced = self._append_particle_reduce_tree(
             input_field=fid,
             chunk_count=in_h.chunk_count,
             kernel="particle_scalar_max_reduce",
-            output_bytes=8,
-            params={},
+            output_buffer=BufferSpec(DType.F64, FixedShape((1,)), InitPolicy.ZERO),
         )
-        return float(self._particle_scalar_from_field(reduced, dtype="float64"))
+        return ParticleScalarHandle(self, reduced, "float64")
 
-    def particle_count(self, mask: ParticleMaskHandle | np.ndarray) -> int:
+    def particle_max(self, values: ParticleArrayHandle | np.ndarray, *, finite_only: bool = True) -> float:
+        """Compatibility eager maximum; high-level callers should use lazy values."""
+
+        return float(self.particle_max_lazy(values, finite_only=finite_only).compute())
+
+    def particle_count_lazy(self, mask: ParticleMaskHandle | np.ndarray) -> ParticleScalarHandle:
+        """Build a lazy selected-particle count without starting execution."""
+
         in_h = self._coerce_particle_mask_handle(mask)
         fid = self._alloc_runtime_field("particle_count")
         stage = Stage(name=self._unique_name("particle_count"))
@@ -1188,30 +1872,34 @@ class Pipeline:
             kernel="particle_count",
             domain=Domain(step=0, level=0, blocks=list(range(in_h.chunk_count))),
             inputs=[FieldRef(in_h.field)],
-            outputs=[FieldRef(fid)],
-            output_bytes=[8],
-            deps={"kind": "None"},
-            params={},
+            outputs=[_fixed_output(fid, DType.I64, 1)],
+            deps=DependencyRule(),
         )
         self._append_particle_stage(stage, chunk_count=in_h.chunk_count)
         reduced = self._append_particle_reduce_tree(
             input_field=fid,
             chunk_count=in_h.chunk_count,
             kernel="particle_int64_sum_reduce",
-            output_bytes=8,
-            params={},
+            output_buffer=BufferSpec(DType.I64, FixedShape((1,)), InitPolicy.ZERO),
         )
-        return int(self._particle_scalar_from_field(reduced, dtype="int64"))
+        return ParticleScalarHandle(self, reduced, "int64")
 
-    def particle_topk_modes(
+    def particle_count(self, mask: ParticleMaskHandle | np.ndarray) -> int:
+        """Compatibility eager count; high-level callers should use lazy values."""
+
+        return int(self.particle_count_lazy(mask).compute())
+
+    def particle_topk_modes_lazy(
         self,
         particle_type: str,
         field: str,
         *,
         k: int,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> ParticleTopKHandle:
+        """Build a lazy top-k mode reduction without starting execution."""
+
         if k <= 0:
-            return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+            raise ValueError("k must be positive")
         chunk_count = self._particle_chunk_count(particle_type)
         counts_fid = self._alloc_runtime_field("particle_topk_counts")
         stage = Stage(name=self._unique_name("particle_topk_map"))
@@ -1220,21 +1908,21 @@ class Pipeline:
             kernel="particle_topk_modes_map",
             domain=Domain(step=0, level=0),
             inputs=[],
-            outputs=[FieldRef(counts_fid)],
-            output_bytes=[0],
-            deps={"kind": "None"},
-            params={
-                "particle_type": particle_type,
-                "field_name": field,
-            },
+            outputs=[_dynamic_output(
+                counts_fid, DType.OPAQUE, DynamicUpperBound.backend_chunk()
+            )],
+            deps=DependencyRule(),
+            params=ParticleFieldParams(particle_type, field),
         )
         self._append_particle_stage(stage, chunk_count=chunk_count)
         reduced = self._append_particle_reduce_tree(
             input_field=counts_fid,
             chunk_count=chunk_count,
             kernel="particle_value_counts_reduce",
-            output_bytes=0,
-            params={},
+            output_buffer=BufferSpec(
+                DType.OPAQUE,
+                DynamicShape(DynamicUpperBound.backend_chunk()),
+            ),
         )
         fid = self._alloc_runtime_field("particle_topk")
         finalize = Stage(name=self._unique_name("particle_topk_finalize"))
@@ -1243,22 +1931,27 @@ class Pipeline:
             kernel="particle_topk_modes_finalize",
             domain=Domain(step=0, level=0, blocks=[0]),
             inputs=[FieldRef(reduced)],
-            outputs=[FieldRef(fid)],
-            output_bytes=[int(k) * 2 * 8],
-            deps={"kind": "None"},
-            params={"k": int(k)},
+            outputs=[_fixed_output(fid, DType.F64, int(k) * 2)],
+            deps=DependencyRule(),
+            params=TopKModesParams(int(k)),
         )
         self._append_particle_stage(finalize, chunk_count=1)
-        self._ensure_particle_executed()
-        raw = self.runtime.get_task_chunk(step=0, level=0, field=fid, version=0, block=0, dataset=self.dataset)
-        arr = np.frombuffer(raw, dtype=np.float64)
-        if arr.size < 2 * int(k):
-            return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
-        values = arr[: int(k)].copy()
-        counts = arr[int(k) : 2 * int(k)].copy()
-        return values, counts
+        return ParticleTopKHandle(self, fid, int(k))
 
-    def particle_histogram1d(
+    def particle_topk_modes(
+        self,
+        particle_type: str,
+        field: str,
+        *,
+        k: int,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compatibility eager top-k; high-level callers should use lazy values."""
+
+        if k <= 0:
+            return np.zeros(0, dtype=np.float64), np.zeros(0, dtype=np.float64)
+        return self.particle_topk_modes_lazy(particle_type, field, k=k).compute()
+
+    def particle_histogram1d_lazy(
         self,
         values: ParticleArrayHandle | np.ndarray,
         *,
@@ -1266,7 +1959,16 @@ class Pipeline:
         hist_range: tuple[float, float] | None = None,
         weights: ParticleArrayHandle | np.ndarray | None = None,
         density: bool = False,
-    ) -> tuple[np.ndarray, np.ndarray]:
+    ) -> ParticleHistogram1DHandle:
+        """Build a lazy particle histogram without starting execution."""
+
+        if (
+            weights is not None
+            and not isinstance(values, ParticleArrayHandle)
+            and not isinstance(weights, ParticleArrayHandle)
+            and np.asarray(values).shape != np.asarray(weights).shape
+        ):
+            raise ValueError("particle_histogram1d values and weights must have matching shapes")
         in_h = self._coerce_particle_array_handle(values)
         if isinstance(bins, int):
             if hist_range is None:
@@ -1283,38 +1985,106 @@ class Pipeline:
             if w_h.chunk_count != chunk_count:
                 raise ValueError("weights must match values chunk_count")
             inputs.append(FieldRef(w_h.field))
+        kernel = "particle_histogram1d_weighted" if weights is not None else "particle_histogram1d"
         fid = self._alloc_runtime_field("particle_hist1d")
         stage = Stage(name=self._unique_name("particle_hist1d"))
         stage.map_blocks(
-            name="particle_histogram1d",
-            kernel="particle_histogram1d",
+            name=kernel,
+            kernel=kernel,
             domain=Domain(step=0, level=0, blocks=list(range(chunk_count))),
             inputs=inputs,
-            outputs=[FieldRef(fid)],
-            output_bytes=[(edges.size - 1) * 8],
-            deps={"kind": "None"},
-            params={"edges": [float(x) for x in edges], "density": False},
+            outputs=[_fixed_output(fid, DType.F64, edges.size - 1)],
+            deps=DependencyRule(),
+            params=ParticleHistogramParams(tuple(float(x) for x in edges)),
         )
         self._append_particle_stage(stage, chunk_count=chunk_count)
         reduced = self._append_particle_reduce_tree(
             input_field=fid,
             chunk_count=chunk_count,
             kernel="uniform_slice_reduce",
-            output_bytes=(edges.size - 1) * 8,
-            params={"bytes_per_value": 8},
+            output_buffer=BufferSpec(
+                DType.F64, FixedShape((int(edges.size - 1),)), InitPolicy.ZERO
+            ),
         )
-        counts = self._particle_materialize_chunks(reduced, chunk_count=1, dtype="float64")[0]
-        if density:
-            total = float(np.sum(counts))
-            if total > 0.0:
-                widths = np.diff(edges)
-                valid = widths > 0.0
-                counts = counts.astype(np.float64, copy=True)
-                counts[valid] /= total * widths[valid]
-        return counts, edges
+        return ParticleHistogram1DHandle(
+            ParticleArrayHandle(self, reduced, 1, "float64"),
+            edges.copy(),
+            density=bool(density),
+        )
+
+    def particle_histogram1d(
+        self,
+        values: ParticleArrayHandle | np.ndarray,
+        *,
+        bins: int | np.ndarray,
+        hist_range: tuple[float, float] | None = None,
+        weights: ParticleArrayHandle | np.ndarray | None = None,
+        density: bool = False,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Compatibility eager histogram; high-level callers should use lazy values."""
+
+        return self.particle_histogram1d_lazy(
+            values,
+            bins=bins,
+            hist_range=hist_range,
+            weights=weights,
+            density=density,
+        ).compute()
 
     def plan(self) -> Plan:
         return Plan(stages=list(self._stages))
+
+    @staticmethod
+    def _producer_plan(
+        fields: Sequence[int], producers: dict[int, list[Stage]]
+    ) -> Plan:
+        roots: list[Stage] = []
+        seen: set[int] = set()
+        for field in fields:
+            for stage in producers.get(int(field), ()):
+                if id(stage) not in seen:
+                    roots.append(stage)
+                    seen.add(id(stage))
+        return Plan(stages=roots)
+
+    def run_for(
+        self,
+        *,
+        mesh_fields: Sequence[int] = (),
+        particle_fields: Sequence[int] = (),
+        progress_bar: bool = False,
+    ) -> None:
+        """Execute only the producer ancestry needed by the requested fields."""
+
+        mesh_plan = self._producer_plan(mesh_fields, self._field_producers)
+        if mesh_plan.stages:
+            self.runtime.run(
+                mesh_plan,
+                runmeta=self.runmeta,
+                dataset=self.dataset,
+                progress_bar=progress_bar,
+            )
+        particle_plan = self._producer_plan(
+            particle_fields, self._particle_producers
+        )
+        if particle_plan.stages:
+            self.runtime.run(
+                particle_plan,
+                runmeta=self._particle_runmeta(),
+                dataset=self.dataset,
+                progress_bar=progress_bar,
+            )
+            self._particle_executed = True
+
+    def mark_persisted(
+        self, *, mesh_fields: Sequence[int] = (), particle_fields: Sequence[int] = ()
+    ) -> None:
+        """Treat materialized fields as graph sources for subsequently built work."""
+
+        for field in mesh_fields:
+            self._field_producers.pop(int(field), None)
+        for field in particle_fields:
+            self._particle_producers.pop(int(field), None)
 
     def run(self, *, progress_bar: bool = False) -> None:
         if self._stages:

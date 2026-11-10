@@ -71,6 +71,13 @@ This assembly phase is intentionally complete: the runtime receives a fully form
 
 The plan is serialized and handed to the runtime. At this point, Python has finished describing intent and the runtime takes over execution.
 
+The serialized FlatBuffer is an ephemeral handoff artifact between the Python
+front-end and native runtime from the same Kangaroo build. It is not a stable
+persistence or interchange format. Schema revisions may change table layouts or
+renumber union discriminators, intentionally invalidating plans encoded by older
+builds; callers should rebuild the plan from its source workflow instead of
+storing, migrating, or replaying packed plan bytes across versions.
+
 Because the graph is complete before execution, optimization passes can reason over the full dependency structure. That enables global transformations such as:
 - fusing compatible kernels across adjacent graph regions
 - splitting heavy kernels or wide stages into finer-grained tasks

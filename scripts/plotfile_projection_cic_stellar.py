@@ -97,8 +97,6 @@ def main() -> int:
             field=out.field,
             version=0,
             block=0,
-            shape=res,
-            bytes_per_value=8,
             dataset=ds,
         )
 

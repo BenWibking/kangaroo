@@ -1,0 +1,18 @@
+[book]
+title = "Kangaroo Documentation"
+authors = ["Kangaroo contributors"]
+description = "User and developer documentation for the Kangaroo distributed analysis runtime"
+language = "en"
+src = "src"
+
+[build]
+build-dir = "book"
+
+[output.html]
+site-url = "/kangaroo/"
+git-repository-url = "https://github.com/BenWibking/kangaroo"
+edit-url-template = "https://github.com/BenWibking/kangaroo/edit/main/docs/src/{path}"
+no-section-label = true
+
+[output.html.search]
+enable = true

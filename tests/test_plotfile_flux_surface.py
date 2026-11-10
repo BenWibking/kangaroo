@@ -196,11 +196,16 @@ def test_flux_surface_json_includes_temperature_bins() -> None:
 def test_cylindrical_flux_surface_json_includes_geometric_sections() -> None:
     heights = np.array([1.0], dtype=np.float64)
     temperature_bins = np.array([0.0, 10.0, 20.0], dtype=np.float64)
-    values = np.zeros((1, 2, 2, 2, 4), dtype=np.float64)
-    values[0, 0, 0, 0] = np.array([-2.0, -3.0, -4.0, -5.0])
-    values[0, 0, 1, 1] = np.array([-7.0, -11.0, -13.0, -17.0])
-    values[0, 1, 0, 0] = np.array([19.0, 23.0, 29.0, 31.0])
-    values[0, 1, 1, 1] = np.array([37.0, 41.0, 43.0, 47.0])
+    values = np.zeros((1, 2, 2, 2, 8), dtype=np.float64)
+    values[0, 0, 0, 0, :4] = np.array([-2.0, -3.0, -4.0, -5.0])
+    values[0, 0, 1, 1, :4] = np.array([-7.0, -11.0, -13.0, -17.0])
+    values[0, 1, 0, 0, :4] = np.array([19.0, 23.0, 29.0, 31.0])
+    values[0, 1, 1, 1, :4] = np.array([37.0, 41.0, 43.0, 47.0])
+
+    values[0, 0, 0, 0, 7] = -3.0
+    values[0, 1, 0, 0, 6] = 9.0
+    values[0, 0, 1, 1, 5] = -8.0
+    values[0, 1, 1, 1, 4] = 12.0
 
     rows, derived = _cylindrical_flux_rows_and_derived(
         heights,
@@ -229,6 +234,16 @@ def test_cylindrical_flux_surface_json_includes_geometric_sections() -> None:
     assert derived["mass_flux_msun_per_yr_by_height"][0][
         "mass_flux_msun_per_yr_bins_by_geometric_section"
     ]["positive"]["walls"] > 0.0
+
+    assert temp_row["fluxes_by_geometric_section"]["walls"][
+        "advective_radial_angular_momentum_flux_cylinder"
+    ] == 12.0
+    assert derived["radial_angular_momentum_flux_by_height"][0][
+        "by_geometric_section"
+    ]["walls"] == {"advective": 12.0, "maxwell": -8.0, "total": 4.0}
+    assert derived["vertical_angular_momentum_flux_by_height"][0][
+        "by_geometric_section"
+    ]["endcaps"] == {"advective": 9.0, "maxwell": -3.0, "total": 6.0}
 
 
 def test_cylindrical_flux_surface_mass_flux_plot_writes_section_sets(

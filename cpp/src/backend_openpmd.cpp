@@ -48,7 +48,7 @@ OpenPMDBackend::OpenPMDBackend(std::string uri) : uri_(std::move(uri)) {
   std::sort(iteration_indices_.begin(), iteration_indices_.end());
 }
 
-std::optional<HostView> OpenPMDBackend::get_chunk(const ChunkRef& ref) {
+std::optional<ChunkBuffer> OpenPMDBackend::get_chunk(const ChunkRef& ref) {
   const auto& cache = get_cache(ref.step);
   if (ref.level < 0 || ref.level >= static_cast<int32_t>(cache.levels.size())) {
     return std::nullopt;
@@ -98,10 +98,11 @@ std::optional<HostView> OpenPMDBackend::get_chunk(const ChunkRef& ref) {
       return std::nullopt;
     }
 
-    HostView view;
+    const std::array<std::uint64_t, 3> extents{nx, ny, nz};
     if (component.getDatatype() == openPMD::Datatype::DOUBLE) {
-      view.data.resize(static_cast<size_t>(elem_count * sizeof(double)));
-      auto* data = reinterpret_cast<double*>(view.data.data());
+      auto view = ChunkBuffer::allocate(BufferDesc::runtime_grid(ScalarType::kF64, extents));
+      auto bytes = view.mutable_byte_view();
+      auto* data = reinterpret_cast<double*>(bytes.data());
       component.loadChunkRaw(data, patch.storage_offset, patch.storage_extent);
       series_->flush();
       scale_values<double>(data, static_cast<size_t>(elem_count), component.unitSI());
@@ -109,8 +110,9 @@ std::optional<HostView> OpenPMDBackend::get_chunk(const ChunkRef& ref) {
       return view;
     }
     if (component.getDatatype() == openPMD::Datatype::FLOAT) {
-      view.data.resize(static_cast<size_t>(elem_count * sizeof(float)));
-      auto* data = reinterpret_cast<float*>(view.data.data());
+      auto view = ChunkBuffer::allocate(BufferDesc::runtime_grid(ScalarType::kF32, extents));
+      auto bytes = view.mutable_byte_view();
+      auto* data = reinterpret_cast<float*>(bytes.data());
       component.loadChunkRaw(data, patch.storage_offset, patch.storage_extent);
       series_->flush();
       scale_values<float>(data, static_cast<size_t>(elem_count), component.unitSI());
@@ -139,19 +141,50 @@ bool OpenPMDBackend::has_chunk(const ChunkRef& ref) const {
   return field_map_.find(ref.field) != field_map_.end();
 }
 
-DatasetMetadata OpenPMDBackend::get_metadata() const {
-  DatasetMetadata meta;
-  const auto& cache = get_cache(0);
-  meta.prob_lo.assign(cache.prob_lo.begin(), cache.prob_lo.end());
-  meta.prob_hi.assign(cache.prob_hi.begin(), cache.prob_hi.end());
-  meta.ref_ratio.reserve(cache.ref_ratio.size());
-  for (const auto& ratio : cache.ref_ratio) {
-    meta.ref_ratio.push_back(ratio[0]);
+std::optional<BufferDesc> OpenPMDBackend::describe_chunk(const ChunkRef& ref) const {
+  const auto& cache = get_cache(ref.step);
+  if (ref.level < 0 || ref.level >= static_cast<int32_t>(cache.levels.size())) {
+    return std::nullopt;
   }
-  return meta;
+  const auto& level = cache.levels.at(static_cast<std::size_t>(ref.level));
+  if (ref.block < 0 || ref.block >= static_cast<int32_t>(level.patches.size())) {
+    return std::nullopt;
+  }
+
+  FieldSpec spec;
+  {
+    std::lock_guard<std::mutex> lock(field_mutex_);
+    const auto it = field_map_.find(ref.field);
+    if (it == field_map_.end()) return std::nullopt;
+    spec = it->second;
+  }
+
+  const auto field = std::find_if(
+      cache.fields.begin(), cache.fields.end(), [&](const OpenPMDFieldInfo& candidate) {
+        return candidate.component_name == spec.component_name;
+      });
+  if (field == cache.fields.end()) return std::nullopt;
+
+  ScalarType scalar;
+  if (field->type == "float64") {
+    scalar = ScalarType::kF64;
+  } else if (field->type == "float32") {
+    scalar = ScalarType::kF32;
+  } else {
+    return std::nullopt;
+  }
+  const auto& xyz = level.patches.at(static_cast<std::size_t>(ref.block)).extent_xyz;
+  const std::array<std::uint64_t, 3> extents{
+      xyz[0] == 0 ? 1 : xyz[0], xyz[1] == 0 ? 1 : xyz[1], xyz[2] == 0 ? 1 : xyz[2]};
+  return BufferDesc::runtime_grid(scalar, extents);
 }
 
-OpenPMDMetadata OpenPMDBackend::metadata(int32_t step) const {
+std::size_t OpenPMDBackend::estimate_chunk_bytes(const ChunkRef& ref) const {
+  const auto desc = describe_chunk(ref);
+  return desc.has_value() ? static_cast<std::size_t>(desc->required_bytes()) : 0;
+}
+
+OpenPMDMetadata OpenPMDBackend::openpmd_metadata(int32_t step) const {
   const auto& cache = get_cache(step);
   OpenPMDMetadata out;
   out.selected_mesh = cache.selected_mesh;
@@ -176,6 +209,38 @@ OpenPMDMetadata OpenPMDBackend::metadata(int32_t step) const {
     out.prob_domain.push_back({level.domain_lo, level.domain_hi});
   }
 
+  return out;
+}
+
+DatasetMetadata OpenPMDBackend::metadata(int32_t step) const {
+  const auto source = openpmd_metadata(step);
+  DatasetMetadata out;
+  out.selected_mesh = source.selected_mesh;
+  out.mesh_names = source.mesh_names;
+  out.finest_level = source.finest_level;
+  out.prob_lo.assign(source.prob_lo.begin(), source.prob_lo.end());
+  out.prob_hi.assign(source.prob_hi.begin(), source.prob_hi.end());
+  for (const auto& ratio : source.ref_ratio) {
+    out.ref_ratio.push_back(ratio[0]);
+  }
+  for (const auto& size : source.cell_size) {
+    out.cell_size.emplace_back(size.begin(), size.end());
+  }
+  for (const auto& level : source.level_boxes) {
+    std::vector<DatasetBox> boxes;
+    for (const auto& [lo, hi] : level) {
+      boxes.push_back(DatasetBox{.lo = lo, .hi = hi});
+    }
+    out.level_boxes.push_back(std::move(boxes));
+  }
+  for (const auto& [lo, hi] : source.prob_domain) {
+    out.prob_domain.push_back(DatasetBox{.lo = lo, .hi = hi});
+  }
+  for (const auto& field : source.fields) {
+    out.var_names.push_back(field.name);
+    out.fields.push_back(DatasetVariableInfo{
+        .name = field.name, .num_components = field.ncomp, .type = field.type});
+  }
   return out;
 }
 

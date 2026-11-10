@@ -1,28 +1,60 @@
 #!/bin/bash
-#SBATCH -t 00:15:00
+#SBATCH -t 00:20:00
 #SBATCH -A ast236
-#SBATCH -N 4
-#SBATCH -p gpu
-#SBATCH -J kangaroo-flux-p2
+#SBATCH -N 1
+#SBATCH -p batch
+#SBATCH -J kangaroo-enclosed-sfr
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=28
+#SBATCH --cpus-per-task=32
 
 set -euo pipefail
 
+# Initialize the module system if this batch shell did not inherit it
+# (sbatch does not propagate exported shell functions or MODULEPATH
+# reliably).
+if ! type module >/dev/null 2>&1; then
+  # shellcheck disable=SC1091
+  source /sw/riker/lmod/lmod/init/bash
+fi
+: "${MODULEPATH:=/etc/scl/modulefiles:/sw/riker/spack/modules/gcc/14.2.0/mpich-5.0.1/gcc-14.2.0:/sw/riker/spack/modules/gcc/14.2.0/gcc-14.2.0:/sw/riker/spack/modules/Core/26.01:/sw/riker/modulefiles}"
+export MODULEPATH
 module load gcc/14.2.0
-: "${PLOTFILE:=/lustre/orion/ast236/proj-shared/wibking/MW_Gen1_Phase2/plt0221965}"
-: "${RMIN_KPC:=5.0}"
-: "${RMAX_KPC:=100.0}"
+
+# Make the personal spack installation discoverable regardless of the
+# submitting shell's PATH (needed for `spack location -i` below).
+if ! command -v spack >/dev/null 2>&1; then
+  export PATH="${HOME}/spack/bin:${PATH}"
+fi
+
+if [[ $# -ne 1 ]]; then
+  echo "Usage: sbatch $0 PLOTFILE" >&2
+  exit 2
+fi
+PLOTFILE=$1
+# Disk profile: SFR(R) within |z| <= DISK_HEIGHT_KPC.
+: "${RMIN_KPC:=0.1}"
+: "${RMAX_KPC:=30.0}"
+: "${DISK_HEIGHT_KPC:=1.0}"
+# Wind profile: SFR(h) within radius WIND_RADIUS_KPC.
+: "${WIND_RADIUS_KPC:=5.0}"
+: "${ZMIN_KPC:=0.1}"
+: "${ZMAX_KPC:=30.0}"
+: "${SFR_WINDOW_MYR:=10.0}"
+: "${FIELD_KIND:=rate_density}"
 : "${KANGAROO_FLUX_PROFILE:=production}"
 
 case "$KANGAROO_FLUX_PROFILE" in
   production)
     : "${NBINS:=50}"
-    : "${OUTPUT_JSON:=flux_surface.json}"
+    : "${OUTPUT_JSON_DISK:=enclosed_sfr_disk.json}"
+    : "${OUTPUT_JSON_WIND:=enclosed_sfr_wind.json}"
+    : "${OUTPUT_JSON_JOINT:=enclosed_sfr_joint.json}"
     ;;
   diagnostic)
     : "${NBINS:=8}"
-    : "${OUTPUT_JSON:=flux_surface.diagnostic.json}"
+    : "${OUTPUT_JSON_DISK:=enclosed_sfr_disk.diagnostic.json}"
+    : "${OUTPUT_JSON_WIND:=enclosed_sfr_wind.diagnostic.json}"
+    : "${OUTPUT_JSON_JOINT:=enclosed_sfr_joint.diagnostic.json}"
     : "${KANGAROO_EVENT_LOG:=auto}"
     : "${KANGAROO_PROGRESS:=1}"
     ;;
@@ -32,13 +64,6 @@ case "$KANGAROO_FLUX_PROFILE" in
     ;;
 esac
 
-# Tuned for the streaming executor and plotfile loader:
-# - run on 1 TB GPU nodes; batch nodes on this cluster have been unstable here;
-# - one HPX locality per node, so Lustre bandwidth scales with node count;
-# - 16 block-bundle reads per node was the observed single-node saturation point;
-# - executor admission is per-locality and bounded by tasks, storage units, and bytes;
-# - the dedicated HPX I/O pool keeps blocking reads off the default compute pool;
-# - zero-copy plotfile reads avoid the old read-buffer-to-runtime-layout transpose copy.
 : "${KANGAROO_EXECUTOR_MODE:=streaming}"
 : "${KANGAROO_EXECUTOR_MAX_ACTIVE_TASKS_PER_LOCALITY:=128}"
 : "${KANGAROO_PLOTFILE_READ_CONCURRENCY:=16}"
@@ -60,9 +85,6 @@ export KANGAROO_PLOTFILE_IO_POOL
 export KANGAROO_PLOTFILE_IO_POOL_THREADS
 export KANGAROO_PLOTFILE_ZERO_COPY_READS
 
-# Progress is useful for coarse diagnosis and is cheap enough for timing runs.
-# JSON event logging is much heavier; enable it explicitly with
-# KANGAROO_EVENT_LOG=auto or a concrete output path.
 PROGRESS_ARGS=()
 if [[ "${KANGAROO_PROGRESS:-0}" == "1" ]]; then
   PROGRESS_ARGS+=(--progress)
@@ -70,7 +92,7 @@ fi
 if [[ -n "${KANGAROO_EVENT_LOG:-}" ]]; then
   mkdir -p event_logs
   if [[ "$KANGAROO_EVENT_LOG" == "1" || "$KANGAROO_EVENT_LOG" == "auto" ]]; then
-    KANGAROO_EVENT_LOG="$PWD/event_logs/flux_surface.${SLURM_JOB_ID:-manual}.events.jsonl"
+    KANGAROO_EVENT_LOG="$PWD/event_logs/enclosed_sfr.${SLURM_JOB_ID:-manual}.events.jsonl"
   fi
   export KANGAROO_EVENT_LOG
 fi
@@ -78,11 +100,12 @@ fi
 export PYTHONUNBUFFERED=1
 export OMP_NUM_THREADS=1
 
-export SPACK_HPX_PREFIX="$(spack location -i hpx@1.11.0%gcc@14.2.0)"
-export LD_LIBRARY_PATH="$SPACK_HPX_PREFIX/lib64:${LD_LIBRARY_PATH:-}"
+export SPACK_HPX_PREFIX="$(spack location -i 'hpx@1.11.0 networking=mpi %gcc@14.2.0')"
+export SPACK_MPI_PREFIX="$(spack location -i 'openmpi%gcc@14.2.0')"
+export LD_LIBRARY_PATH="$SPACK_HPX_PREFIX/lib64:$SPACK_HPX_PREFIX/lib:$SPACK_MPI_PREFIX/lib64:$SPACK_MPI_PREFIX/lib:${LD_LIBRARY_PATH:-}"
 
-NNODES="${SLURM_NNODES:-4}"
-CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-28}"
+NNODES="${SLURM_NNODES:-1}"
+CPUS_PER_TASK="${SLURM_CPUS_PER_TASK:-128}"
 if [[ "${SLURM_TRES_PER_TASK:-}" =~ (^|,)cpu=([0-9]+)(,|$) ]]; then
   CPUS_PER_TASK="${BASH_REMATCH[2]}"
   if [[ "${SLURM_CPUS_PER_TASK:-}" != "$CPUS_PER_TASK" ]]; then
@@ -91,7 +114,6 @@ if [[ "${SLURM_TRES_PER_TASK:-}" =~ (^|,)cpu=([0-9]+)(,|$) ]]; then
   export SLURM_CPUS_PER_TASK="$CPUS_PER_TASK"
 fi
 
-# Avoid guard-page overhead and stack reservation pressure in many-task HPX runs.
 HPX_GUARD_PAGE_ARG=--hpx:ini=hpx.stacks.use_guard_pages=0
 export HPXRUN_ARGS="${HPXRUN_ARGS:+${HPXRUN_ARGS} }${HPX_GUARD_PAGE_ARG}"
 
@@ -101,6 +123,7 @@ echo "SLURM_JOB_ID=${SLURM_JOB_ID:-manual}"
 echo "NNODES=${NNODES}"
 echo "CPUS_PER_TASK=${CPUS_PER_TASK}"
 echo "SPACK_HPX_PREFIX=${SPACK_HPX_PREFIX}"
+echo "SPACK_MPI_PREFIX=${SPACK_MPI_PREFIX}"
 echo "HPXRUN_ARGS=${HPXRUN_ARGS}"
 echo "KANGAROO_FLUX_PROFILE=${KANGAROO_FLUX_PROFILE}"
 echo "KANGAROO_EXECUTOR_MODE=${KANGAROO_EXECUTOR_MODE}"
@@ -115,27 +138,42 @@ echo "KANGAROO_PLOTFILE_IO_POOL_THREADS=${KANGAROO_PLOTFILE_IO_POOL_THREADS}"
 echo "KANGAROO_PLOTFILE_ZERO_COPY_READS=${KANGAROO_PLOTFILE_ZERO_COPY_READS}"
 echo "KANGAROO_EVENT_LOG=${KANGAROO_EVENT_LOG:-disabled}"
 echo "plotfile=${PLOTFILE}"
+echo "rmin_kpc=${RMIN_KPC}"
+echo "rmax_kpc=${RMAX_KPC}"
+echo "disk_height_kpc=${DISK_HEIGHT_KPC}"
+echo "wind_radius_kpc=${WIND_RADIUS_KPC}"
+echo "zmin_kpc=${ZMIN_KPC}"
+echo "zmax_kpc=${ZMAX_KPC}"
 echo "nbins=${NBINS}"
-echo "output_json=${OUTPUT_JSON}"
+echo "sfr_window_myr=${SFR_WINDOW_MYR}"
+echo "field_kind=${FIELD_KIND}"
+echo "output_json_disk=${OUTPUT_JSON_DISK}"
+echo "output_json_wind=${OUTPUT_JSON_WIND}"
+echo "output_json_joint=${OUTPUT_JSON_JOINT}"
 
-"$SPACK_HPX_PREFIX/bin/hpxrun.py" \
+# One AMR-aware cylindrical-moments pass produces both the disk profile
+# SFR(R) for |z| <= DISK_HEIGHT_KPC and the wind profile SFR(h) within
+# WIND_RADIUS_KPC: cells are binned once by (r, |z|), and the enclosed
+# profiles follow by cumulative summation.
+"$PWD/scripts/utils/hpxrun_spack_hpx.sh" \
   -r srun \
-  -p tcp \
+  -p mpi \
   -l "$NNODES" \
   -t "$CPUS_PER_TASK" \
-  "$PWD/.pixi/envs/default/bin/python" \
-  "$PWD/scripts/plotfile_flux_surface.py" \
+  "$PWD/.pixi/envs/spack-hpx/bin/python" \
+  "$PWD/scripts/plotfile_enclosed_sfr.py" \
   -- \
   "$PLOTFILE" \
   --rmin-kpc "$RMIN_KPC" --rmax-kpc "$RMAX_KPC" \
+  --disk-height-kpc "$DISK_HEIGHT_KPC" \
+  --zmin-kpc "$ZMIN_KPC" --zmax-kpc "$ZMAX_KPC" \
+  --wind-radius-kpc "$WIND_RADIUS_KPC" \
   --nbins "$NBINS" \
-  --temperature-bins 0,980,4126,7105,2.0e4,5.0e5,1.0e9 \
-  --density gasDensity \
-  --momx x-GasMomentum --momy y-GasMomentum --momz z-GasMomentum \
-  --energy gasEnergy \
-  --scalar scalar_0 \
-  --bx x-BField --by y-BField --bz z-BField \
+  --field-kind "$FIELD_KIND" \
+  --sfr-window-myr "$SFR_WINDOW_MYR" \
   "${PROGRESS_ARGS[@]}" \
-  --output-json "$OUTPUT_JSON"
+  --output-json "$OUTPUT_JSON_DISK" \
+  --output-json-wind "$OUTPUT_JSON_WIND" \
+  --output-json-joint "$OUTPUT_JSON_JOINT"
 
 date

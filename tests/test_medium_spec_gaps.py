@@ -63,7 +63,7 @@ def test_runmeta_forwards_particle_species_to_core_handle(monkeypatch: pytest.Mo
     assert isinstance(payload["steps"], list)
 
 
-def test_dataset_classifies_any_memory_uri_as_memory(
+def test_dataset_uses_backend_reported_kind(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class _FakeHandle:
@@ -72,6 +72,12 @@ def test_dataset_classifies_any_memory_uri_as_memory(
             self.step = step
             self.level = level
 
+        def kind(self) -> str:
+            return "memory"
+
+        def metadata(self) -> dict:
+            return {}
+
     monkeypatch.setattr("analysis.dataset._core.DatasetHandle", _FakeHandle)
-    ds = Dataset(uri="memory://session-abc", runtime=None)
+    ds = Dataset(uri="custom://session-abc", runtime=None)
     assert ds.kind == "memory"
