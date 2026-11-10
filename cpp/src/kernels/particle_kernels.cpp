@@ -38,10 +38,11 @@ namespace {
 // into cells of other blocks is safe: the partial images are summed.
 class HierarchyDeposit {
  public:
-  HierarchyDeposit(const std::vector<LevelMeta> &levels, int axis,
+  HierarchyDeposit(const std::vector<LevelMeta> &levels,
+                   const std::vector<BoxSpatialIndex> &box_indices, int axis,
                    const double rect[4], int out_nx, int out_ny,
                    std::span<std::uint8_t> out)
-      : levels_(levels), axis_(axis), out_nx_(out_nx), out_ny_(out_ny), out_(out) {
+      : levels_(levels), box_indices_(box_indices), axis_(axis), out_nx_(out_nx), out_ny_(out_ny), out_(out) {
     u_axis_ = (axis == 0) ? 1 : 0;
     v_axis_ = (axis == 2) ? 1 : 2;
     rect_u_lo_ = std::min(rect[0], rect[2]);
@@ -60,14 +61,14 @@ class HierarchyDeposit {
     int32_t hi0[3] = {std::numeric_limits<int32_t>::min(),
                       std::numeric_limits<int32_t>::min(),
                       std::numeric_limits<int32_t>::min()};
-    if (!levels.empty()) {
-      for (const auto &b : levels.front().boxes) {
-        lo0[0] = std::min(lo0[0], b.lo.x);
-        lo0[1] = std::min(lo0[1], b.lo.y);
-        lo0[2] = std::min(lo0[2], b.lo.z);
-        hi0[0] = std::max(hi0[0], b.hi.x);
-        hi0[1] = std::max(hi0[1], b.hi.y);
-        hi0[2] = std::max(hi0[2], b.hi.z);
+    if (!box_indices.empty()) {
+      if (const auto *b = box_indices.front().bounds()) {
+        lo0[0] = b->lo.x;
+        lo0[1] = b->lo.y;
+        lo0[2] = b->lo.z;
+        hi0[0] = b->hi.x;
+        hi0[1] = b->hi.y;
+        hi0[2] = b->hi.z;
       }
     }
     int64_t ratio = 1;
@@ -150,23 +151,11 @@ class HierarchyDeposit {
   }
 
   bool in_grid(int level, const int32_t cell[3]) const {
-    for (const auto &b : levels_[static_cast<std::size_t>(level)].boxes) {
-      if (cell[0] >= b.lo.x && cell[0] <= b.hi.x && cell[1] >= b.lo.y &&
-          cell[1] <= b.hi.y && cell[2] >= b.lo.z && cell[2] <= b.hi.z) {
-        return true;
-      }
-    }
-    return false;
+    return box_indices_[static_cast<std::size_t>(level)].contains(cell);
   }
 
   bool any_grid_meets(int level, const int32_t lo[3], const int32_t hi[3]) const {
-    for (const auto &b : levels_[static_cast<std::size_t>(level)].boxes) {
-      if (b.lo.x <= hi[0] && b.hi.x >= lo[0] && b.lo.y <= hi[1] && b.hi.y >= lo[1] &&
-          b.lo.z <= hi[2] && b.hi.z >= lo[2]) {
-        return true;
-      }
-    }
-    return false;
+    return box_indices_[static_cast<std::size_t>(level)].intersects(lo, hi);
   }
 
   bool resolve(int level, int32_t cell_in[3], double weight, double a, Direction direction) {
@@ -274,6 +263,7 @@ class HierarchyDeposit {
   }
 
   const std::vector<LevelMeta> &levels_;
+  const std::vector<BoxSpatialIndex> &box_indices_;
   int axis_ = 2;
   int u_axis_ = 0;
   int v_axis_ = 1;
@@ -293,17 +283,16 @@ class HierarchyDeposit {
 
 // The step whose level list holds `level`: the executor hands kernels a
 // reference into the run's metadata.
-const std::vector<LevelMeta> &levels_containing(const LevelMeta &level) {
-  const RunMeta &meta = current_runmeta();
+std::size_t step_containing(const RunMeta &meta, const LevelMeta &level) {
   for (const auto &step : meta.steps) {
     for (const auto &candidate : step.levels) {
       if (&candidate == &level) {
-        return step.levels;
+        return static_cast<std::size_t>(&step - meta.steps.data());
       }
     }
   }
   if (meta.steps.size() == 1) {
-    return meta.steps.front().levels;
+    return 0;
   }
   throw std::runtime_error("particle_cic_projection_accumulate: cannot find the block's step");
 }
@@ -737,7 +726,10 @@ void register_particle_kernels(KernelRegistry &registry) {
           if (!(std::abs(rect[2] - rect[0]) > 0.0) || !(std::abs(rect[3] - rect[1]) > 0.0)) {
             return hpx::make_ready_future();
           }
-          HierarchyDeposit deposit(levels_containing(level), axis, rect, out_nx, out_ny, out);
+          const auto &ctx = execution_context(current_execution_context_id());
+          const auto step = step_containing(ctx.meta, level);
+          HierarchyDeposit deposit(ctx.meta.steps[step].levels, ctx.particle_box_indices.at(step),
+                                   axis, rect, out_nx, out_ny, out);
 
           const double *coord[3] = {px_vals.data(), py_vals.data(),
                                     pz_vals.data()};

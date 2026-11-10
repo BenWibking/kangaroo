@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kangaroo/adjacency.hpp"
+#include "kangaroo/box_spatial_index.hpp"
 #include "kangaroo/data_service.hpp"
 #include "kangaroo/data_service_local.hpp"
 #include "kangaroo/dataset_backend.hpp"
@@ -86,6 +87,8 @@ struct ChunkStore {
 struct ExecutionContext {
   int32_t run_id = 0;
   RunMeta meta;
+  // Built once for CIC runs; indexed by step and level, like meta.steps.
+  std::vector<std::vector<BoxSpatialIndex>> particle_box_indices;
   DatasetHandle dataset;
   PlanIR plan;
   std::shared_ptr<AdjacencyService> adjacency;

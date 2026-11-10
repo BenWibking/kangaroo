@@ -152,3 +152,30 @@ def test_cic_keeps_mass_across_coarse_fine_boundaries(tmp_path) -> None:
         total = sum(p[3] for p in coarse) + sum(p[3] for p in fine)
         assert np.isclose(image.sum(), total, rtol=1e-13)
         assert np.all(image >= 0.0)
+
+
+def test_cic_is_independent_of_hierarchy_box_partition(tmp_path) -> None:
+    # Exercise multiple tree branches, missing fine cells, and coarse-fine
+    # queries. Consecutive runs use different metadata to catch stale indices.
+    rng = np.random.default_rng(19)
+    coarse = [(*p, 1.0) for p in rng.uniform(0.0, 1.0, (80, 3))
+              if not all(0.25 <= c < 0.75 for c in p)]
+    fine = [(*p, 2.0) for p in rng.uniform(0.25, 0.75, (80, 3))]
+    coarse += [(0.249, 0.5, 0.5, 3.0), (0.5, 0.751, 0.5, 4.0)]
+    fine += [(0.251, 0.5, 0.5, 5.0), (0.749, 0.749, 0.5, 6.0)]
+    whole = [[((0, 0, 0), (7, 7, 7))], [((4, 4, 4), (11, 11, 11))]]
+    # Unequal extents and reversed order prevent relying on grid numbering
+    # or uniform box sizes in the spatial lookup.
+    partitioned = []
+    for cuts in ([0, 1, 3, 6, 8], [4, 5, 7, 10, 12]):
+        boxes = [((x0, y0, z0), (x1 - 1, y1 - 1, z1 - 1))
+                 for x0, x1 in zip(cuts, cuts[1:])
+                 for y0, y1 in zip(cuts, cuts[1:])
+                 for z0, z1 in zip(cuts, cuts[1:])]
+        partitioned.append(boxes[::-1])
+    expected = _project(_write_plotfile(tmp_path / "whole", whole, [coarse, fine]),
+                        resolution=(13, 7))
+    actual = _project(_write_plotfile(tmp_path / "split", partitioned, [coarse, fine]),
+                      resolution=(13, 7))
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=1e-12)
+    assert np.isclose(actual.sum(), sum(p[3] for p in coarse + fine), rtol=1e-13)

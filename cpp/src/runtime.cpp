@@ -1217,6 +1217,22 @@ std::shared_ptr<ExecutionContext> build_execution_context_impl(int32_t run_id,
   ctx->meta = meta;
   ctx->dataset = dataset;
   ctx->plan = std::move(prepared);
+  bool needs_particle_box_indices = false;
+  for (const auto &stage : ctx->plan.stages) {
+    for (const auto &tmpl : stage.templates) {
+      if (tmpl.kernel == "particle_cic_projection_accumulate") {
+        needs_particle_box_indices = true;
+      }
+    }
+  }
+  if (needs_particle_box_indices) {
+    ctx->particle_box_indices.resize(ctx->meta.steps.size());
+    for (std::size_t step = 0; step < ctx->meta.steps.size(); ++step) {
+      for (const auto &level : ctx->meta.steps[step].levels) {
+        ctx->particle_box_indices[step].emplace_back(level.boxes);
+      }
+    }
+  }
   if (needs_adjacency) {
     ctx->adjacency = std::make_shared<AdjacencyServiceLocal>(ctx->meta);
   } else {
