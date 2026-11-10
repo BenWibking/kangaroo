@@ -102,7 +102,21 @@ def test_submission_dry_run(tmp_path: Path, sbatch_options: list[str]) -> None:
     assert result.returncode == 0, result.stderr
     assert "sbatch " in result.stdout
     assert "make_toomre_q.submit" in result.stdout
+    assert "KANGAROO_HPX_BACKEND=pixi-hpx" in result.stdout
+    assert f"KANGAROO_REPO_ROOT={REPO_ROOT}" in result.stdout
     assert str(plotfile) in result.stdout
     if sbatch_options:
         assert "--time=01:00:00" in result.stdout
     assert not (REPO_ROOT / "results" / "test-campaign" / plotfile.name).exists()
+
+
+def test_submission_preserves_spack_selection(tmp_path: Path) -> None:
+    plotfile = tmp_path / "plt000100"
+    plotfile.mkdir()
+    result = run_kangaroo(
+        "spherical-flux", str(plotfile), "--dry-run", "--", "--nodes=4",
+        extra_env={"KANGAROO_HPX_BACKEND": "spack-hpx"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "KANGAROO_HPX_BACKEND=spack-hpx" in result.stdout
+    assert "--nodes=4" in result.stdout

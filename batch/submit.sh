@@ -20,4 +20,9 @@ if [[ ! -d "$PLOTFILE" ]]; then
   exit 2
 fi
 
-exec sbatch "$BATCH_SCRIPT" "$PLOTFILE"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+BATCH_SCRIPT="$(cd "$(dirname "$BATCH_SCRIPT")" && pwd)/$(basename "$BATCH_SCRIPT")"
+PLOTFILE="$(cd "$PLOTFILE" && pwd -P)"
+export KANGAROO_REPO_ROOT="$REPO_ROOT"
+export KANGAROO_HPX_BACKEND="${KANGAROO_HPX_BACKEND:-pixi-hpx}"
+exec sbatch --export=ALL --chdir="$REPO_ROOT" "$BATCH_SCRIPT" "$PLOTFILE"

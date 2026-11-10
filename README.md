@@ -100,9 +100,23 @@ kangaroo --help
 ```
 
 The CLI submits the existing analysis jobs through Slurm. Submission requires
-`sbatch` and the cluster modules, Spack HPX/MPI runtime, and paths configured in
-`batch/*.submit`. The Pixi setup above builds the local Python API; the batch
-scripts use their cluster-specific runtime.
+`sbatch` and `srun`. By default, batch jobs use the same `.pixi/envs/pixi-hpx`
+Python and HPX installation as the build above, with one node and one task.
+No compiler modules or Spack installation are needed for this mode. Account and
+partition defaults in `batch/*.submit` are cluster-specific; override them after
+`--` as needed.
+
+The vendored HPX has networking disabled. Multi-node MPI jobs require the
+separate Spack build and its matching Python environment:
+
+```bash
+KANGAROO_HPX_BACKEND=spack-hpx kangaroo spherical-flux /path/to/plt000100 -- --nodes=4
+```
+
+This opt-in mode retains the cluster GCC module, Spack HPX/MPI launcher, and
+library paths. Install Kangaroo with the `install-spack-hpx` task before using it.
+Pixi mode rejects allocations containing multiple nodes or tasks to avoid
+launching independent analyses against the same output files.
 
 Run these examples from the repository root so submission outputs and plotting
 inputs share `results/<campaign>/<plotfile>/<analysis>/`. Set a campaign once:
@@ -150,12 +164,8 @@ and writes `stellar_projection_yz.png`.
 
 ### Plot completed results
 
-The plotting commands currently use the separate `default` Pixi environment
-for NumPy and Matplotlib. Install it before plotting:
-
-```bash
-pixi install
-```
+Plotting commands use NumPy and Matplotlib from the same `pixi-hpx` environment
+installed above.
 
 After the corresponding analysis jobs finish:
 

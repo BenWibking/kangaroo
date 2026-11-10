@@ -38,6 +38,8 @@ Plot commands: plot-cylindrical-flux, plot-cylindrical-radial-flux,
 Outputs: results/CAMPAIGN/PLOTFILE/ANALYSIS/
 Set KANGAROO_CAMPAIGN to omit --campaign. Existing batch environment settings
 (e.g. R_MAX_KPC, DISK_HEIGHT_KPC) still apply. Output locations are managed here.
+Jobs default to the single-node pixi-hpx runtime. Set
+KANGAROO_HPX_BACKEND=spack-hpx for the cluster MPI runtime.
 Projection currently uses the stellar yz-map settings in make_projection.submit.
 Plot commands accept either a plotfile directory or its basename and write PNGs
 beside the corresponding JSON output.
@@ -68,7 +70,7 @@ parse_campaign() {
 run_plot() {
   local script=$1
   shift
-  "$REPO_ROOT/.pixi/envs/default/bin/python" "$REPO_ROOT/scripts/$script" "$@"
+  "$REPO_ROOT/.pixi/envs/pixi-hpx/bin/python" "$REPO_ROOT/scripts/$script" "$@"
 }
 if [[ $# -eq 0 || "$1" == --help || "$1" == -h ]]; then usage; exit 0; fi
 command_name=$1
@@ -100,7 +102,7 @@ case "$command_name" in
     parse_campaign "$@"
     plotfile_results="$PWD/results/$campaign/$plotfile_name"
     [[ -d "$plotfile_results" ]] || fail "result directory does not exist: $plotfile_results"
-    [[ -x "$REPO_ROOT/.pixi/envs/default/bin/python" ]] || fail 'default Pixi environment is missing; run pixi install'
+    [[ -x "$REPO_ROOT/.pixi/envs/pixi-hpx/bin/python" ]] || fail 'pixi-hpx environment is missing; run pixi install -e pixi-hpx'
     case "$command_name" in
       plot-cylindrical-flux)
         output_dir="$plotfile_results/cylindrical_flux"
@@ -184,7 +186,7 @@ while [[ $# -gt 0 ]]; do
 done
 [[ "$campaign" =~ ^[a-zA-Z0-9][a-zA-Z0-9._-]*$ ]] || fail 'set --campaign or KANGAROO_CAMPAIGN to a name using letters, digits, dots, underscores, and hyphens'
 output_dir="$REPO_ROOT/results/$campaign/$plotfile_name/$analysis_name"
-exports=()
+exports=("KANGAROO_REPO_ROOT=$REPO_ROOT" "KANGAROO_HPX_BACKEND=${KANGAROO_HPX_BACKEND:-pixi-hpx}")
 case "$command_name" in
   toomre-q) exports+=("OUTPUT_DIR=$output_dir") ;;
   enclosed-sfr)
