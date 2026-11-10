@@ -8,7 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_wheel_packages_product_and_compatibility_namespaces() -> None:
     pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
-    assert 'wheel.packages = ["analysis", "kangaroo"]' in pyproject
+    assert 'wheel.packages = ["analysis", "kangaroo", "potential_replay"]' in pyproject
     assert '"numpy"' in pyproject
 
 

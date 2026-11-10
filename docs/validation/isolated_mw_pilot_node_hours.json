@@ -1,0 +1,93 @@
+{
+  "status": "conditional planning scenarios, not measured pilot costs",
+  "reference": {
+    "path": "/Users/benwibking/amrex_codes/incite-2026/scaling_tests/walltime_scaling_data.csv",
+    "run_series": "2node_super20_optpart",
+    "nodes": 16,
+    "hydro_seconds_per_step": 0.514381006,
+    "mhd_multiplier_from_renewal": 2.7,
+    "derived_mhd_seconds_per_step": 1.3888287162000001
+  },
+  "assumptions": {
+    "nodes": 64,
+    "duration_myr": 5000,
+    "cfl": 0.3,
+    "signal_speed_range_km_s": [
+      3000,
+      6000
+    ],
+    "signal_speed_central_km_s": 4500,
+    "nonshrinking_step_fraction_range": [
+      0.1,
+      0.3
+    ],
+    "nonshrinking_step_fraction_central": 0.2,
+    "contingency_factor": 1.25,
+    "note": "Nonshrinking fraction is a sensitivity assumption, not profiled. Linear mesh strong scaling from 16 to 64 nodes is also assumed. New halo refinement and changed physics are not benchmarked."
+  },
+  "rows": [
+    {
+      "disk_dx_pc": 18.310546875,
+      "low": {
+        "steps": 2792686.0186870317,
+        "seconds_per_step": 0.4513693327650001,
+        "node_hours": 28011.84055282022,
+        "active_days_64_nodes": 18.236875359908996
+      },
+      "central": {
+        "steps": 4189029.0280305482,
+        "seconds_per_step": 0.5555314864800001,
+        "node_hours": 51714.167174437345,
+        "active_days_64_nodes": 33.668077587524316
+      },
+      "high": {
+        "steps": 5585372.037374063,
+        "seconds_per_step": 0.659693640195,
+        "node_hours": 81880.7646928591,
+        "active_days_64_nodes": 53.30778951358014
+      }
+    },
+    {
+      "disk_dx_pc": 36.62109375,
+      "low": {
+        "steps": 1396343.0093435158,
+        "seconds_per_step": 0.17794367926312504,
+        "node_hours": 5521.564724353986,
+        "active_days_64_nodes": 3.594768700751293
+      },
+      "central": {
+        "steps": 2094514.5140152741,
+        "seconds_per_step": 0.31248646114500006,
+        "node_hours": 14544.609517810504,
+        "active_days_64_nodes": 9.469146821491213
+      },
+      "high": {
+        "steps": 2792686.0186870317,
+        "seconds_per_step": 0.447029243026875,
+        "node_hours": 27742.495932120022,
+        "active_days_64_nodes": 18.06152078914064
+      }
+    },
+    {
+      "disk_dx_pc": 73.2421875,
+      "low": {
+        "steps": 698171.5046717579,
+        "seconds_per_step": 0.14376547257539063,
+        "node_hours": 2230.510140173485,
+        "active_days_64_nodes": 1.452155039175446
+      },
+      "central": {
+        "steps": 1047257.2570076371,
+        "seconds_per_step": 0.282105832978125,
+        "node_hours": 6565.275129567241,
+        "active_days_64_nodes": 4.274267662478672
+      },
+      "high": {
+        "steps": 1396343.0093435158,
+        "seconds_per_step": 0.4204461933808594,
+        "node_hours": 13046.380065165667,
+        "active_days_64_nodes": 8.493737021592231
+      }
+    }
+  ]
+}

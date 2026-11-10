@@ -33,6 +33,7 @@ from .kernel_params import (
     ParticleCicProjectionParams,
     SliceFinalizeParams,
     ToomreProfileParams,
+    PotentialSamplesParams,
     UniformProjectionParams,
     UniformSliceCellParams,
 )
@@ -2028,3 +2029,133 @@ def cdf_from_samples(samples: Sequence[float]) -> tuple[list[float], list[float]
     n = len(xs)
     cdf = [(i + 1) / n for i in range(n)]
     return xs, cdf
+
+
+class PotentialSamples:
+    """Compact quadratic MLS statistics at shared harmonic quadrature points.
+
+    Columns: row-major Gram (100), RHS (10), coverage fraction, bad-value
+    fraction, contributing cell count, volume-weighted maximum cell width / support half-width.
+    """
+
+    NUM_STATS = 114
+
+    def __init__(self, *, field: int, points: Sequence[Sequence[float]],
+                 half_width: float, out_name: str = "potential_samples",
+                 reduce_fan_in: Optional[int] = None) -> None:
+        self.field = int(field)
+        self.points = tuple(tuple(float(v) for v in p) for p in points)
+        self.half_width = float(half_width)
+        self.out_name = str(out_name)
+        self.reduce_fan_in = reduce_fan_in
+        if not self.points or any(len(p) != 3 or not all(map(math.isfinite, p))
+                                  for p in self.points):
+            raise ValueError("points must be a nonempty finite (N, 3) array")
+        if not math.isfinite(self.half_width) or self.half_width <= 0:
+            raise ValueError("half_width must be finite and positive")
+
+    def lower(self, ctx: LoweringContext):
+        ds = ctx.dataset
+        levels = ctx.runmeta.steps[ds.step].levels
+        active_by_level = {}
+        for level_idx, level in enumerate(levels):
+            active = []
+            for block_idx, box in enumerate(level.boxes):
+                bounds = [_bounds_1d(box.lo[a], box.hi[a], level.geom.x0[a],
+                                     level.geom.dx[a], level.geom.index_origin[a])
+                          for a in range(3)]
+                if any(all(p[a] + self.half_width > bounds[a][0] and
+                           p[a] - self.half_width < bounds[a][1]
+                           for a in range(3)) for p in self.points):
+                    active.append(block_idx)
+            if active:
+                active_by_level[level_idx] = active
+        if not active_by_level:
+            raise ValueError("sample supports do not intersect any mesh block")
+        output_buffer = BufferSpec(
+            DType.F64,
+            FixedShape((len(self.points), self.NUM_STATS)),
+            InitPolicy.ZERO,
+        )
+        accumulate_stage = ctx.stage("potential_samples")
+        reductions = GraphReductionBuilder(ctx)
+        reductions.add_stage(accumulate_stage)
+        profile_fields: list[ReducedField] = []
+
+        for level_idx in range(len(levels) - 1, -1, -1):
+            blocks = active_by_level.get(level_idx, [])
+            if not blocks:
+                continue
+            covered_boxes = covered_volume_boxes(levels, level=level_idx)
+            covered_payload = _covered_boxes_payload(covered_boxes)
+            profile_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
+
+            for block in blocks:
+                dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
+                accumulate_stage.map_blocks(
+                    name=f"potential_samples_l{level_idx}_b{block}",
+                    kernel="potential_samples_accumulate",
+                    domain=dom,
+                    inputs=[FieldRef(self.field)],
+                    outputs=[OutputRef(profile_field, output_buffer)],
+                    deps=DependencyRule(),
+                    params=PotentialSamplesParams(
+                        points=tuple(v for point in self.points for v in point),
+                        half_width=self.half_width,
+                        covered_boxes=covered_payload,
+                    ),
+                )
+
+            reductions.add_stage(accumulate_stage, outputs=[profile_field])
+            profile_fields.append(
+                reductions.reduce_blocks(
+                    value=ReducedField(profile_field, level_idx),
+                    input_blocks=blocks,
+                    step=ds.step,
+                    fan_in=resolve_reduce_fan_in(self.reduce_fan_in, len(blocks)),
+                    kernel="uniform_slice_reduce",
+                    output_buffer=output_buffer,
+                    stage_name="potential_samples_reduce",
+                    template_name="potential_samples_reduce_s{round}",
+                    singleton_template_name="potential_samples_reduce_single",
+                    temporary_name=f"{self.out_name}_sum_reduce_{level_idx}_{{round}}",
+                    after=accumulate_stage,
+                    normalize_single=True,
+                )
+            )
+
+        total_profile = reductions.reduce_pairwise(
+            profile_fields,
+            step=ds.step,
+            target_level=ds.level,
+            kernel="uniform_slice_add",
+            output_buffer=output_buffer,
+            stage_name="potential_samples_add",
+            template_name="potential_samples_add_{round}_{index}",
+            temporary_name=f"{self.out_name}_sum_add_{{round}}_{{index}}",
+        )
+        out_field = ctx.output_field(self.out_name)
+        finalize = ctx.stage(
+            "potential_samples_output",
+            plane="graph",
+            after=reductions.dependencies([total_profile.field]),
+        )
+        finalize.map_blocks(
+            name="potential_samples_output",
+            kernel="uniform_slice_reduce",
+            domain=ctx.domain(step=ds.step, level=ds.level),
+            inputs=[
+                FieldRef(
+                    total_profile.field.field,
+                    version=total_profile.field.version,
+                    domain=ctx.domain(
+                        step=ds.step, level=total_profile.level, blocks=[0]
+                    ),
+                )
+            ],
+            outputs=[OutputRef(out_field, output_buffer)],
+            deps=DependencyRule(),
+            graph_reduce=GraphReduceSpec(fan_in=1, num_inputs=1),
+        )
+        reductions.add_stage(finalize, outputs=[out_field])
+        return ctx.fragment(reductions.stages)

@@ -12,6 +12,7 @@ void register_default_kernels(KernelRegistry &registry) {
   register_flux_kernels(registry);
   register_reduction_kernels(registry);
   register_toomre_kernels(registry);
+  register_potential_kernels(registry);
 }
 
 } // namespace kangaroo

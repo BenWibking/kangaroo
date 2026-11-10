@@ -254,3 +254,13 @@ kangaroo plot-wind-disk-angular-momentum-flux plt000100
 name, state, elapsed time, node count, and assigned nodes or pending reason.
 It recognizes `kangaroo-*` job names and the existing Kangaroo batch script
 paths, including projection jobs submitted under the older `quokka` name.
+
+### Offline gravitational potential models
+
+Reconstruct the saved total `gpot` with an AMR-aware distributed sample operator,
+then save a smooth signed-height Fourier potential and its analytic force field.
+`scripts/plotfile_potential.py` accepts explicit plotfiles or a CSV/JSON manifest
+and writes portable NumPy-only models plus an actual-time series manifest.
+See [design, CLI examples, schema, and force validation](docs/potential_reconstruction.md).
+The standalone `potential_replay` package needs no Kangaroo runtime or plotfiles.
+Temporal interpolation, orbit integration, and stream generation are not included.

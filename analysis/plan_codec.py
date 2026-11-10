@@ -39,6 +39,7 @@ from .fb import (
     TaskTemplate,
     TopKModesParams,
     ToomreProfileParams,
+    PotentialSamplesParams,
     UniformProjectionParams,
     UniformSliceCellParams,
     UniformSliceParams,
@@ -156,6 +157,10 @@ def _params(value: model_params.KernelParams) -> tuple[int, Any]:
             list(value.radii), list(value.radius_indices), list(value.heights),
             list(value.height_indices), value.num_radii,
             list(value.temperature_bins), value.num_heights, value.gamma
+        )
+    if isinstance(value, p.PotentialSamplesParams):
+        return KernelParams.KernelParams.PotentialSamplesParams, PotentialSamplesParams.PotentialSamplesParamsT(
+            list(value.points), value.half_width
         )
     if isinstance(value, p.ToomreProfileParams):
         return KernelParams.KernelParams.ToomreProfileParams, ToomreProfileParams.ToomreProfileParamsT(

@@ -63,6 +63,13 @@ class CylindricalFluxParams:
 
 
 @dataclass(frozen=True)
+class PotentialSamplesParams:
+    points: tuple[float, ...] = ()  # flattened simulation-frame xyz
+    half_width: float = 1.0
+    covered_boxes: CoveredBoxes = ()
+
+
+@dataclass(frozen=True)
 class ToomreProfileParams:
     radial_edges: tuple[float, ...] = (0.0, 1.0)
     z_bounds: tuple[float, float] = (-1.0, 1.0)
@@ -186,6 +193,7 @@ KernelParams: TypeAlias = (
     | PlotfileLoadParams
     | FluxSurfaceParams
     | CylindricalFluxParams
+    | PotentialSamplesParams
     | ToomreProfileParams
     | UniformSliceCellParams
     | UniformProjectionParams

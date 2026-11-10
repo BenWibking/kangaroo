@@ -104,6 +104,7 @@ table CylindricalFluxParams {
   num_heights:ulong;
   gamma:double = 1.6666666666666667;
 }
+table PotentialSamplesParams { points:[double]; half_width:double = 1.0; }
 table ToomreProfileParams {
   radial_edges:[double];
   z_bounds:[double];
@@ -175,7 +176,8 @@ union KernelParams {
   FiniteOnlyParams,
   ParticleHistogramParams,
   TopKModesParams,
-  SliceFinalizeParams
+  SliceFinalizeParams,
+  PotentialSamplesParams
 }
 
 table TaskTemplate {

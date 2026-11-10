@@ -10,6 +10,7 @@ void register_particle_kernels(KernelRegistry &registry);
 void register_histogram_kernels(KernelRegistry &registry);
 void register_flux_kernels(KernelRegistry &registry);
 void register_reduction_kernels(KernelRegistry &registry);
+void register_potential_kernels(KernelRegistry &registry);
 void register_toomre_kernels(KernelRegistry &registry);
 
 } // namespace kangaroo

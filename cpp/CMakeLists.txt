@@ -51,6 +51,7 @@ set(KANGAROO_RUNTIME_SOURCES
   src/kernels/particle_kernels.cpp
   src/kernels/reduction_kernels.cpp
   src/kernels/toomre_kernels.cpp
+  src/kernels/potential_kernels.cpp
   src/kernels/kernel_buffer_support.cpp
   src/kernels/kernel_param_support.cpp
   src/kernels/particle_kernel_support.cpp
@@ -293,3 +294,6 @@ install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../kangaroo/"
 install(DIRECTORY "${KANGAROO_FLATBUFFER_PYTHON_DIR}/analysis/fb/"
         DESTINATION "${KANGAROO_PYTHON_SITE}/analysis/fb"
         FILES_MATCHING PATTERN "*.py" PATTERN "*.pyi")
+install(DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../potential_replay/"
+        DESTINATION "${KANGAROO_PYTHON_SITE}/potential_replay"
+        FILES_MATCHING PATTERN "*.py")

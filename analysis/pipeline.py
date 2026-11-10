@@ -30,6 +30,7 @@ from .kernel_params import (
 from .ops import (
     CylindricalFluxSurfaceIntegral,
     CylindricalMoments,
+    PotentialSamples,
     FluxSurfaceIntegral,
     Histogram1D,
     Histogram2D,
@@ -1290,6 +1291,20 @@ class Pipeline:
             center=op.center,
             gamma=op.gamma,
         )
+
+    def potential_samples(
+        self, field: int | FieldHandle, *, points: Sequence[Sequence[float]],
+        half_width: float, out: str | None = None,
+        reduce_fan_in: int | None = None,
+    ) -> FieldHandle:
+        """Extract AMR-aware local quadratic statistics, without collecting cells."""
+        name = out or self._unique_name("potential_samples")
+        op = PotentialSamples(field=self._as_field_id(field), points=points,
+                              half_width=half_width, out_name=name,
+                              reduce_fan_in=reduce_fan_in)
+        fragment = op.lower(self._ctx)
+        self._append_fragment(fragment)
+        return FieldHandle(self, self._sink_fields(fragment)[-1], name)
 
     def cylindrical_moments(
         self,

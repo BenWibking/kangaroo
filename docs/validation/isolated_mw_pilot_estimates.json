@@ -1,0 +1,261 @@
+{
+  "status": "scoping calculations, not simulation validation",
+  "assumptions": {
+    "nodes": 64,
+    "duration_gyr": 5,
+    "box_kpc": 1200,
+    "base_grid": 256,
+    "disk_Rmax_kpc": 16,
+    "disk_zmax_kpc": 4,
+    "cfl": 0.3,
+    "illustrative_signal_speed_km_s": 1000,
+    "reference_duration_myr": 600,
+    "phase1_dx_pc": 18.310546875
+  },
+  "particles": {
+    "source": "chunked AgoraGalaxy_particles_HI.gz",
+    "header_count": 21249982,
+    "gzip_stream_complete": true,
+    "mass_bins": [
+      {
+        "mass_g": 2.4950751930000004e+38,
+        "mass_msun": 125477.1353352075,
+        "count": 9999984
+      },
+      {
+        "mass_g": 6.836763843e+36,
+        "mass_msun": 3438.203162733157,
+        "count": 11249998
+      }
+    ],
+    "elapsed_seconds": 10.82118075
+  },
+  "disk_candidates": [
+    {
+      "max_level": 8,
+      "dx_pc": 18.310546875,
+      "ideal_finest_cylinder_cells": 1048035222.5227319,
+      "dt_myr_at_1000km_s": 0.005371171875,
+      "steps_5gyr": 930895.550610173,
+      "ideal_disk_work_relative_phase1_600myr": 8.333333333333334,
+      "potential_only_TB_2myr_cadence_finest_cylinder": 20.96908873223482
+    },
+    {
+      "max_level": 7,
+      "dx_pc": 36.62109375,
+      "ideal_finest_cylinder_cells": 131004402.81534149,
+      "dt_myr_at_1000km_s": 0.01074234375,
+      "steps_5gyr": 465447.7753050865,
+      "ideal_disk_work_relative_phase1_600myr": 0.5208333333333334,
+      "potential_only_TB_2myr_cadence_finest_cylinder": 2.6211360915293525
+    },
+    {
+      "max_level": 6,
+      "dx_pc": 73.2421875,
+      "ideal_finest_cylinder_cells": 16375550.351917686,
+      "dt_myr_at_1000km_s": 0.0214846875,
+      "steps_5gyr": 232723.88765254326,
+      "ideal_disk_work_relative_phase1_600myr": 0.032552083333333336,
+      "potential_only_TB_2myr_cadence_finest_cylinder": 0.32764201144116906
+    },
+    {
+      "max_level": 5,
+      "dx_pc": 146.484375,
+      "ideal_finest_cylinder_cells": 2046943.7939897107,
+      "dt_myr_at_1000km_s": 0.042969375,
+      "steps_5gyr": 116361.94382627163,
+      "ideal_disk_work_relative_phase1_600myr": 0.0020345052083333335,
+      "potential_only_TB_2myr_cadence_finest_cylinder": 0.04095525143014613
+    }
+  ],
+  "halo_candidates": [
+    {
+      "radius_kpc": 5,
+      "dx_over_r_limit": 0.01,
+      "dx_limit_pc": 50.0,
+      "amr_level": 7,
+      "actual_dx_pc": 36.62109375
+    },
+    {
+      "radius_kpc": 5,
+      "dx_over_r_limit": 0.02,
+      "dx_limit_pc": 100.0,
+      "amr_level": 6,
+      "actual_dx_pc": 73.2421875
+    },
+    {
+      "radius_kpc": 5,
+      "dx_over_r_limit": 0.04,
+      "dx_limit_pc": 200.0,
+      "amr_level": 5,
+      "actual_dx_pc": 146.484375
+    },
+    {
+      "radius_kpc": 10,
+      "dx_over_r_limit": 0.01,
+      "dx_limit_pc": 100.0,
+      "amr_level": 6,
+      "actual_dx_pc": 73.2421875
+    },
+    {
+      "radius_kpc": 10,
+      "dx_over_r_limit": 0.02,
+      "dx_limit_pc": 200.0,
+      "amr_level": 5,
+      "actual_dx_pc": 146.484375
+    },
+    {
+      "radius_kpc": 10,
+      "dx_over_r_limit": 0.04,
+      "dx_limit_pc": 400.0,
+      "amr_level": 4,
+      "actual_dx_pc": 292.96875
+    },
+    {
+      "radius_kpc": 15,
+      "dx_over_r_limit": 0.01,
+      "dx_limit_pc": 150.0,
+      "amr_level": 5,
+      "actual_dx_pc": 146.484375
+    },
+    {
+      "radius_kpc": 15,
+      "dx_over_r_limit": 0.02,
+      "dx_limit_pc": 300.0,
+      "amr_level": 4,
+      "actual_dx_pc": 292.96875
+    },
+    {
+      "radius_kpc": 15,
+      "dx_over_r_limit": 0.04,
+      "dx_limit_pc": 600.0,
+      "amr_level": 3,
+      "actual_dx_pc": 585.9375
+    },
+    {
+      "radius_kpc": 20,
+      "dx_over_r_limit": 0.01,
+      "dx_limit_pc": 200.0,
+      "amr_level": 5,
+      "actual_dx_pc": 146.484375
+    },
+    {
+      "radius_kpc": 20,
+      "dx_over_r_limit": 0.02,
+      "dx_limit_pc": 400.0,
+      "amr_level": 4,
+      "actual_dx_pc": 292.96875
+    },
+    {
+      "radius_kpc": 20,
+      "dx_over_r_limit": 0.04,
+      "dx_limit_pc": 800.0,
+      "amr_level": 3,
+      "actual_dx_pc": 585.9375
+    },
+    {
+      "radius_kpc": 30,
+      "dx_over_r_limit": 0.01,
+      "dx_limit_pc": 300.0,
+      "amr_level": 4,
+      "actual_dx_pc": 292.96875
+    },
+    {
+      "radius_kpc": 30,
+      "dx_over_r_limit": 0.02,
+      "dx_limit_pc": 600.0,
+      "amr_level": 3,
+      "actual_dx_pc": 585.9375
+    },
+    {
+      "radius_kpc": 30,
+      "dx_over_r_limit": 0.04,
+      "dx_limit_pc": 1200.0,
+      "amr_level": 2,
+      "actual_dx_pc": 1171.875
+    },
+    {
+      "radius_kpc": 50,
+      "dx_over_r_limit": 0.01,
+      "dx_limit_pc": 500.0,
+      "amr_level": 4,
+      "actual_dx_pc": 292.96875
+    },
+    {
+      "radius_kpc": 50,
+      "dx_over_r_limit": 0.02,
+      "dx_limit_pc": 1000.0,
+      "amr_level": 3,
+      "actual_dx_pc": 585.9375
+    },
+    {
+      "radius_kpc": 50,
+      "dx_over_r_limit": 0.04,
+      "dx_limit_pc": 2000.0,
+      "amr_level": 2,
+      "actual_dx_pc": 1171.875
+    },
+    {
+      "radius_kpc": 100,
+      "dx_over_r_limit": 0.01,
+      "dx_limit_pc": 1000.0,
+      "amr_level": 3,
+      "actual_dx_pc": 585.9375
+    },
+    {
+      "radius_kpc": 100,
+      "dx_over_r_limit": 0.02,
+      "dx_limit_pc": 2000.0,
+      "amr_level": 2,
+      "actual_dx_pc": 1171.875
+    },
+    {
+      "radius_kpc": 100,
+      "dx_over_r_limit": 0.04,
+      "dx_limit_pc": 4000.0,
+      "amr_level": 1,
+      "actual_dx_pc": 2343.75
+    }
+  ],
+  "analysis_table_provenance": {
+    "path": "/Users/benwibking/amrex_codes/incite-2026/outputs/MW_Gen1/noCGM_1uG/EMEF_sfr0.3/combined_disk_mass_timeseries.csv",
+    "first": {
+      "phase": "Phase 1",
+      "time_myr": "0.0",
+      "gas_mass_msun": "8133272743.125999",
+      "old_stellar_mass_msun": "36479727511.75936",
+      "new_stellar_mass_msun": "0.0",
+      "gas_fraction": "0.18230723548424346",
+      "plotfile": "/lustre/orion/ast236/proj-shared/wibking/noCGM_1uG/Phase1_EMEF/plt0000000",
+      "star_formation_rate_msun_per_yr": "nan"
+    },
+    "last": {
+      "phase": "Phase 2",
+      "time_myr": "550.5740565445049",
+      "gas_mass_msun": "2321323140.6821394",
+      "old_stellar_mass_msun": "37019817225.80193",
+      "new_stellar_mass_msun": "5726030805.764853",
+      "gas_fraction": "0.051508072956474894",
+      "plotfile": "/lustre/orion/ast236/proj-shared/wibking/noCGM_1uG/Phase2_EMEF/plt0666501",
+      "star_formation_rate_msun_per_yr": "0.5818997956886292"
+    },
+    "note": "table values and aperture, not a new plotfile measurement"
+  },
+  "throughput_targets": [
+    {
+      "allocation_days": 7,
+      "node_hours": 10752,
+      "required_myr_per_wall_hour": 29.761904761904763
+    },
+    {
+      "allocation_days": 14,
+      "node_hours": 21504,
+      "required_myr_per_wall_hour": 14.880952380952381
+    },
+    {
+      "allocation_days": 30,
+      "node_hours": 46080,
+      "required_myr_per_wall_hour": 6.944444444444445
+    }
+  ]
+}

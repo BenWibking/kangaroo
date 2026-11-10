@@ -88,6 +88,13 @@ struct CylindricalFluxParams {
                             num_radii & temperature_bins & num_heights & gamma)
 };
 
+struct PotentialSamplesParams {
+  std::vector<double> points;
+  double half_width = 1.0;
+  std::shared_ptr<const CoveredBoxListIR> covered_boxes;
+  KANGAROO_SERIALIZE_FIELDS(points & half_width)
+};
+
 struct ToomreProfileParams {
   std::vector<double> radial_edges{0.0, 1.0};
   std::array<double, 2> z_bounds{-1.0, 1.0};
@@ -220,7 +227,7 @@ using KernelParamsIR =
                  Histogram2DParams, ParticleFieldParams, ParticleCicGridParams,
                  ParticleCicProjectionParams, ScalarParams, ValuesParams,
                  FiniteOnlyParams, ParticleHistogramParams, TopKModesParams,
-                 SliceFinalizeParams>;
+                 SliceFinalizeParams, PotentialSamplesParams>;
 
 template <typename Params>
 const Params &require_kernel_params(const KernelParamsIR &params,

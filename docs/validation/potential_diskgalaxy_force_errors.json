@@ -1,0 +1,212 @@
+{
+  "all": {
+    "count": 1080,
+    "zero_reference_count": 0,
+    "rms_absolute": 6.345355935351344e-10,
+    "median_relative": 0.029790924001964123,
+    "p95_relative": 0.07936853874910732
+  },
+  "refinement_interface": {
+    "count": 548,
+    "zero_reference_count": 0,
+    "rms_absolute": 5.429446669538122e-10,
+    "median_relative": 0.029818912947558777,
+    "p95_relative": 0.07231278107117887
+  },
+  "interior": {
+    "count": 532,
+    "zero_reference_count": 0,
+    "rms_absolute": 7.167464206782432e-10,
+    "median_relative": 0.029701160040466246,
+    "p95_relative": 0.08501015712889205
+  },
+  "bins": [
+    {
+      "radius": [
+        0.0,
+        1.542838790745684e+22
+      ],
+      "height": [
+        -3.702813097789641e+22,
+        -1.542838790745684e+22
+      ],
+      "count": 13,
+      "zero_reference_count": 0,
+      "rms_absolute": 7.272483304250843e-10,
+      "median_relative": 0.03842765272380254,
+      "p95_relative": 0.062118918198273886
+    },
+    {
+      "radius": [
+        0.0,
+        1.542838790745684e+22
+      ],
+      "height": [
+        -1.542838790745684e+22,
+        0.0
+      ],
+      "count": 6,
+      "zero_reference_count": 0,
+      "rms_absolute": 1.5121728194805067e-09,
+      "median_relative": 0.05220855560072807,
+      "p95_relative": 0.0720533997115205
+    },
+    {
+      "radius": [
+        0.0,
+        1.542838790745684e+22
+      ],
+      "height": [
+        0.0,
+        1.542838790745684e+22
+      ],
+      "count": 12,
+      "zero_reference_count": 0,
+      "rms_absolute": 3.786093904411598e-09,
+      "median_relative": 0.045127998075522806,
+      "p95_relative": 0.17059212045163472
+    },
+    {
+      "radius": [
+        0.0,
+        1.542838790745684e+22
+      ],
+      "height": [
+        1.542838790745684e+22,
+        3.702813097789641e+22
+      ],
+      "count": 9,
+      "zero_reference_count": 0,
+      "rms_absolute": 5.161366351542893e-10,
+      "median_relative": 0.02958090678159238,
+      "p95_relative": 0.04015689553589121
+    },
+    {
+      "radius": [
+        1.542838790745684e+22,
+        4.628516372237051e+22
+      ],
+      "height": [
+        -3.702813097789641e+22,
+        -1.542838790745684e+22
+      ],
+      "count": 101,
+      "zero_reference_count": 0,
+      "rms_absolute": 4.727952539013951e-10,
+      "median_relative": 0.03061196838986732,
+      "p95_relative": 0.07397768504263458
+    },
+    {
+      "radius": [
+        1.542838790745684e+22,
+        4.628516372237051e+22
+      ],
+      "height": [
+        -1.542838790745684e+22,
+        0.0
+      ],
+      "count": 84,
+      "zero_reference_count": 0,
+      "rms_absolute": 9.670814393779928e-10,
+      "median_relative": 0.03449919876798606,
+      "p95_relative": 0.09915166844471605
+    },
+    {
+      "radius": [
+        1.542838790745684e+22,
+        4.628516372237051e+22
+      ],
+      "height": [
+        0.0,
+        1.542838790745684e+22
+      ],
+      "count": 101,
+      "zero_reference_count": 0,
+      "rms_absolute": 7.813870077075207e-10,
+      "median_relative": 0.03454665453725652,
+      "p95_relative": 0.08633306402541352
+    },
+    {
+      "radius": [
+        1.542838790745684e+22,
+        4.628516372237051e+22
+      ],
+      "height": [
+        1.542838790745684e+22,
+        3.702813097789641e+22
+      ],
+      "count": 95,
+      "zero_reference_count": 0,
+      "rms_absolute": 3.981595859955318e-10,
+      "median_relative": 0.027236123570192814,
+      "p95_relative": 0.05969477180366168
+    },
+    {
+      "radius": [
+        4.628516372237051e+22,
+        9.257032744474102e+22
+      ],
+      "height": [
+        -3.702813097789641e+22,
+        -1.542838790745684e+22
+      ],
+      "count": 129,
+      "zero_reference_count": 0,
+      "rms_absolute": 2.362627617647431e-10,
+      "median_relative": 0.02730036991384432,
+      "p95_relative": 0.06074062000617428
+    },
+    {
+      "radius": [
+        4.628516372237051e+22,
+        9.257032744474102e+22
+      ],
+      "height": [
+        -1.542838790745684e+22,
+        0.0
+      ],
+      "count": 191,
+      "zero_reference_count": 0,
+      "rms_absolute": 3.2697559264394106e-10,
+      "median_relative": 0.027623116845366148,
+      "p95_relative": 0.07807344815532594
+    },
+    {
+      "radius": [
+        4.628516372237051e+22,
+        9.257032744474102e+22
+      ],
+      "height": [
+        0.0,
+        1.542838790745684e+22
+      ],
+      "count": 193,
+      "zero_reference_count": 0,
+      "rms_absolute": 3.7860470122692476e-10,
+      "median_relative": 0.031217982567504642,
+      "p95_relative": 0.0952559217443623
+    },
+    {
+      "radius": [
+        4.628516372237051e+22,
+        9.257032744474102e+22
+      ],
+      "height": [
+        1.542838790745684e+22,
+        3.702813097789641e+22
+      ],
+      "count": 146,
+      "zero_reference_count": 0,
+      "rms_absolute": 2.14021651791388e-10,
+      "median_relative": 0.025990306054694698,
+      "p95_relative": 0.05903367104986723
+    }
+  ],
+  "reference": "gradient of cell-center trilinear AMR potential; coarse prolongation at missing fine stencil centers",
+  "temporal_error": "not assessed",
+  "reference_discretization_error": "not removed",
+  "model": "/private/tmp/kangaroo-potential-real/snapshot_0000_plt0000020.npz",
+  "plotfile": "/Users/benwibking/amrex_codes/amrex-visit-plugin/example_data/DiskGalaxy/plt0000020",
+  "points": "/private/tmp/kangaroo-potential-real/heldout.npy",
+  "header_sha256": "76a13284c3caba92c772faf580e5463418b4938e9bec8ee290474e55f188412c"
+}

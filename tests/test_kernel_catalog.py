@@ -4,6 +4,7 @@ from __future__ import annotations
 EXPECTED_DEFAULT_KERNELS = {
     "toomre_profile_accumulate",
     "cylindrical_moments_accumulate",
+    "potential_samples_accumulate",
     "amr_subbox_fetch_pack",
     "cylindrical_flux_surface_integral_accumulate",
     "field_expr",

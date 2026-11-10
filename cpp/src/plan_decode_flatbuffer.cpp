@@ -233,6 +233,13 @@ KernelParamsIR decode_params(const fb::KernelParamsUnion &input) {
     out.gamma = p.gamma;
     return out;
   }
+  case fb::KernelParams::PotentialSamplesParams: {
+    const auto &p = *input.AsPotentialSamplesParams();
+    PotentialSamplesParams out;
+    out.points = p.points;
+    out.half_width = p.half_width;
+    return out;
+  }
   case fb::KernelParams::ToomreProfileParams: {
     const auto &p = *input.AsToomreProfileParams();
     ToomreProfileParams out;
