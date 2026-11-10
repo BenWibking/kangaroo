@@ -8,8 +8,8 @@
 - Root docs: `README.md`, `PLAN.md`, and performance/tracking notes for design context.
 
 ## Build, Test, and Development Commands
-- `pixi install`: create/update the managed dev environment (Python, HPX, CMake, pytest, etc.).
-- `pixi run configure`: configure CMake in `.pixi/build` with HPX and nanobind paths.
+- `pixi install -e pixi-hpx`: create/update the managed dev environment (Python, HPX, CMake, pytest, etc.).
+- `pixi run configure`: configure CMake in `.pixi/build-pixi-hpx` using the `pixi-hpx` environment with HPX and nanobind paths.
 - `pixi run build`: compile C++ targets.
 - `pixi run install`: install extension modules and Python package into the Pixi environment.
 - `pixi run test`: run tests (`pytest -q`).
