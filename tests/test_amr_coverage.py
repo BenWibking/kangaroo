@@ -43,7 +43,8 @@ def test_coverage_maps_physical_selections_across_levels() -> None:
     levels = _levels()
 
     plane_indices = plane_indices_by_level(levels, axis=2, coord=2.5)
-    assert plane_indices == {0: 12, 1: 24}
+    # 2.5 lies in level-1 cell 20 + 5, the upper half of level-0 cell 12.
+    assert plane_indices == {0: 12, 1: 25}
     assert covered_plane_boxes(
         levels, level=0, axis=2, plane_indices=plane_indices
     ) == [((10, 10, 12), (13, 17, 12))]
@@ -97,8 +98,8 @@ def test_multilevel_refinement_ratios_are_accumulated() -> None:
 
     assert plane_indices_by_level(levels, axis=2, coord=2.5) == {
         0: 12,
-        1: 24,
-        2: 72,
+        1: 25,
+        2: 75,
     }
     assert covered_volume_boxes(levels, level=0) == [
         ((10, 10, 10), (10, 10, 10))
@@ -134,3 +135,13 @@ def test_block_selection_uses_the_same_plane_and_slab_seam() -> None:
             coarse, axis=2, axis_range=(11, 12), rect=rect
         )
     ) == [0]
+
+
+def test_plane_index_is_the_cell_containing_the_plane_on_every_level() -> None:
+    levels = _levels()
+    # Lower half of level-0 cell 12: the first fine cell under it.
+    assert plane_indices_by_level(levels, axis=2, coord=2.2) == {0: 12, 1: 24}
+    # Upper half: the second.
+    assert plane_indices_by_level(levels, axis=2, coord=2.7) == {0: 12, 1: 25}
+    # On a level-1 face, the cell above it.
+    assert plane_indices_by_level(levels, axis=2, coord=2.0) == {0: 12, 1: 24}

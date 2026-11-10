@@ -83,7 +83,14 @@ void register_core_kernels(KernelRegistry &registry) {
           std::vector<hpx::future<SubboxView>> pending_subboxes;
           auto output_writer = outputs[0].begin_async_dynamic_write();
 
-          DataServiceLocal data_service;
+          // The running plan's data service. A default-constructed one has
+          // its own empty chunk store, so its get_subbox futures could never
+          // be fulfilled, and destroying it when the kernel returned broke
+          // them (HPX broken_promise): the payload went out empty and every
+          // stencil silently lost its halo. Shared with the continuation so
+          // it outlives the futures it issued.
+          auto data_service = std::make_shared<DataServiceLocal>(
+              current_execution_context_id());
           for (int16_t lev = 0;
                lev < static_cast<int16_t>(step_meta.levels.size()); ++lev) {
             const auto &lev_meta =
@@ -125,12 +132,13 @@ void register_core_kernels(KernelRegistry &registry) {
               ref.request_box = request_box;
               pending_patches.push_back(
                   PendingPatch{.level = lev, .geom = lev_meta.geom});
-              pending_subboxes.push_back(data_service.get_subbox(ref));
+              pending_subboxes.push_back(data_service->get_subbox(ref));
             }
           }
 
           return hpx::when_all(std::move(pending_subboxes))
               .then([pending_patches = std::move(pending_patches),
+                     data_service,
                      output_writer](auto &&all) mutable {
                 auto ready_subboxes = all.get();
                 std::vector<AmrPatchRecord> packed_patches;

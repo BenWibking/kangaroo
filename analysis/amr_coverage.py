@@ -12,22 +12,16 @@ IndexBox = tuple[Index3, Index3]
 def plane_indices_by_level(
     levels: Sequence[Any], *, axis: int, coord: float
 ) -> dict[int, int]:
-    """Map one physical plane to the corresponding cell index on every level."""
-    if not levels:
-        return {}
-    base_geom = levels[0].geom
-    base_index = _cell_index(base_geom, axis, coord)
-    base_origin = base_geom.index_origin[axis]
-    indices: dict[int, int] = {}
-    ratio = 1
-    for level in range(len(levels)):
-        if level > 0:
-            ratio *= int(levels[level - 1].geom.ref_ratio)
-        indices[level] = (
-            (base_index - base_origin) * ratio
-            + levels[level].geom.index_origin[axis]
-        )
-    return indices
+    """Map one physical plane to the cell containing it on every level.
+
+    Each level locates the plane itself. Refining the level-0 index instead
+    picks the lowest fine cell under the coarse one, which is a different
+    plane whenever ``coord`` lies in the upper part of the coarse cell.
+    """
+    return {
+        level: _cell_index(level_meta.geom, axis, coord)
+        for level, level_meta in enumerate(levels)
+    }
 
 
 def axis_ranges_by_level(

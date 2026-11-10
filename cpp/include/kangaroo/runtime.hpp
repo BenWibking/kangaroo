@@ -1,6 +1,7 @@
 #pragma once
 
 #include "kangaroo/adjacency.hpp"
+#include "kangaroo/box_spatial_index.hpp"
 #include "kangaroo/data_service.hpp"
 #include "kangaroo/data_service_local.hpp"
 #include "kangaroo/dataset_backend.hpp"
@@ -86,6 +87,8 @@ struct ChunkStore {
 struct ExecutionContext {
   int32_t run_id = 0;
   RunMeta meta;
+  // Built once for CIC runs; indexed by step and level, like meta.steps.
+  std::vector<std::vector<BoxSpatialIndex>> particle_box_indices;
   DatasetHandle dataset;
   PlanIR plan;
   std::shared_ptr<AdjacencyService> adjacency;
@@ -220,6 +223,9 @@ bool execution_context_may_produce_chunk(int32_t run_id, const ChunkRef& ref);
 void erase_execution_context(int32_t run_id);
 const RunMeta& current_runmeta();
 const DatasetHandle& current_dataset();
+// The run whose kernel is executing on this thread (ScopedExecutionContext),
+// for a kernel that needs the run's own data service; 0 outside a kernel.
+int32_t current_execution_context_id();
 
 void set_global_kernel_registry(KernelRegistry* registry);
 KernelRegistry& global_kernels();
