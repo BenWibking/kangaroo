@@ -1626,6 +1626,10 @@ ExecutorOptions executor_options_from_environment() {
   return options;
 }
 
+struct Executor::StreamingPlanEstimates {
+  ChunkEstimateMap known_outputs;
+};
+
 Executor::Executor(int32_t plan_id, const RunMeta& meta, DataService& data, AdjacencyService& adj)
     : Executor(plan_id, meta, data, adj, executor_options_from_environment()) {}
 
@@ -1677,14 +1681,30 @@ hpx::future<void> Executor::run(const PlanIR& plan) {
     current_plan_ = nullptr;
     return hpx::make_ready_future();
   }
+  std::shared_ptr<const StreamingPlanEstimates> estimates;
   if (options_.mode == "streaming") {
     try {
-      register_streaming_input_consumers(plan).get();
+      // Consumer registration and stage dispatch both read this per-run map.
+      estimates = std::make_shared<const StreamingPlanEstimates>(
+          StreamingPlanEstimates{build_known_output_estimates(plan, meta_, data_)});
+      register_streaming_input_consumers(plan, *estimates).get();
     } catch (...) {
       current_plan_ = nullptr;
       throw;
     }
   }
+
+  auto run_stage = [this, estimates = std::move(estimates)](int32_t stage_idx,
+                                                           const StageIR& stage) {
+    if (estimates) {
+      return run_stage_streaming(stage_idx, stage, *estimates);
+    }
+    if (options_.mode != "eager") {
+      return hpx::make_exceptional_future<void>(
+          std::runtime_error("unsupported KANGAROO_EXECUTOR_MODE: " + options_.mode));
+    }
+    return run_stage_eager(stage_idx, stage);
+  };
 
   std::vector<hpx::shared_future<void>> stage_futures(nstages);
   for (int32_t stage_idx : order) {
@@ -1700,7 +1720,7 @@ hpx::future<void> Executor::run(const PlanIR& plan) {
       deps.push_back(stage_futures.at(dep));
     }
     stage_futures[stage_idx] =
-        hpx::when_all(std::move(deps)).then([this, stage, stage_idx](auto&& ready_deps) {
+        hpx::when_all(std::move(deps)).then([run_stage, stage, stage_idx](auto&& ready_deps) {
           auto dep_results = ready_deps.get();
           for (auto& dep : dep_results) {
             dep.get();
@@ -1722,17 +1742,6 @@ hpx::future<void> Executor::run(const PlanIR& plan) {
     current_plan_ = nullptr;
     return;
   });
-}
-
-hpx::future<void> Executor::run_stage(int32_t stage_idx, const StageIR& stage) {
-  if (options_.mode == "streaming") {
-    return run_stage_streaming(stage_idx, stage);
-  }
-  if (options_.mode != "eager") {
-    return hpx::make_exceptional_future<void>(
-        std::runtime_error("unsupported KANGAROO_EXECUTOR_MODE: " + options_.mode));
-  }
-  return run_stage_eager(stage_idx, stage);
 }
 
 hpx::future<void> Executor::run_stage_eager(int32_t stage_idx, const StageIR& stage) {
@@ -1830,13 +1839,9 @@ std::vector<std::vector<TaskInstance>> partition_tasks_by_locality(
   return partitions;
 }
 
-std::vector<TaskInstance> Executor::expand_stage_tasks(int32_t stage_idx,
-                                                       const StageIR& stage) const {
-  if (current_plan_ == nullptr) {
-    throw std::runtime_error("executor expand_stage_tasks requires active plan");
-  }
-  const ChunkEstimateMap known_outputs =
-      build_known_output_estimates(*current_plan_, meta_, data_);
+std::vector<TaskInstance> Executor::expand_stage_tasks(
+    int32_t stage_idx, const StageIR& stage, const StreamingPlanEstimates& estimates) const {
+  const auto& known_outputs = estimates.known_outputs;
   std::vector<TaskInstance> tasks;
   for (std::size_t tmpl_idx_size = 0; tmpl_idx_size < stage.templates.size(); ++tmpl_idx_size) {
     const int32_t tmpl_idx = static_cast<int32_t>(tmpl_idx_size);
@@ -1958,7 +1963,8 @@ std::vector<TaskInstance> Executor::expand_stage_tasks(int32_t stage_idx,
   return tasks;
 }
 
-hpx::future<void> Executor::register_streaming_input_consumers(const PlanIR& plan) const {
+hpx::future<void> Executor::register_streaming_input_consumers(
+    const PlanIR& plan, const StreamingPlanEstimates& estimates) const {
   auto* local_data = dynamic_cast<DataServiceLocal*>(&data_);
   if (local_data == nullptr) {
     return hpx::make_ready_future();
@@ -1966,7 +1972,8 @@ hpx::future<void> Executor::register_streaming_input_consumers(const PlanIR& pla
 
   std::unordered_map<ChunkRef, std::int64_t, ChunkRefHash, ChunkRefEq> counts;
   for (std::size_t stage_idx = 0; stage_idx < plan.stages.size(); ++stage_idx) {
-    auto tasks = expand_stage_tasks(static_cast<int32_t>(stage_idx), plan.stages[stage_idx]);
+    auto tasks =
+        expand_stage_tasks(static_cast<int32_t>(stage_idx), plan.stages[stage_idx], estimates);
     for (const auto& task : tasks) {
       for (const auto& ref : task.input_refs) {
         counts[ref] += 1;
@@ -1984,14 +1991,14 @@ hpx::future<void> Executor::register_streaming_input_consumers(const PlanIR& pla
   return local_data->register_input_consumers(consumer_counts);
 }
 
-hpx::future<void> Executor::run_stage_streaming(int32_t stage_idx, const StageIR& stage) {
-  auto tasks = expand_stage_tasks(stage_idx, stage);
-  if (tasks.empty()) {
-    return hpx::make_ready_future();
-  }
-
+hpx::future<void> Executor::run_stage_streaming(int32_t stage_idx, const StageIR& stage,
+                                                const StreamingPlanEstimates& estimates) {
   if (current_plan_ == nullptr) {
     throw std::runtime_error("executor run_stage_streaming requires active plan");
+  }
+  auto tasks = expand_stage_tasks(stage_idx, stage, estimates);
+  if (tasks.empty()) {
+    return hpx::make_ready_future();
   }
 
   const auto localities = hpx::find_all_localities();

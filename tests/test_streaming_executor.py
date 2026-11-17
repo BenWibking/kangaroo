@@ -398,6 +398,39 @@ def test_streaming_executor_accounts_like_input_output_bytes(tmp_path, monkeypat
     assert max_active <= 2
 
 
+def test_streaming_executor_propagates_estimates_to_dependent_stages(monkeypatch) -> None:
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MODE", "streaming")
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MAX_OUTPUT_BYTES_PER_LOCALITY", "16")
+
+    rt = Runtime()
+    runmeta = _runmeta(3)
+    ds = open_dataset("memory://streaming-estimates", runmeta=runmeta, runtime=rt, step=0, level=0)
+    source, intermediate, output = 43521, 43522, 43523
+    for block in range(3):
+        _set_scalar(ds, field=source, block=block, value=float(block))
+
+    producer = Stage("producer")
+    consumer = Stage("consumer", after=[producer])
+    for stage, field_in, field_out in ((producer, source, intermediate), (consumer, intermediate, output)):
+        stage.map_blocks(
+            name=stage.name,
+            kernel="field_expr",
+            domain=Domain(step=0, level=0),
+            inputs=[FieldRef(field_in)],
+            outputs=[OutputRef(FieldRef(field_out), BufferSpec(DType.F64, LikeInputShape(0)))],
+            params=FieldExprParams("value + 1", ("value",)),
+        )
+
+    rt.run(Plan(stages=[consumer]), runmeta=runmeta, dataset=ds)
+
+    for block in range(3):
+        got = rt.get_task_chunk_array(
+            step=0, level=0, field=output, version=0, block=block,
+            shape=(1, 1, 1), dtype=np.float64, dataset=ds,
+        )
+        assert got.item() == block + 2
+
+
 def test_streaming_executor_accounts_plotfile_like_input_output_bytes(
     tmp_path, monkeypatch
 ) -> None:

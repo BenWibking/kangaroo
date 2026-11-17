@@ -114,12 +114,13 @@ def test_runtime_rejects_get_task_chunk_during_inflight_run() -> None:
     assert not err
 
 
-def test_runtime_logs_python_prepare_phases(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_runtime_logs_python_prepare_phases(monkeypatch: pytest.MonkeyPatch, tmp_path) -> None:
     seen: list[tuple[str, str]] = []
 
     def _record_phase(name, status, start, end, category, worker_label, locality) -> None:
         seen.append((name, status))
 
+    monkeypatch.setenv("KANGAROO_DASHBOARD_PLAN", str(tmp_path / "plan.json"))
     monkeypatch.setattr(runtime_mod._core, "log_phase_event", _record_phase)
     rt = Runtime(core_runtime=_ImmediateCoreRuntime())
     rt._bind_dataset_handle = lambda dataset: None  # type: ignore[method-assign]
@@ -128,28 +129,42 @@ def test_runtime_logs_python_prepare_phases(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert ("python_plan_to_dict", "start") in seen
     assert ("python_plan_to_dict", "end") in seen
+    assert ("python_write_dashboard_plan", "start") in seen
+    assert ("python_write_dashboard_plan", "end") in seen
     assert ("python_encode_plan_flatbuffer", "start") in seen
     assert ("python_encode_plan_flatbuffer", "end") in seen
     assert ("python_prepare_plan", "start") in seen
     assert ("python_prepare_plan", "end") in seen
 
 
-def test_runtime_writes_dashboard_plan_only_when_configured(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
+@pytest.mark.parametrize("configured", [None, "  ", "dashboard/plan.json"])
+def test_runtime_builds_dashboard_plan_only_when_configured(
+    monkeypatch: pytest.MonkeyPatch, tmp_path, configured: str | None
 ) -> None:
     rt = Runtime(core_runtime=_ImmediateCoreRuntime())
-    rt._bind_dataset_handle = lambda dataset: None  # type: ignore[method-assign]
     plan = Plan(stages=[])
     plan_path = tmp_path / "dashboard" / "plan.json"
+    converted: list[Plan] = []
 
-    monkeypatch.delenv("KANGAROO_DASHBOARD_PLAN", raising=False)
-    rt.run(plan, runmeta=_FakeRunMeta(), dataset=_FakeDataset())
-    assert not plan_path.exists()
+    def _record_conversion(plan: Plan) -> dict:
+        converted.append(plan)
+        return plan_to_dict(plan)
 
-    monkeypatch.setenv("KANGAROO_DASHBOARD_PLAN", str(plan_path))
+    monkeypatch.setattr(runtime_mod, "plan_to_dict", _record_conversion)
+    if configured is None:
+        monkeypatch.delenv("KANGAROO_DASHBOARD_PLAN", raising=False)
+    else:
+        path = str(tmp_path / configured) if configured.strip() else configured
+        monkeypatch.setenv("KANGAROO_DASHBOARD_PLAN", path)
+
     rt.run(plan, runmeta=_FakeRunMeta(), dataset=_FakeDataset())
-    assert plan_path.exists()
-    assert json.loads(plan_path.read_text(encoding="utf-8")) == {"stages": []}
+
+    if configured and configured.strip():
+        assert converted == [plan]
+        assert json.loads(plan_path.read_text(encoding="utf-8")) == {"stages": []}
+    else:
+        assert not converted
+        assert not plan_path.exists()
 
 
 def test_plan_to_dict_hoists_shared_covered_boxes() -> None:

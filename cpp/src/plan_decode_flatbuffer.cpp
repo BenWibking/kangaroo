@@ -350,31 +350,30 @@ PlanIR decode_plan_flatbuffer(std::span<const std::uint8_t> payload) {
   flatbuffers::Verifier verifier(payload.data(), payload.size());
   if (!fb::VerifyPlanBuffer(verifier))
     throw std::runtime_error("invalid typed plan FlatBuffer");
-  std::unique_ptr<fb::PlanT> input(fb::GetPlan(payload.data())->UnPack());
-  if (!input)
-    throw std::runtime_error("could not unpack typed plan");
+  const auto *input = fb::GetPlan(payload.data());
 
   PlanIR plan;
-  plan.shared_covered_boxes.reserve(input->shared_covered_boxes.size());
-  for (const auto &list : input->shared_covered_boxes) {
-    CoveredBoxListIR boxes;
-    if (list) {
-      boxes.reserve(list->boxes.size());
-      for (const auto &box : list->boxes) {
-        if (!box)
-          throw std::runtime_error("covered box is missing");
-        boxes.push_back(
-            CoveredBoxIR{copy_array<int32_t, 3>(box->lo, "covered box lo"),
-                         copy_array<int32_t, 3>(box->hi, "covered box hi")});
+  // Read inline boxes from the verified buffer to avoid an intermediate copy.
+  if (const auto *lists = input->shared_covered_boxes()) {
+    plan.shared_covered_boxes.reserve(lists->size());
+    for (const auto *list : *lists) {
+      CoveredBoxListIR boxes;
+      if (const auto *packed_boxes = list->boxes()) {
+        boxes.reserve(packed_boxes->size());
+        for (const auto *box : *packed_boxes) {
+          const auto *lo = box->lo();
+          const auto *hi = box->hi();
+          boxes.push_back(CoveredBoxIR{{lo->Get(0), lo->Get(1), lo->Get(2)},
+                                       {hi->Get(0), hi->Get(1), hi->Get(2)}});
+        }
       }
+      plan.shared_covered_boxes.push_back(std::move(boxes));
     }
-    plan.shared_covered_boxes.push_back(std::move(boxes));
   }
 
-  plan.stages.reserve(input->stages.size());
-  for (const auto &stage_in : input->stages) {
-    if (!stage_in)
-      throw std::runtime_error("plan stage is missing");
+  plan.stages.reserve(input->stages()->size());
+  for (const auto *packed_stage : *input->stages()) {
+    std::unique_ptr<fb::StageT> stage_in(packed_stage->UnPack());
     StageIR stage;
     stage.name = stage_in->name;
     stage.plane = decode_plane(stage_in->plane);

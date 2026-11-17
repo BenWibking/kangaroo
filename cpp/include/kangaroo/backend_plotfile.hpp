@@ -3,9 +3,13 @@
 #include "kangaroo/dataset_backend.hpp"
 #include "kangaroo/plotfile_reader.hpp"
 
+#include <hpx/synchronization/spinlock.hpp>
+
 #include <map>
 #include <mutex>
+#include <optional>
 #include <string>
+#include <vector>
 
 namespace kangaroo {
 
@@ -42,8 +46,17 @@ class PlotfileBackend : public DatasetBackend {
   void set_field_map(std::map<int32_t, int32_t> field_map);
   
  private:
+  struct FabMetadata {
+    int32_t ncomp;
+    ScalarType scalar;
+  };
+
+  std::optional<FabMetadata> fab_metadata(int level, std::size_t block) const;
+
   std::string plotfile_dir_;
   plotfile::PlotfileReader reader_;
+  mutable hpx::spinlock fab_metadata_mutex_;
+  mutable std::vector<std::vector<std::optional<FabMetadata>>> fab_metadata_by_level_;
   mutable std::mutex map_mutex_;
   std::map<int32_t, int32_t> field_map_;
 };

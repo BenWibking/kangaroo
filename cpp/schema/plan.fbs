@@ -1,6 +1,6 @@
 namespace analysis.fb;
 
-file_identifier "KPLN";
+file_identifier "KPL2";
 
 enum ExecPlane : ubyte { Chunk, Graph, Mixed }
 enum DepKind : ubyte { None, FaceNeighbors }
@@ -51,9 +51,10 @@ table OutputRef {
   buffer:BufferSpec;
 }
 
-table CoveredBox {
-  lo:[int];
-  hi:[int];
+// Keep each box inline so large coverage lists do not consume the table budget.
+struct CoveredBox {
+  lo:[int:3];
+  hi:[int:3];
 }
 
 table CoveredBoxList {

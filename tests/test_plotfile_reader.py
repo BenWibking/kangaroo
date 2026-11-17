@@ -157,3 +157,38 @@ def test_read_fab_crops_stored_ghost_cells(tmp_path) -> None:
     values = list(struct.unpack(f"<{len(fab['data']) // 8}d", fab["data"]))
     assert values == expected
     assert -1.0e30 not in values
+
+
+def test_streaming_plotfile_estimates_use_valid_fab_shape(tmp_path, monkeypatch) -> None:
+    import numpy as np
+
+    from analysis import Runtime
+    from analysis.buffer import BufferSpec, DType, LikeInputShape
+    from analysis.dataset import open_dataset
+    from analysis.kernel_params import FieldExprParams
+    from analysis.plan import Domain, FieldRef, OutputRef, Plan, Stage
+
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MODE", "streaming")
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MAX_OUTPUT_BYTES_PER_LOCALITY", "256")
+    plotfile = tmp_path / "plt"
+    expected = _write_grown_plotfile(plotfile, ngrow=1)
+    rt = Runtime()
+    ds = open_dataset(str(plotfile), runtime=rt, step=0, level=0)
+    source = ds.field_id("rho")
+    output = rt.alloc_field_id("identity")
+    stage = Stage("identity")
+    stage.map_blocks(
+        name="identity",
+        kernel="field_expr",
+        domain=Domain(step=0, level=0),
+        inputs=[FieldRef(source)],
+        outputs=[OutputRef(FieldRef(output), BufferSpec(DType.F64, LikeInputShape(0)))],
+        params=FieldExprParams("value", ("value",)),
+    )
+    rt.run(Plan([stage]), runmeta=ds.get_runmeta(), dataset=ds)
+
+    got = rt.get_task_chunk_array(
+        step=0, level=0, field=output, version=0, block=1,
+        shape=(2, 4, 4), dtype=np.float64, dataset=ds,
+    )
+    np.testing.assert_array_equal(got.ravel(order="F"), expected)

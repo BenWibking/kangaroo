@@ -89,7 +89,52 @@ def test_plan_encoder_derives_valid_stage_dependency_indices() -> None:
 
     parent = Stage("parent")
     child = Stage("child", after=[parent])
-    assert encode_plan(Plan([child]))[4:8] == b"KPLN"
+    assert encode_plan(Plan([child]))[4:8] == b"KPL2"
+
+
+def test_plan_encoder_packs_shared_coverage_as_inline_structs() -> None:
+    from analysis.fb.CoveredBox import CoveredBox
+    from analysis.fb.Plan import Plan as PackedPlan
+    from analysis.kernel_params import UniformProjectionParams
+    from analysis.plan import Domain, Plan, Stage
+    from analysis.plan_codec import encode_plan
+
+    class TrackedBoxes(tuple):
+        hash_calls = 0
+
+        def __hash__(self) -> int:
+            self.hash_calls += 1
+            return super().__hash__()
+
+    boxes = TrackedBoxes((((-9, -8, -7), (-6, -5, -4)), ((1, 2, 3), (4, 5, 6))))
+    equal_boxes = TrackedBoxes(boxes)
+    assert equal_boxes is not boxes
+    stage = Stage("projection")
+    coverage_by_block = [boxes] * 4 + [equal_boxes] * 4
+    for block, coverage_boxes in enumerate(coverage_by_block):
+        stage.map_blocks(
+            name=f"projection_b{block}",
+            kernel="uniform_projection_accumulate",
+            domain=Domain(0, 0, blocks=[block]),
+            inputs=[],
+            outputs=[],
+            params=UniformProjectionParams(covered_boxes=coverage_boxes),
+        )
+
+    packed = PackedPlan.GetRootAs(encode_plan(Plan([stage])))
+    assert CoveredBox.SizeOf() == 24
+    assert packed.SharedCoveredBoxesLength() == 1
+    coverage = packed.SharedCoveredBoxes(0)
+    assert coverage.BoxesLength() == len(boxes)
+    for i, (lo, hi) in enumerate(boxes):
+        box = coverage.Boxes(i)
+        assert tuple(box.Lo()) == lo
+        assert tuple(box.Hi()) == hi
+    packed_stage = packed.Stages(0)
+    refs = [packed_stage.Templates(i).CoveredBoxesRef() for i in range(len(coverage_by_block))]
+    assert refs == [0] * len(coverage_by_block)
+    assert boxes.hash_calls <= 2
+    assert equal_boxes.hash_calls <= 2
 
 
 def test_neighbor_dep_faces_and_width() -> None:

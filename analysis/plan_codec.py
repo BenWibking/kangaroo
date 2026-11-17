@@ -224,6 +224,7 @@ def encode_plan(plan: model_plan.Plan) -> bytes:
     stage_ids = {id(stage): index for index, stage in enumerate(topo)}
     shared_boxes: list[model_params.CoveredBoxes] = []
     shared_box_indices: dict[model_params.CoveredBoxes, int] = {}
+    shared_box_indices_by_id: dict[int, int] = {}
     stages: list[Stage.StageT] = []
 
     for stage in topo:
@@ -232,11 +233,16 @@ def encode_plan(plan: model_plan.Plan) -> bytes:
             boxes = model_params.covered_boxes(template.params)
             covered_ref = -1
             if boxes:
-                covered_ref = shared_box_indices.get(boxes, -1)
+                # Template params keep the tuples alive; reuse their IDs to skip rehashing.
+                box_id = id(boxes)
+                covered_ref = shared_box_indices_by_id.get(box_id, -1)
                 if covered_ref < 0:
-                    covered_ref = len(shared_boxes)
-                    shared_boxes.append(boxes)
-                    shared_box_indices[boxes] = covered_ref
+                    covered_ref = shared_box_indices.get(boxes, -1)
+                    if covered_ref < 0:
+                        covered_ref = len(shared_boxes)
+                        shared_boxes.append(boxes)
+                        shared_box_indices[boxes] = covered_ref
+                    shared_box_indices_by_id[box_id] = covered_ref
             params_type, params = _params(template.params)
             deps = template.deps
             templates.append(
@@ -270,11 +276,11 @@ def encode_plan(plan: model_plan.Plan) -> bytes:
 
     covered = [
         CoveredBoxList.CoveredBoxListT(
-            [CoveredBox.CoveredBoxT(list(lo), list(hi)) for lo, hi in boxes]
+            [CoveredBox.CoveredBoxT(lo, hi) for lo, hi in boxes]
         )
         for boxes in shared_boxes
     ]
     builder = flatbuffers.Builder(1024)
     root = Plan.PlanT(stages=stages, sharedCoveredBoxes=covered).Pack(builder)
-    builder.Finish(root, file_identifier=b"KPLN")
+    builder.Finish(root, file_identifier=b"KPL2")
     return bytes(builder.Output())

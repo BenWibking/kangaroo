@@ -143,12 +143,12 @@ class Runtime:
         if self._run_in_progress:
             raise RuntimeError("runtime run is already in progress")
         prepare_start = time.time()
-        phase_start = prepare_start
-        plan_ir = plan_to_dict(plan)
-        phase_end = time.time()
-        _log_phase_span("python_plan_to_dict", phase_start, phase_end)
         configured_plan_path = os.environ.get("KANGAROO_DASHBOARD_PLAN", "").strip()
         if configured_plan_path:
+            phase_start = time.time()
+            plan_ir = plan_to_dict(plan)
+            phase_end = time.time()
+            _log_phase_span("python_plan_to_dict", phase_start, phase_end)
             phase_start = time.time()
             plan_path = Path(configured_plan_path)
             plan_path.parent.mkdir(parents=True, exist_ok=True)

@@ -94,8 +94,10 @@ void log_plotfile_read_fab_event(const char* status,
 }  // namespace
 
 PlotfileBackend::PlotfileBackend(std::string plotfile_dir)
-    : plotfile_dir_(std::move(plotfile_dir)), reader_(plotfile_dir_) {
+    : plotfile_dir_(std::move(plotfile_dir)), reader_(plotfile_dir_),
+      fab_metadata_by_level_(reader_.num_levels()) {
   for (int level = 0; level < reader_.num_levels(); ++level) {
+    fab_metadata_by_level_[level].resize(reader_.num_fabs(level));
     std::unordered_set<std::string> checked_files;
     for (const auto& fab : reader_.vismf_header(level).fab_on_disk) {
       if (!checked_files.insert(fab.file_name).second) {
@@ -252,24 +254,22 @@ bool PlotfileBackend::has_chunk(const ChunkRef& ref) const {
   return get_component_index(ref.field) >= 0;
 }
 
-std::optional<BufferDesc> PlotfileBackend::describe_chunk(const ChunkRef& ref) const {
-  if (ref.level < 0 || ref.level >= reader_.num_levels()) {
-    return std::nullopt;
-  }
-  const auto& header = reader_.vismf_header(ref.level);
-  const auto block = static_cast<std::size_t>(ref.block);
-  if (ref.block < 0 || block >= header.box_array.boxes.size() ||
-      block >= header.fab_on_disk.size()) {
-    return std::nullopt;
-  }
-  const int32_t component = get_component_index(ref.field);
-  if (component < 0) {
-    return std::nullopt;
+std::optional<PlotfileBackend::FabMetadata> PlotfileBackend::fab_metadata(
+    int level, std::size_t block) const {
+  auto& cached = fab_metadata_by_level_[level][block];
+  {
+    std::lock_guard lock(fab_metadata_mutex_);
+    if (cached) {
+      return cached;
+    }
   }
 
+  // Do not hold the cache lock during file I/O. Concurrent first lookups may
+  // read the same header, but subsequent lookups share the cached metadata.
   try {
+    const auto& header = reader_.vismf_header(level);
     const auto& fab_on_disk = header.fab_on_disk[block];
-    const std::string path = plotfile_dir_ + "/Level_" + std::to_string(ref.level) + "/" +
+    const std::string path = plotfile_dir_ + "/Level_" + std::to_string(level) + "/" +
                              fab_on_disk.file_name;
     std::ifstream stream(path, std::ios::binary);
     if (!stream) {
@@ -277,23 +277,55 @@ std::optional<BufferDesc> PlotfileBackend::describe_chunk(const ChunkRef& ref) c
     }
     stream.seekg(fab_on_disk.offset, std::ios::beg);
     const auto fab = plotfile::read_fab_header(stream);
-    if (component >= fab.ncomp) {
-      return std::nullopt;
-    }
-    const int64_t nx = static_cast<int64_t>(fab.box.hi.x) - fab.box.lo.x + 1;
-    const int64_t ny = static_cast<int64_t>(fab.box.hi.y) - fab.box.lo.y + 1;
-    const int64_t nz = static_cast<int64_t>(fab.box.hi.z) - fab.box.lo.z + 1;
-    if (nx <= 0 || ny <= 0 || nz <= 0) {
+    const auto& valid = header.box_array.boxes[block];
+    if (valid.lo.x < fab.box.lo.x || valid.lo.y < fab.box.lo.y || valid.lo.z < fab.box.lo.z ||
+        valid.hi.x > fab.box.hi.x || valid.hi.y > fab.box.hi.y || valid.hi.z > fab.box.hi.z) {
       return std::nullopt;
     }
     const auto scalar = fab.real_desc.type == plotfile::RealType::kFloat32
                             ? ScalarType::kF32
                             : ScalarType::kF64;
-    const std::array<std::uint64_t, 3> extents{
-        static_cast<std::uint64_t>(nx), static_cast<std::uint64_t>(ny),
-        static_cast<std::uint64_t>(nz)};
-    return plotfile_zero_copy_reads_enabled() ? BufferDesc::plotfile_grid(scalar, extents)
-                                              : BufferDesc::runtime_grid(scalar, extents);
+    std::lock_guard lock(fab_metadata_mutex_);
+    cached = FabMetadata{fab.ncomp, scalar};
+    return cached;
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
+std::optional<BufferDesc> PlotfileBackend::describe_chunk(const ChunkRef& ref) const {
+  if (ref.level < 0 || ref.level >= reader_.num_levels() || ref.block < 0) {
+    return std::nullopt;
+  }
+  const auto& header = reader_.vismf_header(ref.level);
+  const auto block = static_cast<std::size_t>(ref.block);
+  if (block >= header.box_array.boxes.size() || block >= header.fab_on_disk.size()) {
+    return std::nullopt;
+  }
+  const int32_t component = get_component_index(ref.field);
+  if (component < 0) {
+    return std::nullopt;
+  }
+  const auto metadata = fab_metadata(ref.level, block);
+  if (!metadata || component >= metadata->ncomp) {
+    return std::nullopt;
+  }
+
+  // Payload reads crop stored ghost cells to the valid box.
+  const auto& valid = header.box_array.boxes[block];
+  const int64_t nx = static_cast<int64_t>(valid.hi.x) - valid.lo.x + 1;
+  const int64_t ny = static_cast<int64_t>(valid.hi.y) - valid.lo.y + 1;
+  const int64_t nz = static_cast<int64_t>(valid.hi.z) - valid.lo.z + 1;
+  if (nx <= 0 || ny <= 0 || nz <= 0) {
+    return std::nullopt;
+  }
+  const std::array<std::uint64_t, 3> extents{
+      static_cast<std::uint64_t>(nx), static_cast<std::uint64_t>(ny),
+      static_cast<std::uint64_t>(nz)};
+  try {
+    return plotfile_zero_copy_reads_enabled()
+               ? BufferDesc::plotfile_grid(metadata->scalar, extents)
+               : BufferDesc::runtime_grid(metadata->scalar, extents);
   } catch (const std::exception&) {
     return std::nullopt;
   }

@@ -67,15 +67,19 @@ class Executor {
   hpx::future<void> run(const PlanIR& plan);
 
  private:
-  hpx::future<void> run_stage(int32_t stage_idx, const StageIR& stage);
+  struct StreamingPlanEstimates;
+
   hpx::future<void> run_stage_eager(int32_t stage_idx, const StageIR& stage);
-  hpx::future<void> run_stage_streaming(int32_t stage_idx, const StageIR& stage);
+  hpx::future<void> run_stage_streaming(int32_t stage_idx, const StageIR& stage,
+                                        const StreamingPlanEstimates& estimates);
   hpx::future<void> run_block_task(const TaskTemplateIR& tmpl, int32_t stage_idx, int32_t tmpl_idx,
                                    int32_t block);
   hpx::future<void> run_graph_task(const TaskTemplateIR& tmpl, int32_t stage_idx, int32_t tmpl_idx,
                                    int32_t group_idx);
-  std::vector<TaskInstance> expand_stage_tasks(int32_t stage_idx, const StageIR& stage) const;
-  hpx::future<void> register_streaming_input_consumers(const PlanIR& plan) const;
+  std::vector<TaskInstance> expand_stage_tasks(int32_t stage_idx, const StageIR& stage,
+                                                const StreamingPlanEstimates& estimates) const;
+  hpx::future<void> register_streaming_input_consumers(
+      const PlanIR& plan, const StreamingPlanEstimates& estimates) const;
   std::size_t streaming_locality_task_window() const;
   std::size_t streaming_locality_storage_unit_window() const;
 
