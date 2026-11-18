@@ -147,7 +147,10 @@ kangaroo jobs
 name, state, elapsed time, node count, and assigned nodes or pending reason.
 Relative plotfile paths are resolved before submission; jobs run from the
 repository root. Outputs and Slurm logs go under `results/`. Existing batch
-settings control scientific parameters and overwrite behavior. For example:
+settings control scientific parameters and overwrite behavior. Set
+`KANGAROO_PROGRESS=1` to show a progress bar in the Slurm output without a JSONL
+file. Set `KANGAROO_EVENT_LOG=auto` separately to save a trace (the diagnostic
+flux profile defaults to saving one). For example:
 
 ```bash
 R_MIN_KPC=0.5 R_MAX_KPC=16 Z_MAX_KPC=4 kangaroo toomre-q /path/to/plt000100

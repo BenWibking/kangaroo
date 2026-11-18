@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 import os
 import sys
-import tempfile
 import threading
 import time
 from dataclasses import asdict
@@ -171,51 +170,19 @@ class Runtime:
 
     def _run_packed_plan_with_progress(self, plan: Plan, packed: bytes, *, runmeta, dataset) -> None:
         total_tasks = _count_plan_tasks(plan, runmeta=runmeta)
+        progress = _core.TaskProgress()
         stop_progress = threading.Event()
-        progress_thread: threading.Thread | None = None
-        configured_event_log = os.environ.get("KANGAROO_EVENT_LOG", "").strip()
-        if configured_event_log:
-            event_log = Path(configured_event_log)
-            event_log.parent.mkdir(parents=True, exist_ok=True)
-            self.set_event_log_path(str(event_log))
-            progress_thread = threading.Thread(
-                target=_task_progress_monitor,
-                args=(event_log, total_tasks, stop_progress),
-                daemon=True,
-            )
-            progress_thread.start()
-            try:
-                self._rt.run_packed_plan(packed, runmeta._h, dataset._h)
-            finally:
-                stop_progress.set()
-                if progress_thread is not None:
-                    progress_thread.join(timeout=2.0)
-                try:
-                    self.set_event_log_path("")
-                except Exception:
-                    pass
-            return
-
-        with tempfile.TemporaryDirectory(prefix="kangaroo-events-") as tmpdir:
-            event_log = Path(tmpdir) / "events.jsonl"
-            self.set_event_log_path(str(event_log))
-            progress_thread = threading.Thread(
-                target=_task_progress_monitor,
-                args=(event_log, total_tasks, stop_progress),
-                daemon=True,
-            )
-            progress_thread.start()
-            try:
-                self._rt.run_packed_plan(packed, runmeta._h, dataset._h)
-            finally:
-                stop_progress.set()
-                if progress_thread is not None:
-                    progress_thread.join(timeout=2.0)
-                # Clear the event log path so later runs do not target a deleted temp file.
-                try:
-                    self.set_event_log_path("")
-                except Exception:
-                    pass
+        progress_thread = threading.Thread(
+            target=_task_progress_monitor,
+            args=(progress, total_tasks, stop_progress),
+            daemon=True,
+        )
+        progress_thread.start()
+        try:
+            self._rt.run_packed_plan(packed, runmeta._h, dataset._h, progress=progress)
+        finally:
+            stop_progress.set()
+            progress_thread.join(timeout=2.0)
 
     def set_event_log_path(self, path: str) -> None:
         self._rt.set_event_log_path(path)
@@ -427,124 +394,29 @@ def _count_plan_tasks(plan: Plan, *, runmeta: Any) -> int:
     return total
 
 
-def _fallback_task_id(event: dict) -> str:
-    return (
-        f"{event.get('stage','?')}:{event.get('template','?')}:"
-        f"{event.get('block','?')}:{event.get('start',0.0)}"
-    )
-
-
-def _event_log_paths(log_path: Path) -> list[Path]:
-    paths = [log_path]
-    suffix = log_path.suffix
-    if suffix:
-        pattern = f"{log_path.stem}.locality*{suffix}"
-    else:
-        pattern = f"{log_path.name}.locality*"
-    paths.extend(sorted(p for p in log_path.parent.glob(pattern) if p != log_path))
-    return paths
-
-
-def _is_main_task_completion(event: dict) -> bool:
-    if not isinstance(event, dict) or event.get("type") != "task":
-        return False
-    status = str(event.get("status", ""))
-    if status not in {"end", "error"}:
-        return False
-    task_id = str(event.get("id") or _fallback_task_id(event))
-    return task_id.count(":") == 3
-
-
-def _task_progress_monitor(log_path: Path, total_tasks: int, stop_event: threading.Event) -> None:
+def _task_progress_monitor(progress: Any, total_tasks: int, stop_event: threading.Event) -> None:
     try:
         from tqdm.auto import tqdm
-    except Exception:
-        tqdm = None
+    except ImportError:
+        return
 
-    seen_done: set[str] = set()
-    offsets: dict[Path, int] = {}
-    bar = None
-    if tqdm is not None:
-        bar = tqdm(
-            total=total_tasks or None,
-            desc="pipeline tasks",
-            unit="task",
-            mininterval=1.0,
-            miniters=1,
-            smoothing=0.0,
-        )
-        bar.refresh()
-
-    def _update_bar() -> None:
-        if bar is None:
-            return
-        delta = len(seen_done) - bar.n
+    with tqdm(
+        total=total_tasks or None,
+        desc="pipeline tasks",
+        unit="task",
+        mininterval=1.0,
+        miniters=1,
+        smoothing=0.0,
+    ) as bar:
+        while not stop_event.wait(timeout=1.0):
+            delta = progress.completed - bar.n
+            if delta > 0:
+                bar.update(delta)
+            else:
+                bar.refresh()
+        delta = progress.completed - bar.n
         if delta > 0:
             bar.update(delta)
-
-    try:
-        while True:
-            progressed = False
-            for path in _event_log_paths(log_path):
-                try:
-                    with path.open("r", encoding="utf-8") as handle:
-                        handle.seek(offsets.get(path, 0))
-                        while True:
-                            pos = handle.tell()
-                            line = handle.readline()
-                            if not line:
-                                offsets[path] = pos
-                                break
-                            offsets[path] = handle.tell()
-                            line = line.strip()
-                            if not line:
-                                continue
-                            try:
-                                event = json.loads(line)
-                            except json.JSONDecodeError:
-                                continue
-                            if not _is_main_task_completion(event):
-                                continue
-                            task_id = str(event.get("id") or _fallback_task_id(event))
-                            if task_id in seen_done:
-                                continue
-                            seen_done.add(task_id)
-                            progressed = True
-                except FileNotFoundError:
-                    pass
-
-            if progressed:
-                _update_bar()
-            elif bar is not None:
-                bar.refresh()
-
-            if stop_event.is_set():
-                time.sleep(0.1)
-                for path in _event_log_paths(log_path):
-                    try:
-                        with path.open("r", encoding="utf-8") as handle:
-                            handle.seek(offsets.get(path, 0))
-                            for line in handle:
-                                line = line.strip()
-                                if not line:
-                                    continue
-                                try:
-                                    event = json.loads(line)
-                                except json.JSONDecodeError:
-                                    continue
-                                if not _is_main_task_completion(event):
-                                    continue
-                                task_id = str(event.get("id") or _fallback_task_id(event))
-                                seen_done.add(task_id)
-                    except FileNotFoundError:
-                        pass
-                _update_bar()
-                break
-
-            time.sleep(1.0)
-    finally:
-        if bar is not None:
-            bar.close()
 
 
 def log_task_event(

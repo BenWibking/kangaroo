@@ -34,6 +34,23 @@ struct FabGroupKeyHash {
   }
 };
 
+std::optional<std::array<std::uint64_t, 3>> valid_fab_extents(
+    const plotfile::VisMFHeader& header, std::size_t block) {
+  if (block >= header.box_array.boxes.size() || block >= header.fab_on_disk.size()) {
+    return std::nullopt;
+  }
+  const auto& valid = header.box_array.boxes[block];
+  const int64_t nx = static_cast<int64_t>(valid.hi.x) - valid.lo.x + 1;
+  const int64_t ny = static_cast<int64_t>(valid.hi.y) - valid.lo.y + 1;
+  const int64_t nz = static_cast<int64_t>(valid.hi.z) - valid.lo.z + 1;
+  if (nx <= 0 || ny <= 0 || nz <= 0) {
+    return std::nullopt;
+  }
+  return std::array<std::uint64_t, 3>{static_cast<std::uint64_t>(nx),
+                                      static_cast<std::uint64_t>(ny),
+                                      static_cast<std::uint64_t>(nz)};
+}
+
 bool plotfile_zero_copy_reads_enabled() {
   static const bool enabled = [] {
     const char* env = std::getenv("KANGAROO_PLOTFILE_ZERO_COPY_READS");
@@ -52,20 +69,21 @@ double now_seconds() {
   return std::chrono::duration<double>(now.time_since_epoch()).count();
 }
 
-void log_plotfile_read_fab_event(const char* status,
-                                 const ChunkRef& ref,
-                                 std::size_t bytes,
-                                 double start,
-                                 double end,
-                                 const std::string& file_name,
-                                 int64_t file_offset,
-                                 int32_t comp_start,
-                                 int32_t comp_count) {
+void log_plotfile_io_event(const char* op,
+                           const char* status,
+                           const ChunkRef& ref,
+                           std::size_t bytes,
+                           double start,
+                           double end,
+                           const std::string& file_name,
+                           int64_t file_offset,
+                           int32_t comp_start,
+                           int32_t comp_count) {
   if (!has_event_log()) {
     return;
   }
   DataEvent event;
-  event.op = "plotfile_read_fab";
+  event.op = op;
   event.mode = "plotfile";
   event.status = status;
   event.file = file_name;
@@ -174,7 +192,7 @@ std::vector<std::optional<ChunkBuffer>> PlotfileBackend::get_chunks(const std::v
             reader_.vismf_header(key.level).fab_on_disk.at(static_cast<std::size_t>(key.block));
         ChunkRef read_ref = refs[sorted[run_begin]];
         const double read_start = now_seconds();
-        log_plotfile_read_fab_event("start",
+        log_plotfile_io_event("plotfile_read_fab", "start",
                                     read_ref,
                                     0,
                                     read_start,
@@ -185,7 +203,7 @@ std::vector<std::optional<ChunkBuffer>> PlotfileBackend::get_chunks(const std::v
                                     max_comp - min_comp + 1);
         auto fab = reader_.read_fab(key.level, key.block, min_comp, max_comp - min_comp + 1);
         const double read_end = now_seconds();
-        log_plotfile_read_fab_event("end",
+        log_plotfile_io_event("plotfile_read_fab", "end",
                                     read_ref,
                                     fab.bytes.size(),
                                     read_start,
@@ -224,7 +242,7 @@ std::vector<std::optional<ChunkBuffer>> PlotfileBackend::get_chunks(const std::v
             reader_.vismf_header(key.level).fab_on_disk.at(static_cast<std::size_t>(key.block));
         ChunkRef read_ref = refs[sorted[run_begin]];
         const double error_ts = now_seconds();
-        log_plotfile_read_fab_event("error",
+        log_plotfile_io_event("plotfile_read_fab", "error",
                                     read_ref,
                                     0,
                                     error_ts,
@@ -266,31 +284,44 @@ std::optional<PlotfileBackend::FabMetadata> PlotfileBackend::fab_metadata(
 
   // Do not hold the cache lock during file I/O. Concurrent first lookups may
   // read the same header, but subsequent lookups share the cached metadata.
-  try {
-    const auto& header = reader_.vismf_header(level);
-    const auto& fab_on_disk = header.fab_on_disk[block];
-    const std::string path = plotfile_dir_ + "/Level_" + std::to_string(level) + "/" +
-                             fab_on_disk.file_name;
-    std::ifstream stream(path, std::ios::binary);
-    if (!stream) {
+  const auto& header = reader_.vismf_header(level);
+  const auto& fab_on_disk = header.fab_on_disk[block];
+  const bool trace = has_event_log();
+  const double start = trace ? now_seconds() : 0.0;
+  const auto metadata = [&]() -> std::optional<FabMetadata> {
+    try {
+      const std::string path = plotfile_dir_ + "/Level_" + std::to_string(level) + "/" +
+                               fab_on_disk.file_name;
+      std::ifstream stream(path, std::ios::binary);
+      if (!stream) {
+        return std::nullopt;
+      }
+      stream.seekg(fab_on_disk.offset, std::ios::beg);
+      const auto fab = plotfile::read_fab_header(stream);
+      const auto& valid = header.box_array.boxes[block];
+      if (valid.lo.x < fab.box.lo.x || valid.lo.y < fab.box.lo.y || valid.lo.z < fab.box.lo.z ||
+          valid.hi.x > fab.box.hi.x || valid.hi.y > fab.box.hi.y || valid.hi.z > fab.box.hi.z) {
+        return std::nullopt;
+      }
+      const auto scalar = fab.real_desc.type == plotfile::RealType::kFloat32
+                              ? ScalarType::kF32
+                              : ScalarType::kF64;
+      return FabMetadata{fab.ncomp, scalar};
+    } catch (const std::exception&) {
       return std::nullopt;
     }
-    stream.seekg(fab_on_disk.offset, std::ios::beg);
-    const auto fab = plotfile::read_fab_header(stream);
-    const auto& valid = header.box_array.boxes[block];
-    if (valid.lo.x < fab.box.lo.x || valid.lo.y < fab.box.lo.y || valid.lo.z < fab.box.lo.z ||
-        valid.hi.x > fab.box.hi.x || valid.hi.y > fab.box.hi.y || valid.hi.z > fab.box.hi.z) {
-      return std::nullopt;
-    }
-    const auto scalar = fab.real_desc.type == plotfile::RealType::kFloat32
-                            ? ScalarType::kF32
-                            : ScalarType::kF64;
-    std::lock_guard lock(fab_metadata_mutex_);
-    cached = FabMetadata{fab.ncomp, scalar};
-    return cached;
-  } catch (const std::exception&) {
-    return std::nullopt;
+  }();
+  if (trace) {
+    const ChunkRef ref{0, static_cast<int16_t>(level), -1, 0, static_cast<int32_t>(block)};
+    log_plotfile_io_event("plotfile_read_fab_header", metadata ? "end" : "error",
+                          ref, 0, start, now_seconds(), fab_on_disk.file_name,
+                          fab_on_disk.offset, -1, -1);
   }
+  if (metadata) {
+    std::lock_guard lock(fab_metadata_mutex_);
+    cached = metadata;
+  }
+  return metadata;
 }
 
 std::optional<BufferDesc> PlotfileBackend::describe_chunk(const ChunkRef& ref) const {
@@ -299,11 +330,9 @@ std::optional<BufferDesc> PlotfileBackend::describe_chunk(const ChunkRef& ref) c
   }
   const auto& header = reader_.vismf_header(ref.level);
   const auto block = static_cast<std::size_t>(ref.block);
-  if (block >= header.box_array.boxes.size() || block >= header.fab_on_disk.size()) {
-    return std::nullopt;
-  }
+  const auto extents = valid_fab_extents(header, block);
   const int32_t component = get_component_index(ref.field);
-  if (component < 0) {
+  if (!extents || component < 0) {
     return std::nullopt;
   }
   const auto metadata = fab_metadata(ref.level, block);
@@ -311,29 +340,35 @@ std::optional<BufferDesc> PlotfileBackend::describe_chunk(const ChunkRef& ref) c
     return std::nullopt;
   }
 
-  // Payload reads crop stored ghost cells to the valid box.
-  const auto& valid = header.box_array.boxes[block];
-  const int64_t nx = static_cast<int64_t>(valid.hi.x) - valid.lo.x + 1;
-  const int64_t ny = static_cast<int64_t>(valid.hi.y) - valid.lo.y + 1;
-  const int64_t nz = static_cast<int64_t>(valid.hi.z) - valid.lo.z + 1;
-  if (nx <= 0 || ny <= 0 || nz <= 0) {
-    return std::nullopt;
-  }
-  const std::array<std::uint64_t, 3> extents{
-      static_cast<std::uint64_t>(nx), static_cast<std::uint64_t>(ny),
-      static_cast<std::uint64_t>(nz)};
   try {
     return plotfile_zero_copy_reads_enabled()
-               ? BufferDesc::plotfile_grid(metadata->scalar, extents)
-               : BufferDesc::runtime_grid(metadata->scalar, extents);
+               ? BufferDesc::plotfile_grid(metadata->scalar, *extents)
+               : BufferDesc::runtime_grid(metadata->scalar, *extents);
   } catch (const std::exception&) {
     return std::nullopt;
   }
 }
 
 std::size_t PlotfileBackend::estimate_chunk_bytes(const ChunkRef& ref) const {
-  const auto desc = describe_chunk(ref);
-  return desc.has_value() ? static_cast<std::size_t>(desc->required_bytes()) : 0;
+  if (ref.level < 0 || ref.level >= reader_.num_levels() || ref.block < 0) {
+    return 0;
+  }
+  const auto& header = reader_.vismf_header(ref.level);
+  const int32_t component = get_component_index(ref.field);
+  if (component < 0 || component >= header.ncomp) {
+    return 0;
+  }
+  const auto extents = valid_fab_extents(header, static_cast<std::size_t>(ref.block));
+  if (!extents) {
+    return 0;
+  }
+  // Reads crop to the valid box. Budget for the widest supported scalar so
+  // admission control does not have to open each FAB to find its precision.
+  std::uint64_t bytes = scalar_size(ScalarType::kF64);
+  for (auto extent : *extents) {
+    bytes = checked_multiply(bytes, extent);
+  }
+  return static_cast<std::size_t>(bytes);
 }
 
 std::optional<std::uint64_t> PlotfileBackend::estimate_particle_chunk_records(

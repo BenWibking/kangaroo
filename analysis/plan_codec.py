@@ -73,11 +73,12 @@ def _domain(value: model_plan.Domain) -> Domain.DomainT:
     )
 
 
-def _field_ref(value: model_plan.FieldRef, fallback: model_plan.Domain) -> FieldRef.FieldRefT:
+def _field_ref(value: model_plan.FieldRef) -> FieldRef.FieldRefT:
     return FieldRef.FieldRefT(
         field=value.field,
         version=value.version,
-        domain=_domain(value.domain if value.domain is not None else fallback),
+        # An omitted domain uses the template's step/level and the current block.
+        domain=_domain(value.domain) if value.domain is not None else None,
     )
 
 
@@ -251,7 +252,7 @@ def encode_plan(plan: model_plan.Plan) -> bytes:
                     plane=_PLANE[template.plane],
                     kernel=template.kernel,
                     domain=_domain(template.domain),
-                    inputs=[_field_ref(ref, template.domain) for ref in template.inputs],
+                    inputs=[_field_ref(ref) for ref in template.inputs],
                     outputs=[OutputRef.OutputRefT(ref.field.field, ref.field.version, _buffer_spec(ref.buffer)) for ref in template.outputs],
                     deps=DependencyRule.DependencyRuleT(
                         kind=0 if deps.kind == "None" else 1,

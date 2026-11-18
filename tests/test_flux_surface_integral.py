@@ -412,6 +412,47 @@ def test_cylindrical_flux_surface_integral_lowering_accepts_radius_array() -> No
     assert _output_bytes(accum[0]) == 512
 
 
+def test_cylindrical_flux_groups_blocks_by_height_subset() -> None:
+    from analysis.fb.Plan import Plan as PackedPlan
+    from analysis.plan_codec import encode_plan
+
+    rt = _FakeRuntime()
+    runmeta = _RunMeta([
+        _Step(0, [_Level(
+            geom=_Geom(dx=(1.0, 1.0, 1.0), x0=(0.0, -0.5, 0.0), index_origin=(0, 0, 0)),
+            boxes=[_Box((0, 0, z), (0, 0, z)) for z in (0, 2, -1, -3, 5)],
+        )]),
+    ])
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=_FakeDataset(rt))
+    pipe.cylindrical_flux_surface_integral(
+        1,
+        momentum=(2, 3, 4),
+        energy=5,
+        passive_scalar=6,
+        magnetic_field=(7, 8, 9),
+        radius=0.5,
+        height=[0.5, 2.5],
+        out="flux",
+        reduce_fan_in=4,
+    )
+
+    plan = pipe.plan()
+    accumulate, reduce, finalize = plan.topo_stages()
+    assert [tmpl.domain.blocks for tmpl in accumulate.templates] == [[0, 2], [1, 3]]
+    assert [tmpl.params.height_indices for tmpl in accumulate.templates] == [(0, 1), (1,)]
+    assert [tmpl.params.heights for tmpl in accumulate.templates] == [(0.5, 2.5), (2.5,)]
+    assert reduce.templates[0].graph_reduce.input_blocks == (0, 1, 2, 3)
+
+    packed_bytes = encode_plan(plan)
+    assert packed_bytes[4:8] == b"KPL2"
+    packed = PackedPlan.GetRootAs(packed_bytes)
+    grouped = packed.Stages(0).Templates(0)
+    assert [grouped.Domain().Blocks(i) for i in range(grouped.Domain().BlocksLength())] == [0, 2]
+    assert all(grouped.Inputs(i).Domain() is None for i in range(grouped.InputsLength()))
+    assert finalize.templates[0].inputs[0].domain is not None
+    assert packed.Stages(2).Templates(0).Inputs(0).Domain() is not None
+
+
 def test_cylindrical_flux_surface_integral_rejects_two_dimensional_scan() -> None:
     rt = _FakeRuntime()
     runmeta = _RunMeta(

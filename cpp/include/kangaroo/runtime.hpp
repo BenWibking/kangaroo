@@ -93,6 +93,7 @@ struct ExecutionContext {
   PlanIR plan;
   std::shared_ptr<AdjacencyService> adjacency;
   std::shared_ptr<ChunkStore> chunk_store;
+  std::shared_ptr<TaskProgress> progress;
 };
 
 class ScopedExecutionContext {
@@ -102,6 +103,10 @@ class ScopedExecutionContext {
 
  private:
   int32_t previous_run_id_ = 0;
+};
+
+struct TaskProgressHandle {
+  std::shared_ptr<TaskProgress> counter = std::make_shared<TaskProgress>();
 };
 
 class Runtime {
@@ -117,7 +122,8 @@ class Runtime {
 
   void run_packed_plan(const std::vector<std::uint8_t>& packed,
                        const RunMetaHandle& runmeta,
-                       const DatasetHandle& dataset);
+                       const DatasetHandle& dataset,
+                       TaskProgressHandle* progress = nullptr);
 
   void preload_dataset(const RunMetaHandle& runmeta,
                        const DatasetHandle& dataset,
@@ -216,7 +222,8 @@ void log_data_event(const DataEvent& event);
 void set_execution_context(int32_t run_id,
                            const RunMeta& meta,
                            const DatasetHandle& dataset,
-                           const PlanIR& plan);
+                           const PlanIR& plan,
+                           bool track_progress = false);
 std::shared_ptr<ExecutionContext> execution_context_shared(int32_t run_id);
 const ExecutionContext& execution_context(int32_t run_id);
 bool execution_context_may_produce_chunk(int32_t run_id, const ChunkRef& ref);

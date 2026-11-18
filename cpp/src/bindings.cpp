@@ -1040,6 +1040,12 @@ NB_MODULE(_core, m) {
         nb::arg("worker_label") = nb::none(),
         nb::arg("locality") = nb::none());
 
+  nb::class_<kangaroo::TaskProgressHandle>(m, "TaskProgress")
+      .def(nb::init<>())
+      .def_prop_ro("completed", [](const kangaroo::TaskProgressHandle& self) {
+        return self.counter->completed.load(std::memory_order_relaxed);
+      });
+
   nb::class_<kangaroo::Runtime>(m, "Runtime")
       .def(nb::init<>())
       .def("__init__",
@@ -1100,17 +1106,19 @@ NB_MODULE(_core, m) {
       .def("preload_dataset", &kangaroo::Runtime::preload_dataset)
       .def("run_packed_plan",
            &kangaroo::Runtime::run_packed_plan,
-           nb::call_guard<nb::gil_scoped_release>())
+           nb::arg("packed"), nb::arg("runmeta"), nb::arg("dataset"),
+           nb::arg("progress") = nb::none(), nb::call_guard<nb::gil_scoped_release>())
       .def("run_packed_plan",
            [](kangaroo::Runtime& self, nb::bytes packed, kangaroo::RunMetaHandle& runmeta,
-              kangaroo::DatasetHandle& dataset) {
+              kangaroo::DatasetHandle& dataset, kangaroo::TaskProgressHandle* progress) {
              // Copy Python-owned bytes while the GIL is held, then release it for the
              // long-running C++/HPX execution.
              auto* data = static_cast<const std::uint8_t*>(packed.data());
              std::vector<std::uint8_t> buffer(data, data + packed.size());
              nb::gil_scoped_release release;
-             self.run_packed_plan(buffer, runmeta, dataset);
-           });
+             self.run_packed_plan(buffer, runmeta, dataset, progress);
+           }, nb::arg("packed"), nb::arg("runmeta"), nb::arg("dataset"),
+           nb::arg("progress") = nb::none());
 
   nb::class_<kangaroo::KernelDesc>(m, "KernelDesc")
       .def_ro("name", &kangaroo::KernelDesc::name)

@@ -1369,7 +1369,8 @@ KernelRegistry& global_kernels() {
 void set_execution_context(int32_t run_id,
                            const RunMeta& meta,
                            const DatasetHandle& dataset,
-                           const PlanIR& plan) {
+                           const PlanIR& plan,
+                           bool track_progress) {
   std::shared_ptr<ChunkStore> chunk_store;
   {
     std::lock_guard<std::mutex> lock(g_ctx_mutex);
@@ -1379,6 +1380,7 @@ void set_execution_context(int32_t run_id,
     }
   }
   auto ctx = build_execution_context_impl(run_id, meta, dataset, plan, std::move(chunk_store));
+  if (track_progress) ctx->progress = std::make_shared<TaskProgress>();
   std::lock_guard<std::mutex> lock(g_ctx_mutex);
   g_execution_contexts[run_id] = std::move(ctx);
 }
@@ -1433,8 +1435,14 @@ const DatasetHandle& current_dataset() {
 void set_execution_context_action(int32_t run_id,
                                   const RunMeta& meta,
                                   const DatasetHandle& dataset,
-                                  const PlanIR& plan) {
-  set_execution_context(run_id, meta, dataset, plan);
+                                  const PlanIR& plan,
+                                  bool track_progress) {
+  set_execution_context(run_id, meta, dataset, plan, track_progress);
+}
+
+std::uint64_t completed_tasks_action(int32_t run_id) {
+  const auto ctx = execution_context_shared(run_id);
+  return ctx->progress ? ctx->progress->completed.load(std::memory_order_relaxed) : 0;
 }
 
 void erase_execution_context_action(int32_t run_id) {
@@ -1484,6 +1492,7 @@ void release_console_worker_action() {
 }  // namespace kangaroo
 
 HPX_PLAIN_ACTION(kangaroo::set_execution_context_action, kangaroo_set_execution_context_action)
+HPX_PLAIN_ACTION(kangaroo::completed_tasks_action, kangaroo_completed_tasks_action)
 HPX_PLAIN_ACTION(kangaroo::erase_execution_context_action, kangaroo_erase_execution_context_action)
 HPX_PLAIN_ACTION(kangaroo::preload_action, kangaroo_preload_action)
 HPX_PLAIN_ACTION(kangaroo::set_event_log_action, kangaroo_set_event_log_action)
@@ -1644,7 +1653,9 @@ void log_data_event(const DataEvent& event) {
 
 void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
                               const RunMetaHandle& runmeta,
-                              const DatasetHandle& dataset) {
+                              const DatasetHandle& dataset,
+                              TaskProgressHandle* progress) {
+  if (progress) progress->counter->completed.store(0, std::memory_order_relaxed);
   ensure_hpx_started();
   g_locality_hint.store(static_cast<int32_t>(hpx::get_locality_id()), std::memory_order_release);
   ActivePlanRunGuard active_run_guard;
@@ -1723,11 +1734,15 @@ void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
   preload_run_id_ = 0;
   timed_phase("runtime_broadcast_execution_context", "kangaroo.runtime.setup", [&]() {
     hpx::lcos::broadcast<::kangaroo_set_execution_context_action>(
-        localities, plan_id, runmeta.meta, dataset, plan)
+        localities, plan_id, runmeta.meta, dataset, plan, progress != nullptr)
         .get();
     return 0;
   });
   auto ctx = execution_context_shared(plan_id);
+  const bool gather_progress = progress != nullptr && localities.size() > 1;
+  if (progress && !gather_progress) {
+    ctx->progress = progress->counter;
+  }
 
   auto erase_context = [&](int32_t run_id) {
     timed_phase("runtime_erase_execution_context", "kangaroo.runtime.cleanup", [&]() {
@@ -1747,9 +1762,35 @@ void Runtime::run_packed_plan(const std::vector<std::uint8_t>& packed,
 
   try {
     DataServiceLocal data(plan_id, &dataset);
-    Executor executor(plan_id, ctx->meta, data, *ctx->adjacency);
+    Executor executor(plan_id, ctx->meta, data, *ctx->adjacency,
+                      executor_options_from_environment(), ctx->progress);
     timed_phase("runtime_execute_plan", "kangaroo.runtime.execute", [&]() {
-      executor.run(ctx->plan).get();
+      auto done = executor.run(ctx->plan);
+      if (!gather_progress) {
+        done.get();
+        return 0;
+      }
+      // Streaming tasks finish on their assigned locality. Gather counts
+      // periodically on an HPX worker instead of sending a message per task.
+      hpx::async([&, done = std::move(done)]() mutable {
+        auto sample_progress = [&]() {
+          try {
+            std::uint64_t completed = 0;
+            for (auto count : hpx::lcos::broadcast<::kangaroo_completed_tasks_action>(
+                     localities, plan_id).get()) {
+              completed += count;
+            }
+            progress->counter->completed.store(completed, std::memory_order_relaxed);
+          } catch (...) {
+            // A progress update must not interrupt a running plan.
+          }
+        };
+        while (done.wait_for(std::chrono::seconds(1)) == hpx::future_status::timeout) {
+          sample_progress();
+        }
+        sample_progress();
+        done.get();
+      }).get();
       return 0;
     });
   } catch (...) {
@@ -1797,7 +1838,7 @@ void Runtime::preload_dataset(const RunMetaHandle& runmeta,
   preload_run_id_ = has_persistent_context ? retained_output_run_id_
                                            : allocate_runtime_run_id();
   hpx::lcos::broadcast<::kangaroo_set_execution_context_action>(
-      localities, preload_run_id_, runmeta.meta, dataset, PlanIR{})
+      localities, preload_run_id_, runmeta.meta, dataset, PlanIR{}, false)
       .get();
   hpx::lcos::broadcast<::kangaroo_preload_action>(localities, preload_run_id_, fields).get();
 }

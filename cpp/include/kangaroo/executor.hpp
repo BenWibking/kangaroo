@@ -6,9 +6,11 @@
 #include "kangaroo/plan_ir.hpp"
 #include "kangaroo/runmeta.hpp"
 
+#include <atomic>
 #include <cstddef>
 #include <cstdint>
 #include <hpx/future.hpp>
+#include <memory>
 #include <span>
 #include <string>
 #include <vector>
@@ -16,6 +18,10 @@
 namespace kangaroo {
 
 struct DatasetHandle;
+
+struct TaskProgress {
+  std::atomic<std::uint64_t> completed{0};
+};
 
 void prepare_plan(PlanIR& plan, KernelRegistry& kernels);
 void validate_plan_kernel_contracts(const PlanIR& plan,
@@ -60,9 +66,8 @@ struct TaskInstance {
 
 class Executor {
  public:
-  Executor(int32_t plan_id, const RunMeta& meta, DataService& data, AdjacencyService& adj);
   Executor(int32_t plan_id, const RunMeta& meta, DataService& data, AdjacencyService& adj,
-           ExecutorOptions options);
+           ExecutorOptions options, std::shared_ptr<TaskProgress> progress = nullptr);
 
   hpx::future<void> run(const PlanIR& plan);
 
@@ -88,6 +93,7 @@ class Executor {
   DataService& data_;
   AdjacencyService& adj_;
   ExecutorOptions options_;
+  std::shared_ptr<TaskProgress> progress_;
   const PlanIR* current_plan_ = nullptr;
 };
 

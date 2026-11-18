@@ -21,7 +21,7 @@ from analysis import Runtime
 from analysis.dataset import open_dataset
 from analysis.kernel_params import FieldExprParams, ScalarParams
 from analysis.pipeline import Pipeline
-from analysis.plan import Domain, FieldRef, Plan, Stage
+from analysis.plan import Domain, FieldRef, GraphReduceSpec, Plan, Stage
 from analysis.runmeta import BlockBox, LevelGeom, LevelMeta, RunMeta, StepMeta
 
 
@@ -109,6 +109,54 @@ def test_plan_preparation_rejects_kernel_parameter_mismatch() -> None:
 def _set_scalar(ds, *, field: int, block: int, value: float) -> None:
     arr = np.asarray([[[value]]], dtype=np.float64)
     ds._h.set_chunk_ref(0, 0, field, 0, block, arr.tobytes(order="C"), "f64", [1, 1, 1])
+
+
+@pytest.mark.parametrize("mode", ["eager", "streaming"])
+@pytest.mark.parametrize("save_trace", [False, True])
+def test_progress_reports_tasks_without_requiring_event_log(
+    tmp_path, monkeypatch, capsys, mode, save_trace
+) -> None:
+    pytest.importorskip("tqdm")
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MODE", mode)
+    monkeypatch.delenv("KANGAROO_EVENT_LOG", raising=False)
+    monkeypatch.chdir(tmp_path)
+    trace = tmp_path / "trace.jsonl"
+    rt = Runtime()
+    rt.set_event_log_path(str(trace) if save_trace else "")
+
+    def reject_progress_log_setup(path):
+        pytest.fail(f"progress attempted to change the event log path: {path}")
+
+    runmeta = _runmeta(2)
+    ds = open_dataset("memory://progress", runmeta=runmeta, step=0, level=0, runtime=rt)
+    for block in range(2):
+        ds._h.set_chunk_ref(0, 0, 1, 0, block, struct.pack("<q", block + 1), "i64", [1])
+    output_spec = BufferSpec(DType.I64, FixedShape((1,)))
+    copy = Stage("copy")
+    copy.map_blocks(
+        name="copy", kernel="particle_int64_sum_reduce", domain=Domain(0, 0),
+        inputs=[FieldRef(1)], outputs=[OutputRef(FieldRef(2), output_spec)],
+    )
+    reduce = Stage("reduce", plane="graph", after=[copy])
+    reduce.map_blocks(
+        name="reduce", kernel="particle_int64_sum_reduce", domain=Domain(0, 0),
+        inputs=[FieldRef(2)], outputs=[OutputRef(FieldRef(3), output_spec)],
+        graph_reduce=GraphReduceSpec(fan_in=2, num_inputs=2),
+    )
+    try:
+        with monkeypatch.context() as m:
+            m.setattr(rt, "set_event_log_path", reject_progress_log_setup)
+            rt.run(Plan([reduce]), runmeta=runmeta, dataset=ds, progress_bar=True)
+    finally:
+        rt.set_event_log_path("")
+
+    assert "3/3" in capsys.readouterr().err
+    if save_trace:
+        events = [json.loads(line) for line in trace.read_text().splitlines()]
+        assert sum(e["type"] == "task" and e["status"] == "end" and e["id"].count(":") == 3
+                   for e in events) == 3
+    else:
+        assert not list(tmp_path.iterdir())
 
 
 def _write_single_fab_plotfile(path) -> None:

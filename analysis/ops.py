@@ -1593,7 +1593,8 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
 
         for level_idx in range(len(levels) - 1, -1, -1):
             level_meta = levels[level_idx]
-            block_surface_indices: list[tuple[int, list[int]]] = []
+            blocks_by_surfaces: dict[tuple[int, ...], list[int]] = {}
+            blocks: list[int] = []
             for block_idx, block in enumerate(level_meta.boxes):
                 lo2, hi2, z_abs_min, z_abs_max = self._block_cylinder_bounds(level_meta, block)
                 active_surface_indices: list[int] = []
@@ -1609,41 +1610,32 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
                         height_intersects[height_idx] = True
                         active_surface_indices.append(surface_idx)
                 if active_surface_indices:
-                    block_surface_indices.append((block_idx, active_surface_indices))
-            if not block_surface_indices:
+                    blocks_by_surfaces.setdefault(tuple(active_surface_indices), []).append(block_idx)
+                    # Keep the original block order for the reduction.
+                    blocks.append(block_idx)
+            if not blocks:
                 continue
-            blocks = [block_idx for block_idx, _ in block_surface_indices]
 
             covered_boxes = covered_volume_boxes(levels, level=level_idx)
             covered_payload = _covered_boxes_payload(covered_boxes)
             flux_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 
-            for block, active_surface_indices in block_surface_indices:
-                dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
-                active_radii = [
-                    self.radii[idx] for idx in active_surface_indices
-                ] if len(self.radii) > 1 else [self.radii[0]]
-                active_radius_indices = (
-                    active_surface_indices if len(self.radii) > 1 else [0]
-                )
-                active_heights = [
-                    self.heights[idx] for idx in active_surface_indices
-                ] if len(self.heights) > 1 else [self.heights[0]]
-                active_height_indices = (
-                    active_surface_indices if len(self.heights) > 1 else [0]
-                )
+            for active_surface_indices, group_blocks in blocks_by_surfaces.items():
+                dom = ctx.domain(step=ds.step, level=level_idx, blocks=group_blocks)
+                active_radius_indices = active_surface_indices if len(self.radii) > 1 else (0,)
+                active_height_indices = active_surface_indices if len(self.heights) > 1 else (0,)
                 accumulate_stage.map_blocks(
-                    name=f"cylindrical_flux_surface_integral_b{block}",
+                    name=f"cylindrical_flux_surface_integral_l{level_idx}_b{group_blocks[0]}",
                     kernel="cylindrical_flux_surface_integral_accumulate",
                     domain=dom,
                     inputs=[FieldRef(fid) for fid in input_fields],
                     outputs=[_fixed_f64_shape(flux_field, out_shape)],
                     deps=DependencyRule(),
                     params=CylindricalFluxParams(
-                        radii=tuple(active_radii),
-                        radius_indices=tuple(active_radius_indices),
-                        heights=tuple(active_heights),
-                        height_indices=tuple(active_height_indices),
+                        radii=tuple(self.radii[idx] for idx in active_radius_indices),
+                        radius_indices=active_radius_indices,
+                        heights=tuple(self.heights[idx] for idx in active_height_indices),
+                        height_indices=active_height_indices,
                         num_radii=len(self.radii),
                         num_heights=len(self.heights),
                         temperature_bins=tuple(self.temperature_bins or ()),

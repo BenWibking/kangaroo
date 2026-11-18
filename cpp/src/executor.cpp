@@ -16,6 +16,7 @@
 #include <queue>
 #include <sstream>
 #include <stdexcept>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -83,6 +84,44 @@ int32_t graph_reduce_group_end(const GraphReduceSpecIR& params, int32_t group_id
 double now_seconds() {
   auto now = std::chrono::system_clock::now();
   return std::chrono::duration<double>(now.time_since_epoch()).count();
+}
+
+template <typename Fn>
+auto trace_streaming_setup(const char* name, Fn&& fn, int32_t stage_idx = -1) {
+  if (!has_event_log() && !has_perfetto_trace()) {
+    return fn();
+  }
+
+  PhaseEvent event;
+  event.name = name;
+  if (stage_idx >= 0) {
+    event.name += "/" + std::to_string(stage_idx);
+  }
+  event.category = "kangaroo.executor.setup";
+  event.locality = static_cast<int32_t>(hpx::get_locality_id());
+  event.worker = static_cast<int32_t>(hpx::get_worker_thread_num());
+  event.status = "start";
+  event.ts = event.start = event.end = now_seconds();
+  log_phase_event(event);
+
+  auto finish = [&](const char* status) {
+    event.status = status;
+    event.ts = event.end = now_seconds();
+    log_phase_event(event);
+  };
+  try {
+    if constexpr (std::is_void_v<std::invoke_result_t<Fn&>>) {
+      fn();
+      finish("end");
+    } else {
+      auto result = fn();
+      finish("end");
+      return result;
+    }
+  } catch (...) {
+    finish("error");
+    throw;
+  }
 }
 
 struct ViewSummary {
@@ -241,6 +280,15 @@ std::optional<BufferFacts> estimate_output_spec(
                               : std::nullopt;
 }
 
+bool output_estimates_need_input_facts(const TaskTemplateIR& tmpl) {
+  return std::any_of(tmpl.outputs.begin(), tmpl.outputs.end(), [](const auto& output) {
+    const auto& spec = output.buffer;
+    return spec.shape_kind == ShapeRuleKind::kLikeInput ||
+           (spec.shape_kind == ShapeRuleKind::kDynamic &&
+            spec.dynamic_upper_bound.kind != DynamicUpperBoundKind::kLiteral);
+  });
+}
+
 std::optional<std::size_t> template_output_storage_bytes(
     const TaskTemplateIR& tmpl,
     const DataService& data,
@@ -249,9 +297,11 @@ std::optional<std::size_t> template_output_storage_bytes(
     const std::vector<ChunkRef>& input_refs,
     const ChunkEstimateMap& known_outputs) {
   std::vector<BufferFacts> inputs;
-  inputs.reserve(input_refs.size());
-  for (const auto& ref : input_refs) {
-    inputs.push_back(estimate_input_ref(known_outputs, data, ref));
+  if (output_estimates_need_input_facts(tmpl)) {
+    inputs.reserve(input_refs.size());
+    for (const auto& ref : input_refs) {
+      inputs.push_back(estimate_input_ref(known_outputs, data, ref));
+    }
   }
   std::size_t bytes = 0;
   for (std::size_t output_index = 0; output_index < tmpl.outputs.size(); ++output_index) {
@@ -282,6 +332,9 @@ ChunkEstimateMap build_known_output_estimates(const PlanIR& plan,
       if (tmpl.outputs.empty()) {
         continue;
       }
+      // Exact descriptors can require I/O. Fixed shapes and literal bounds
+      // can be resolved without inspecting any input buffers.
+      const bool needs_input_facts = output_estimates_need_input_facts(tmpl);
       if (tmpl.plane == ExecPlane::Chunk) {
         const auto& level = meta.steps.at(static_cast<std::size_t>(tmpl.domain.step))
                                 .levels.at(static_cast<std::size_t>(tmpl.domain.level));
@@ -297,11 +350,13 @@ ChunkEstimateMap build_known_output_estimates(const PlanIR& plan,
         }
         for (int32_t block : blocks) {
           std::vector<BufferFacts> inputs;
-          inputs.reserve(tmpl.inputs.size());
-          for (const auto& input : tmpl.inputs) {
-            const auto loc = resolve_input_location(tmpl, input, block);
-            inputs.push_back(estimate_input_ref(
-                known, data, ChunkRef{loc.step, loc.level, input.field, input.version, loc.block}));
+          if (needs_input_facts) {
+            inputs.reserve(tmpl.inputs.size());
+            for (const auto& input : tmpl.inputs) {
+              const auto loc = resolve_input_location(tmpl, input, block);
+              inputs.push_back(estimate_input_ref(
+                  known, data, ChunkRef{loc.step, loc.level, input.field, input.version, loc.block}));
+            }
           }
           for (std::size_t output_index = 0; output_index < tmpl.outputs.size();
                ++output_index) {
@@ -324,19 +379,21 @@ ChunkEstimateMap build_known_output_estimates(const PlanIR& plan,
         const int32_t n_groups = graph_reduce_group_count(params);
         for (int32_t group_idx = 0; group_idx < n_groups; ++group_idx) {
           const int32_t out_block = graph_reduce_output_block(params, group_idx);
-          const int32_t start = graph_reduce_group_start(params, group_idx);
-          const int32_t end = graph_reduce_group_end(params, group_idx);
           std::vector<BufferFacts> inputs;
-          for (const auto& input : tmpl.inputs) {
-            for (int32_t idx = start; idx < end; ++idx) {
-              const int32_t block_id = params.input_blocks.empty()
-                  ? params.input_base + idx
-                  : params.input_blocks.at(static_cast<std::size_t>(idx));
-              const int32_t step = input.domain.has_value() ? input.domain->step : tmpl.domain.step;
-              const int16_t level =
-                  input.domain.has_value() ? input.domain->level : tmpl.domain.level;
-              inputs.push_back(estimate_input_ref(
-                  known, data, ChunkRef{step, level, input.field, input.version, block_id}));
+          if (needs_input_facts) {
+            const int32_t start = graph_reduce_group_start(params, group_idx);
+            const int32_t end = graph_reduce_group_end(params, group_idx);
+            for (const auto& input : tmpl.inputs) {
+              for (int32_t idx = start; idx < end; ++idx) {
+                const int32_t block_id = params.input_blocks.empty()
+                    ? params.input_base + idx
+                    : params.input_blocks.at(static_cast<std::size_t>(idx));
+                const int32_t step = input.domain.has_value() ? input.domain->step : tmpl.domain.step;
+                const int16_t level =
+                    input.domain.has_value() ? input.domain->level : tmpl.domain.level;
+                inputs.push_back(estimate_input_ref(
+                    known, data, ChunkRef{step, level, input.field, input.version, block_id}));
+              }
             }
           }
           for (std::size_t output_index = 0; output_index < tmpl.outputs.size();
@@ -364,7 +421,12 @@ ChunkEstimateMap build_known_output_estimates(const PlanIR& plan,
 std::size_t estimate_task_input_ref_bytes(const ChunkEstimateMap& known_outputs,
                                           const DataService& data,
                                           const ChunkRef& ref) {
-  return estimate_input_ref(known_outputs, data, ref).storage_bytes;
+  const auto known = known_outputs.find(ref);
+  if (known != known_outputs.end()) return known->second.storage_bytes;
+  const auto bytes = data.estimate_host_bytes(ref);
+  if (bytes > 0) return bytes;
+  const auto desc = data.describe_host(ref);
+  return desc ? static_cast<std::size_t>(desc->required_bytes()) : 0;
 }
 
 TaskEvent base_task_event(const TaskTemplateIR& tmpl,
@@ -1120,7 +1182,8 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
                                            std::size_t max_active_tasks,
                                            std::size_t max_active_storage_units,
                                            std::size_t max_input_bytes,
-                                           std::size_t max_output_storage_bytes) {
+                                           std::size_t max_output_storage_bytes,
+                                           std::shared_ptr<TaskProgress> progress) {
   if (tasks.empty()) {
     return hpx::make_ready_future();
   }
@@ -1139,6 +1202,7 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
     const RunMeta* meta = nullptr;
     DataService* data = nullptr;
     AdjacencyService* adj = nullptr;
+    std::shared_ptr<TaskProgress> progress;
     std::vector<TaskInstance> pending;
     std::size_t max_active_tasks = 1;
     std::size_t max_active_storage_units = 0;
@@ -1407,6 +1471,7 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
             active[i].future = std::move(result.futures[i]);
           }
         }
+        if (progress) progress->completed.fetch_add(1, std::memory_order_relaxed);
         result.futures[result.index].get();
         release_consumed_inputs(active[result.index].input_refs);
         remove_storage_units(active[result.index].storage_units);
@@ -1427,6 +1492,7 @@ hpx::future<void> run_stage_partition_impl(int32_t plan_id,
   runner->meta = &meta;
   runner->data = &data;
   runner->adj = &adj;
+  runner->progress = std::move(progress);
   runner->pending = std::move(tasks);
   runner->max_active_tasks = std::max<std::size_t>(1, max_active_tasks);
   runner->max_active_storage_units = max_active_storage_units;
@@ -1481,7 +1547,8 @@ hpx::future<void> run_stage_partition_remote(int32_t plan_id,
                                   task_limit,
                                   storage_unit_limit,
                                   static_cast<std::size_t>(max_input_bytes),
-                                  static_cast<std::size_t>(max_output_storage_bytes))
+                                  static_cast<std::size_t>(max_output_storage_bytes),
+                                  ctx->progress)
       .then([ctx = std::move(ctx), data = std::move(data)](auto&& done) mutable {
         done.get();
       });
@@ -1630,12 +1697,10 @@ struct Executor::StreamingPlanEstimates {
   ChunkEstimateMap known_outputs;
 };
 
-Executor::Executor(int32_t plan_id, const RunMeta& meta, DataService& data, AdjacencyService& adj)
-    : Executor(plan_id, meta, data, adj, executor_options_from_environment()) {}
-
 Executor::Executor(int32_t plan_id, const RunMeta& meta, DataService& data, AdjacencyService& adj,
-                   ExecutorOptions options)
-    : plan_id_(plan_id), meta_(meta), data_(data), adj_(adj), options_(std::move(options)) {}
+                   ExecutorOptions options, std::shared_ptr<TaskProgress> progress)
+    : plan_id_(plan_id), meta_(meta), data_(data), adj_(adj), options_(std::move(options)),
+      progress_(std::move(progress)) {}
 
 hpx::future<void> Executor::run(const PlanIR& plan) {
   current_plan_ = &plan;
@@ -1685,9 +1750,13 @@ hpx::future<void> Executor::run(const PlanIR& plan) {
   if (options_.mode == "streaming") {
     try {
       // Consumer registration and stage dispatch both read this per-run map.
-      estimates = std::make_shared<const StreamingPlanEstimates>(
-          StreamingPlanEstimates{build_known_output_estimates(plan, meta_, data_)});
-      register_streaming_input_consumers(plan, *estimates).get();
+      estimates = trace_streaming_setup("executor_streaming_build_output_estimates", [&] {
+        return std::make_shared<const StreamingPlanEstimates>(
+            StreamingPlanEstimates{build_known_output_estimates(plan, meta_, data_)});
+      });
+      trace_streaming_setup("executor_streaming_register_input_consumers", [&] {
+        register_streaming_input_consumers(plan, *estimates).get();
+      });
     } catch (...) {
       current_plan_ = nullptr;
       throw;
@@ -1749,6 +1818,16 @@ hpx::future<void> Executor::run_stage_eager(int32_t stage_idx, const StageIR& st
     throw std::runtime_error("executor run_stage requires active plan");
   }
   std::vector<hpx::future<void>> futures;
+  auto add_task = [&](hpx::future<void> task) {
+    // Eager dispatch already receives each completion on the coordinator.
+    if (progress_) {
+      task = task.then([progress = progress_](auto&& done) {
+        progress->completed.fetch_add(1, std::memory_order_relaxed);
+        done.get();
+      });
+    }
+    futures.push_back(std::move(task));
+  };
   for (std::size_t tmpl_idx = 0; tmpl_idx < stage.templates.size(); ++tmpl_idx) {
     const auto& tmpl = stage.templates[tmpl_idx];
     if (stage.plane == ExecPlane::Chunk) {
@@ -1761,13 +1840,11 @@ hpx::future<void> Executor::run_stage_eager(int32_t stage_idx, const StageIR& st
 
       if (tmpl.domain.blocks.has_value()) {
         for (int32_t block : tmpl.domain.blocks.value()) {
-          futures.push_back(
-              run_block_task(tmpl, stage_idx, static_cast<int32_t>(tmpl_idx), block));
+          add_task(run_block_task(tmpl, stage_idx, static_cast<int32_t>(tmpl_idx), block));
         }
       } else {
         for (int32_t block = 0; block < nblocks; ++block) {
-          futures.push_back(
-              run_block_task(tmpl, stage_idx, static_cast<int32_t>(tmpl_idx), block));
+          add_task(run_block_task(tmpl, stage_idx, static_cast<int32_t>(tmpl_idx), block));
         }
       }
     } else if (stage.plane == ExecPlane::Graph) {
@@ -1778,8 +1855,7 @@ hpx::future<void> Executor::run_stage_eager(int32_t stage_idx, const StageIR& st
       const auto& params = prepared_graph_reduce(tmpl);
       const int32_t n_groups = graph_reduce_group_count(params);
       for (int32_t group_idx = 0; group_idx < n_groups; ++group_idx) {
-        futures.push_back(
-            run_graph_task(tmpl, stage_idx, static_cast<int32_t>(tmpl_idx), group_idx));
+        add_task(run_graph_task(tmpl, stage_idx, static_cast<int32_t>(tmpl_idx), group_idx));
       }
     } else {
       return hpx::make_exceptional_future<void>(
@@ -1970,24 +2046,27 @@ hpx::future<void> Executor::register_streaming_input_consumers(
     return hpx::make_ready_future();
   }
 
-  std::unordered_map<ChunkRef, std::int64_t, ChunkRefHash, ChunkRefEq> counts;
-  for (std::size_t stage_idx = 0; stage_idx < plan.stages.size(); ++stage_idx) {
-    auto tasks =
-        expand_stage_tasks(static_cast<int32_t>(stage_idx), plan.stages[stage_idx], estimates);
-    for (const auto& task : tasks) {
-      for (const auto& ref : task.input_refs) {
-        counts[ref] += 1;
+  auto consumer_counts = trace_streaming_setup("executor_streaming_count_input_consumers", [&] {
+    std::unordered_map<ChunkRef, std::int64_t, ChunkRefHash, ChunkRefEq> counts;
+    for (std::size_t stage_idx = 0; stage_idx < plan.stages.size(); ++stage_idx) {
+      auto tasks =
+          expand_stage_tasks(static_cast<int32_t>(stage_idx), plan.stages[stage_idx], estimates);
+      for (const auto& task : tasks) {
+        for (const auto& ref : task.input_refs) {
+          counts[ref] += 1;
+        }
       }
     }
-  }
 
-  std::vector<ChunkConsumerCount> consumer_counts;
-  consumer_counts.reserve(counts.size());
-  for (const auto& [ref, count] : counts) {
-    if (count > 0) {
-      consumer_counts.push_back(ChunkConsumerCount{ref, count});
+    std::vector<ChunkConsumerCount> result;
+    result.reserve(counts.size());
+    for (const auto& [ref, count] : counts) {
+      if (count > 0) {
+        result.push_back(ChunkConsumerCount{ref, count});
+      }
     }
-  }
+    return result;
+  });
   return local_data->register_input_consumers(consumer_counts);
 }
 
@@ -1996,14 +2075,18 @@ hpx::future<void> Executor::run_stage_streaming(int32_t stage_idx, const StageIR
   if (current_plan_ == nullptr) {
     throw std::runtime_error("executor run_stage_streaming requires active plan");
   }
-  auto tasks = expand_stage_tasks(stage_idx, stage, estimates);
+  auto tasks = trace_streaming_setup("executor_streaming_expand_stage", [&] {
+    return expand_stage_tasks(stage_idx, stage, estimates);
+  }, stage_idx);
   if (tasks.empty()) {
     return hpx::make_ready_future();
   }
 
   const auto localities = hpx::find_all_localities();
   const std::size_t locality_count = std::max<std::size_t>(1, localities.size());
-  auto partitions = partition_tasks_by_locality(std::move(tasks), locality_count);
+  auto partitions = trace_streaming_setup("executor_streaming_partition_stage", [&] {
+    return partition_tasks_by_locality(std::move(tasks), locality_count);
+  }, stage_idx);
   const int here = hpx::get_locality_id();
   const std::size_t task_limit = streaming_locality_task_window();
   const std::size_t storage_unit_limit = streaming_locality_storage_unit_window();
@@ -2032,7 +2115,8 @@ hpx::future<void> Executor::run_stage_streaming(int32_t stage_idx, const StageIR
                                                            task_limit,
                                                            storage_unit_limit,
                                                            options_.max_input_bytes_per_locality,
-                                                           options_.max_output_storage_bytes_per_locality));
+                                                           options_.max_output_storage_bytes_per_locality,
+                                                           progress_));
       continue;
     }
     partition_futures.push_back(

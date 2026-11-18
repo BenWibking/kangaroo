@@ -109,7 +109,7 @@ def test_plotfile_reader_particles_diskgalaxy() -> None:
     assert int(stage_chunk["count"]) == stage_chunk["data"].shape[0]
 
 
-def _write_grown_plotfile(root, ngrow: int) -> list[float]:
+def _write_grown_plotfile(root, ngrow: int, *, single_precision: bool = False) -> list[float]:
     """A one-level 4^3 plotfile with one 2x4x4 grid pair whose FABs are stored
     over their grown boxes, ghost cells holding a sentinel. Returns grid 1's
     valid values in x-fastest order."""
@@ -119,7 +119,12 @@ def _write_grown_plotfile(root, ngrow: int) -> list[float]:
         "((0,0,0) (3,3,3) (0,0,0))\n0\n1 1 1\n0\n0\n"
         "0 2 0.0\n0\n0 2\n0 4\n0 4\n2 4\n0 4\n0 4\nLevel_0/Cell\n"
     )
-    desc = "((8, (64 11 52 0 1 12 0 1023)),(8, (8 7 6 5 4 3 2 1)))"
+    if single_precision:
+        desc = "((8, (32 8 23 0 1 9 0 127)),(4, (4 3 2 1)))"
+        scalar_format = "<f"
+    else:
+        desc = "((8, (64 11 52 0 1 12 0 1023)),(8, (8 7 6 5 4 3 2 1)))"
+        scalar_format = "<d"
     boxes = [((0, 0, 0), (1, 3, 3)), ((2, 0, 0), (3, 3, 3))]
     data = bytearray()
     offsets = []
@@ -135,7 +140,7 @@ def _write_grown_plotfile(root, ngrow: int) -> list[float]:
                 for i in range(glo[0], ghi[0] + 1):
                     valid = all(lo[a] <= c <= hi[a] for a, c in enumerate((i, j, k)))
                     value = 1.0 + i + 10.0 * j + 100.0 * k if valid else -1.0e30
-                    data += struct.pack("<d", value)
+                    data += struct.pack(scalar_format, value)
                     if valid and grid == 1:
                         expected.append(value)
     (root / "Level_0" / "Cell_D_00000").write_bytes(bytes(data))
@@ -159,11 +164,17 @@ def test_read_fab_crops_stored_ghost_cells(tmp_path) -> None:
     assert -1.0e30 not in values
 
 
-def test_streaming_plotfile_estimates_use_valid_fab_shape(tmp_path, monkeypatch) -> None:
+@pytest.mark.parametrize("like_input", [False, True], ids=["fixed-shape", "like-input"])
+@pytest.mark.parametrize("single_precision", [False, True], ids=["f64", "f32"])
+def test_streaming_plotfile_estimates_use_valid_fab_shape(
+    tmp_path, monkeypatch, like_input, single_precision
+) -> None:
+    import json
+
     import numpy as np
 
     from analysis import Runtime
-    from analysis.buffer import BufferSpec, DType, LikeInputShape
+    from analysis.buffer import BufferSpec, DType, FixedShape, LikeInputShape
     from analysis.dataset import open_dataset
     from analysis.kernel_params import FieldExprParams
     from analysis.plan import Domain, FieldRef, OutputRef, Plan, Stage
@@ -171,7 +182,9 @@ def test_streaming_plotfile_estimates_use_valid_fab_shape(tmp_path, monkeypatch)
     monkeypatch.setenv("KANGAROO_EXECUTOR_MODE", "streaming")
     monkeypatch.setenv("KANGAROO_EXECUTOR_MAX_OUTPUT_BYTES_PER_LOCALITY", "256")
     plotfile = tmp_path / "plt"
-    expected = _write_grown_plotfile(plotfile, ngrow=1)
+    expected = _write_grown_plotfile(plotfile, ngrow=1, single_precision=single_precision)
+    shape = (2, 4, 4)
+    output_shape = LikeInputShape(0) if like_input else FixedShape(shape)
     rt = Runtime()
     ds = open_dataset(str(plotfile), runtime=rt, step=0, level=0)
     source = ds.field_id("rho")
@@ -182,13 +195,47 @@ def test_streaming_plotfile_estimates_use_valid_fab_shape(tmp_path, monkeypatch)
         kernel="field_expr",
         domain=Domain(step=0, level=0),
         inputs=[FieldRef(source)],
-        outputs=[OutputRef(FieldRef(output), BufferSpec(DType.F64, LikeInputShape(0)))],
+        outputs=[OutputRef(FieldRef(output), BufferSpec(DType.F64, output_shape))],
         params=FieldExprParams("value", ("value",)),
     )
-    rt.run(Plan([stage]), runmeta=ds.get_runmeta(), dataset=ds)
+    events_path = tmp_path / "setup.jsonl"
+    rt.set_event_log_path(str(events_path))
+    try:
+        rt.run(Plan([stage]), runmeta=ds.get_runmeta(), dataset=ds)
+    finally:
+        rt.set_event_log_path("")
+
+    events = [json.loads(line) for line in events_path.read_text().splitlines()]
+    phases = {
+        (e["name"], e["status"]): e["ts"]
+        for e in events if e["type"] == "phase" and e["category"] == "kangaroo.executor.setup"
+    }
+    build = "executor_streaming_build_output_estimates"
+    register = "executor_streaming_register_input_consumers"
+    count = "executor_streaming_count_input_consumers"
+    expand = "executor_streaming_expand_stage/0"
+    partition = "executor_streaming_partition_stage/0"
+    order = [(build, "start"), (build, "end"), (register, "start"), (count, "start"),
+             (count, "end"), (register, "end"), (expand, "start"), (expand, "end"),
+             (partition, "start"), (partition, "end")]
+    timestamps = [phases[key] for key in order]
+    assert timestamps == sorted(timestamps)
+    reads = [e for e in events if e.get("op") == "plotfile_read_fab_header"]
+    assert sorted(e["block"] for e in reads) == ([0, 1] if like_input else [])
+    for read in reads:
+        assert read["status"] == "end"
+        assert phases[build, "start"] <= read["start"] <= read["end"] <= phases[build, "end"]
+
+    queues = [e for e in events if e.get("op") == "dataset_load_queue"]
+    assert sorted(e["block"] for e in queues) == [0, 1]
+    assert all(e["estimated_bytes"] == 2 * 4 * 4 * 8 for e in queues)
+    payloads = [e for e in events if e.get("op") == "plotfile_read_fab" and e["status"] == "end"]
+    assert sorted(e["block"] for e in payloads) == [0, 1]
+    assert all(e["bytes"] == 2 * 4 * 4 * (4 if single_precision else 8) for e in payloads)
+    assert all(e["start"] >= phases[partition, "end"] for e in payloads)
 
     got = rt.get_task_chunk_array(
         step=0, level=0, field=output, version=0, block=1,
-        shape=(2, 4, 4), dtype=np.float64, dataset=ds,
+        shape=shape, dtype=np.float64, dataset=ds,
     )
     np.testing.assert_array_equal(got.ravel(order="F"), expected)
