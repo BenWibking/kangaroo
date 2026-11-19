@@ -1446,6 +1446,22 @@ class CylindricalMoments:
         return ctx.fragment(reductions.stages)
 
 
+# Keep this order in sync with cylindrical_flux_surface_integral_accumulate.
+CYLINDRICAL_FLUX_COMPONENTS = (
+    "mass_flux_cylinder",
+    "hydro_energy_flux_cylinder",
+    "mhd_energy_flux_cylinder",
+    "passive_scalar_flux_cylinder",
+    "advective_radial_angular_momentum_flux_cylinder",
+    "maxwell_radial_angular_momentum_flux_cylinder",
+    "advective_vertical_angular_momentum_flux_cylinder",
+    "maxwell_vertical_angular_momentum_flux_cylinder",
+    "kinetic_energy_flux_cylinder",
+    "thermal_enthalpy_flux_cylinder",
+    "poynting_flux_cylinder",
+)
+
+
 class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
     def __init__(
         self,
@@ -1578,10 +1594,11 @@ class CylindricalFluxSurfaceIntegral(FluxSurfaceIntegral):
         out_shape_parts.append(2)
         if num_temperature_bins > 1:
             out_shape_parts.append(num_temperature_bins)
+        num_components = len(CYLINDRICAL_FLUX_COMPONENTS)
         if len(out_shape_parts) < 3:
-            out_shape_parts.extend((num_geometric_sections, 8))
+            out_shape_parts.extend((num_geometric_sections, num_components))
         else:
-            out_shape_parts.append(num_geometric_sections * 8)
+            out_shape_parts.append(num_geometric_sections * num_components)
         out_shape = tuple(out_shape_parts)
         radius_intersects = [False] * len(self.radii)
         height_intersects = [False] * len(self.heights)
@@ -1865,6 +1882,7 @@ class Histogram2D:
         out_name: str = "histogram2d",
         weight_field: int | None = None,
         weight_mode: str = "input",
+        log_bins: bool = False,
         domain: Domain | None = None,
         reduce_fan_in: Optional[int] = None,
     ) -> None:
@@ -1876,6 +1894,7 @@ class Histogram2D:
         self.out_name = out_name
         self.weight_field = weight_field
         self.weight_mode = weight_mode
+        self.log_bins = log_bins
         self.domain = domain
         self.reduce_fan_in = reduce_fan_in
 
@@ -1890,6 +1909,9 @@ class Histogram2D:
             raise ValueError("histogram ranges must be finite")
         if x1 <= x0 or y1 <= y0:
             raise ValueError("histogram ranges must be increasing")
+        if self.log_bins and (x0 <= 0 or y0 <= 0 or math.log10(x1) <= math.log10(x0)
+                              or math.log10(y1) <= math.log10(y0)):
+            raise ValueError("log histogram ranges must be positive and increasing in log space")
 
         levels = ctx.runmeta.steps[ds.step].levels
         hist_fields: list[ReducedField] = []
@@ -1919,26 +1941,25 @@ class Histogram2D:
             hist_field = ctx.temp_field(f"{self.out_name}_sum_l{level_idx}")
 
             stage = ctx.stage("histogram2d")
-            for block in blocks:
-                dom = ctx.domain(step=ds.step, level=level_idx, blocks=[block])
-                inputs = [FieldRef(self.x_field), FieldRef(self.y_field)]
-                if self.weight_field is not None:
-                    inputs.append(FieldRef(self.weight_field))
-                stage.map_blocks(
-                    name=f"histogram2d_b{block}",
-                    kernel="histogram2d_accumulate",
-                    domain=dom,
-                    inputs=inputs,
-                    outputs=[_fixed_f64_shape(hist_field, (nx, ny))],
-                    deps=DependencyRule(),
-                    params=Histogram2DParams(
-                        x_range=(float(x0), float(x1)),
-                        y_range=(float(y0), float(y1)),
-                        bins=(int(nx), int(ny)),
-                        weight_mode=self.weight_mode,
-                        covered_boxes=covered_payload,
-                    ),
-                )
+            inputs = [FieldRef(self.x_field), FieldRef(self.y_field)]
+            if self.weight_field is not None:
+                inputs.append(FieldRef(self.weight_field))
+            stage.map_blocks(
+                name=f"histogram2d_l{level_idx}",
+                kernel="histogram2d_accumulate",
+                domain=ctx.domain(step=ds.step, level=level_idx, blocks=blocks),
+                inputs=inputs,
+                outputs=[_fixed_f64_shape(hist_field, (nx, ny))],
+                deps=DependencyRule(),
+                params=Histogram2DParams(
+                    x_range=(float(x0), float(x1)),
+                    y_range=(float(y0), float(y1)),
+                    bins=(int(nx), int(ny)),
+                    weight_mode=self.weight_mode,
+                    covered_boxes=covered_payload,
+                    log_bins=self.log_bins,
+                ),
+            )
             reductions.add_stage(stage, outputs=[hist_field])
             hist_fields.append(
                 reductions.reduce_blocks(
@@ -2012,9 +2033,17 @@ def histogram_edges_2d(
     x_range: tuple[float, float],
     y_range: tuple[float, float],
     bins: tuple[int, int],
+    *,
+    log_bins: bool = False,
 ) -> tuple[list[float], list[float]]:
-    nx, ny = bins
-    return histogram_edges_1d(x_range, nx), histogram_edges_1d(y_range, ny)
+    def edges(bounds: tuple[float, float], count: int) -> list[float]:
+        if not log_bins:
+            return histogram_edges_1d(bounds, count)
+        lo, hi = bounds
+        log_edges = histogram_edges_1d((math.log10(lo), math.log10(hi)), count)
+        return [lo, *(10.0 ** edge for edge in log_edges[1:-1]), hi]
+
+    return edges(x_range, bins[0]), edges(y_range, bins[1])
 
 
 def cdf_from_histogram(counts: Sequence[float], *, normalize: bool = True) -> list[float]:

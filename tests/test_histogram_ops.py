@@ -297,6 +297,44 @@ def test_histogram1d_amr_covered_boxes_masking() -> None:
     assert np.allclose(raw, np.array([288.0]))
 
 
+def test_log_temperature_density_histogram_weights_uncovered_amr_cells(monkeypatch) -> None:
+    monkeypatch.setenv("KANGAROO_EXECUTOR_MODE", "streaming")
+    levels = [
+        LevelMeta(LevelGeom(dx=(2.0, 2.0, 2.0), x0=(0.0, 0.0, 0.0), ref_ratio=2),
+                  [BlockBox((0, 0, 0), (3, 0, 0))]),
+        LevelMeta(LevelGeom(dx=(1.0, 1.0, 1.0), x0=(0.0, 0.0, 0.0), ref_ratio=1),
+                  [BlockBox((0, 0, 0), (1, 1, 1))]),
+    ]
+    runmeta = _runmeta_with_step_index(0, levels)
+    rt = Runtime()
+    ds = open_dataset("memory://phase-diagram", runmeta=runmeta, runtime=rt)
+    coarse_density = np.array([100., 10., 100., 1.]).reshape(4, 1, 1)
+    coarse_temp = np.array([1000., 100., 1000., np.nan]).reshape(4, 1, 1)
+    fine_density = np.array([1., 3., 0., -1., 11., 12., 101., np.inf]).reshape(2, 2, 2)
+    fine_temp = np.array([10., 15., 20., 25., 25., 0., 30., 40.]).reshape(2, 2, 2)
+    for level, (density, temperature) in enumerate(
+        [(coarse_density, coarse_temp), (fine_density, fine_temp)]
+    ):
+        for field, values in enumerate((density, temperature), start=1):
+            _set_block_double(ds, step=0, level=level, field=field, block=0, values=values)
+    pipe = Pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+    hist = pipe.histogram2d(1, 2, x_range=(1., 100.), y_range=(10., 1000.),
+                            bins=(2, 2), weight_mode="cell_mass", log_bins=True)
+    pipe.run()
+    density_edges, temperature_edges = hist.edges
+    np.testing.assert_allclose(density_edges, [1., 10., 100.])
+    np.testing.assert_allclose(temperature_edges, [10., 100., 1000.])
+    density = np.r_[coarse_density[1:].ravel(), fine_density.ravel()]
+    temperature = np.r_[coarse_temp[1:].ravel(), fine_temp.ravel()]
+    weights = density * np.r_[np.full(3, 8.0), np.ones(8)]
+    valid = np.isfinite(density) & np.isfinite(temperature)
+    expected, _, _ = np.histogram2d(density[valid], temperature[valid],
+                                     bins=hist.edges, weights=weights[valid])
+    actual = rt.get_task_chunk_array(step=0, level=0, field=hist.counts.field, block=0, dataset=ds)
+    np.testing.assert_allclose(actual, expected)
+    assert actual.sum() == 895.0
+
+
 def test_histogram_cdf_helpers() -> None:
     cdf = cdf_from_histogram([1.0, 2.0, 3.0])
     assert np.allclose(cdf, np.array([1.0 / 6.0, 3.0 / 6.0, 1.0]))

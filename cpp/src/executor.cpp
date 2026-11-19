@@ -1597,6 +1597,8 @@ void prepare_plan(PlanIR& plan, KernelRegistry& kernels) {
   validate_plan_kernel_contracts(plan, kernels);
   std::vector<std::shared_ptr<const CoveredBoxListIR>> shared_covered_boxes;
   shared_covered_boxes.reserve(plan.shared_covered_boxes.size());
+  std::vector<std::shared_ptr<const BoxSpatialIndex>> coverage_indices(
+      plan.shared_covered_boxes.size());
   for (const auto& boxes : plan.shared_covered_boxes) {
     shared_covered_boxes.push_back(std::make_shared<CoveredBoxListIR>(boxes));
   }
@@ -1615,7 +1617,23 @@ void prepare_plan(PlanIR& plan, KernelRegistry& kernels) {
       }
       std::visit(
           [&](auto& params) {
-            if constexpr (requires { params.covered_boxes; }) {
+            if constexpr (requires { params.coverage_index; }) {
+              params.coverage_index.reset();
+              if (covered_boxes && !covered_boxes->empty()) {
+                auto& index = coverage_indices[tmpl.covered_boxes_ref];
+                if (!index) {
+                  std::vector<BlockBox> boxes;
+                  boxes.reserve(covered_boxes->size());
+                  for (const auto& b : *covered_boxes) {
+                    if (b.lo[0] <= b.hi[0] && b.lo[1] <= b.hi[1] && b.lo[2] <= b.hi[2]) {
+                      boxes.push_back({{b.lo[0], b.lo[1], b.lo[2]}, {b.hi[0], b.hi[1], b.hi[2]}});
+                    }
+                  }
+                  index = std::make_shared<BoxSpatialIndex>(boxes);
+                }
+                params.coverage_index = index;
+              }
+            } else if constexpr (requires { params.covered_boxes; }) {
               params.covered_boxes = covered_boxes;
             }
           },

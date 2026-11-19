@@ -118,6 +118,7 @@ class Histogram2DParams:
     bins: tuple[int, int] = (1, 1)
     weight_mode: str = "input"
     covered_boxes: CoveredBoxes = ()
+    log_bins: bool = False
 
 
 @dataclass(frozen=True)

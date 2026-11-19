@@ -16,6 +16,8 @@
 
 namespace kangaroo {
 
+class BoxSpatialIndex;
+
 struct CoveredBoxIR {
   std::array<int32_t, 3> lo{0, 0, 0};
   std::array<int32_t, 3> hi{0, 0, 0};
@@ -144,8 +146,9 @@ struct Histogram2DParams {
   std::array<double, 2> y_range{0.0, 1.0};
   std::array<int32_t, 2> bins{1, 1};
   std::string weight_mode{"input"};
-  std::shared_ptr<const CoveredBoxListIR> covered_boxes;
-  KANGAROO_SERIALIZE_FIELDS(x_range & y_range & bins & weight_mode)
+  bool log_bins = false;
+  std::shared_ptr<const BoxSpatialIndex> coverage_index;  // Built locally from the plan.
+  KANGAROO_SERIALIZE_FIELDS(x_range & y_range & bins & weight_mode & log_bins)
 };
 
 struct ParticleFieldParams {

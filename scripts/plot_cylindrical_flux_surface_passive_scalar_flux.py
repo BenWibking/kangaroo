@@ -11,6 +11,11 @@ from typing import Any, NamedTuple
 import matplotlib.pyplot as plt
 import numpy as np
 
+if __package__:
+    from .plot_signed_flux import SIGN_LEGEND, fit_plot_title, flux_y_limits, plot_signed_flux
+else:
+    from plot_signed_flux import SIGN_LEGEND, fit_plot_title, flux_y_limits, plot_signed_flux
+
 
 FLUX_KEY = "passive_scalar_flux_cylinder"
 GEOMETRIC_SECTIONS = ("walls", "endcaps")
@@ -39,7 +44,7 @@ class ScalarFluxData(NamedTuple):
 
 class AxisLimits(NamedTuple):
     xlim: tuple[float, float]
-    ylim: tuple[float, float]
+    ylim: tuple[float, float] | None
 
 
 def _temperature_label(row: dict[str, Any]) -> str:
@@ -241,17 +246,20 @@ def _setup_axes(
     linear_y: bool,
     axis_limits: AxisLimits | None,
 ) -> None:
-    ax.axhline(0.0, color="0.3", linewidth=0.8)
     ax.set_xscale("log")
-    if not linear_y:
-        ax.set_yscale("symlog")
+    if linear_y:
+        ax.axhline(0.0, color="0.3", linewidth=0.8)
+    else:
+        ax.set_yscale("log")
     if axis_limits is not None:
         ax.set_xlim(axis_limits.xlim)
-        ax.set_ylim(axis_limits.ylim)
+        if axis_limits.ylim is not None:
+            ax.set_ylim(axis_limits.ylim)
     ax.set_xlabel("half-height [kpc]")
-    ax.set_ylabel(f"{scalar_name} flux [{MSUN_PER_YEAR_LABEL}]")
-    ax.set_title(title)
-    ax.legend(fontsize="small")
+    quantity = "flux" if linear_y else "flux magnitude"
+    ax.set_ylabel(f"{scalar_name} {quantity} [{MSUN_PER_YEAR_LABEL}]")
+    fit_plot_title(ax.set_title(title), ax.bbox.width)
+    ax.legend(fontsize="small", title=None if linear_y else SIGN_LEGEND)
     ax.grid(True, which="both", alpha=0.25)
 
 
@@ -265,9 +273,11 @@ def _plot_lines(
 ) -> None:
     fig, ax = plt.subplots(figsize=(7, 4.5))
     for values, label, linestyle in lines:
-        ax.plot(
+        plot_signed_flux(
+            ax,
             data.height_kpc,
             values,
+            linear_y=linear_y,
             marker="o",
             linewidth=1.6,
             markersize=4,
@@ -275,6 +285,8 @@ def _plot_lines(
             label=label,
         )
     _setup_axes(ax, title, data.scalar_name, linear_y, axis_limits)
+    if not linear_y:
+        ax.set_ylim(flux_y_limits([values for values, _, _ in lines], linear_y=False))
     fig.tight_layout()
     fig.savefig(output, dpi=200)
     plt.close(fig)
@@ -283,6 +295,8 @@ def _plot_lines(
 def _compute_axis_limits(
     height_kpc: np.ndarray,
     y_values: list[np.ndarray],
+    *,
+    linear_y: bool,
 ) -> AxisLimits:
     height = np.asarray(height_kpc, dtype=np.float64)
     if np.any(height <= 0.0):
@@ -295,18 +309,8 @@ def _compute_axis_limits(
         x_pad = 10.0 ** (0.03 * np.log10(x_max / x_min))
         xlim = (x_min / x_pad, x_max * x_pad)
 
-    y = np.concatenate([np.ravel(values) for values in y_values])
-    y_min = float(np.min(y))
-    y_max = float(np.max(y))
-    if y_min == y_max:
-        padding = max(abs(y_min) * 0.05, 1.0)
-    else:
-        padding = 0.05 * (y_max - y_min)
-    ylim = (y_min - padding, y_max + padding)
-    if ylim[0] <= 0.0 <= ylim[1]:
-        max_abs = max(abs(ylim[0]), abs(ylim[1]))
-        ylim = (-max_abs, max_abs)
-    return AxisLimits(xlim=xlim, ylim=ylim)
+    # Share y limits across temperature plots only in linear mode.
+    return AxisLimits(xlim=xlim, ylim=flux_y_limits(y_values, linear_y=True) if linear_y else None)
 
 
 def _plot_scalar_flux_set(
@@ -319,6 +323,7 @@ def _plot_scalar_flux_set(
         axis_limits = _compute_axis_limits(
             data.height_kpc,
             [data.positive, data.negative, data.net],
+            linear_y=linear_y,
         )
         _plot_lines(
             output,
@@ -342,6 +347,7 @@ def _plot_scalar_flux_set(
     total_axis_limits = _compute_axis_limits(
         data.height_kpc,
         [total_inflows, total_outflows, total_net],
+        linear_y=linear_y,
     )
     axis_limits = _compute_axis_limits(
         data.height_kpc,
@@ -350,6 +356,7 @@ def _plot_scalar_flux_set(
             temp.positive,
             net_by_temperature,
         ],
+        linear_y=linear_y,
     )
     outputs: list[Path] = []
 
@@ -446,7 +453,7 @@ def main() -> int:
     parser.add_argument(
         "--linear-y",
         action="store_true",
-        help="Use a linear y-axis instead of symlog.",
+        help="Plot signed values on a linear y-axis instead of log magnitudes.",
     )
     args = parser.parse_args()
 

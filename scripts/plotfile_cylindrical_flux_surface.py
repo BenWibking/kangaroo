@@ -26,9 +26,10 @@ if REPO_ROOT not in sys.path:
 
 from analysis import Runtime, run_console_main  # noqa: E402
 from analysis.dataset import open_dataset  # noqa: E402
+from analysis.ops import CYLINDRICAL_FLUX_COMPONENTS as COMPONENTS  # noqa: E402
 from analysis.pipeline import pipeline  # noqa: E402
+from analysis.runtime import trace_phase  # noqa: E402
 from scripts.plotfile_flux_surface import (  # noqa: E402
-    COMPONENTS as SPHERE_COMPONENTS,
     FIELD_CANDIDATES,
     MSUN_G,
     SIGN_BINS,
@@ -43,12 +44,6 @@ from scripts.plotfile_flux_surface import (  # noqa: E402
 )
 
 
-COMPONENTS = tuple(name.replace("_sphere", "_cylinder") for name in SPHERE_COMPONENTS) + (
-    "advective_radial_angular_momentum_flux_cylinder",
-    "maxwell_radial_angular_momentum_flux_cylinder",
-    "advective_vertical_angular_momentum_flux_cylinder",
-    "maxwell_vertical_angular_momentum_flux_cylinder",
-)
 GEOMETRIC_SECTIONS = ("endcaps", "walls")
 
 
@@ -95,7 +90,7 @@ def _flux_rows_and_derived(
         ):
             values_by_temperature_section = values[:, :, np.newaxis, :, :]
         else:
-            raise ValueError("flux values must have shape (num_heights, 2, 2, 8)")
+            raise ValueError(f"flux values must have shape (num_heights, 2, 2, {len(COMPONENTS)})")
         temperature_edges = None
     else:
         expected_shape = (
@@ -116,7 +111,8 @@ def _flux_rows_and_derived(
             values_by_temperature_section[:, :, :, 1, :] = values
         elif values.shape != expected_shape:
             raise ValueError(
-                "flux values must have shape (num_heights, 2, num_temperature_bins, 2, 8)"
+                "flux values must have shape "
+                f"(num_heights, 2, num_temperature_bins, 2, {len(COMPONENTS)})"
             )
         else:
             values_by_temperature_section = values
@@ -292,10 +288,12 @@ def main() -> int:
     rt = Runtime.from_parsed_args(a, unknown_args=u)
 
     def _run() -> int:
-        ds = open_dataset(a.plotfile, runtime=rt, step=0, level=0)
-        bundle = ds.metadata_bundle()
-        runmeta = bundle.runmeta
-        available = _metadata_var_names(bundle.dataset)
+        with trace_phase("python_open_plotfile"):
+            ds = open_dataset(a.plotfile, runtime=rt, step=0, level=0)
+        with trace_phase("python_load_plotfile_metadata"):
+            bundle = ds.metadata_bundle()
+            runmeta = bundle.runmeta
+            available = _metadata_var_names(bundle.dataset)
 
         if a.list_fields:
             for idx, name in enumerate(available):
@@ -399,34 +397,35 @@ def main() -> int:
             file=sys.stderr,
             flush=True,
         )
-        pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
-        density = pipe.field(fields["density"][1])
-        momentum = tuple(
-            pipe.field(fields[role][1]) for role in ("momx", "momy", "momz")
-        )
-        energy = pipe.field(fields["energy"][1])
-        passive_scalar = pipe.field(fields["scalar"][1])
-        magnetic_field = tuple(
-            pipe.field(fields[role][1]) for role in ("bx", "by", "bz")
-        )
-        temperature = (
-            pipe.field(fields["temperature"][1])
-            if temperature_bins is not None
-            else None
-        )
-        flux = pipe.cylindrical_flux_surface_integral(
-            density,
-            momentum=momentum,
-            energy=energy,
-            passive_scalar=passive_scalar,
-            magnetic_field=magnetic_field,
-            radius=radii,
-            height=heights,
-            temperature=temperature,
-            temperature_bins=temperature_bins,
-            gamma=float(a.gamma),
-            out="cylindrical_flux_surface_integral",
-        )
+        with trace_phase("python_build_cylindrical_flux_plan"):
+            pipe = pipeline(runtime=rt, runmeta=runmeta, dataset=ds)
+            density = pipe.field(fields["density"][1])
+            momentum = tuple(
+                pipe.field(fields[role][1]) for role in ("momx", "momy", "momz")
+            )
+            energy = pipe.field(fields["energy"][1])
+            passive_scalar = pipe.field(fields["scalar"][1])
+            magnetic_field = tuple(
+                pipe.field(fields[role][1]) for role in ("bx", "by", "bz")
+            )
+            temperature = (
+                pipe.field(fields["temperature"][1])
+                if temperature_bins is not None
+                else None
+            )
+            flux = pipe.cylindrical_flux_surface_integral(
+                density,
+                momentum=momentum,
+                energy=energy,
+                passive_scalar=passive_scalar,
+                magnetic_field=magnetic_field,
+                radius=radii,
+                height=heights,
+                temperature=temperature,
+                temperature_bins=temperature_bins,
+                gamma=float(a.gamma),
+                out="cylindrical_flux_surface_integral",
+            )
         pipe.run(progress_bar=bool(a.progress))
 
         scan_count = max(len(radii), len(heights))
@@ -539,6 +538,7 @@ def main() -> int:
             "endcap_normal_convention": "upper +z, lower -z; both summed",
             "center": [0.0, 0.0, 0.0],
             "magnetic_normalization": "magnetic_energy_density = B^2/2",
+            "energy_flux_units": "erg s^-1 (for cgs input)",
             "radial_angular_momentum_flux_units": "g cm^2 s^-2 (for cgs input)",
             "vertical_angular_momentum_flux_units": "g cm^2 s^-2 (for cgs input)",
             "sign_bin_convention": "sign of each flux component, not velocity",

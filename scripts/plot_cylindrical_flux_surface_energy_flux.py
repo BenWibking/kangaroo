@@ -11,10 +11,22 @@ from typing import Any, NamedTuple
 import matplotlib.pyplot as plt
 import numpy as np
 
+if __package__:
+    from .plot_signed_flux import SIGN_LEGEND, fit_plot_title, flux_y_limits, plot_signed_flux
+else:
+    from plot_signed_flux import SIGN_LEGEND, fit_plot_title, flux_y_limits, plot_signed_flux
+
 
 ENERGY_COMPONENTS = {
     "hydro": ("hydro_energy_flux_cylinder", "hydro energy flux"),
     "mhd": ("mhd_energy_flux_cylinder", "MHD energy flux"),
+    "kinetic": ("kinetic_energy_flux_cylinder", "kinetic energy flux"),
+    "enthalpy": ("thermal_enthalpy_flux_cylinder", "thermal enthalpy flux"),
+    "poynting": ("poynting_flux_cylinder", "Poynting flux"),
+}
+ENERGY_BREAKDOWN = {
+    "hydro": ("kinetic", "enthalpy"),
+    "mhd": ("kinetic", "enthalpy", "poynting"),
 }
 GEOMETRIC_SECTIONS = ("walls", "endcaps")
 LSUN_ERG_PER_S = 3.828e33
@@ -41,7 +53,7 @@ class EnergyFluxData(NamedTuple):
 
 class AxisLimits(NamedTuple):
     xlim: tuple[float, float]
-    ylim: tuple[float, float]
+    ylim: tuple[float, float] | None
 
 
 def _temperature_label(row: dict[str, Any]) -> str:
@@ -147,11 +159,9 @@ def _flux_rows_from_single_height(data: dict[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
-def _load_energy_flux(path: Path, section: str, component: str) -> EnergyFluxData:
+def _load_energy_flux(data: dict[str, Any], section: str, component: str) -> EnergyFluxData:
     section = _section_label(section)
     flux_key, component_label = ENERGY_COMPONENTS[component]
-    with path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
 
     time = data.get("time")
     time_myr = None if time is None else float(time) / SECONDS_PER_MYR
@@ -262,17 +272,20 @@ def _setup_axes(
     linear_y: bool,
     axis_limits: AxisLimits | None,
 ) -> None:
-    ax.axhline(0.0, color="0.3", linewidth=0.8)
     ax.set_xscale("log")
-    if not linear_y:
-        ax.set_yscale("symlog", linthresh=0.1)
+    if linear_y:
+        ax.axhline(0.0, color="0.3", linewidth=0.8)
+    else:
+        ax.set_yscale("log")
     if axis_limits is not None:
         ax.set_xlim(axis_limits.xlim)
-        ax.set_ylim(axis_limits.ylim)
+        if axis_limits.ylim is not None:
+            ax.set_ylim(axis_limits.ylim)
     ax.set_xlabel("half-height [kpc]")
-    ax.set_ylabel(f"{component_label} [{LSUN_LABEL}]")
-    ax.set_title(title)
-    ax.legend(fontsize="small")
+    quantity = component_label if linear_y else f"{component_label} magnitude"
+    ax.set_ylabel(f"{quantity} [{LSUN_LABEL}]")
+    fit_plot_title(ax.set_title(title), ax.bbox.width)
+    ax.legend(fontsize="small", title=None if linear_y else SIGN_LEGEND)
     ax.grid(True, which="both", alpha=0.25)
 
 
@@ -286,9 +299,11 @@ def _plot_lines(
 ) -> None:
     fig, ax = plt.subplots(figsize=(7, 4.5))
     for values, label, linestyle in lines:
-        ax.plot(
+        plot_signed_flux(
+            ax,
             data.height_kpc,
             values,
+            linear_y=linear_y,
             marker="o",
             linewidth=1.6,
             markersize=4,
@@ -296,6 +311,8 @@ def _plot_lines(
             label=label,
         )
     _setup_axes(ax, title, data.component_label, linear_y, axis_limits)
+    if not linear_y:
+        ax.set_ylim(flux_y_limits([values for values, _, _ in lines], linear_y=False))
     fig.tight_layout()
     fig.savefig(output, dpi=200)
     plt.close(fig)
@@ -304,6 +321,8 @@ def _plot_lines(
 def _compute_axis_limits(
     height_kpc: np.ndarray,
     y_values: list[np.ndarray],
+    *,
+    linear_y: bool,
 ) -> AxisLimits:
     height = np.asarray(height_kpc, dtype=np.float64)
     if np.any(height <= 0.0):
@@ -316,72 +335,66 @@ def _compute_axis_limits(
         x_pad = 10.0 ** (0.03 * np.log10(x_max / x_min))
         xlim = (x_min / x_pad, x_max * x_pad)
 
-    y = np.concatenate([np.ravel(values) for values in y_values])
-    y_min = float(np.min(y))
-    y_max = float(np.max(y))
-    if y_min == y_max:
-        padding = max(abs(y_min) * 0.05, 1.0)
-    else:
-        padding = 0.05 * (y_max - y_min)
-    ylim = (y_min - padding, y_max + padding)
-    if ylim[0] <= 0.0 <= ylim[1]:
-        max_abs = max(abs(ylim[0]), abs(ylim[1]))
-        ylim = (-max_abs, max_abs)
-    return AxisLimits(xlim=xlim, ylim=ylim)
+    # Share y limits across temperature plots only in linear mode.
+    return AxisLimits(xlim=xlim, ylim=flux_y_limits(y_values, linear_y=True) if linear_y else None)
+
+
+def _energy_budget_lines(
+    data: EnergyFluxData, breakdown: list[EnergyFluxData], temperature_bin: int | None = None,
+) -> list[tuple[np.ndarray, str, str]]:
+    def signed_fluxes(channel: EnergyFluxData) -> tuple[np.ndarray, np.ndarray]:
+        if temperature_bin is not None:
+            temp = channel.temperature
+            if temp is None:
+                raise ValueError(f"Temperature bins missing for {channel.component_label}.")
+            return temp.negative[temperature_bin], temp.positive[temperature_bin]
+        return channel.negative, channel.positive
+
+    negative, positive = signed_fluxes(data)
+    lines = [(negative, "total negative", "-"), (positive, "total positive", "-"),
+             (negative + positive, "total net", "--")]
+    for channel in breakdown:
+        negative, positive = signed_fluxes(channel)
+        lines.append((negative + positive, f"{channel.component_label} (net)", "-"))
+    return lines
 
 
 def _plot_energy_flux_set(
     data: EnergyFluxData,
+    breakdown: list[EnergyFluxData],
     output: Path,
     title: str,
     linear_y: bool,
 ) -> list[Path]:
+    total_lines = _energy_budget_lines(data, breakdown)
+    total_axis_limits = _compute_axis_limits(
+        data.height_kpc, [values for values, _, _ in total_lines], linear_y=linear_y,
+    )
     if data.temperature is None:
-        axis_limits = _compute_axis_limits(
-            data.height_kpc,
-            [data.positive, data.negative, data.net],
-        )
         _plot_lines(
             output,
             data,
-            [
-                (data.negative, "negative", "-"),
-                (data.positive, "positive", "-"),
-                (data.net, "net", "--"),
-            ],
+            total_lines,
             title,
             linear_y,
-            axis_limits,
+            total_axis_limits,
         )
         return [output]
 
     temp = data.temperature
     net_by_temperature = temp.negative + temp.positive
-    total_negative = np.sum(temp.negative, axis=0)
-    total_positive = np.sum(temp.positive, axis=0)
-    total_net = total_negative + total_positive
-    total_axis_limits = _compute_axis_limits(
-        data.height_kpc,
-        [total_negative, total_positive, total_net],
-    )
+    bin_lines = [_energy_budget_lines(data, breakdown, i) for i in range(len(temp.labels))]
     axis_limits = _compute_axis_limits(
         data.height_kpc,
-        [
-            temp.negative,
-            temp.positive,
-            net_by_temperature,
-        ],
+        [values for lines in bin_lines for values, _, _ in lines],
+        linear_y=linear_y,
     )
     outputs: list[Path] = []
 
     _plot_lines(
         output,
         data,
-        [
-            (total_negative, "negative", "-"),
-            (total_positive, "positive", "-"),
-            (total_net, "net", "--"),
-        ],
+        total_lines,
         f"{title}: all temperature phases",
         linear_y,
         total_axis_limits,
@@ -426,11 +439,7 @@ def _plot_energy_flux_set(
         _plot_lines(
             bin_output,
             data,
-            [
-                (temp.negative[i], "negative", "-"),
-                (temp.positive[i], "positive", "-"),
-                (net_by_temperature[i], "net", "--"),
-            ],
+            bin_lines[i],
             f"{title}: {label}",
             linear_y,
             axis_limits,
@@ -479,13 +488,13 @@ def main() -> int:
     parser.add_argument(
         "--linear-y",
         action="store_true",
-        help="Use a linear y-axis instead of symlog.",
+        help="Plot signed values on a linear y-axis instead of log magnitudes.",
     )
     args = parser.parse_args()
 
     output = Path(args.output)
     components = (
-        list(ENERGY_COMPONENTS)
+        list(ENERGY_BREAKDOWN)
         if args.component == "both"
         else [args.component]
     )
@@ -496,16 +505,26 @@ def main() -> int:
     )
     include_component = len(components) > 1
 
+    with Path(args.input).open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    rows = payload.get("fluxes_by_height") or _flux_rows_from_single_height(payload)
+    recorded_components = rows[0].get("fluxes", {})
     outputs: list[Path] = []
     for component in components:
         for section in sections:
-            data = _load_energy_flux(Path(args.input), section, component)
+            data = _load_energy_flux(payload, section, component)
+            breakdown = [
+                _load_energy_flux(payload, section, term)
+                for term in ENERGY_BREAKDOWN[component]
+                if ENERGY_COMPONENTS[term][0] in recorded_components
+            ]
             title = f"{args.title}: {data.component_label} ({section})"
             if data.time_myr is not None:
                 title = f"{title}, t = {data.time_myr:.3f} Myr"
             outputs.extend(
                 _plot_energy_flux_set(
                     data,
+                    breakdown,
                     _section_output(output, component, section, include_component),
                     title,
                     args.linear_y,

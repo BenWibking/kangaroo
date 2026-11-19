@@ -165,6 +165,25 @@ internal energy, magnetic fields, and `gpot`.
 `projection` uses the stellar yz-map settings in `batch/make_projection.submit`
 and writes `stellar_projection_yz.png`.
 
+`temperature-density` sums gas mass (`density × cell volume`) into logarithmic
+bins, excluding coarse cells covered by finer AMR grids. Specify positive ranges
+in g/cm³ and K; cells outside either range are omitted. Density and temperature
+fields are inferred from plotfile metadata, or can be set with `--density FIELD`
+and `--temperature FIELD`.
+
+```bash
+kangaroo temperature-density /path/to/plt000100 --campaign my_run \
+  --density-range 1e-30 1e-20 --temperature-range 10 1e9 --bins 128 128 \
+  -- --time=02:00:00
+kangaroo plot-temperature-density plt000100 --campaign my_run
+```
+
+`temperature_density/temperature_density_histogram.json` stores the physical
+bin edges, mass per bin in solar masses (density index first), and total in-range
+mass. The plotting command writes `temperature_density.png` beside it and
+requires only the JSON. On large plotfiles, increase bin counts cautiously:
+partial histograms use memory proportional to blocks per level × bins per plot.
+
 ### Plot completed results
 
 Plotting commands use NumPy and Matplotlib from the same `pixi-hpx` environment

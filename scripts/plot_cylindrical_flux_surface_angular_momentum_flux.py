@@ -19,6 +19,11 @@ from typing import Any, NamedTuple
 import matplotlib.pyplot as plt
 import numpy as np
 
+if __package__:
+    from .plot_signed_flux import SIGN_LEGEND, fit_plot_title, flux_y_limits, plot_signed_flux
+else:
+    from plot_signed_flux import SIGN_LEGEND, fit_plot_title, flux_y_limits, plot_signed_flux
+
 
 SECONDS_PER_MYR = 1.0e6 * 365.25 * 24.0 * 3600.0
 FLUX_UNITS_LABEL = r"g cm$^2$ s$^{-2}$"
@@ -210,23 +215,25 @@ def _plot_direction(
     linear_y: bool,
     x_axis: str,
 ) -> None:
-    ax.axhline(0.0, color="0.3", linewidth=0.8)
-    ax.plot(flux.x_kpc, flux.advective, "o-", label="advective")
-    ax.plot(flux.x_kpc, flux.maxwell, "o-", label="Maxwell")
-    ax.plot(flux.x_kpc, flux.total, "o--", label="total")
+    if linear_y:
+        ax.axhline(0.0, color="0.3", linewidth=0.8)
+    for values, label, linestyle in (
+        (flux.advective, "advective", "-"),
+        (flux.maxwell, "Maxwell", "-"),
+        (flux.total, "total", "--"),
+    ):
+        plot_signed_flux(ax, flux.x_kpc, values, label=label, linear_y=linear_y,
+                         linestyle=linestyle, marker="o")
     ax.set_xscale("log")
     if not linear_y:
-        largest = max(
-            float(np.max(np.abs(flux.advective))),
-            float(np.max(np.abs(flux.maxwell))),
-            float(np.max(np.abs(flux.total))),
-        )
-        ax.set_yscale("symlog", linthresh=max(largest * 1.0e-4, 1.0))
+        ax.set_yscale("log")
+        ax.set_ylim(flux_y_limits([flux.advective, flux.maxwell, flux.total], linear_y=False))
     ax.set_xlabel(X_AXES[x_axis]["xlabel"])
-    ax.set_ylabel(r"$L_z$ angular momentum flux [" + FLUX_UNITS_LABEL + "]")
-    ax.set_title(DIRECTIONS[direction]["title"])
+    quantity = "angular momentum flux" if linear_y else "angular momentum flux magnitude"
+    ax.set_ylabel(r"$L_z$ " + quantity + " [" + FLUX_UNITS_LABEL + "]")
+    fit_plot_title(ax.set_title(DIRECTIONS[direction]["title"]), ax.bbox.width)
     ax.grid(True, which="both", alpha=0.25)
-    ax.legend(fontsize="small")
+    ax.legend(fontsize="small", title=None if linear_y else SIGN_LEGEND)
 
 
 def main() -> int:
@@ -276,7 +283,7 @@ def main() -> int:
     parser.add_argument(
         "--linear-y",
         action="store_true",
-        help="Use a linear y-axis instead of symlog.",
+        help="Plot signed values on a linear y-axis instead of log magnitudes.",
     )
     args = parser.parse_args()
 
@@ -320,7 +327,7 @@ def main() -> int:
         height = data.get("height_kpc")
         if height is not None:
             title += f", |z| <= {float(height):g} kpc"
-    fig.suptitle(title)
+    fit_plot_title(fig.suptitle(title), fig.bbox.width)
     fig.tight_layout()
     output = Path(args.output) if args.output is not None else Path(output_default)
     fig.savefig(output, dpi=200)

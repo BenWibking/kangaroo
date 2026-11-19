@@ -332,7 +332,7 @@ import numpy as np
 
 nt = 1 if result.temperature_bins is None else len(result.temperature_bins) - 1
 # Logical axes: half-height, flux sign, temperature, section, component.
-values = np.asarray(result.values).reshape(len(result.heights), 2, nt, 2, 8)
+values = np.asarray(result.values).reshape(len(result.heights), 2, nt, 2, 11)
 net = values.sum(axis=(1, 2))
 radial_advective = net[:, 1, 4]   # section 1 is walls
 radial_maxwell = net[:, 1, 5]
@@ -342,7 +342,15 @@ vertical_maxwell = net[:, 0, 7]
 vertical_total = vertical_advective + vertical_maxwell
 ```
 
-These are angular momentum per time (`g cm^2 s^-2` for cgs inputs), not flux
+Cylindrical flux JSON also includes `kinetic_energy_flux_cylinder`,
+`thermal_enthalpy_flux_cylinder`, and `poynting_flux_cylinder` (indices 8–10).
+Each is an integrated power in erg/s for cgs input and is tabulated by its
+own sign, geometric section, and temperature bin when requested. Net kinetic
+plus net enthalpy equals net hydro energy flux; adding net Poynting gives
+net MHD energy flux. These identities do not generally hold separately within
+positive and negative sign bins, because the channels are binned independently.
+
+The angular-momentum channels are angular momentum per time (`g cm^2 s^-2` for cgs inputs), not flux
 per area and not a time-integrated change. No gravitational torque is included.
 The existing geometry approximates the curved wall by tangent-plane sections
 of intersecting AMR cells and uses piecewise-constant states. The wall lever

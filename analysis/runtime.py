@@ -5,6 +5,8 @@ import os
 import sys
 import threading
 import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict
 from typing import Any
 
@@ -444,6 +446,21 @@ def log_phase_event(
     if not hasattr(_core, "log_phase_event"):
         return
     _core.log_phase_event(name, status, start, end, category, worker_label, locality)
+
+
+@contextmanager
+def trace_phase(name: str, *, category: str = "kangaroo.python.setup") -> Iterator[None]:
+    """Record a Python phase on the console locality, if tracing is enabled."""
+    start = time.time()
+    log_phase_event(name, "start", start=start, end=start, category=category,
+                    worker_label="python-main", locality=0)
+    status = "error"
+    try:
+        yield
+        status = "end"
+    finally:
+        log_phase_event(name, status, start=start, end=time.time(), category=category,
+                        worker_label="python-main", locality=0)
 
 
 def set_event_log_path(path: str) -> None:

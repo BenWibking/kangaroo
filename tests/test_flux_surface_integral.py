@@ -340,6 +340,9 @@ def test_cylindrical_flux_surface_integral_lowering_accepts_height_array() -> No
         "maxwell_radial_angular_momentum_flux_cylinder_negative",
         "advective_vertical_angular_momentum_flux_cylinder_negative",
         "maxwell_vertical_angular_momentum_flux_cylinder_negative",
+        "kinetic_energy_flux_cylinder_negative",
+        "thermal_enthalpy_flux_cylinder_negative",
+        "poynting_flux_cylinder_negative",
         "mass_flux_cylinder_positive",
         "hydro_energy_flux_cylinder_positive",
         "mhd_energy_flux_cylinder_positive",
@@ -348,6 +351,9 @@ def test_cylindrical_flux_surface_integral_lowering_accepts_height_array() -> No
         "maxwell_radial_angular_momentum_flux_cylinder_positive",
         "advective_vertical_angular_momentum_flux_cylinder_positive",
         "maxwell_vertical_angular_momentum_flux_cylinder_positive",
+        "kinetic_energy_flux_cylinder_positive",
+        "thermal_enthalpy_flux_cylinder_positive",
+        "poynting_flux_cylinder_positive",
     )
     templates = [tmpl for stage in plan.stages for tmpl in stage.templates]
     accum = [
@@ -359,10 +365,10 @@ def test_cylindrical_flux_surface_integral_lowering_accepts_height_array() -> No
     assert accum[0].params.radii == (0.5,)
     assert accum[0].params.radius_indices == (0,)
     assert accum[0].params.heights == (0.5, 1.5)
-    assert _output_bytes(accum[0]) == 512
+    assert _output_bytes(accum[0]) == 704
     reducers = [tmpl for tmpl in templates if tmpl.kernel == "uniform_slice_reduce"]
     assert reducers
-    assert all(_output_bytes(tmpl) == 512 for tmpl in reducers)
+    assert all(_output_bytes(tmpl) == 704 for tmpl in reducers)
 
 
 def test_cylindrical_flux_surface_integral_lowering_accepts_radius_array() -> None:
@@ -409,7 +415,7 @@ def test_cylindrical_flux_surface_integral_lowering_accepts_radius_array() -> No
     assert len(accum) == 1
     assert accum[0].params.radii == (0.5, 1.5)
     assert accum[0].params.radius_indices == (0, 1)
-    assert _output_bytes(accum[0]) == 512
+    assert _output_bytes(accum[0]) == 704
 
 
 def test_cylindrical_flux_groups_blocks_by_height_subset() -> None:
@@ -849,14 +855,16 @@ def test_cylindrical_flux_surface_integral_runtime_outputs_endcaps_and_walls() -
         step=step,
         level=0,
         field=flux.field,
-        shape=(2, 2, 8),
+        shape=(2, 2, 11),
         dtype=np.float64,
         dataset=ds,
         block=0,
     )
-    expected = np.zeros((2, 2, 8), dtype=np.float64)
+    expected = np.zeros((2, 2, 11), dtype=np.float64)
     expected[0, 0, :4] = np.array([-4.0, -(199.0 / 3.0), -(199.0 / 3.0), -10.0])
     expected[1, 0, :4] = np.array([4.0, 199.0 / 3.0, 199.0 / 3.0, 10.0])
+    expected[0, 0, 8:] = [-8.0, -175.0 / 3.0, 0.0]
+    expected[1, 0, 8:] = [8.0, 175.0 / 3.0, 0.0]
     expected *= np.pi / 8.0  # cap footprint is a half disk of radius 0.5
     assert np.allclose(raw, expected)
 
@@ -917,7 +925,7 @@ def test_cylindrical_flux_surface_integral_runtime_radius_array_matches_scalars(
         block=0,
         dtype=np.float64,
         dataset=ds,
-    ).reshape(2, 2, 2, 8)
+    ).reshape(2, 2, 2, 11)
     for radius_idx, scalar in enumerate((scalar_small, scalar_large)):
         scalar_values = rt.get_task_chunk_array(
             step=step,
@@ -926,7 +934,7 @@ def test_cylindrical_flux_surface_integral_runtime_radius_array_matches_scalars(
             block=0,
             dtype=np.float64,
             dataset=ds,
-        ).reshape(2, 2, 8)
+        ).reshape(2, 2, 11)
         np.testing.assert_allclose(vectorized_values[radius_idx], scalar_values)
 
 
@@ -1016,13 +1024,14 @@ def test_cylindrical_flux_surface_integral_runtime_one_cell_mhd_energy_term() ->
         step=step,
         level=0,
         field=flux.field,
-        shape=(2, 2, 8),
+        shape=(2, 2, 11),
         dtype=np.float64,
         dataset=ds,
         block=0,
     )
-    expected = np.zeros((2, 2, 8), dtype=np.float64)
+    expected = np.zeros((2, 2, 11), dtype=np.float64)
     expected[1, 1, :4] = np.array([6.0, 87.0, 90.0, 15.0])
+    expected[1, 1, 8:] = [27.0, 60.0, 3.0]
     assert np.allclose(raw, expected)
 
 
@@ -1402,7 +1411,7 @@ def test_cylindrical_angular_momentum_uses_surface_lever_arm_and_flux_sign(
     pipe.run()
     result = rt.get_task_chunk_array(
         step=0, level=0, field=flux.field, block=0, dtype=np.float64, dataset=ds,
-    ).reshape(2, 2, 2, 2, 8)
+    ).reshape(2, 2, 2, 2, 11)
     assert np.all(result[:, :, 0] == 0.0)
     for height_idx, height in enumerate((0.25, 0.4)):
         area = 2.0 * height  # tangent-plane wall strip in this unit-width cell
@@ -1412,6 +1421,13 @@ def test_cylindrical_angular_momentum_uses_surface_lever_arm_and_flux_sign(
         expected[0 if advective < 0.0 else 1, 0] = advective
         expected[0, 1] = maxwell
         np.testing.assert_allclose(result[height_idx, :, 1, 1, 4:6], expected)
+        # The wall carries Poynting flux even in the case with zero normal gas velocity.
+        b2 = 2.0**2 + 3.0**2 + 5.0**2
+        poynting = (b2 * momx / 2.0 - (2.0 * momx + 3.0 * momy)) * area
+        np.testing.assert_allclose(
+            result[height_idx, :, 1, 1, 10], [min(poynting, 0.0), max(poynting, 0.0)]
+        )
+        np.testing.assert_allclose(result[height_idx, :, 1, 0, 8:10], 0.0)
         # Integral x dA over x>=0, |y|<0.5 in the radius-0.75 disk.
         cap_moment_x = 23.0 / 96.0
         np.testing.assert_allclose(result[height_idx, :, 1, 0, 6], 0.0)
@@ -1477,7 +1493,7 @@ def _cylindrical_analytic_profile(
     pipe.run()
     result = rt.get_task_chunk_array(
         step=0, level=0, field=flux.field, block=0, dtype=np.float64, dataset=ds,
-    ).reshape(2, 2, 8)
+    ).reshape(2, 2, 11)
     return result[:, 1].sum(axis=0)
 
 
@@ -1537,7 +1553,7 @@ def test_cylindrical_endcap_disk_area_and_lever_moments(
     pipe.run()
     result = rt.get_task_chunk_array(
         step=0, level=0, field=flux.field, block=0, dtype=np.float64, dataset=ds,
-    ).reshape(2, 2, 8)
+    ).reshape(2, 2, 11)
     np.testing.assert_allclose(result[:, 0, 0], [-4.0 * area, 4.0 * area], atol=1.e-14)
     advective = 2.0 * (3.0 * x_moment - y_moment)
     maxwell = -5.0 * (2.0 * x_moment - y_moment)
@@ -1594,7 +1610,7 @@ def _vertical_analytic_profile(
     pipe.run()
     return rt.get_task_chunk_array(
         step=0, level=0, field=flux.field, block=0, dtype=np.float64, dataset=ds,
-    ).reshape(2, 2, 8)
+    ).reshape(2, 2, 11)
 
 
 def test_cylindrical_vertical_flux_converges_and_counts_grid_aligned_caps_once() -> None:
@@ -1707,7 +1723,7 @@ def test_cylindrical_wall_grid_face_has_single_owner(axis, side, layout, offset)
     pipe.run()
     result = rt.get_task_chunk_array(
         step=0, level=0, field=flux.field, block=0, dtype=np.float64, dataset=ds,
-    ).reshape(2, 2, 8)
+    ).reshape(2, 2, 11)
     # The tangent patch has area 1 * (2 * height) = 0.5.
     expected = np.array([[0.0, 0.0, -6.0 * radius],
                          [0.5, radius, 0.0]])

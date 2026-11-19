@@ -30,10 +30,14 @@ Usage: kangaroo jobs
 List your pending/running Kangaroo jobs with "kangaroo jobs", or submit an
 existing analysis batch job from this checkout.
 Commands: toomre-q, enclosed-sfr, cylindrical-flux, cylindrical-radial-flux,
-          spherical-flux, projection
+          spherical-flux, projection, temperature-density
 Plot commands: plot-cylindrical-flux, plot-cylindrical-radial-flux,
                plot-spherical-flux, plot-radial-flux-to-sfr,
-               plot-wind-disk-angular-momentum-flux
+               plot-wind-disk-angular-momentum-flux, plot-temperature-density
+
+For temperature-density, pass --density-range MIN MAX (g/cm^3) and
+--temperature-range MIN MAX (K). Optional: --bins NX NY (default: 128 128),
+--density FIELD, --temperature FIELD.
 
 Outputs: results/CAMPAIGN/PLOTFILE/ANALYSIS/
 Set KANGAROO_CAMPAIGN to omit --campaign. Existing batch environment settings
@@ -51,6 +55,8 @@ Examples:
   kangaroo cylindrical-flux /path/to/plt000100 --dry-run
   kangaroo plot-cylindrical-flux plt000100
   kangaroo plot-radial-flux-to-sfr plt000100
+  kangaroo temperature-density /path/to/plt000100 --density-range 1e-30 1e-20 --temperature-range 10 1e9
+  kangaroo plot-temperature-density plt000100
 HELP
 }
 fail() { echo "kangaroo: $*" >&2; exit 2; }
@@ -87,14 +93,14 @@ case "$command_name" in
           "JOBID", "NAME", "STATE", "ELAPSED", "NODES", "NODELIST(REASON)"
       }
       $2 ~ /^kangaroo-/ || \
-      $7 ~ /\/kangaroo\/batch\/make_(toomre_q|enclosed_sfr|cylindrical_flux|cylindrical_radial_flux|spherical_flux|projection)\.submit([[:space:]]|$)/ {
+      $7 ~ /\/kangaroo\/batch\/make_(toomre_q|enclosed_sfr|cylindrical_flux|cylindrical_radial_flux|spherical_flux|projection|temperature_density)\.submit([[:space:]]|$)/ {
         printf "%-20s %-32s %-10s %-12s %-6s %s\n", $1, $2, $3, $4, $5, $6
         count++
       }
       END { if (!count) print "No pending or running Kangaroo jobs." }
     ' <<< "$queue"
     exit 0 ;;
-  plot-cylindrical-flux|plot-cylindrical-radial-flux|plot-spherical-flux|plot-radial-flux-to-sfr|plot-wind-disk-angular-momentum-flux)
+  plot-cylindrical-flux|plot-cylindrical-radial-flux|plot-spherical-flux|plot-radial-flux-to-sfr|plot-wind-disk-angular-momentum-flux|plot-temperature-density)
     [[ $# -gt 0 ]] || fail 'a plotfile directory or basename is required'
     plotfile_name=$(basename "$1")
     [[ "$plotfile_name" == "$1" || -d "$1" ]] || fail "plotfile directory does not exist: $1"
@@ -134,6 +140,12 @@ case "$command_name" in
         run_plot plot_flux_surface_energy_flux.py "$input" -o energy_flux_vs_radius.png
         run_plot plot_flux_surface_passive_scalar_flux.py "$input" -o passive_scalar_flux_vs_radius.png
         ;;
+      plot-temperature-density)
+        output_dir="$plotfile_results/temperature_density"
+        input="$output_dir/temperature_density_histogram.json"
+        [[ -f "$input" ]] || fail "batch output does not exist: $input"
+        run_plot plot_temperature_density.py "$input" -o "$output_dir/temperature_density.png"
+        ;;
       plot-radial-flux-to-sfr)
         flux_input="$plotfile_results/cylindrical_radial_flux/cylindrical_radial_flux.json"
         sfr_input="$plotfile_results/enclosed_sfr/enclosed_sfr_disk.json"
@@ -161,7 +173,7 @@ case "$command_name" in
         ;;
     esac
     exit 0 ;;
-  toomre-q|enclosed-sfr|cylindrical-flux|cylindrical-radial-flux|spherical-flux|projection)
+  toomre-q|enclosed-sfr|cylindrical-flux|cylindrical-radial-flux|spherical-flux|projection|temperature-density)
     analysis_name=${command_name//-/_} ;;
   *) fail "unknown command '$command_name' (see --help)" ;;
 esac
@@ -173,6 +185,7 @@ shift
 campaign=${KANGAROO_CAMPAIGN:-}
 dry_run=0
 sbatch_args=()
+analysis_args=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --campaign)
@@ -180,6 +193,14 @@ while [[ $# -gt 0 ]]; do
       campaign=$2; shift 2 ;;
     --campaign=*) campaign=${1#*=}; shift ;;
     --dry-run) dry_run=1; shift ;;
+    --bins|--density-range|--temperature-range)
+      [[ "$command_name" == temperature-density ]] || fail "unknown option '$1'"
+      [[ $# -ge 3 ]] || fail "$1 requires two values"
+      analysis_args+=("$1" "$2" "$3"); shift 3 ;;
+    --density|--temperature)
+      [[ "$command_name" == temperature-density ]] || fail "unknown option '$1'"
+      [[ $# -ge 2 && "$2" != --* ]] || fail "$1 requires a field name"
+      analysis_args+=("$1" "$2"); shift 2 ;;
     --) shift; sbatch_args=("$@"); break ;;
     *) fail "unknown option '$1'; put Slurm options after --" ;;
   esac
@@ -197,11 +218,16 @@ case "$command_name" in
   cylindrical-radial-flux) exports+=("OUTPUT_JSON=$output_dir/cylindrical_radial_flux.json") ;;
   spherical-flux) exports+=("OUTPUT_JSON=$output_dir/flux_surface.json") ;;
   projection) exports+=("OUTPUT_PNG=$output_dir/stellar_projection_yz.png") ;;
+  temperature-density)
+    python3 "$REPO_ROOT/scripts/plotfile_temperature_density.py" "$plotfile" \
+      ${analysis_args[@]+"${analysis_args[@]}"} --validate-only || exit 2
+    exports+=("OUTPUT_JSON=$output_dir/temperature_density_histogram.json") ;;
 esac
 batch_script="$REPO_ROOT/batch/make_${analysis_name}.submit"
 # Bash 3 with nounset treats an empty array as unset.
 args=(sbatch ${sbatch_args[@]+"${sbatch_args[@]}"} --export=ALL --chdir="$REPO_ROOT"
-  --output="$output_dir/slurm-%j.out" "$batch_script" "$plotfile")
+  --output="$output_dir/slurm-%j.out" "$batch_script" "$plotfile"
+  ${analysis_args[@]+"${analysis_args[@]}"})
 if [[ "$dry_run" == 1 ]]; then
   printf '%q ' env "${exports[@]}" "${args[@]}"
   printf '\n'

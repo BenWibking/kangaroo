@@ -291,6 +291,7 @@ KernelParamsIR decode_params(const fb::KernelParamsUnion &input) {
     out.y_range = copy_array<double, 2>(p.y_range, "histogram y range");
     out.bins = copy_array<int32_t, 2>(p.bins, "histogram bins");
     out.weight_mode = p.weight_mode;
+    out.log_bins = p.log_bins;
     return out;
   }
   case fb::KernelParams::ParticleFieldParams: {

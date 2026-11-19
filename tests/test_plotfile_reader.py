@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import math
 import os
 import struct
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -164,13 +166,83 @@ def test_read_fab_crops_stored_ghost_cells(tmp_path) -> None:
     assert -1.0e30 not in values
 
 
+def test_temperature_density_cli_writes_mass_bins_and_plot(tmp_path) -> None:
+    import numpy as np
+
+    from scripts.plotfile_flux_surface import MSUN_G
+
+    repo = Path(__file__).resolve().parents[1]
+    plotfile = tmp_path / "plt"
+    values = _write_grown_plotfile(plotfile, ngrow=1)
+    # The two blocks are offset by two cells along x. Use rho for both axes
+    # in this single-field plotfile to check loading, weighting and output units.
+    density = np.r_[values, np.asarray(values) - 2.0]
+    directory = tmp_path / "results/demo/plt/temperature_density"
+    directory.mkdir(parents=True)
+    output = directory / "temperature_density_histogram.json"
+    env = dict(os.environ, KANGAROO_EXECUTOR_MODE="streaming", KANGAROO_EVENT_LOG="",
+               KANGAROO_REPO_ROOT=str(repo), MPLBACKEND="Agg")
+    result = subprocess.run(
+        [sys.executable, str(repo / "scripts/plotfile_temperature_density.py"), str(plotfile),
+         "--density-range", "1", "1000", "--temperature-range", "1", "1000",
+         "--temperature", "rho", "--bins", "3", "4", "--output-json", str(output)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    payload = json.loads(output.read_text())
+    expected, _, _ = np.histogram2d(
+        density, density, bins=(payload["density_edges"], payload["temperature_edges"]),
+        weights=density / MSUN_G,
+    )
+    np.testing.assert_allclose(payload["mass_msun"], expected, atol=0.0)
+    assert payload["total_mass_msun"] == pytest.approx(density.sum() / MSUN_G, abs=0.0)
+
+    result = subprocess.run(
+        [str(repo / "scripts/kangaroo"), "plot-temperature-density", "plt", "--campaign", "demo"],
+        cwd=tmp_path, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (directory / "temperature_density.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+
+
+@pytest.mark.parametrize("save_trace", [True, False])
+def test_cylindrical_flux_cli_traces_startup_phases(tmp_path, save_trace) -> None:
+    plotfile = tmp_path / "plt"
+    _write_grown_plotfile(plotfile, ngrow=1)
+    trace = tmp_path / "events.jsonl"
+    output = tmp_path / "flux.json"
+    script = Path(__file__).resolve().parents[1] / "scripts/plotfile_cylindrical_flux_surface.py"
+    cmd = [sys.executable, str(script), str(plotfile), "--radius", "1.5", "--height", "1.5",
+           "--output-json", str(output), "--progress"]
+    for field in ("density", "momx", "momy", "momz", "energy", "scalar", "bx", "by", "bz"):
+        cmd.extend([f"--{field}", "rho"])
+    env = dict(os.environ, KANGAROO_EXECUTOR_MODE="streaming",
+               KANGAROO_EVENT_LOG=str(trace) if save_trace else "")
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert output.is_file()
+    if not save_trace:
+        assert not trace.exists()
+        return
+
+    events = [json.loads(line) for line in trace.read_text().splitlines()]
+    phases = {(e["name"], e["status"]): e for e in events if e["type"] == "phase"}
+    previous_end = 0.0
+    for name in ("python_open_plotfile", "python_load_plotfile_metadata",
+                 "python_build_cylindrical_flux_plan", "python_encode_plan_flatbuffer"):
+        start = phases[name, "start"]
+        end = phases[name, "end"]
+        assert start["category"] == end["category"] == "kangaroo.python.setup"
+        assert previous_end <= start["ts"] == end["start"] <= end["ts"]
+        previous_end = end["ts"]
+    assert previous_end <= phases["runtime_execute_plan", "start"]["ts"]
+
+
 @pytest.mark.parametrize("like_input", [False, True], ids=["fixed-shape", "like-input"])
 @pytest.mark.parametrize("single_precision", [False, True], ids=["f64", "f32"])
 def test_streaming_plotfile_estimates_use_valid_fab_shape(
     tmp_path, monkeypatch, like_input, single_precision
 ) -> None:
-    import json
-
     import numpy as np
 
     from analysis import Runtime

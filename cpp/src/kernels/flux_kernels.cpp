@@ -368,9 +368,9 @@ void register_flux_kernels(KernelRegistry &registry) {
      * `height_indices`, `num_radii`, `num_heights`, `temperature_bins`,
      * `gamma`, and `covered_boxes` select the cylinder sections, output slots,
      * thermodynamic bins, equation of state, and AMR mask.
-     * @par Chunk outputs `outputs[0]` is an f64 tensor of signed mass,
-     * energy, passive-scalar, and advective/Maxwell radial and vertical L_z
-     * flux for each section and temperature bin.
+     * @par Chunk outputs `outputs[0]` is an f64 tensor of signed mass, hydro
+     * and MHD energy, passive-scalar, radial and vertical L_z, and separate
+     * kinetic, thermal enthalpy, and Poynting fluxes.
      */
     registry.register_typed_kernel<Params>(
         KernelDesc{.name = "cylindrical_flux_surface_integral_accumulate",
@@ -388,13 +388,20 @@ void register_flux_kernels(KernelRegistry &registry) {
           const std::size_t num_temperature_bins =
               use_temperature_bins ? params.temperature_bins.size() - 1 : 1;
           constexpr std::size_t num_geometric_sections = 2;
-          constexpr std::size_t num_components = 8;
+          // Keep the component order in sync with CYLINDRICAL_FLUX_COMPONENTS.
+          constexpr std::size_t num_components = 11;
           constexpr std::size_t endcaps_section = 0;
           constexpr std::size_t walls_section = 1;
           if (outputs.empty()) {
             return hpx::make_ready_future();
           }
           auto output_storage_bytes = outputs[0].mutable_byte_view();
+          const auto expected_output_bytes = checked_multiply(
+              checked_multiply(std::max(params.num_radii, params.num_heights), num_temperature_bins),
+              2 * num_geometric_sections * num_components * sizeof(double));
+          if (output_storage_bytes.size() != expected_output_bytes) {
+            throw std::runtime_error("cylindrical flux output must have 11 components per sign, section, and temperature bin");
+          }
           std::fill(output_storage_bytes.begin(), output_storage_bytes.end(),
                     std::uint8_t{0});
           if (inputs.size() < 9 ||
@@ -605,10 +612,11 @@ void register_flux_kernels(KernelRegistry &registry) {
             const double bdotv = vx * bx + vy * by + vz * bz;
             const double bnormal = nx * bx + ny * by + nz * bz;
             const double mass_flux = rho * vnormal * area;
-            const double hydro_energy_flux = (ehydro + pgas) * vnormal * area;
-            const double mhd_energy_flux =
-                ((energy_density + pgas + emag) * vnormal - bdotv * bnormal) *
-                area;
+            const double kinetic_energy_flux = kinetic * vnormal * area;
+            const double thermal_enthalpy_flux = (ehydro - kinetic + pgas) * vnormal * area;
+            const double poynting_flux = (2.0 * emag * vnormal - bdotv * bnormal) * area;
+            const double hydro_energy_flux = kinetic_energy_flux + thermal_enthalpy_flux;
+            const double mhd_energy_flux = hydro_energy_flux + poynting_flux;
             const double scalar_flux = scalar_density * vnormal * area;
             // These two components measure radial L_z transport only.
             // The lever arm is the requested cylinder radius, not cell radius.
@@ -636,7 +644,10 @@ void register_flux_kernels(KernelRegistry &registry) {
                 advective_angular_momentum_flux,
                 maxwell_angular_momentum_flux,
                 vertical_advective_angular_momentum_flux,
-                vertical_maxwell_angular_momentum_flux};
+                vertical_maxwell_angular_momentum_flux,
+                kinetic_energy_flux,
+                thermal_enthalpy_flux,
+                poynting_flux};
             const std::size_t surface_base = surface_idx *
                 2 * num_temperature_bins * num_geometric_sections *
                 num_components;

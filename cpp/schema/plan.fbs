@@ -128,7 +128,7 @@ table UniformProjectionParams {
 table FieldExprParams { expression:string; variables:[string]; }
 table UniformSliceParams { axis:int = 2; coord:double; rect:[double]; resolution:[int]; }
 table Histogram1DParams { bounds:[double]; bins:int = 1; }
-table Histogram2DParams { x_range:[double]; y_range:[double]; bins:[int]; weight_mode:string; }
+table Histogram2DParams { x_range:[double]; y_range:[double]; bins:[int]; weight_mode:string; log_bins:bool; }
 table ParticleFieldParams { particle_type:string; field_name:string; }
 table ParticleCicGridParams {
   particle_type:string;

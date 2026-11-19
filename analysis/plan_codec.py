@@ -186,7 +186,7 @@ def _params(value: model_params.KernelParams) -> tuple[int, Any]:
         )
     if isinstance(value, p.Histogram2DParams):
         return KernelParams.KernelParams.Histogram2DParams, Histogram2DParams.Histogram2DParamsT(
-            list(value.x_range), list(value.y_range), list(value.bins), value.weight_mode
+            list(value.x_range), list(value.y_range), list(value.bins), value.weight_mode, value.log_bins
         )
     if isinstance(value, p.ParticleFieldParams):
         return KernelParams.KernelParams.ParticleFieldParams, ParticleFieldParams.ParticleFieldParamsT(

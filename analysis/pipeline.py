@@ -28,6 +28,7 @@ from .kernel_params import (
     ValuesParams,
 )
 from .ops import (
+    CYLINDRICAL_FLUX_COMPONENTS,
     CylindricalFluxSurfaceIntegral,
     CylindricalMoments,
     FluxSurfaceIntegral,
@@ -116,10 +117,11 @@ class Histogram2DHandle:
     x_range: tuple[float, float]
     y_range: tuple[float, float]
     bins: tuple[int, int]
+    log_bins: bool = False
 
     @property
     def edges(self) -> tuple[list[float], list[float]]:
-        return histogram_edges_2d(self.x_range, self.y_range, self.bins)
+        return histogram_edges_2d(self.x_range, self.y_range, self.bins, log_bins=self.log_bins)
 
     def compute(self) -> Any:
         """Execute and return typed 2D histogram counts and edges."""
@@ -177,23 +179,10 @@ class CylindricalFluxSurfaceIntegralHandle:
     heights: tuple[float, ...] = ()
     temperature_bins: tuple[float, ...] | None = None
     geometric_sections: tuple[str, ...] = ("endcaps", "walls")
-    components: tuple[str, ...] = (
-        "mass_flux_cylinder_negative",
-        "hydro_energy_flux_cylinder_negative",
-        "mhd_energy_flux_cylinder_negative",
-        "passive_scalar_flux_cylinder_negative",
-        "advective_radial_angular_momentum_flux_cylinder_negative",
-        "maxwell_radial_angular_momentum_flux_cylinder_negative",
-        "advective_vertical_angular_momentum_flux_cylinder_negative",
-        "maxwell_vertical_angular_momentum_flux_cylinder_negative",
-        "mass_flux_cylinder_positive",
-        "hydro_energy_flux_cylinder_positive",
-        "mhd_energy_flux_cylinder_positive",
-        "passive_scalar_flux_cylinder_positive",
-        "advective_radial_angular_momentum_flux_cylinder_positive",
-        "maxwell_radial_angular_momentum_flux_cylinder_positive",
-        "advective_vertical_angular_momentum_flux_cylinder_positive",
-        "maxwell_vertical_angular_momentum_flux_cylinder_positive",
+    components: tuple[str, ...] = tuple(
+        f"{name}_{sign}"
+        for sign in ("negative", "positive")
+        for name in CYLINDRICAL_FLUX_COMPONENTS
     )
 
     @property
@@ -1369,6 +1358,7 @@ class Pipeline:
         out: str | None = None,
         weights: int | FieldHandle | None = None,
         weight_mode: str = "input",
+        log_bins: bool = False,
         domain: Domain | None = None,
         reduce_fan_in: int | None = None,
     ) -> Histogram2DHandle:
@@ -1383,6 +1373,7 @@ class Pipeline:
             out_name=out_name,
             weight_field=weight_field,
             weight_mode=weight_mode,
+            log_bins=log_bins,
             domain=domain,
             reduce_fan_in=reduce_fan_in,
         ).lower(self._ctx)
@@ -1393,6 +1384,7 @@ class Pipeline:
             x_range=x_range,
             y_range=y_range,
             bins=(int(bins[0]), int(bins[1])),
+            log_bins=log_bins,
         )
 
     # Particle operators (pipeline facade)

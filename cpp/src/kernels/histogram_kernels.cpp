@@ -2,6 +2,7 @@
 
 #include "kernel_buffer_support.hpp"
 #include "kernel_param_support.hpp"
+#include "kangaroo/box_spatial_index.hpp"
 
 #include <optional>
 
@@ -152,7 +153,8 @@ void register_histogram_kernels(KernelRegistry &registry) {
      * @par Chunk inputs `inputs[0]` and `inputs[1]` are matching real-valued x
      * and y block grids; optional `inputs[2]` is a matching weight grid.
      * @par Typed parameters `x_range`, `y_range`, `bins`, `weight_mode`,
-     * and `covered_boxes` define binning, weighting, and excluded AMR cells.
+     * and `log_bins` define binning and weighting. The coverage index excludes
+     * cells represented on finer AMR levels.
      * @par Chunk outputs `outputs[0]` is an f64 two-dimensional histogram.
      */
     registry.register_typed_kernel<Params>(
@@ -179,9 +181,32 @@ void register_histogram_kernels(KernelRegistry &registry) {
           const double yhi = params.y_range[1];
           if (!std::isfinite(xlo) || !std::isfinite(xhi) ||
               !std::isfinite(ylo) || !std::isfinite(yhi) || xhi <= xlo ||
-              yhi <= ylo) {
+              yhi <= ylo || (params.log_bins && (xlo <= 0.0 || ylo <= 0.0))) {
             return hpx::make_ready_future();
           }
+
+          const auto make_bin_index = [log_bins = params.log_bins](double lo, double hi, int bins) {
+            std::vector<double> interior_edges;
+            if (log_bins) {
+              const double start = std::log10(lo);
+              const double width = (std::log10(hi) - start) / bins;
+              interior_edges.reserve(bins - 1);
+              for (int i = 1; i < bins; ++i) {
+                interior_edges.push_back(std::pow(10.0, start + i * width));
+              }
+            }
+            const double inv_width = static_cast<double>(bins) / (hi - lo);
+            return [=, edges = std::move(interior_edges)](double value) {
+              if (!std::isfinite(value) || value < lo || value > hi) return -1;
+              if (value == hi) return bins - 1;
+              if (log_bins) {
+                return static_cast<int>(std::upper_bound(edges.begin(), edges.end(), value) - edges.begin());
+              }
+              return std::min(bins - 1, static_cast<int>(std::floor((value - lo) * inv_width)));
+            };
+          };
+          const auto x_bin = make_bin_index(xlo, xhi, nx_bins);
+          const auto y_bin = make_bin_index(ylo, yhi, ny_bins);
 
           auto out = outputs[0].mutable_view<double, 2>();
           for (int ix = 0; ix < nx_bins; ++ix)
@@ -203,24 +228,11 @@ void register_histogram_kernels(KernelRegistry &registry) {
             std::optional<RealBufferAccessor> weights;
             if (inputs.size() == 3)
               weights = make_real_buffer_accessor(inputs[2]);
-            const double inv_dx = static_cast<double>(nx_bins) / (xhi - xlo);
-            const double inv_dy = static_cast<double>(ny_bins) / (yhi - ylo);
             for (std::size_t index = 0; index < count; ++index) {
-              const double x = x_values(index);
-              const double y = y_values(index);
-              if (!std::isfinite(x) || !std::isfinite(y) || x < xlo ||
-                  x > xhi || y < ylo || y > yhi)
-                continue;
-              const int ix =
-                  x == xhi
-                      ? nx_bins - 1
-                      : static_cast<int>(std::floor((x - xlo) * inv_dx));
-              const int iy =
-                  y == yhi
-                      ? ny_bins - 1
-                      : static_cast<int>(std::floor((y - ylo) * inv_dy));
-              if (ix < 0 || ix >= nx_bins || iy < 0 || iy >= ny_bins)
-                continue;
+              const int ix = x_bin(x_values(index));
+              if (ix < 0) continue;
+              const int iy = y_bin(y_values(index));
+              if (iy < 0) continue;
               const double weight = weights ? (*weights)(index) : 1.0;
               if (std::isfinite(weight))
                 out(ix, iy) = static_cast<double>(out(ix, iy)) + weight;
@@ -240,21 +252,12 @@ void register_histogram_kernels(KernelRegistry &registry) {
             return hpx::make_ready_future();
           }
 
-          auto covered = [&](int ix, int iy, int iz) -> bool {
-            if (!params.covered_boxes) {
-              return false;
-            }
-            for (const auto &b : *params.covered_boxes) {
-              if (covered_box_contains(b, ix, iy, iz)) {
-                return true;
-              }
-            }
-            return false;
-          };
+          const int32_t block_lo[] = {box.lo.x, box.lo.y, box.lo.z};
+          const int32_t block_hi[] = {box.hi.x, box.hi.y, box.hi.z};
+          const auto* coverage = params.coverage_index.get();
+          if (coverage && !coverage->intersects(block_lo, block_hi)) coverage = nullptr;
           const double cell_volume =
               level.geom.dx[0] * level.geom.dx[1] * level.geom.dx[2];
-          const double inv_dx = static_cast<double>(nx_bins) / (xhi - xlo);
-          const double inv_dy = static_cast<double>(ny_bins) / (yhi - ylo);
           auto accumulate = [&](auto... typed_inputs) {
             static_assert(sizeof...(typed_inputs) == 2 ||
                           sizeof...(typed_inputs) == 3);
@@ -266,24 +269,13 @@ void register_histogram_kernels(KernelRegistry &registry) {
               for (int j = 0; j < ny; ++j) {
                 const int gj = box.lo.y + j;
                 for (int k = 0; k < nz; ++k) {
-                  const int gk = box.lo.z + k;
-                  if (covered(gi, gj, gk))
-                    continue;
+                  const int32_t cell[] = {gi, gj, box.lo.z + k};
+                  if (coverage && coverage->contains(cell)) continue;
                   const double x = static_cast<double>(x_values(i, j, k));
-                  const double y = static_cast<double>(y_values(i, j, k));
-                  if (!std::isfinite(x) || !std::isfinite(y) || x < xlo ||
-                      x > xhi || y < ylo || y > yhi)
-                    continue;
-                  const int ix =
-                      x == xhi
-                          ? nx_bins - 1
-                          : static_cast<int>(std::floor((x - xlo) * inv_dx));
-                  const int iy =
-                      y == yhi
-                          ? ny_bins - 1
-                          : static_cast<int>(std::floor((y - ylo) * inv_dy));
-                  if (ix < 0 || ix >= nx_bins || iy < 0 || iy >= ny_bins)
-                    continue;
+                  const int ix = x_bin(x);
+                  if (ix < 0) continue;
+                  const int iy = y_bin(static_cast<double>(y_values(i, j, k)));
+                  if (iy < 0) continue;
                   double weight = 1.0;
                   if constexpr (sizeof...(typed_inputs) == 3) {
                     weight =

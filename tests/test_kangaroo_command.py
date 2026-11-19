@@ -110,6 +110,26 @@ def test_submission_dry_run(tmp_path: Path, sbatch_options: list[str]) -> None:
     assert not (REPO_ROOT / "results" / "test-campaign" / plotfile.name).exists()
 
 
+def test_temperature_density_submission_options(tmp_path: Path) -> None:
+    plotfile = tmp_path / "plt000100"
+    plotfile.mkdir()
+    result = run_kangaroo(
+        "temperature-density", str(plotfile), "--density-range", "1e-30", "1e-20",
+        "--temperature-range", "10", "1e9", "--bins", "64", "48", "--temperature", "T",
+        "--dry-run", "--", "--time=02:00:00",
+    )
+    assert result.returncode == 0, result.stderr
+    assert "make_temperature_density.submit" in result.stdout
+    assert "temperature_density_histogram.json" in result.stdout
+    assert "--time=02:00:00" in result.stdout
+    assert "--bins 64 48 --temperature T" in result.stdout
+
+    result = run_kangaroo("temperature-density", str(plotfile), "--density-range", "0", "1",
+                          "--temperature-range", "10", "100", "--dry-run")
+    assert result.returncode == 2
+    assert "positive" in result.stderr
+
+
 def test_submission_preserves_spack_selection(tmp_path: Path) -> None:
     plotfile = tmp_path / "plt000100"
     plotfile.mkdir()
